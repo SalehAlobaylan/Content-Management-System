@@ -1,9 +1,10 @@
 package main
 
 import (
-	"src/models"
-	"src/routes"
-	"src/utils"
+    "content-management-system/src/models"
+    "content-management-system/src/routes"
+    "content-management-system/src/utils"
+
 
 	"log"
 	"os"
@@ -19,7 +20,7 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	models.AutoMigrate(db) // new
+	utils.AutoMigrate(db) // new
 
 
 
@@ -29,8 +30,7 @@ func main() {
 
 	router := gin.Default()
 
-	routes.SetupRoutes(router, db) //new
-	routes.InitializeRoutes(router, db)
+	routes.SetupRoutes(router, db)
 
 
 

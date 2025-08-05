@@ -2,9 +2,15 @@ package models
 
 import (
 	"time"
-	"gorm.io/gorm"
 )
 
 type Post struct {
+	ID uint `gorm:"primaryKey" json:"id"`
+	Title string `gorm:"size:255;not null" json:"title" binding:"required"`
+	Content string `gorm:"type:text;not null" json:"content" binding:"required"`
+	Author string `gorm:"size:255;not null" json:"author" binding:"required"`
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+	Media []Media `gorm:"foreignKey:post_media"`  // (slice of Media, representing a many-to-many relationship)
 
 }
