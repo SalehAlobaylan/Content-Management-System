@@ -11,6 +11,6 @@ type Post struct {
 	Author string `gorm:"size:255;not null" json:"author" binding:"required"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
-	Media []Media `gorm:"foreignKey:post_media"`  // (slice of Media, representing a many-to-many relationship)
+	Media []Media `gorm:"many2many:post_media"`  // (slice of Media, representing a many-to-many relationship)
 
 }

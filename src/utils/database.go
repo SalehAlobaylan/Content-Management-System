@@ -1,11 +1,12 @@
 package utils
 
 import (
+	// "content-management-system/src/models"
+	
 	"fmt"
 	"os"
 
 	"gorm.io/driver/postgres"
-	"content-management-system/src/models"
 	"gorm.io/gorm"
 )
 
@@ -29,7 +30,16 @@ func ConnectDB() (*gorm.DB, error) {
 	return db, nil
 }
 
-func AutoMigrate(db *gorm.DB) {
-	db.AutoMigrate(&models.Post{}, &models.Media{}, &models.Page{})
+func AutoMigrate(db *gorm.DB, models ...interface{}) error {
+	return db.AutoMigrate(models...)
 }
+func SeedData(db *gorm.DB) error {
+	// db.Create(&models.Post{
+	// 	Title: "Hello World",
+	// 	Content: "This is a test post",
+	// })
+	return nil
+}
+
+
 

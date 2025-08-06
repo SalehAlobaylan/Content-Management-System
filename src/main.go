@@ -1,13 +1,14 @@
 package main
 
 import (
-    // "content-management-system/src/models" // needs it for automigrate
+    "content-management-system/src/models" // needs it for automigrate
     "content-management-system/src/routes"
     "content-management-system/src/utils"
 
 
 	"log"
 	"os"
+	// "fmt"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/joho/godotenv/autoload"
@@ -28,6 +29,12 @@ func main() {
 	}
 
 
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatalf("Failed to get database instance: %v", err)
+	}
+
+	defer sqlDB.Close()
 
 
 
@@ -35,8 +42,19 @@ func main() {
 	if env == "" { //if env is not set, set it to development as default
 		env = "development"
 	}
+	if env == "development" {
+		log.Println("%Migrating and seeding data...")
+		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil{ // use it in development 
+			log.Fatalf("Failed to migrate database: %v", err)
+		} 
+		if err := utils.SeedData(db); err != nil{ // use it in development 
+			log.Fatalf("Failed to seed data: %v", err)
+		} 
+	}
+	if env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
-	utils.AutoMigrate(db) // use it in development 
 
 
 	router := gin.Default()
