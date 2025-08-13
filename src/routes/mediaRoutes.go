@@ -1,4 +1,5 @@
 package routes
+
 import (
 	"content-management-system/src/controllers"
 
@@ -6,10 +7,10 @@ import (
 	"gorm.io/gorm"
 )
 
-func SetupMediaRoutes(router *gin.Engine, db *gorm.DB) {
+func SetupMediaRoutes(router gin.IRouter, db *gorm.DB) {
+	controllers.InitMediaController(db)
 	router.POST("/media", controllers.CreateMedia)
+	router.GET("/media", controllers.GetMedia)
 	router.GET("/media/:id", controllers.GetMedia)
-	router.PUT("/media/:id", controllers.UpdateMedia)
 	router.DELETE("/media/:id", controllers.DeleteMedia)
 }
-

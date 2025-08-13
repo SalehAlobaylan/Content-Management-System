@@ -1,13 +1,13 @@
 package main
 
 import (
-    "content-management-system/src/models" // needs it for automigrate
-    "content-management-system/src/routes"
-    "content-management-system/src/utils"
-
+	"content-management-system/src/models" // needs it for automigrate
+	"content-management-system/src/routes"
+	"content-management-system/src/utils"
 
 	"log"
 	"os"
+
 	// "fmt"
 
 	"github.com/gin-gonic/gin"
@@ -16,18 +16,24 @@ import (
 )
 
 func SetupRoutes(router *gin.Engine, db *gorm.DB) {
-	routes.SetupPostRoutes(router, db)
-	routes.SetupMediaRoutes(router, db)
-	routes.SetupPageRoutes(router, db)
+	router.Use(func(c *gin.Context) {
+		c.Set("db", db)
+		c.Next()
+	})
+
+	v1 := router.Group("/api/v1")
+	routes.SetupPostRoutes(v1, db)
+	routes.SetupMediaRoutes(v1, db)
+	routes.SetupPageRoutes(v1, db)
+
 }
 
 func main() {
 
-	db, err:= utils.ConnectDB()
+	db, err := utils.ConnectDB()
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
-
 
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -36,37 +42,29 @@ func main() {
 
 	defer sqlDB.Close()
 
-
-
 	env := os.Getenv("ENV")
 	if env == "" { //if env is not set, set it to development as default
 		env = "development"
 	}
 	if env == "development" {
 		log.Println("%Migrating and seeding data...")
-		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil{ // use it in development 
+		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil { // use it in development
 			log.Fatalf("Failed to migrate database: %v", err)
-		} 
-		if err := utils.SeedData(db); err != nil{ // use it in development 
+		}
+		if err := utils.SeedData(db); err != nil { // use it in development
 			log.Fatalf("Failed to seed data: %v", err)
-		} 
+		}
 	}
 	if env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-
-
 	router := gin.Default()
 
-	
 	SetupRoutes(router, db)
 
-
-
-	if err :=router.Run(":8080"); err != nil {
+	if err := router.Run(":8080"); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
-
 
 }
