@@ -33,7 +33,9 @@ func ConnectDB() (*gorm.DB, error) {
 func AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	return db.AutoMigrate(models...)
 }
-func SeedData(db *gorm.DB) error {
+
+
+func SeedData(db *gorm.DB) error { // todo
 	// db.Create(&models.Post{
 	// 	Title: "Hello World",
 	// 	Content: "This is a test post",

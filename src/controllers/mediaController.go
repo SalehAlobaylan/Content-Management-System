@@ -54,8 +54,28 @@ func GetMedia(c *gin.Context) {
 }
 
 func DeleteMedia(c *gin.Context) {
+	var mediaToStore models.Media // create a media object to store the media to be deleted
+
+	if err := c.ShouldBindJSON(&mediaToStore); err != nil {
+			// The c.ShouldBindJSON() function:
+			// Reads the request body
+			// Parses it as JSON
+			// Maps the fields to your struct
+			// Returns an error if anything goes wrong
+			// This makes it easy to handle complex input data without manually parsing JSON.
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid media data"})
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 
+	if err := db.First(&mediaToStore, c.Param("id")).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "media not found"})
+		return
+	}
+
+	db.Delete(&mediaToStore)
+	c.JSON(http.StatusOK, gin.H{"message": "media deleted successfully"})
 }
 
 var mediaDB *gorm.DB
