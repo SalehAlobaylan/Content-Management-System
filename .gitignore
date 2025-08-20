@@ -9,3 +9,7 @@
 ./env.development.local.example
 ./env.production.local.example
 ./env.test.local.example
+
+example.compose.yaml
+Dockerfile.example
+README.Docker.md

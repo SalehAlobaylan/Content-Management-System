@@ -1,0 +1,15 @@
+FROM golang:1.23.4
+
+WORKDIR /app
+
+COPY go.mod go.sum ./ 
+
+# RUN go mod download && go mod verify
+RUN go mod download 
+
+COPY . .
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["go","run","main.go"]
