@@ -10,12 +10,16 @@ import (
 )
 
 func CreatePost(c *gin.Context) {
+	db:= c.MustGet("db").(*gorm.DB)
 
+	var post models.Post
+
+	c.JSON(http.StatusCreated, post)
 }
 
 func GetPosts(c *gin.Context) {
 	db:= c.MustGet("db").(*gorm.DB)
-	var posts []models.Post
+	var posts []models.Post // add [] becuase it multiple posts
 
 	title:= c.Query("title")  // query params
 	author:= c.Query("author")
@@ -45,13 +49,34 @@ func GetPosts(c *gin.Context) {
 }
 
 func GetPost(c *gin.Context) {
+	db:= c.MustGet("db").(*gorm.DB)
+	var post models.Post // no need to put in a slice [] becuase it single post
 
+	postID:= c.Param("id")
+
+	if err := db.First(&post, postID).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{
+			Code: http.StatusNotFound,
+			Message: "Post not found",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, post)
 }
 
 func UpdatePost(c *gin.Context) {
+	db:= c.MustGet("db").(*gorm.DB)
+	var post models.Post
+
+	c.JSON(http.StatusOK, post)
 
 }
 func DeletePost(c *gin.Context) {
+	db:= c.MustGet("db").(*gorm.DB)
+	var post models.Post
+
+	c.JSON(http.StatusNoContent, post)
 
 }
 
