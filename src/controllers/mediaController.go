@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/utils"
 	"errors"
 	"net/http"
 	"strconv"
@@ -12,8 +13,12 @@ import (
 
 func CreateMedia(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	var media models.Media
 
-
+	c.JSON(http.StatusCreated, utils.ResponseMessage{
+		Code: http.StatusCreated,
+		Message: "Media created successfully",
+	})
 }
 
 func GetMedia(c *gin.Context) {
