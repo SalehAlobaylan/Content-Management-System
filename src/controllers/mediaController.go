@@ -38,10 +38,16 @@ func GetMedia(c *gin.Context) {
 		var media models.Media
 		if err := mediaDB.First(&media, parsedID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				c.JSON(http.StatusNotFound, gin.H{"error": "media not found"})
+				c.JSON(http.StatusNotFound, utils.HTTPError{
+					Code: http.StatusNotFound,
+					Message: "Media not found",
+				})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch media"})
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{
+				Code: http.StatusInternalServerError,
+				Message: "Failed to fetch media",
+			})
 			return
 		}
 
@@ -52,7 +58,10 @@ func GetMedia(c *gin.Context) {
 	// no id provided -> fetch all media
 	var allMedia []models.Media
 	if err := mediaDB.Find(&allMedia).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch media"})
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code: http.StatusInternalServerError,
+			Message: "Failed to fetch media",
+		})
 		return
 	}
 	c.JSON(http.StatusOK, allMedia)
@@ -68,19 +77,28 @@ func DeleteMedia(c *gin.Context) {
 			// Maps the fields to your struct
 			// Returns an error if anything goes wrong
 			// This makes it easy to handle complex input data without manually parsing JSON.
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid media data"})
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code: http.StatusBadRequest,
+			Message: "Invalid media data",
+		})
 		return
 	}
 
 	db := c.MustGet("db").(*gorm.DB)
 
 	if err := db.First(&mediaToStore, c.Param("id")).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "media not found"})
+		c.JSON(http.StatusNotFound, utils.HTTPError{
+			Code: http.StatusNotFound,
+			Message: "Media not found",
+		})
 		return
 	}
 
 	db.Delete(&mediaToStore)
-	c.JSON(http.StatusOK, gin.H{"message": "media deleted successfully"})
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code: http.StatusOK,
+		Message: "Media deleted successfully",
+	})
 }
 
 var mediaDB *gorm.DB
