@@ -15,6 +15,33 @@ func CreateMedia(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var media models.Media
 
+	if err:= c.ShouldBindJSON(&media); err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code: http.StatusBadRequest,
+			Message: "Invalid media data",
+		})
+		return
+	}
+
+	transaction := db.Begin()
+	if err:= transaction.Create(&media).Error; err != nil {
+		transaction.Rollback()
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code: http.StatusInternalServerError,
+			Message: "Failed to create media: " + err.Error(),
+		})
+		return
+	}
+
+	if err:= transaction.Commit().Error; err != nil {
+		transaction.Rollback()
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code: http.StatusInternalServerError,
+			Message: "Failed to create media: " + err.Error(),
+		})
+		return
+	}
+
 	c.JSON(http.StatusCreated, utils.ResponseMessage{
 		Code: http.StatusCreated,
 		Message: "Media created successfully",
@@ -93,8 +120,23 @@ func DeleteMedia(c *gin.Context) {
 		})
 		return
 	}
-
-	db.Delete(&mediaToStore)
+	transaction := db.Begin()
+	if err:= transaction.Delete(&mediaToStore).Error; err != nil {
+		transaction.Rollback()
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code: http.StatusInternalServerError,
+			Message: "Failed to delete media: " + err.Error(),
+		})
+		return
+	}
+	if err:= transaction.Commit().Error; err != nil {
+		transaction.Rollback()
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code: http.StatusInternalServerError,
+			Message: "Failed to delete media: " + err.Error(),
+		})
+		return
+	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code: http.StatusOK,
 		Message: "Media deleted successfully",
