@@ -46,9 +46,11 @@ func main() {
 	if env == "" { //if env is not set, set it to development as default
 		env = "development"
 	}
-	if env == "development" {
-		log.Println("%Migrating and seeding data...")
-		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil { // use it in development
+
+	// Run migrations in development environments
+	if env == "development" || env == "dev" {
+		log.Println("Migrating and seeding data...")
+		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
 		if err := utils.SeedData(db); err != nil { // use it in development

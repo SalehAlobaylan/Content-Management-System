@@ -27,6 +27,7 @@ func CreatePage(c *gin.Context) {
 	if err:= transaction.Create(&page).Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Data: page,
 			Code: http.StatusInternalServerError,
 			Message: "Failed to create page: " + err.Error(),
 		})
@@ -130,6 +131,7 @@ func UpdatePage(c *gin.Context) {
 
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Data: page,
 		Code: http.StatusOK,
 		Message: "Page updated successfully",
 	})

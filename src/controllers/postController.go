@@ -151,7 +151,6 @@ func GetPost(c *gin.Context) {
 
 	if err := db.Preload("Media").First(&post, postID).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
-			Data: post,
 			Code:    http.StatusNotFound,
 			Message: "Post not found",
 		})

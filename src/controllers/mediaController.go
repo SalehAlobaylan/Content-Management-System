@@ -43,8 +43,8 @@ func CreateMedia(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, utils.ResponseMessage{
-		Data: media,
-		Code: http.StatusCreated,
+		Data:    media,
+		Code:    http.StatusCreated,
 		Message: "Media created successfully",
 	})
 }
@@ -80,8 +80,8 @@ func GetMedia(c *gin.Context) {
 		}
 
 		c.JSON(http.StatusOK, utils.ResponseMessage{
-			Data: media,
-			Code: http.StatusOK,
+			Data:    media,
+			Code:    http.StatusOK,
 			Message: "Media fetched successfully",
 		})
 		return
@@ -97,8 +97,8 @@ func GetMedia(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data: allMedia,
-		Code: http.StatusOK,
+		Data:    allMedia,
+		Code:    http.StatusOK,
 		Message: "Media fetched successfully",
 	})
 }
@@ -147,7 +147,7 @@ func DeleteMedia(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data: mediaToStore,
+		Data:    mediaToStore,
 		Code:    http.StatusOK,
 		Message: "Media deleted successfully",
 	})
