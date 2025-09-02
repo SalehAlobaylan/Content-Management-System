@@ -16,6 +16,7 @@ func CreatePage(c *gin.Context) {
 
 	if err:= c.ShouldBindJSON(&page); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Data: page,
 			Code: http.StatusBadRequest,
 			Message: "Invalid request body: " + err.Error(),
 		})
@@ -35,6 +36,7 @@ func CreatePage(c *gin.Context) {
 	if err:= transaction.Commit().Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Data: page,
 			Code: http.StatusInternalServerError,
 			Message: "Failed to create page: " + err.Error(),
 		})
@@ -42,6 +44,7 @@ func CreatePage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, utils.ResponseMessage{
+		Data: page,
 		Code: http.StatusCreated,
 		Message: "Page created successfully",
 	})
@@ -55,6 +58,7 @@ func GetPage(c *gin.Context) {
 	// catch error with HTTPError
 	if _, err:= strconv.Atoi(pageID); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Data: page,
 			Code: http.StatusBadRequest,
 			Message: "Invalid page ID",
 		})
@@ -71,6 +75,7 @@ func GetPage(c *gin.Context) {
 	c.MustGet("db").(*gorm.DB).First(&page, pageID)
 	
 	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Data: page,
 		Code: http.StatusOK,
 		Message: "Page retrieved successfully",
 	})
@@ -90,6 +95,7 @@ func UpdatePage(c *gin.Context) {
 	}
 	if err:= db.First(&page, pageID).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
+			Data: page,
 			Code: http.StatusNotFound,
 			Message: "Page not found",
 		})
@@ -97,6 +103,7 @@ func UpdatePage(c *gin.Context) {
 	}
 	if err:= c.ShouldBindJSON(&page); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Data: page,
 			Code: http.StatusBadRequest,
 			Message: "Invalid page data",
 		})
@@ -114,6 +121,7 @@ func UpdatePage(c *gin.Context) {
 	}
 	if err:= transaction.Commit().Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Data: page,
 			Code: http.StatusInternalServerError,
 			Message: "Failed to update page: " + err.Error(),
 		})
@@ -133,6 +141,7 @@ func DeletePage(c *gin.Context) {
 	pageID:= c.Param("id")
 	if _, err:= strconv.Atoi(pageID); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Data: page,
 			Code: http.StatusBadRequest,
 			Message: "Invalid page ID",
 		})
@@ -140,6 +149,7 @@ func DeletePage(c *gin.Context) {
 	}
 	if err:= c.ShouldBindJSON(&page); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Data: page,
 			Code: http.StatusBadRequest,
 			Message: "Invalid page data",
 		})
@@ -147,6 +157,7 @@ func DeletePage(c *gin.Context) {
 	}
 		if err:= db.First(&page, pageID).Error; err != nil {
 			c.JSON(http.StatusNotFound, utils.HTTPError{
+				Data: page,
 				Code: http.StatusNotFound,
 				Message: "Page not found",
 			})
@@ -164,12 +175,14 @@ func DeletePage(c *gin.Context) {
 	if err:= transaction.Commit().Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Data: page,
 			Code: http.StatusInternalServerError,
 			Message: "Failed to delete page: " + err.Error(),
 		})
 		return
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Data: page,
 		Code: http.StatusOK,
 		Message: "Page deleted successfully",
 	})
