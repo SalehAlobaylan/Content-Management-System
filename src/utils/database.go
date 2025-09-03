@@ -2,14 +2,13 @@ package utils
 
 import (
 	// "content-management-system/src/models"
-	
+
 	"fmt"
 	"os"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
-
 
 func ConnectDB() (*gorm.DB, error) {
 	dbUser := os.Getenv("DB_USER")
@@ -18,22 +17,52 @@ func ConnectDB() (*gorm.DB, error) {
 	dbHost := os.Getenv("DB_HOST")
 	dbPort := os.Getenv("DB_PORT")
 
+	// Ensure the target database exists before connecting to it
+	if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName); err != nil {
+		return nil, err
+	}
+
 	dsn := fmt.Sprintf(
 		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC",
 		dbHost, dbUser, dbPassword, dbName, dbPort,
 	)
-	
+
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
+
+	// Ensure pgcrypto extension for gen_random_uuid()
+	_ = db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error
+
 	return db, nil
+}
+
+func ensureDatabaseExists(host, port, user, password, dbName string) error {
+	adminDSN := fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=postgres port=%s sslmode=disable TimeZone=UTC",
+		host, user, password, port,
+	)
+	adminDB, err := gorm.Open(postgres.Open(adminDSN), &gorm.Config{})
+	if err != nil {
+		return err
+	}
+
+	var exists bool
+	if err := adminDB.Raw("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ?)", dbName).Scan(&exists).Error; err != nil {
+		return err
+	}
+	if !exists {
+		if err := adminDB.Exec("CREATE DATABASE " + dbName).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	return db.AutoMigrate(models...)
 }
-
 
 func SeedData(db *gorm.DB) error { // todo
 	// db.Create(&models.Post{
@@ -42,6 +71,3 @@ func SeedData(db *gorm.DB) error { // todo
 	// })
 	return nil
 }
-
-
-

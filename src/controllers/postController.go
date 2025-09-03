@@ -4,9 +4,9 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -16,7 +16,7 @@ func CreatePost(c *gin.Context) {
 	var post models.Post
 	if err := c.ShouldBindJSON(&post); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
-			Data: post,
+			Data:    post,
 			Code:    http.StatusBadRequest,
 			Message: err.Error(),
 		})
@@ -29,27 +29,27 @@ func CreatePost(c *gin.Context) {
 	if err := transaction.Create(&post).Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Data: post,
+			Data:    post,
 			Code:    http.StatusInternalServerError,
 			Message: err.Error(),
 		})
 		return
 	}
 
-	// Handle many-to-many media association if IDs are provided
+	// Handle many-to-many media association if PublicIDs are provided
 	if len(post.Media) > 0 {
-		var mediaIDs []uint
+		var publicIDs []uuid.UUID
 		for _, m := range post.Media {
-			if m.ID > 0 {
-				mediaIDs = append(mediaIDs, m.ID)
+			if m.PublicID != uuid.Nil {
+				publicIDs = append(publicIDs, m.PublicID)
 			}
 		}
-		if len(mediaIDs) > 0 {
+		if len(publicIDs) > 0 {
 			var mediaList []models.Media
-			if err := transaction.Find(&mediaList, mediaIDs).Error; err != nil {
+			if err := transaction.Where("public_id IN ?", publicIDs).Find(&mediaList).Error; err != nil {
 				transaction.Rollback()
 				c.JSON(http.StatusBadRequest, utils.HTTPError{
-					Data: post,
+					Data:    post,
 					Code:    http.StatusBadRequest,
 					Message: "Invalid media IDs",
 				})
@@ -58,7 +58,7 @@ func CreatePost(c *gin.Context) {
 			if err := transaction.Model(&post).Association("Media").Replace(mediaList); err != nil {
 				transaction.Rollback()
 				c.JSON(http.StatusInternalServerError, utils.HTTPError{
-					Data: post,
+					Data:    post,
 					Code:    http.StatusInternalServerError,
 					Message: err.Error(),
 				})
@@ -71,7 +71,7 @@ func CreatePost(c *gin.Context) {
 	if err := transaction.Preload("Media").First(&post, post.ID).Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Data: post,
+			Data:    post,
 			Code:    http.StatusInternalServerError,
 			Message: err.Error(),
 		})
@@ -81,7 +81,7 @@ func CreatePost(c *gin.Context) {
 	if err := transaction.Commit().Error; err != nil {
 		transaction.Rollback()
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Data: post,
+			Data:    post,
 			Code:    http.StatusInternalServerError,
 			Message: err.Error(),
 		})
@@ -89,7 +89,7 @@ func CreatePost(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, utils.ResponseMessage{
-		Data: post,	
+		Data:    post,
 		Code:    http.StatusCreated,
 		Message: "Post created successfully",
 	})
@@ -116,7 +116,7 @@ func GetPosts(c *gin.Context) {
 	// Use proper preloading for media relationships
 	if err := query.Preload("Media").Find(&posts).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Data: posts,
+			Data:    posts,
 			Code:    http.StatusInternalServerError,
 			Message: err.Error(),
 		})
@@ -124,32 +124,31 @@ func GetPosts(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data: posts,
-		Code: http.StatusOK,
+		Data:    posts,
+		Code:    http.StatusOK,
 		Message: "Posts fetched successfully",
 	})
 }
 
 func GetPost(c *gin.Context) {
 	postIDStr := c.Param("id")
-	postIDInt, err := strconv.Atoi(postIDStr)
-	if err != nil || postIDInt <= 0 {
+	parsedID, err := uuid.Parse(postIDStr)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
 			Code:    http.StatusBadRequest,
 			Message: "Invalid post ID",
 		})
 		return
 	}
-	postID := uint(postIDInt)
-	// 		The Type Conversion Chain
-	// 		c.Param("postID") → Returns string (e.g., "123")
-	// 		strconv.Atoi() → Converts string to int (e.g., 123)
-	// 		uint() → Converts int to uint (e.g., 123 as unsigned integer)
-
+	//      The Type Conversion Chain
+	//      c.Param("postID") → Returns string (e.g., "123")
+	//      strconv.Atoi() → Converts string to int (e.g., 123)
+	//      uint() → Converts int to uint (e.g., 123 as unsigned integer)
+	// all that maybe deleted now and not happenning anymore
 	db := c.MustGet("db").(*gorm.DB)
 	var post models.Post // no need to put in a slice [] becuase it single post
 
-	if err := db.Preload("Media").First(&post, postID).Error; err != nil {
+	if err := db.Preload("Media").First(&post, "public_id = ?", parsedID).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Post not found",
@@ -158,8 +157,8 @@ func GetPost(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data: post,
-		Code: http.StatusOK,
+		Data:    post,
+		Code:    http.StatusOK,
 		Message: "Post fetched successfully",
 	})
 }
@@ -168,17 +167,15 @@ func UpdatePost(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var post models.Post
 	var postIDStr = c.Param("id")
-	postIDInt, err := strconv.Atoi(postIDStr)
-	postID := uint(postIDInt)
-
-	if err != nil || postIDInt <= 0 {
+	parsedID, err := uuid.Parse(postIDStr)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
 			Code:    http.StatusBadRequest,
 			Message: "Invalid post ID",
 		})
 		return
 	}
-	if err := db.First(&post, postID).Error; err != nil {
+	if err := db.First(&post, "public_id = ?", parsedID).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Post not found",
@@ -203,8 +200,8 @@ func UpdatePost(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data: post,
-		Code: http.StatusOK,
+		Data:    post,
+		Code:    http.StatusOK,
 		Message: "Post updated successfully",
 	})
 
@@ -213,10 +210,8 @@ func DeletePost(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var post models.Post
 	var postIDStr = c.Param("id")
-	postIDInt, err := strconv.Atoi(postIDStr)
-	postID := uint(postIDInt)
-
-	if err != nil || postIDInt <= 0 {
+	parsedID, err := uuid.Parse(postIDStr)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
 			Code:    http.StatusBadRequest,
 			Message: "Invalid post ID",
@@ -224,7 +219,7 @@ func DeletePost(c *gin.Context) {
 		return
 	}
 
-	if err := db.First(&post, postID).Error; err != nil {
+	if err := db.First(&post, "public_id = ?", parsedID).Error; err != nil {
 
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
@@ -243,7 +238,7 @@ func DeletePost(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNoContent, utils.ResponseMessage{
-		Code: http.StatusNoContent,
+		Code:    http.StatusNoContent,
 		Message: "Post deleted successfully",
 	})
 
@@ -276,5 +271,5 @@ func DeletePost(c *gin.Context) {
 // 	c.JSON(http.StatusOK, post)
 // 	return
 // }
-
+//
 // }

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	_ "github.com/joho/godotenv/autoload"
 	"gorm.io/gorm"
 )
 
@@ -16,31 +17,6 @@ var (
 	testDB *gorm.DB
 	router *gin.Engine
 )
-
-// TODO: Import required packages for:
-// - Database (gorm, postgres driver)
-// - Gin framework
-// - Testing
-// - Logging
-// - OS operations
-// - Your application packages (models, routes)
-
-// TODO: Define package-level variables for:
-// - Test database connection
-// - Gin router instance
-
-/*
-INTEGRATION TEST SETUP GUIDE
-
-This file sets up the integration test environment for your CMS backend.
-It handles database connections, schema migrations, and cleanup.
-
-Key Components:
-1. Test database connection
-2. Router setup
-3. Schema migrations
-4. Test cleanup
-*/
 
 func TestMain(m *testing.M) {
 	setup()
@@ -52,11 +28,12 @@ func TestMain(m *testing.M) {
 func setup() {
 	gin.SetMode(gin.TestMode)
 
+	// Provide sensible defaults for local testing if env vars are not set
 	setDefaultEnvIfEmpty("DB_USER", "postgres")
-	setDefaultEnvIfEmpty("DB_PASSWORD", "postgres")
+	setDefaultEnvIfEmpty("DB_PASSWORD", "927319")
 	setDefaultEnvIfEmpty("DB_NAME", "cms_test")
 	setDefaultEnvIfEmpty("DB_HOST", "localhost")
-	setDefaultEnvIfEmpty("DB_PORT", "5432")
+	setDefaultEnvIfEmpty("DB_PORT", "5433")
 
 	var err error
 	testDB, err = utils.ConnectDB()
@@ -64,7 +41,7 @@ func setup() {
 		log.Fatalf("failed to connect test database: %v", err)
 	}
 
-	if err := utils.AutoMigrate(testDB, &models.Page{}, &models.Media{}, &models.Post{}); err != nil {
+	if err := testDB.AutoMigrate(&models.Page{}, &models.Media{}, &models.Post{}); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
 
@@ -95,6 +72,12 @@ func cleanup() {
 	}
 }
 
+func setDefaultEnvIfEmpty(key, value string) {
+	if os.Getenv(key) == "" {
+		_ = os.Setenv(key, value)
+	}
+}
+
 func clearTables() {
 	if testDB == nil {
 		return
@@ -103,12 +86,6 @@ func clearTables() {
 	_ = testDB.Exec("DELETE FROM posts").Error
 	_ = testDB.Exec("DELETE FROM media").Error
 	_ = testDB.Exec("DELETE FROM pages").Error
-}
-
-func setDefaultEnvIfEmpty(key, value string) {
-	if os.Getenv(key) == "" {
-		_ = os.Setenv(key, value)
-	}
 }
 
 /*

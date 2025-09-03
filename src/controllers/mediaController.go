@@ -5,9 +5,9 @@ import (
 	"content-management-system/src/utils"
 	"errors"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -57,14 +57,14 @@ func GetMedia(c *gin.Context) {
 
 	mediaIDParam := c.Param("id")
 	if mediaIDParam != "" { // fetch a specific media by ID
-		parsedID, err := strconv.Atoi(mediaIDParam)
-		if err != nil || parsedID <= 0 {
+		parsedUUID, err := uuid.Parse(mediaIDParam)
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid media id"})
 			return
 		}
 
 		var media models.Media
-		if err := mediaDB.First(&media, parsedID).Error; err != nil {
+		if err := mediaDB.Preload("Post").First(&media, "public_id = ?", parsedUUID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusNotFound, utils.HTTPError{
 					Code:    http.StatusNotFound,
@@ -89,7 +89,7 @@ func GetMedia(c *gin.Context) {
 
 	// no id provided -> fetch all media
 	var allMedia []models.Media
-	if err := mediaDB.Find(&allMedia).Error; err != nil {
+	if err := mediaDB.Preload("Post").Find(&allMedia).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
 			Message: "Failed to fetch media",
@@ -122,7 +122,16 @@ func DeleteMedia(c *gin.Context) {
 
 	db := c.MustGet("db").(*gorm.DB)
 
-	if err := db.First(&mediaToStore, c.Param("id")).Error; err != nil {
+	parsedUUID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid media id",
+		})
+		return
+	}
+
+	if err := db.First(&mediaToStore, "public_id = ?", parsedUUID).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Media not found",
