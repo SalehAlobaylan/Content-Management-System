@@ -1,1 +1,2 @@
--- TODO: Add down migration for media table
+-- Drop media table
+DROP TABLE IF EXISTS media;

@@ -4,6 +4,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,15 +14,18 @@ import (
 )
 
 func TestMediaIntegration(t *testing.T) {
+	fmt.Println("📸 Starting Media Integration Tests")
 	clearTables()
 
 	t.Run("Create Media", func(t *testing.T) {
+		fmt.Println("  🔨 Testing media creation...")
 		body := `{"url":"http://example.com/test.jpg","type":"image"}`
 		req := httptest.NewRequest("POST", "/api/v1/media", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
+		fmt.Printf("  📊 Create media response: %d\n", w.Code)
 		if w.Code != http.StatusCreated {
 			t.Fatalf("Expected status 201, got %d: %s", w.Code, w.Body.String())
 		}
@@ -33,6 +37,7 @@ func TestMediaIntegration(t *testing.T) {
 		var response models.Media
 		b, _ := json.Marshal(wrapper.Data)
 		_ = json.Unmarshal(b, &response)
+		fmt.Printf("  ✅ Created media with URL: %s\n", response.URL)
 		if response.URL != "http://example.com/test.jpg" {
 			t.Errorf("Expected URL 'http://example.com/test.jpg', got %s", response.URL)
 		}
@@ -41,10 +46,12 @@ func TestMediaIntegration(t *testing.T) {
 	})
 
 	t.Run("Get All Media", func(t *testing.T) {
+		fmt.Println("  📋 Testing media list retrieval...")
 		req := httptest.NewRequest("GET", "/api/v1/media", nil)
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
+		fmt.Printf("  📊 List media response: %d\n", w.Code)
 		if w.Code != http.StatusOK {
 			t.Fatalf("Expected status 200, got %d: %s", w.Code, w.Body.String())
 		}
@@ -56,11 +63,15 @@ func TestMediaIntegration(t *testing.T) {
 		var list []models.Media
 		b, _ := json.Marshal(wrapper.Data)
 		_ = json.Unmarshal(b, &list)
+		fmt.Printf("  📊 Found %d media items\n", len(list))
 		if len(list) == 0 {
 			t.Errorf("Expected non-empty media list")
 		}
 		if len(list) > 0 && list[0].PublicID == uuid.Nil {
 			t.Errorf("Expected listed media to have PublicID")
+		}
+		if len(list) > 0 {
+			fmt.Printf("  ✅ First media PublicID: %s\n", list[0].PublicID.String())
 		}
 	})
 }

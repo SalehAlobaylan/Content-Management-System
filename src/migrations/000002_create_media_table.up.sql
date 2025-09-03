@@ -1,6 +1,9 @@
--- TODO: Create media table
--- - Add primary key id column as SERIAL
--- - Add required url column to store file location/path
--- - Add type column to identify media type (image, video, etc.)
--- - Add timestamps for created_at and updated_at
---   Note: timestamps should use timezone for global compatibility
+-- Create media table matching models.Media
+CREATE TABLE IF NOT EXISTS media (
+    id SERIAL PRIMARY KEY,
+    public_id UUID DEFAULT gen_random_uuid() UNIQUE,
+    url VARCHAR(255) NOT NULL,
+    type VARCHAR(50),
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
