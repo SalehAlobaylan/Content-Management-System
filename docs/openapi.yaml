@@ -1,0 +1,360 @@
+openapi: 3.0.3
+info:
+  title: Content Management System API
+  version: 1.0.0
+  description: REST API for managing pages, posts, and media.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development server
+paths:
+  /pages:
+    post:
+      summary: Create a page
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PageCreate"
+      responses:
+        "201":
+          description: Page created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePage"
+  /pages/{id}:
+    get:
+      summary: Get a page by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+          description: Numeric page ID
+      responses:
+        "200":
+          description: Page retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePage"
+        "404":
+          description: Not found
+    put:
+      summary: Update a page by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PageUpdate"
+      responses:
+        "200":
+          description: Page updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePage"
+    delete:
+      summary: Delete a page by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      responses:
+        "200":
+          description: Page deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePage"
+
+  /posts:
+    get:
+      summary: List posts
+      responses:
+        "200":
+          description: Posts list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePostList"
+    post:
+      summary: Create a post
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostCreate"
+      responses:
+        "201":
+          description: Post created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePost"
+  /posts/{id}:
+    get:
+      summary: Get a post by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      responses:
+        "200":
+          description: Post retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePost"
+        "404":
+          description: Not found
+    put:
+      summary: Update a post by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostUpdate"
+      responses:
+        "200":
+          description: Post updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePost"
+    delete:
+      summary: Delete a post by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      responses:
+        "200":
+          description: Post deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponsePost"
+
+  /media:
+    get:
+      summary: List media
+      responses:
+        "200":
+          description: Media list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponseMediaList"
+    post:
+      summary: Create a media item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MediaCreate"
+      responses:
+        "201":
+          description: Media created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponseMedia"
+  /media/{id}:
+    get:
+      summary: Get a media item by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      responses:
+        "200":
+          description: Media retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponseMedia"
+    delete:
+      summary: Delete a media item by ID
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: integer
+          required: true
+      responses:
+        "200":
+          description: Media deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiResponseMedia"
+
+components:
+  schemas:
+    ResponseEnvelope:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: OK
+    Page:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [title, content]
+    PageCreate:
+      type: object
+      properties:
+        title:
+          type: string
+        content:
+          type: string
+      required: [title, content]
+    PageUpdate:
+      allOf:
+        - $ref: "#/components/schemas/PageCreate"
+    Post:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        content:
+          type: string
+        author:
+          type: string
+        media:
+          type: array
+          items:
+            $ref: "#/components/schemas/Media"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [title, content, author]
+    PostCreate:
+      type: object
+      properties:
+        title:
+          type: string
+        content:
+          type: string
+        author:
+          type: string
+      required: [title, content, author]
+    PostUpdate:
+      allOf:
+        - $ref: "#/components/schemas/PostCreate"
+    Media:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [url]
+    MediaCreate:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        type:
+          type: string
+      required: [url]
+
+    ApiResponsePage:
+      allOf:
+        - $ref: "#/components/schemas/ResponseEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/Page"
+    ApiResponsePost:
+      allOf:
+        - $ref: "#/components/schemas/ResponseEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/Post"
+    ApiResponseMedia:
+      allOf:
+        - $ref: "#/components/schemas/ResponseEnvelope"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/Media"
+    ApiResponsePostList:
+      allOf:
+        - $ref: "#/components/schemas/ResponseEnvelope"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Post"
+    ApiResponseMediaList:
+      allOf:
+        - $ref: "#/components/schemas/ResponseEnvelope"
+        - type: object
+          properties:
+            data:
+              type: array
+              items:
+                $ref: "#/components/schemas/Media"
