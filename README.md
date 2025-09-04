@@ -8,16 +8,29 @@
   <img src="https://skillicons.dev/icons?i=docker" alt="Docker" height="50" />
 </p>
 
-for non-cached system you can use this command:
-go test -v ./src/tests/integration
 
-## Documentation
+# Install dependencies and run
+
+    go mod download
+    go run src/main.go
 
 - Go doc (terminal):
-
+````
   - View all exported APIs: `cd src; go doc -all`
   - View a package: `go doc ./src/models`
   - View a symbol: `go doc ./src/models Post`
+
+Server runs on `http://localhost:8080`
+````
+
+## Testing
+
+````
+go test -v ./src/tests/integration
+````
+or non-cached system you can use this command:
+      
+      go test -v ./src/tests/integration
 
 - Swagger/OpenAPI UI:
 
@@ -25,5 +38,5 @@ go test -v ./src/tests/integration
   - Serve static docs locally: `go run ./cmd/docserver`
   - Open in browser: `http://localhost:8090`
 
-- Optional: Install Swagger generator (no code changes required here):
-  - `go install github.com/swaggo/swag/cmd/swag@latest`
+- Swagger UI: `go run ./cmd/docserver` → `http://localhost:8090`
+- Go docs: `cd src; go doc -all`
