@@ -1,4 +1,4 @@
-"# Content-Management-System"
+# Content-Management-System
 
 ## Tech Stack
 
