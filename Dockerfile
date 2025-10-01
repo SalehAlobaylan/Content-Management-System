@@ -12,4 +12,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["go","run","src/main.go"]
+CMD ["go","run","main.go"]

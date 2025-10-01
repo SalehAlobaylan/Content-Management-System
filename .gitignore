@@ -1,14 +1,14 @@
-./env
-./env.local
-./env.development
-./env.production
-./env.test
-./env.development.local
-./env.production.local
-./env.test.local
-./env.development.local.example
-./env.production.local.example
-./env.test.local.example
+env
+env.local
+env.development
+env.production
+env.test
+env.development.local
+env.production.local
+env.test.local
+env.development.local.example
+env.production.local.example
+env.test.local.example
 
 example.compose.yaml
 Dockerfile.example
