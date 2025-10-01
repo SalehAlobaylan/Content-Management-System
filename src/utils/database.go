@@ -16,15 +16,21 @@ func ConnectDB() (*gorm.DB, error) {
 	dbName := os.Getenv("DB_NAME")
 	dbHost := os.Getenv("DB_HOST")
 	dbPort := os.Getenv("DB_PORT")
+	sslMode := os.Getenv("DB_SSLMODE")
+
+	// Default to require for production (DigitalOcean)
+	if sslMode == "" {
+		sslMode = "require"
+	}
 
 	// Ensure the target database exists before connecting to it
-	if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName); err != nil {
+	if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName, sslMode); err != nil {
 		return nil, err
 	}
 
 	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=UTC",
-		dbHost, dbUser, dbPassword, dbName, dbPort,
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC",
+		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode,
 	)
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
@@ -38,10 +44,10 @@ func ConnectDB() (*gorm.DB, error) {
 	return db, nil
 }
 
-func ensureDatabaseExists(host, port, user, password, dbName string) error {
+func ensureDatabaseExists(host, port, user, password, dbName, sslMode string) error {
 	adminDSN := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=postgres port=%s sslmode=disable TimeZone=UTC",
-		host, user, password, port,
+		"host=%s user=%s password=%s dbname=postgres port=%s sslmode=%s TimeZone=UTC",
+		host, user, password, port, sslMode,
 	)
 	adminDB, err := gorm.Open(postgres.Open(adminDSN), &gorm.Config{})
 	if err != nil {
