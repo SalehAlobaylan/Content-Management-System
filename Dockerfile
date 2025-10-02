@@ -4,12 +4,14 @@ WORKDIR /app
 
 COPY go.mod go.sum ./ 
 
-# RUN go mod download && go mod verify
 RUN go mod download 
 
 COPY . .
 
+# Build the binary for faster startup and better error handling
+RUN go build -o /app/server ./src/main.go
+
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["go","run","src/main.go"]
+CMD ["/app/server"]
