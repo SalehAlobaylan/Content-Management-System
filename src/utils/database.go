@@ -17,15 +17,20 @@ func ConnectDB() (*gorm.DB, error) {
 	dbHost := os.Getenv("DB_HOST")
 	dbPort := os.Getenv("DB_PORT")
 	sslMode := os.Getenv("DB_SSLMODE")
+	env := os.Getenv("ENV")
 
 	// Default to require for production (DigitalOcean)
 	if sslMode == "" {
 		sslMode = "require"
 	}
 
-	// Ensure the target database exists before connecting to it
-	if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName, sslMode); err != nil {
-		return nil, err
+	// Only try to ensure database exists in development
+	// In production (DigitalOcean), the database should already exist
+	if env == "development" || env == "dev" || env == "" {
+		if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName, sslMode); err != nil {
+			// Log but don't fail - database might already exist
+			fmt.Printf("Warning: Could not ensure database exists: %v\n", err)
+		}
 	}
 
 	dsn := fmt.Sprintf(
@@ -35,7 +40,7 @@ func ConnectDB() (*gorm.DB, error) {
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
 	// Ensure pgcrypto extension for gen_random_uuid()
