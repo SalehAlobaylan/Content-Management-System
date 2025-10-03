@@ -76,13 +76,17 @@ func main() {
 	}
 
 	// Run migrations in development environments
-	if env == "development" || env == "dev" {
-		log.Println("Migrating and seeding data...")
+	// Note: In production, after initial setup, use proper migration tools instead
+	if env == "development" || env == "dev" || env == "production" {
+		log.Println("Migrating database...")
 		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
-		if err := utils.SeedData(db); err != nil { // use it in development
-			log.Fatalf("Failed to seed data: %v", err)
+		// Only seed in development
+		if env == "development" || env == "dev" {
+			if err := utils.SeedData(db); err != nil {
+				log.Fatalf("Failed to seed data: %v", err)
+			}
 		}
 	}
 	if env == "production" {
