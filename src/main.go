@@ -7,9 +7,11 @@ import (
 
 	"log"
 	"os"
+	"time"
 
 	// "fmt"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	_ "github.com/joho/godotenv/autoload"
 	"gorm.io/gorm"
@@ -88,6 +90,16 @@ func main() {
 	}
 
 	router := gin.Default()
+
+	// Configure CORS to allow all origins
+	router.Use(cors.New(cors.Config{
+		AllowAllOrigins:  true,
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: false,
+		MaxAge:           12 * time.Hour,
+	}))
 
 	SetupRoutes(router, db)
 
