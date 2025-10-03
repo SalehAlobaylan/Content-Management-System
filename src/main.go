@@ -16,6 +16,22 @@ import (
 )
 
 func SetupRoutes(router *gin.Engine, db *gorm.DB) {
+	// Welcome endpoint
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"message": "Welcome to Content Management System API",
+			"version": "1.0.0",
+			"endpoints": gin.H{
+				"health":        "/health",
+				"api":           "/api/v1",
+				"posts":         "/api/v1/posts",
+				"media":         "/api/v1/media",
+				"pages":         "/api/v1/pages",
+				"documentation": "/docs",
+			},
+		})
+	})
+
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
