@@ -10,6 +10,38 @@ import (
 	"gorm.io/gorm"
 )
 
+var postQueryConfig = utils.QueryConfig{
+	DefaultLimit: 20,
+	MaxLimit:     100,
+	DefaultSort: []utils.SortParam{
+		{Field: "created_at", Direction: "desc"},
+	},
+	SortableFields: map[string]string{
+		"created_at": "posts.created_at",
+		"updated_at": "posts.updated_at",
+		"title":      "posts.title",
+		"author":     "posts.author",
+	},
+	FilterableFields: map[string]string{
+		"title":      "posts.title",
+		"author":     "posts.author",
+		"content":    "posts.content",
+		"created_at": "posts.created_at",
+		"updated_at": "posts.updated_at",
+		"id":         "posts.public_id",
+	},
+	SearchableFields: map[string]string{
+		"title":   "posts.title",
+		"content": "posts.content",
+		"author":  "posts.author",
+	},
+	DefaultSearchFields: []string{"title", "content", "author"},
+	FieldDefaultOperators: map[string]string{
+		"title":   "contains",
+		"content": "contains",
+	},
+}
+
 func CreatePost(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
@@ -96,25 +128,24 @@ func CreatePost(c *gin.Context) {
 }
 
 func GetPosts(c *gin.Context) {
-
-	title := c.Query("title") // query params
-	author := c.Query("author")
-
 	db := c.MustGet("db").(*gorm.DB)
-	var posts []models.Post // add [] becuase it multiple posts
 
-	// query:= db // it should be this but logically i think it wrong
-	query := db.Model(&models.Post{})
-	if title != "" { // if title params provided fetch posts with title
-		query = query.Where("title LIKE ?", "%"+title+"%")
+	params, err := utils.ParseQueryParams(c, postQueryConfig)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: err.Error(),
+		})
+		return
 	}
 
-	if author != "" {
-		query = query.Where("author = ?", author)
-	}
+	baseQuery := db.Model(&models.Post{})
+	baseQuery = utils.ApplyQuery(baseQuery, params, postQueryConfig)
+	baseQuery = baseQuery.Preload("Media")
 
-	// Use proper preloading for media relationships
-	if err := query.Preload("Media").Find(&posts).Error; err != nil {
+	var posts []models.Post
+	meta, err := utils.FetchWithPagination(baseQuery, params, &posts)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Data:    posts,
 			Code:    http.StatusInternalServerError,
@@ -123,8 +154,12 @@ func GetPosts(c *gin.Context) {
 		return
 	}
 
+	links := utils.BuildPaginationLinks(c, meta)
+
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Data:    posts,
+		Meta:    meta,
+		Links:   links,
 		Code:    http.StatusOK,
 		Message: "Posts fetched successfully",
 	})

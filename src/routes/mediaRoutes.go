@@ -8,7 +8,6 @@ import (
 )
 
 func SetupMediaRoutes(router gin.IRouter, db *gorm.DB) {
-	controllers.InitMediaController(db)
 	router.POST("/media", controllers.CreateMedia)
 	router.GET("/media", controllers.GetMedia)
 	router.GET("/media/:id", controllers.GetMedia)

@@ -23,6 +23,7 @@ func setupPageRouter(t *testing.T) (*gin.Engine, *gorm.DB, sqlmock.Sqlmock) {
 	gin.SetMode(gin.TestMode)
 	router, db, mock := utils.SetupRouterAndMockDB(t)
 	router.POST("/pages", controllers.CreatePage)
+	router.GET("/pages", controllers.GetPages)
 	router.GET("/pages/:id", controllers.GetPage)
 	router.PUT("/pages/:id", controllers.UpdatePage)
 	router.DELETE("/pages/:id", controllers.DeletePage)

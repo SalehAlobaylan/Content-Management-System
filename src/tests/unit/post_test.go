@@ -74,7 +74,9 @@ func TestCreatePost_DBError(t *testing.T) {
 func TestGetPosts_Success(t *testing.T) {
 	router, mock := setupPostRouter(t)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM "posts"`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT .* FROM "posts"`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT * FROM "post_media"`)).
 		WillReturnRows(sqlmock.NewRows([]string{"post_id", "media_id"}))

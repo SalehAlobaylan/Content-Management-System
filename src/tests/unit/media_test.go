@@ -19,7 +19,6 @@ import (
 func setupMediaRouter(t *testing.T) (*gin.Engine, sqlmock.Sqlmock) {
 	gin.SetMode(gin.TestMode)
 	router, _, mock := utils.SetupRouterAndMockDB(t)
-	controllers.InitMediaController(nil) // ensure mediaDB is nil to hit init guard when needed
 	router.POST("/media", controllers.CreateMedia)
 	router.GET("/media/:id", controllers.GetMedia)
 	router.GET("/media", controllers.GetMedia)

@@ -11,6 +11,34 @@ import (
 	"gorm.io/gorm"
 )
 
+var mediaQueryConfig = utils.QueryConfig{
+	DefaultLimit: 20,
+	MaxLimit:     100,
+	DefaultSort: []utils.SortParam{
+		{Field: "created_at", Direction: "desc"},
+	},
+	SortableFields: map[string]string{
+		"created_at": "media.created_at",
+		"updated_at": "media.updated_at",
+		"type":       "media.type",
+	},
+	FilterableFields: map[string]string{
+		"type":       "media.type",
+		"url":        "media.url",
+		"id":         "media.public_id",
+		"created_at": "media.created_at",
+		"updated_at": "media.updated_at",
+	},
+	SearchableFields: map[string]string{
+		"url":  "media.url",
+		"type": "media.type",
+	},
+	DefaultSearchFields: []string{"url", "type"},
+	FieldDefaultOperators: map[string]string{
+		"url": "contains",
+	},
+}
+
 func CreateMedia(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var media models.Media
@@ -50,21 +78,21 @@ func CreateMedia(c *gin.Context) {
 }
 
 func GetMedia(c *gin.Context) {
-	if mediaDB == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
-		return
-	}
-
+	db := c.MustGet("db").(*gorm.DB)
 	mediaIDParam := c.Param("id")
+
 	if mediaIDParam != "" { // fetch a specific media by ID
 		parsedUUID, err := uuid.Parse(mediaIDParam)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid media id"})
+			c.JSON(http.StatusBadRequest, utils.HTTPError{
+				Code:    http.StatusBadRequest,
+				Message: "Invalid media id",
+			})
 			return
 		}
 
 		var media models.Media
-		if err := mediaDB.Preload("Post").First(&media, "public_id = ?", parsedUUID).Error; err != nil {
+		if err := db.Preload("Post").First(&media, "public_id = ?", parsedUUID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				c.JSON(http.StatusNotFound, utils.HTTPError{
 					Code:    http.StatusNotFound,
@@ -87,17 +115,35 @@ func GetMedia(c *gin.Context) {
 		return
 	}
 
-	// no id provided -> fetch all media
-	var allMedia []models.Media
-	if err := mediaDB.Preload("Post").Find(&allMedia).Error; err != nil {
+	params, err := utils.ParseQueryParams(c, mediaQueryConfig)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: err.Error(),
+		})
+		return
+	}
+
+	query := db.Model(&models.Media{})
+	query = utils.ApplyQuery(query, params, mediaQueryConfig)
+	query = query.Preload("Post")
+
+	var mediaList []models.Media
+	meta, err := utils.FetchWithPagination(query, params, &mediaList)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
 			Message: "Failed to fetch media",
 		})
 		return
 	}
+
+	links := utils.BuildPaginationLinks(c, meta)
+
 	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Data:    allMedia,
+		Data:    mediaList,
+		Meta:    meta,
+		Links:   links,
 		Code:    http.StatusOK,
 		Message: "Media fetched successfully",
 	})
@@ -160,12 +206,6 @@ func DeleteMedia(c *gin.Context) {
 		Code:    http.StatusOK,
 		Message: "Media deleted successfully",
 	})
-}
-
-var mediaDB *gorm.DB
-
-func InitMediaController(db *gorm.DB) {
-	mediaDB = db
 }
 
 // func GetMedia(c *gin.Context) {
