@@ -22,13 +22,17 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"message": "Welcome to Content Management System API",
-			"version": "1.0.0",
+			"version": "1.1.0",
 			"endpoints": gin.H{
 				"health":        "/health",
 				"api":           "/api/v1",
 				"posts":         "/api/v1/posts",
 				"media":         "/api/v1/media",
 				"pages":         "/api/v1/pages",
+				"feed_foryou":   "/api/v1/feed/foryou",
+				"feed_news":     "/api/v1/feed/news",
+				"content":       "/api/v1/content/:id",
+				"interactions":  "/api/v1/interactions",
 				"documentation": "/docs",
 			},
 		})
@@ -50,6 +54,11 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupPostRoutes(v1, db)
 	routes.SetupMediaRoutes(v1, db)
 	routes.SetupPageRoutes(v1, db)
+
+	// Lumen Platform routes
+	routes.SetupFeedRoutes(v1, db)
+	routes.SetupInteractionRoutes(v1, db)
+	routes.SetupContentRoutes(v1, db)
 
 }
 
@@ -79,13 +88,26 @@ func main() {
 	// Note: In production, after initial setup, use proper migration tools instead
 	if env == "development" || env == "dev" || env == "production" {
 		log.Println("Migrating database...")
-		if err := utils.AutoMigrate(db, &models.Page{}, &models.Post{}, &models.Media{}); err != nil {
+		if err := utils.AutoMigrate(db,
+			&models.Page{},
+			&models.Post{},
+			&models.Media{},
+			// Lumen Platform models
+			&models.ContentItem{},
+			&models.Transcript{},
+			&models.UserInteraction{},
+			&models.ContentSource{},
+		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
 		// Only seed in development
 		if env == "development" || env == "dev" {
 			if err := utils.SeedData(db); err != nil {
 				log.Fatalf("Failed to seed data: %v", err)
+			}
+			// Seed Lumen Platform content
+			if err := utils.SeedLumenData(db); err != nil {
+				log.Fatalf("Failed to seed Lumen data: %v", err)
 			}
 		}
 	}

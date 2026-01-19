@@ -1,63 +1,90 @@
 package utils
 
 import (
-	// "content-management-system/src/models"
-
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
+// ConnectDB connects to PostgreSQL using DATABASE_URL or individual env vars as fallback
 func ConnectDB() (*gorm.DB, error) {
-	dbUser := os.Getenv("DB_USER")
-	dbPassword := os.Getenv("DB_PASSWORD")
-	dbName := os.Getenv("DB_NAME")
-	dbHost := os.Getenv("DB_HOST")
-	dbPort := os.Getenv("DB_PORT")
-	sslMode := os.Getenv("DB_SSLMODE")
 	env := os.Getenv("ENV")
 
-	// Default to require for production (DigitalOcean)
-	if sslMode == "" {
-		sslMode = "require"
-	}
+	// Get connection string - prefer DATABASE_URL
+	dsn := getDatabaseURL()
 
-	// Only try to ensure database exists in development
-	// In production (DigitalOcean), the database should already exist
+	// In development, try to ensure the database exists
 	if env == "development" || env == "dev" || env == "" {
-		if err := ensureDatabaseExists(dbHost, dbPort, dbUser, dbPassword, dbName, sslMode); err != nil {
+		if err := ensureDatabaseExistsFromURL(dsn); err != nil {
 			// Log but don't fail - database might already exist
 			fmt.Printf("Warning: Could not ensure database exists: %v\n", err)
 		}
 	}
-
-	dsn := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC",
-		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode,
-	)
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	// Ensure pgcrypto extension for gen_random_uuid()
+	// Ensure required PostgreSQL extensions
 	_ = db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error
+	_ = db.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error
 
 	return db, nil
 }
 
-func ensureDatabaseExists(host, port, user, password, dbName, sslMode string) error {
-	adminDSN := fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=postgres port=%s sslmode=%s TimeZone=UTC",
-		host, user, password, port, sslMode,
+// getDatabaseURL returns the database connection string
+// Priority: DATABASE_URL > individual DB_* variables
+func getDatabaseURL() string {
+	// Check for DATABASE_URL first (preferred)
+	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
+		return databaseURL
+	}
+
+	// Fallback: build from individual variables (for backward compatibility)
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASSWORD")
+	dbName := os.Getenv("DB_NAME")
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	sslMode := os.Getenv("DB_SSLMODE")
+
+	// Default values
+	if dbHost == "" {
+		dbHost = "localhost"
+	}
+	if dbPort == "" {
+		dbPort = "5432"
+	}
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+
+	return fmt.Sprintf(
+		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC",
+		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode,
 	)
+}
+
+// ensureDatabaseExistsFromURL tries to create the database if it doesn't exist
+func ensureDatabaseExistsFromURL(dsn string) error {
+	// Extract database name and create admin connection string
+	dbName, adminDSN := parseAndModifyDSN(dsn)
+	if dbName == "" || adminDSN == "" {
+		return fmt.Errorf("could not parse database connection string")
+	}
+
 	adminDB, err := gorm.Open(postgres.Open(adminDSN), &gorm.Config{})
 	if err != nil {
 		return err
 	}
+
+	sqlDB, _ := adminDB.DB()
+	defer sqlDB.Close()
 
 	var exists bool
 	if err := adminDB.Raw("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ?)", dbName).Scan(&exists).Error; err != nil {
@@ -71,14 +98,38 @@ func ensureDatabaseExists(host, port, user, password, dbName, sslMode string) er
 	return nil
 }
 
+// parseAndModifyDSN extracts the database name and returns a connection string for 'postgres' database
+func parseAndModifyDSN(dsn string) (dbName string, adminDSN string) {
+	// Handle URL format: postgres://user:pass@host:port/dbname?sslmode=disable
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", ""
+		}
+		dbName = strings.TrimPrefix(u.Path, "/")
+		u.Path = "/postgres"
+		return dbName, u.String()
+	}
+
+	// Handle key=value format: host=... user=... dbname=...
+	parts := strings.Fields(dsn)
+	var newParts []string
+	for _, part := range parts {
+		if strings.HasPrefix(part, "dbname=") {
+			dbName = strings.TrimPrefix(part, "dbname=")
+			newParts = append(newParts, "dbname=postgres")
+		} else {
+			newParts = append(newParts, part)
+		}
+	}
+	return dbName, strings.Join(newParts, " ")
+}
+
 func AutoMigrate(db *gorm.DB, models ...interface{}) error {
 	return db.AutoMigrate(models...)
 }
 
-func SeedData(db *gorm.DB) error { // todo
-	// db.Create(&models.Post{
-	// 	Title: "Hello World",
-	// 	Content: "This is a test post",
-	// })
+func SeedData(db *gorm.DB) error {
+	// Placeholder for original CMS seed data
 	return nil
 }

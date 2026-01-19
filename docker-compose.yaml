@@ -1,21 +1,65 @@
 services:
+  # Go CMS API Server (Lumen Backend)
   server:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumen-api
     ports:
-    - "8080:8080"
-    env_file:
-      - .env
-    depends_on: # to make the server waits for the db to be ready
-      - db
-  db:
-    image: postgres:latest
+      - "8080:8080"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      - ENV=development
+      - DATABASE_URL=postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-lumen_db}?sslmode=disable
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - lumen-network
+
+  # PostgreSQL with pgvector extension (required for Lumen embeddings)
+  db:
+    image: ankane/pgvector:latest
+    container_name: lumen-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-lumen_db}
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./src/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-lumen_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - lumen-network
 
+  # Redis for caching (optional, for future use)
+  redis:
+    image: redis:7-alpine
+    container_name: lumen-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - lumen-network
+
+networks:
+  lumen-network:
+    driver: bridge
 
 volumes:
   postgres_data:
+  redis_data:

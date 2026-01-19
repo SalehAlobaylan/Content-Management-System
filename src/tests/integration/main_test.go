@@ -32,15 +32,21 @@ func setup() {
 	fmt.Println("🔧 Setting up test environment...")
 	gin.SetMode(gin.TestMode)
 
-	// Provide sensible defaults for local testing if env vars are not set
-	setDefaultEnvIfEmpty("DB_USER", "postgres")
-	setDefaultEnvIfEmpty("DB_PASSWORD", "927319")
-	setDefaultEnvIfEmpty("DB_NAME", "cms_test")
-	setDefaultEnvIfEmpty("DB_HOST", "localhost")
-	setDefaultEnvIfEmpty("DB_PORT", "5433")
+	// Set DATABASE_URL for tests (preferred method)
+	// Falls back to building from individual vars if not set
+	if os.Getenv("DATABASE_URL") == "" {
+		dbUser := getEnvOrDefault("DB_USER", "postgres")
+		dbPassword := getEnvOrDefault("DB_PASSWORD", "927319")
+		dbName := getEnvOrDefault("DB_NAME", "cms_test")
+		dbHost := getEnvOrDefault("DB_HOST", "localhost")
+		dbPort := getEnvOrDefault("DB_PORT", "5433")
 
-	fmt.Printf("📊 Connecting to test database: %s@%s:%s/%s\n",
-		os.Getenv("DB_USER"), os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), os.Getenv("DB_NAME"))
+		databaseURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+			dbUser, dbPassword, dbHost, dbPort, dbName)
+		os.Setenv("DATABASE_URL", databaseURL)
+	}
+
+	fmt.Printf("📊 Connecting to test database: %s\n", os.Getenv("DATABASE_URL"))
 
 	var err error
 	testDB, err = utils.ConnectDB()
@@ -49,7 +55,16 @@ func setup() {
 	}
 
 	fmt.Println("🔄 Running database migrations...")
-	if err := testDB.AutoMigrate(&models.Page{}, &models.Media{}, &models.Post{}); err != nil {
+	if err := testDB.AutoMigrate(
+		&models.Page{},
+		&models.Media{},
+		&models.Post{},
+		// Lumen Platform models
+		&models.ContentItem{},
+		&models.Transcript{},
+		&models.UserInteraction{},
+		&models.ContentSource{},
+	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
 
@@ -64,6 +79,10 @@ func setup() {
 	routes.SetupPostRoutes(v1, testDB)
 	routes.SetupMediaRoutes(v1, testDB)
 	routes.SetupPageRoutes(v1, testDB)
+	// Lumen Platform routes
+	routes.SetupFeedRoutes(v1, testDB)
+	routes.SetupInteractionRoutes(v1, testDB)
+	routes.SetupContentRoutes(v1, testDB)
 	fmt.Println("✅ Test environment setup complete!")
 }
 
@@ -73,6 +92,12 @@ func cleanup() {
 		return
 	}
 	m := testDB.Migrator()
+	// Lumen Platform tables
+	_ = m.DropTable(&models.UserInteraction{})
+	_ = m.DropTable(&models.Transcript{})
+	_ = m.DropTable(&models.ContentItem{})
+	_ = m.DropTable(&models.ContentSource{})
+	// Original CMS tables
 	_ = m.DropTable("post_media")
 	_ = m.DropTable(&models.Post{})
 	_ = m.DropTable(&models.Media{})
@@ -89,6 +114,13 @@ func setDefaultEnvIfEmpty(key, value string) {
 	if os.Getenv(key) == "" {
 		_ = os.Setenv(key, value)
 	}
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
 
 func clearTables() {
