@@ -74,4 +74,3 @@ func TestDeleteMedia_InvalidID(t *testing.T) {
 		t.Fatalf("expected %d, got %d", http.StatusBadRequest, w.Code)
 	}
 }
-

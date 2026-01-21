@@ -10,11 +10,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// ConnectDB connects to PostgreSQL using DATABASE_URL or individual env vars as fallback
+// ConnectDB connects to PostgreSQL using DATABASE_URL environment variable
 func ConnectDB() (*gorm.DB, error) {
 	env := os.Getenv("ENV")
 
-	// Get connection string - prefer DATABASE_URL
+	// Get connection string from DATABASE_URL (required)
 	dsn := getDatabaseURL()
 
 	// In development, try to ensure the database exists
@@ -37,37 +37,14 @@ func ConnectDB() (*gorm.DB, error) {
 	return db, nil
 }
 
-// getDatabaseURL returns the database connection string
-// Priority: DATABASE_URL > individual DB_* variables
+// getDatabaseURL returns the database connection string from DATABASE_URL
+// This is the only supported method for database configuration
 func getDatabaseURL() string {
-	// Check for DATABASE_URL first (preferred)
-	if databaseURL := os.Getenv("DATABASE_URL"); databaseURL != "" {
-		return databaseURL
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		panic("DATABASE_URL environment variable is required but not set")
 	}
-
-	// Fallback: build from individual variables (for backward compatibility)
-	dbUser := os.Getenv("DB_USER")
-	dbPassword := os.Getenv("DB_PASSWORD")
-	dbName := os.Getenv("DB_NAME")
-	dbHost := os.Getenv("DB_HOST")
-	dbPort := os.Getenv("DB_PORT")
-	sslMode := os.Getenv("DB_SSLMODE")
-
-	// Default values
-	if dbHost == "" {
-		dbHost = "localhost"
-	}
-	if dbPort == "" {
-		dbPort = "5432"
-	}
-	if sslMode == "" {
-		sslMode = "disable"
-	}
-
-	return fmt.Sprintf(
-		"host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=UTC",
-		dbHost, dbUser, dbPassword, dbName, dbPort, sslMode,
-	)
+	return databaseURL
 }
 
 // ensureDatabaseExistsFromURL tries to create the database if it doesn't exist

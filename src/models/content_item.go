@@ -44,8 +44,8 @@ const (
 
 // ContentItem represents all content types in the Lumen platform feeds
 type ContentItem struct {
-	ID        uint      `gorm:"primaryKey" json:"-"`
-	PublicID  uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ID       uint      `gorm:"primaryKey" json:"-"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
 
 	// Classification
 	Type   ContentType   `gorm:"type:varchar(20);not null" json:"type"`
@@ -64,8 +64,8 @@ type ContentItem struct {
 	DurationSec  *int    `gorm:"type:integer" json:"duration_sec,omitempty"`
 
 	// Attribution
-	Author       *string `gorm:"type:varchar(255)" json:"author,omitempty"`
-	SourceName   *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`
+	Author        *string `gorm:"type:varchar(255)" json:"author,omitempty"`
+	SourceName    *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`
 	SourceFeedURL *string `gorm:"type:text" json:"-"`
 
 	// Tags & AI

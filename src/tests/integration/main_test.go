@@ -32,18 +32,10 @@ func setup() {
 	fmt.Println("🔧 Setting up test environment...")
 	gin.SetMode(gin.TestMode)
 
-	// Set DATABASE_URL for tests (preferred method)
-	// Falls back to building from individual vars if not set
+	// Set DATABASE_URL for tests if not already set
 	if os.Getenv("DATABASE_URL") == "" {
-		dbUser := getEnvOrDefault("DB_USER", "postgres")
-		dbPassword := getEnvOrDefault("DB_PASSWORD", "927319")
-		dbName := getEnvOrDefault("DB_NAME", "cms_test")
-		dbHost := getEnvOrDefault("DB_HOST", "localhost")
-		dbPort := getEnvOrDefault("DB_PORT", "5433")
-
-		databaseURL := fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-			dbUser, dbPassword, dbHost, dbPort, dbName)
-		os.Setenv("DATABASE_URL", databaseURL)
+		// Default test database connection
+		os.Setenv("DATABASE_URL", "postgres://postgres:927319@localhost:5433/cms_test?sslmode=disable")
 	}
 
 	fmt.Printf("📊 Connecting to test database: %s\n", os.Getenv("DATABASE_URL"))

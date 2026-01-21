@@ -14,7 +14,7 @@ package utils
 * The helpers encapsulate per-operator SQL (value filters, LIKE patterns, IN/
 * NOT IN, null checks) so controllers only deal with high-level configs.
 *
-*/
+ */
 
 import (
 	"fmt"
@@ -245,7 +245,7 @@ func applySearch(query *gorm.DB, params QueryParams, cfg QueryConfig) *gorm.DB {
 		return query
 	}
 
-	return query.Where("(" + strings.Join(clauses, " OR ") + ")", args...)
+	return query.Where("("+strings.Join(clauses, " OR ")+")", args...)
 }
 
 func buildLink(path string, values url.Values, page, limit int) *string {
@@ -273,4 +273,3 @@ func cloneValues(values url.Values) url.Values {
 	}
 	return clone
 }
-
