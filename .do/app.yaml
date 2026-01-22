@@ -1,0 +1,51 @@
+name: lumen-backend
+region: nyc
+
+services:
+  - name: api
+    # Use Dockerfile instead of buildpack auto-detection
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github:
+      branch: main
+      deploy_on_push: true
+    
+    # Health check endpoint
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 10
+      period_seconds: 30
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    
+    # Environment variables
+    envs:
+      - key: ENV
+        value: production
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: PORT
+        value: "8080"
+      - key: GIN_MODE
+        value: release
+    
+    # HTTP configuration
+    http_port: 8080
+    
+    # Instance configuration
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    
+    # Routes
+    routes:
+      - path: /
+
+# Optional: Add managed database
+# databases:
+#   - name: lumen-db
+#     engine: PG
+#     version: "15"
+#     production: false
+#     cluster_name: lumen-db-cluster

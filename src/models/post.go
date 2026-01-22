@@ -8,7 +8,7 @@ import (
 
 type Post struct {
 	ID        uint      `gorm:"primaryKey" json:"-"`
-	PublicID  uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	PublicID  uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_posts_public_id" json:"id"`
 	Title     string    `gorm:"size:255;not null" json:"title" binding:"required"`
 	Content   string    `gorm:"type:text;not null" json:"content" binding:"required"`
 	Author    string    `gorm:"size:255;not null" json:"author" binding:"required"`
