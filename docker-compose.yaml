@@ -8,9 +8,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      - ENV=development
-      # DATABASE_URL is the single source of truth for database configuration
-      # Set this in your .env file or it will use the default below
+      # Use ENV from .env file, default to development for local docker usage
+      - ENV=${ENV:-development}
+      # DATABASE_URL from .env file - REQUIRED for production deployments
+      # For local development with docker-compose db, use: postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable
       - DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable}
     depends_on:
       db:
