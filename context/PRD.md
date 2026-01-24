@@ -1,60 +1,125 @@
-# Product Requirements Document: Lumen
+# Turfa — Product Requirements Document (PRD)
 
-**Version:** 1.3
-**Last Updated:** January 18, 2026
-**Product Type:** Social Media Platform
-**Platform:** Web Application (Mobile-First)
+Version: 1.3
+Last Updated: January 18, 2026
+Product Type: Social Media Platform
+Platform: Web Application (Mobile-First)
 
----
+## 1) Executive summary
 
-## 1. Executive Summary
-**Lumen** is a mobile-first social platform that merges an audio-first "For You" feed with a magazine-style "News" feed. The key innovation is **dual-mode discovery**: users switch between immersive audio entertainment and premium journalism in a single app, both consumed via TikTok-style vertical snap scrolling.
+Turfa is a mobile-first social platform that merges an audio-first “For You” feed with a magazine-style “News” feed, consumed via TikTok-style vertical snap scrolling. The product’s core innovation is “dual-mode discovery,” where users switch between immersive audio entertainment and premium journalism in one app.
 
-### Core Value Proposition
-*   **For Consumers:** Discover podcasts and news without "decision fatigue." Scroll to listen, scroll to read.
-*   **For Creators:** Viral discovery for audio content (podcasts, show clips) usually buried in traditional podcast apps.
-*   **For Publishers:** A premium, magazine-quality presentation layer for journalism.
+Core value proposition:
 
----
+- For consumers: discover podcasts and news without decision fatigue.
+- For creators: viral discovery for audio content (podcasts, show clips).
+- For publishers: premium, magazine-style presentation for journalism.
 
-## 2. Core Concept & Feeds
+## 2) Core concept & feeds
 
-### 2.1 The "For You" Feed (Audio-First)
-A vertical feed of **Audio-Focused Videos**.
-*   **Content:** Podcast clips, interview segments, audio newsletters.
-*   **Format:** Full-screen MP4 video. If the source is audio-only, the system generates a video container (visualizer/cover art) so the UX remains consistent.
-*   **Experience:** Snap scrolling, auto-play, infinite discovery.
+Turfa has dual feeds: For You and News.
 
-### 2.2 The "News" Feed (Editorial)
-A vertical feed of **Curated News Slides**.
-*   **Slide Structure:** Each scroll snaps to a single slide containing exactly:
-    *   **1 Featured Item:** (e.g., An in-depth article, blog post, or newsletter).
-    *   **3 Related Briefs:** (e.g., Tweets, comments, short news updates) related to the feature.
-*   **Experience:** Magazine-like reading. The "Related" items provide context or reaction to the main story.
+### 2.1 For You feed (audio-first)
 
----
+- A vertical feed of audio-focused videos.
+- Format is full-screen MP4 video; audio-only sources must be converted upstream.
+- Experience is snap scrolling, auto-play, and infinite discovery.
 
-## 3. Feature Specifications (MVP)
+### 2.2 News feed (editorial)
 
-### 3.1 Interaction
-*   **Vertical Snap Scroll:** CSS `scroll-snap` for satisfying, full-page transitions.
-*   **Auto-Play:** Videos play immediately upon landing.
-*   **Actions:** Like (Double-tap), Comment, Share, Bookmark.
+- A vertical feed of curated news slides.
+- Each slide contains exactly 1 featured item and 3 related briefs.
+- Experience is “magazine-like reading,” where related items provide context or reaction to the main story.
 
-### 3.2 Content Types (MVP)
-*   **News Featured:** Articles, Blogs.
-*   **News Related:** Tweets, Comments, Short Articles.
-*   **For You:** MP4 Videos (Source: Podcasts, Uploads).
+Scroll units:
 
----
+- News: slide (1 featured + 3 related).
+- For You: card (1 full-screen MP4).
 
-## 4. Discovery Strategy
-*   **Ranking:** AI-driven vector similarity (semantic match) + Freshness + Global Trends.
-*   **Diversity:** Logic to prevent seeing the same creator/topic 3 times in a row.
+## 3) MVP feature specifications
 
----
+### 3.1 Interaction (MVP)
 
-## 5. Success Metrics
-*   **Session Duration:** Target > 15 mins.
-*   **Audio Completion Rate:** Target > 40%.
-*   **Feed Switch Rate:** % of users using *both* feeds in one session.
+- Vertical snap scroll using CSS scroll-snap for full-page transitions.
+- Auto-play videos immediately upon landing.
+- Actions include Like, Comment, Share, Bookmark.
+- Interaction triggers include like, bookmark, share, view (visibility-based), and complete (media finishes).
+
+### 3.2 Content types (MVP)
+
+- News featured items: articles and blogs.
+- News related items: tweets, comments, and short articles.
+- For You: MP4 videos sourced from podcasts and uploads.
+
+## 4) Discovery strategy (MVP)
+
+Ranking combines:
+
+- Semantic similarity (vector search).
+- Freshness.
+- Engagement signals.
+- Diversity rules to avoid repeated topics/creators.
+
+## 5) Success metrics (initial targets)
+
+- Session duration target: > 15 minutes.
+- Audio completion rate target: > 40%.
+- Feed switch rate: percentage of users using both feeds in one session.
+
+## 6) System location & service boundaries
+
+This PRD defines the user experience, feed shapes, and MVP outcomes that the Turfa Web App consumes and the backend services produce.
+
+Service boundaries (must be respected):
+
+- Aggregation Service: ingests external sources, runs FFmpeg conversions, generates transcripts and embeddings, and writes back via CMS internal APIs.
+- CMS/Feed Service: reads content_items, runs pgvector similarity, assembles feeds, and serves JSON to the app.
+- Platform Console: triggers ingestion and monitors content_items.status via CMS admin APIs.
+
+## 7) Feed response shapes
+
+News feed response (1 featured + 3 related per slide):
+
+```json
+{
+  "slides": [
+    {
+      "slide_id": "uuid-slide-1",
+      "featured": {
+        "id": "...",
+        "title": "Big Tech News",
+        "type": "ARTICLE",
+        "image": "..."
+      },
+      "related": [
+        { "id": "...", "body": "My reaction...", "type": "TWEET" },
+        { "id": "...", "body": "Great insight", "type": "COMMENT" },
+        { "id": "...", "title": "Analysis", "type": "ARTICLE" }
+      ]
+    }
+  ]
+}
+```
+
+For You feed response (MP4-ready):
+
+```json
+{
+  "items": [
+    {
+      "id": "uuid-1",
+      "type": "VIDEO",
+      "url": "https://s3.../podcast_clip.mp4",
+      "title": "The Future of AI",
+      "duration": 120
+    }
+  ]
+}
+```
+
+## 8) Platform alignment (non-PRD but required constraints)
+
+- For You must always return MP4 URLs; audio sources must be converted upstream.
+- News slides must always follow 1 featured + 3 related rule.
+- Vector search relies on pgvector with 384-dimension embeddings.
+- content_items is the polymorphic content store for all types.
