@@ -31,6 +31,7 @@ func TestMain(m *testing.M) {
 func setup() {
 	fmt.Println("🔧 Setting up test environment...")
 	gin.SetMode(gin.TestMode)
+	os.Setenv("JWT_SECRET", "test_secret")
 
 	// Set DATABASE_URL for tests if not already set
 	if os.Getenv("DATABASE_URL") == "" {
@@ -56,6 +57,7 @@ func setup() {
 		&models.Transcript{},
 		&models.UserInteraction{},
 		&models.ContentSource{},
+		&models.AdminUser{},
 	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
@@ -75,6 +77,7 @@ func setup() {
 	routes.SetupFeedRoutes(v1, testDB)
 	routes.SetupInteractionRoutes(v1, testDB)
 	routes.SetupContentRoutes(v1, testDB)
+	routes.SetupAdminAuthRoutes(router, testDB)
 	fmt.Println("✅ Test environment setup complete!")
 }
 
@@ -89,6 +92,7 @@ func cleanup() {
 	_ = m.DropTable(&models.Transcript{})
 	_ = m.DropTable(&models.ContentItem{})
 	_ = m.DropTable(&models.ContentSource{})
+	_ = m.DropTable(&models.AdminUser{})
 	// Original CMS tables
 	_ = m.DropTable("post_media")
 	_ = m.DropTable(&models.Post{})
@@ -120,6 +124,7 @@ func clearTables() {
 	if testDB == nil {
 		return
 	}
+	_ = testDB.Exec("DELETE FROM admin_users").Error
 	_ = testDB.Exec("DELETE FROM post_media").Error
 	_ = testDB.Exec("DELETE FROM posts").Error
 	_ = testDB.Exec("DELETE FROM media").Error

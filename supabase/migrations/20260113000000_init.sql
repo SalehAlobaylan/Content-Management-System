@@ -40,3 +40,18 @@ create table if not exists post_media (
     constraint fk_post_media_post foreign key (post_id) references posts(id) on delete cascade,
     constraint fk_post_media_media foreign key (media_id) references media(id) on delete cascade
 );
+
+-- admin_users
+create table if not exists admin_users (
+    id serial primary key,
+    public_id uuid default gen_random_uuid() unique not null,
+    email varchar(255) not null unique,
+    role varchar(50) not null,
+    password_hash text not null,
+    permissions text[],
+    is_active boolean default true,
+    created_at timestamptz default current_timestamp,
+    updated_at timestamptz default current_timestamp
+);
+
+create index if not exists idx_admin_users_public_id on admin_users(public_id);

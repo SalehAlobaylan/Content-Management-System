@@ -144,6 +144,23 @@ CREATE INDEX IF NOT EXISTS idx_content_sources_type ON content_sources(type);
 CREATE INDEX IF NOT EXISTS idx_content_sources_active ON content_sources(is_active);
 
 -- ===========================================
+-- Admin Users (Platform Console auth)
+-- ===========================================
+CREATE TABLE IF NOT EXISTS admin_users (
+    id SERIAL PRIMARY KEY,
+    public_id UUID DEFAULT gen_random_uuid() UNIQUE NOT NULL,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    role VARCHAR(50) NOT NULL,
+    password_hash TEXT NOT NULL,
+    permissions TEXT[],
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_users_public_id ON admin_users(public_id);
+
+-- ===========================================
 -- Helper function for updated_at trigger
 -- ===========================================
 CREATE OR REPLACE FUNCTION update_updated_at_column()

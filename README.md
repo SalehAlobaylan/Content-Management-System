@@ -13,30 +13,75 @@
 
     go mod download
     go run src/main.go
-
-- Go doc (terminal):
-````
-  - View all exported APIs: `cd src; go doc -all`
-  - View a package: `go doc ./src/models`
-  - View a symbol: `go doc ./src/models Post`
-
+ 
+ - Go doc (terminal):
+ ```
+   - View all exported APIs: `cd src; go doc -all`
+   - View a package: `go doc ./src/models`
+   - View a symbol: `go doc ./src/models Post`
+ 
 Server runs on `http://localhost:8080`
-````
+ ```
+
+## Configuration
+
+### Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+```
+# Database
+DATABASE_URL=postgres://user:password@localhost:5432/dbname?sslmode=disable
+
+# Auth (required for Platform Console)
+JWT_SECRET=your_secure_secret_here
+JWT_EXPIRATION_HOURS=24
+
+# Admin User (dev only)
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=ChangeMe123!
+ADMIN_ROLE=admin
+```
+
+## API Endpoints
+
+### Public Endpoints
+
+- `GET /` - Welcome message and endpoint list
+- `GET /health` - Health check
+- `GET /docs` - OpenAPI documentation
+
+### Platform Endpoints (`/api/v1`)
+
+- `GET /api/v1/feed/foryou` - For You feed
+- `GET /api/v1/feed/news` - News feed
+- `GET /api/v1/content/:id` - Content item details
+- `GET /api/v1/interactions` - User interactions
+- `GET /api/v1/interactions/bookmarks` - Bookmarked content
+- `GET /api/v1/posts` - Posts CRUD
+- `GET /api/v1/media` - Media CRUD
+- `GET /api/v1/pages` - Pages CRUD
+
+### Admin Endpoints
+
+- `POST /admin/login` - Admin login (issues JWT)
+- `GET /admin/me` - Get current admin user (requires JWT)
 
 ## Testing
 
-````
+```
 go test -v ./src/tests/integration
-````
-or non-cached system you can use this command:
-      
-      go test -v ./src/tests/integration
+```
 
-- Swagger/OpenAPI UI:
+To run only admin auth tests:
+```
+go test -v ./src/tests/integration -run Admin
+```
+ 
+ - Swagger/OpenAPI UI:
 
-  - Spec file: `docs/openapi.yaml`
-  - Serve static docs locally: `go run ./cmd/docserver`
-  - Open in browser: `http://localhost:8090`
-
-- Swagger UI: `go run ./cmd/docserver` → `http://localhost:8090`
-- Go docs: `cd src; go doc -all`
+   - Spec file: `docs/openapi.yaml`
+   - Serve static docs locally: `go run ./cmd/docserver`
+   - Open in browser: `http://localhost:8090`
+   - Swagger UI: `go run ./cmd/docserver` → `http://localhost:8090`
+   - Go docs: `cd src; go doc -all`

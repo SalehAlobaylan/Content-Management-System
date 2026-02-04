@@ -13,6 +13,11 @@ services:
       # DATABASE_URL from .env file - REQUIRED for production deployments
       # For local development with docker-compose db, use: postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable
       - DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable}
+      - JWT_SECRET=${JWT_SECRET:-dev_jwt_secret_change_me}
+      - JWT_EXPIRATION_HOURS=${JWT_EXPIRATION_HOURS:-24}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-ChangeMe123!}
+      - ADMIN_ROLE=${ADMIN_ROLE:-admin}
     depends_on:
       db:
         condition: service_healthy

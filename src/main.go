@@ -97,6 +97,7 @@ func main() {
 			&models.Transcript{},
 			&models.UserInteraction{},
 			&models.ContentSource{},
+			&models.AdminUser{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
@@ -108,6 +109,10 @@ func main() {
 			// Seed Lumen Platform content
 			if err := utils.SeedLumenData(db); err != nil {
 				log.Fatalf("Failed to seed Lumen data: %v", err)
+			}
+			// Seed default admin user (dev only)
+			if err := utils.SeedAdminUser(db); err != nil {
+				log.Fatalf("Failed to seed admin user: %v", err)
 			}
 		}
 	}
@@ -128,6 +133,7 @@ func main() {
 	}))
 
 	SetupRoutes(router, db)
+	routes.SetupAdminAuthRoutes(router, db)
 
 	log.Println("Starting server on :8080...")
 	if err := router.Run(":8080"); err != nil {
