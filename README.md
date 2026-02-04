@@ -66,6 +66,12 @@ ADMIN_ROLE=admin
 
 - `POST /admin/login` - Admin login (issues JWT)
 - `GET /admin/me` - Get current admin user (requires JWT)
+- `GET /admin/users` - List admin users
+- `POST /admin/users` - Create admin user
+- `GET /admin/users/:id` - Get admin user
+- `PUT /admin/users/:id` - Update admin user
+- `DELETE /admin/users/:id` - Delete admin user
+- `POST /admin/users/:id/password` - Reset admin password
 
 ## Testing
 
