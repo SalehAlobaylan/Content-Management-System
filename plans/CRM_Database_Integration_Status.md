@@ -1,13 +1,13 @@
 # CRM Service Database Integration - Status Summary
 
 **Date:** January 31, 2026
-**Purpose:** Inform CMS team about CRM service database integration with shared `turfa_platform` database
+**Purpose:** Inform CMS team about CRM service database integration with shared `wahb_platform` database
 
 ---
 
 ## Executive Summary
 
-The CRM Service has been successfully integrated with the shared `turfa_platform` database. This document outlines what was done, the current configuration, and what the CMS team needs to coordinate on.
+The CRM Service has been successfully integrated with the shared `wahb_platform` database. This document outlines what was done, the current configuration, and what the CMS team needs to coordinate on.
 
 ---
 
@@ -18,15 +18,15 @@ The CRM Service has been successfully integrated with the shared `turfa_platform
 The following configuration files have been updated to use the shared database:
 
 **`.env.example`** - Updated with:
-- `DATABASE_URL` pointing to `turfa_platform` database (not `crm_db`)
+- `DATABASE_URL` pointing to `wahb_platform` database (not `crm_db`)
 - `JWT_SECRET` notes that it must match CMS service
 - Comments clarifying shared nature of database and JWT
 
 **`docker-compose.yml`** - Updated with:
-- PostgreSQL service named `turfa-platform-postgres`
-- Database name changed from `crm_db` to `turfa_platform`
-- Network renamed to `turfa-platform-network`
-- Migration runner updated to use `turfa_platform` database
+- PostgreSQL service named `wahb-platform-postgres`
+- Database name changed from `crm_db` to `wahb_platform`
+- Network renamed to `wahb-platform-network`
+- Migration runner updated to use `wahb_platform` database
 
 ### 1.2 Migration Tools Added
 
@@ -49,7 +49,7 @@ The following configuration files have been updated to use the shared database:
 
 ### 2.1 CRM Tables
 
-All CRM tables have been created in the shared `turfa_platform` database:
+All CRM tables have been created in the shared `wahb_platform` database:
 
 | Table | Primary Key | Soft Delete | Purpose |
 |-------|-------------|--------------|----------|
@@ -132,7 +132,7 @@ Authorization: Bearer <jwt-token>
 
 ✅ **CRM Service is operational**
 - Running on port 3000
-- Connected to shared `turfa_platform` database
+- Connected to shared `wahb_platform` database
 - All endpoints registered and functional
 - Pipeline stages seeded (idempotent)
 
@@ -165,7 +165,7 @@ Authorization: Bearer <jwt-token>
 CRM Service requires:
 
 ```env
-DATABASE_URL=postgres://user:password@host:5432/turfa_platform?sslmode=mode
+DATABASE_URL=postgres://user:password@host:5432/wahb_platform?sslmode=mode
 JWT_SECRET=<same-as-cms>
 JWT_ISSUER=cms
 CORS_ALLOWED_ORIGINS=<console-origins>
@@ -223,9 +223,9 @@ When adding new database changes:
 
 ### 7.1 Required Coordination
 
-1. **Verify CMS DATABASE_URL** points to `turfa_platform` database
+1. **Verify CMS DATABASE_URL** points to `wahb_platform` database
    ```env
-   DATABASE_URL=postgres://.../turfa_platform?sslmode=...
+   DATABASE_URL=postgres://.../wahb_platform?sslmode=...
    ```
 
 2. **Ensure JWT_SECRET matches** between CMS and CRM services
@@ -322,14 +322,14 @@ For issues related to:
 
 ✅ **CRM Service Database Integration - COMPLETE**
 
-- Shared `turfa_platform` database configured
+- Shared `wahb_platform` database configured
 - All CRM tables created with no conflicts
 - Migration tools and documentation in place
 - Service running and operational
 - Ready for CMS service coordination
 
 **Next Steps for CMS Team:**
-1. Update CMS to use `turfa_platform` database
+1. Update CMS to use `wahb_platform` database
 2. Ensure `JWT_SECRET` matches CRM configuration
 3. Issue JWTs with required claims
 4. Test authentication flow between CMS and CRM

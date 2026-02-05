@@ -55,7 +55,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupMediaRoutes(v1, db)
 	routes.SetupPageRoutes(v1, db)
 
-	// Lumen Platform routes
+	// Wahb Platform routes
 	routes.SetupFeedRoutes(v1, db)
 	routes.SetupInteractionRoutes(v1, db)
 	routes.SetupContentRoutes(v1, db)
@@ -92,7 +92,7 @@ func main() {
 			&models.Page{},
 			&models.Post{},
 			&models.Media{},
-			// Lumen Platform models
+			// Wahb Platform models
 			&models.ContentItem{},
 			&models.Transcript{},
 			&models.UserInteraction{},
@@ -106,9 +106,9 @@ func main() {
 			if err := utils.SeedData(db); err != nil {
 				log.Fatalf("Failed to seed data: %v", err)
 			}
-			// Seed Lumen Platform content
-			if err := utils.SeedLumenData(db); err != nil {
-				log.Fatalf("Failed to seed Lumen data: %v", err)
+			// Seed Wahb Platform content
+			if err := utils.SeedWahbData(db); err != nil {
+				log.Fatalf("Failed to seed Wahb data: %v", err)
 			}
 			// Seed default admin user (dev only)
 			if err := utils.SeedAdminUser(db); err != nil {

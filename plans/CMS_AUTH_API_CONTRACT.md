@@ -235,7 +235,7 @@ The CMS service must allow CORS requests from the Platform Console:
 // Example Gin CORS middleware
 func CORSMiddleware() gin.HandlerFunc {
     return func(c *gin.Context) {
-        c.Writer.Header().Set("Access-Control-Allow-Origin", "https://console.turfa.com")
+        c.Writer.Header().Set("Access-Control-Allow-Origin", "https://console.wahb.com")
         c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
         c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
         c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")

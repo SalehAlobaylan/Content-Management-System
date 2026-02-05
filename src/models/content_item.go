@@ -42,7 +42,7 @@ const (
 	ContentStatusArchived   ContentStatus = "ARCHIVED"
 )
 
-// ContentItem represents all content types in the Lumen platform feeds
+// ContentItem represents all content types in the Wahb platform feeds
 type ContentItem struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_content_items_public_id" json:"id"`

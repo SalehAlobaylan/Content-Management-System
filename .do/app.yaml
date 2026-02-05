@@ -1,4 +1,4 @@
-name: lumen-backend
+name: wahb-cms
 region: nyc
 
 services:
@@ -44,8 +44,8 @@ services:
 
 # Optional: Add managed database
 # databases:
-#   - name: lumen-db
+#   - name: wahb-db
 #     engine: PG
 #     version: "15"
 #     production: false
-#     cluster_name: lumen-db-cluster
+#     cluster_name: wahb-db-cluster

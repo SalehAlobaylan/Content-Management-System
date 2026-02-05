@@ -1,18 +1,18 @@
 services:
-  # Go CMS API Server (Lumen Backend)
+  # Go CMS API Server (Wahb CMS)
   server:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: lumen-api
+    container_name: wahb-cms
     ports:
       - "8080:8080"
     environment:
       # Use ENV from .env file, default to development for local docker usage
       - ENV=${ENV:-development}
       # DATABASE_URL from .env file - REQUIRED for production deployments
-      # For local development with docker-compose db, use: postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable
-      - DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@db:5432/lumen_db?sslmode=disable}
+      # For local development with docker-compose db, use: postgres://postgres:postgres@db:5432/wahb_db?sslmode=disable
+      - DATABASE_URL=${DATABASE_URL:-postgres://postgres:postgres@db:5432/wahb_db?sslmode=disable}
       - JWT_SECRET=${JWT_SECRET:-dev_jwt_secret_change_me}
       - JWT_EXPIRATION_HOURS=${JWT_EXPIRATION_HOURS:-24}
       - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@example.com}
@@ -23,36 +23,36 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks:
-      - lumen-network
+      - wahb-network
 
-  # PostgreSQL with pgvector extension (required for Lumen embeddings)
+  # PostgreSQL with pgvector extension (required for Wahb embeddings)
   db:
     image: ankane/pgvector:latest
-    container_name: lumen-db
+    container_name: wahb-db
     environment:
       # Extract credentials from DATABASE_URL or use defaults
       # Format: postgres://USER:PASSWORD@HOST:PORT/DATABASE
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-lumen_db}
+      POSTGRES_DB: ${POSTGRES_DB:-wahb_db}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./src/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-lumen_db}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-wahb_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
     restart: unless-stopped
     networks:
-      - lumen-network
+      - wahb-network
 
   # Redis for caching (optional, for future use)
   redis:
     image: redis:7-alpine
-    container_name: lumen-redis
+    container_name: wahb-redis
     ports:
       - "6379:6379"
     volumes:
@@ -64,10 +64,10 @@ services:
       retries: 5
     restart: unless-stopped
     networks:
-      - lumen-network
+      - wahb-network
 
 networks:
-  lumen-network:
+  wahb-network:
     driver: bridge
 
 volumes:
