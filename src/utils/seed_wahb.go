@@ -11,17 +11,17 @@ import (
 	"gorm.io/gorm"
 )
 
-// SeedLumenData seeds demo content for the Lumen Platform
-func SeedLumenData(db *gorm.DB) error {
+// SeedWahbData seeds demo content for the Wahb Platform
+func SeedWahbData(db *gorm.DB) error {
 	// Check if already seeded
 	var count int64
 	db.Model(&models.ContentItem{}).Count(&count)
 	if count > 0 {
-		log.Println("Lumen data already seeded, skipping...")
+		log.Println("Wahb data already seeded, skipping...")
 		return nil
 	}
 
-	log.Println("Seeding Lumen Platform data...")
+	log.Println("Seeding Wahb Platform data...")
 
 	// Seed VIDEO/PODCAST content for "For You" feed
 	forYouItems := []models.ContentItem{
@@ -108,14 +108,14 @@ func SeedLumenData(db *gorm.DB) error {
 		}
 	}
 
-	log.Printf("Seeded %d content items for Lumen Platform", len(allItems))
+	log.Printf("Seeded %d content items for Wahb Platform", len(allItems))
 	return nil
 }
 
 func createVideoContent(title, sourceName, author string, duration int) models.ContentItem {
 	now := time.Now().Add(-time.Duration(rand.Intn(72)) * time.Hour)
-	mediaURL := "https://cdn.lumen.app/videos/" + uuid.New().String() + ".mp4"
-	thumbnailURL := "https://cdn.lumen.app/thumbnails/" + uuid.New().String() + ".jpg"
+	mediaURL := "https://cdn.wahb.app/videos/" + uuid.New().String() + ".mp4"
+	thumbnailURL := "https://cdn.wahb.app/thumbnails/" + uuid.New().String() + ".jpg"
 
 	return models.ContentItem{
 		Type:         models.ContentTypeVideo,
@@ -138,8 +138,8 @@ func createVideoContent(title, sourceName, author string, duration int) models.C
 
 func createArticleContent(title, excerpt, sourceName, author string) models.ContentItem {
 	now := time.Now().Add(-time.Duration(rand.Intn(48)) * time.Hour)
-	thumbnailURL := "https://cdn.lumen.app/articles/" + uuid.New().String() + ".jpg"
-	originalURL := "https://source.lumen.app/articles/" + uuid.New().String()
+	thumbnailURL := "https://cdn.wahb.app/articles/" + uuid.New().String() + ".jpg"
+	originalURL := "https://source.wahb.app/articles/" + uuid.New().String()
 
 	return models.ContentItem{
 		Type:         models.ContentTypeArticle,

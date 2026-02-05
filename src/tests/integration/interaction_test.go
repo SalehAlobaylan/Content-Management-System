@@ -12,7 +12,7 @@ import (
 
 func TestInteractionIntegration(t *testing.T) {
 	fmt.Println("💬 Starting Interaction Integration Tests")
-	clearLumenTables()
+	clearWahbTables()
 	seedTestContent()
 
 	var testContentID string

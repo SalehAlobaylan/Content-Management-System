@@ -1,4 +1,4 @@
--- PostgreSQL initialization script for Lumen Platform
+-- PostgreSQL initialization script for Wahb Platform
 -- This runs automatically when the Docker container is first created
 
 -- ===========================================

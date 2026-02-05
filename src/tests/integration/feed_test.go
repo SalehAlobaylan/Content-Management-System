@@ -15,7 +15,7 @@ import (
 
 func TestFeedIntegration(t *testing.T) {
 	fmt.Println("📰 Starting Feed Integration Tests")
-	clearLumenTables()
+	clearWahbTables()
 	seedTestContent()
 
 	t.Run("Get ForYou Feed", func(t *testing.T) {
@@ -155,7 +155,7 @@ func TestFeedIntegration(t *testing.T) {
 
 func TestContentIntegration(t *testing.T) {
 	fmt.Println("📦 Starting Content Integration Tests")
-	clearLumenTables()
+	clearWahbTables()
 	seedTestContent()
 
 	t.Run("Get Content Item", func(t *testing.T) {
@@ -200,8 +200,8 @@ func TestContentIntegration(t *testing.T) {
 
 // Helper functions
 
-func clearLumenTables() {
-	fmt.Println("🗑️  Clearing Lumen test tables...")
+func clearWahbTables() {
+	fmt.Println("🗑️  Clearing Wahb test tables...")
 	if testDB == nil {
 		return
 	}
@@ -209,7 +209,7 @@ func clearLumenTables() {
 	_ = testDB.Exec("DELETE FROM transcripts").Error
 	_ = testDB.Exec("DELETE FROM content_items").Error
 	_ = testDB.Exec("DELETE FROM content_sources").Error
-	fmt.Println("✅ Lumen tables cleared")
+	fmt.Println("✅ Wahb tables cleared")
 }
 
 func seedTestContent() {

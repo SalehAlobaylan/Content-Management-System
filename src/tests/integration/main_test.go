@@ -52,7 +52,7 @@ func setup() {
 		&models.Page{},
 		&models.Media{},
 		&models.Post{},
-		// Lumen Platform models
+		// Wahb Platform models
 		&models.ContentItem{},
 		&models.Transcript{},
 		&models.UserInteraction{},
@@ -73,7 +73,7 @@ func setup() {
 	routes.SetupPostRoutes(v1, testDB)
 	routes.SetupMediaRoutes(v1, testDB)
 	routes.SetupPageRoutes(v1, testDB)
-	// Lumen Platform routes
+	// Wahb Platform routes
 	routes.SetupFeedRoutes(v1, testDB)
 	routes.SetupInteractionRoutes(v1, testDB)
 	routes.SetupContentRoutes(v1, testDB)
@@ -87,7 +87,7 @@ func cleanup() {
 		return
 	}
 	m := testDB.Migrator()
-	// Lumen Platform tables
+	// Wahb Platform tables
 	_ = m.DropTable(&models.UserInteraction{})
 	_ = m.DropTable(&models.Transcript{})
 	_ = m.DropTable(&models.ContentItem{})

@@ -1,5 +1,5 @@
--- Lumen Platform Schema Migration
--- This creates all tables needed for the Lumen social media backend
+-- Wahb Platform Schema Migration
+-- This creates all tables needed for the Wahb social media backend
 
 -- ===========================================
 -- Extensions

@@ -75,7 +75,7 @@ Uncomment the `databases` section in `.do/app.yaml`:
 
 ```yaml
 databases:
-  - name: lumen-db
+  - name: wahb-db
     engine: PG
     version: "15"
     production: true  # Set to true for production!
