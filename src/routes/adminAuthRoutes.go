@@ -21,4 +21,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.PUT("/users/:id", controllers.UpdateAdminUser)
 	adminGroup.DELETE("/users/:id", controllers.DeleteAdminUser)
 	adminGroup.POST("/users/:id/password", controllers.ResetAdminUserPassword)
+
+	adminGroup.GET("/sources", controllers.ListContentSources)
+	adminGroup.POST("/sources", controllers.CreateContentSource)
+	adminGroup.GET("/sources/:id", controllers.GetContentSource)
+	adminGroup.PUT("/sources/:id", controllers.UpdateContentSource)
+	adminGroup.DELETE("/sources/:id", controllers.DeleteContentSource)
+	adminGroup.POST("/sources/:id/run", controllers.RunContentSource)
+
+	adminGroup.GET("/content", controllers.ListContentItems)
+	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
+	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 }
