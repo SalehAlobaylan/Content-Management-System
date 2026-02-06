@@ -60,6 +60,9 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupInteractionRoutes(v1, db)
 	routes.SetupContentRoutes(v1, db)
 
+	// Internal service-to-service routes
+	routes.SetupInternalRoutes(router, db)
+
 }
 
 func main() {
