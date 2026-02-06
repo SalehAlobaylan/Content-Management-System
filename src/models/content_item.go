@@ -51,6 +51,8 @@ type ContentItem struct {
 	Type   ContentType   `gorm:"type:varchar(20);not null" json:"type"`
 	Source SourceType    `gorm:"type:varchar(20);not null" json:"source,omitempty"`
 	Status ContentStatus `gorm:"type:varchar(20);default:'READY'" json:"status,omitempty"`
+	// Idempotency
+	IdempotencyKey *string `gorm:"type:varchar(128);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
 
 	// Content
 	Title    *string `gorm:"type:text" json:"title,omitempty"`
@@ -72,6 +74,9 @@ type ContentItem struct {
 	TopicTags pq.StringArray  `gorm:"type:text[]" json:"topic_tags,omitempty"`
 	Embedding pgvector.Vector `gorm:"type:vector(384)" json:"-"`
 	Metadata  datatypes.JSON  `gorm:"type:jsonb" json:"metadata,omitempty"`
+
+	// Transcript link (optional)
+	TranscriptID *uuid.UUID `gorm:"type:uuid" json:"transcript_id,omitempty"`
 
 	// Engagement counters
 	LikeCount    int `gorm:"default:0" json:"like_count"`
