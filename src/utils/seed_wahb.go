@@ -132,7 +132,7 @@ func createVideoContent(title, sourceName, author string, duration int) models.C
 		ShareCount:   rand.Intn(200) + 5,
 		ViewCount:    rand.Intn(50000) + 1000,
 		PublishedAt:  &now,
-		Embedding:    generateMockEmbedding(),
+		Embedding:    func() *pgvector.Vector { v := generateMockEmbedding(); return &v }(),
 	}
 }
 
@@ -156,7 +156,7 @@ func createArticleContent(title, excerpt, sourceName, author string) models.Cont
 		ShareCount:   rand.Intn(100) + 2,
 		ViewCount:    rand.Intn(20000) + 500,
 		PublishedAt:  &now,
-		Embedding:    generateMockEmbedding(),
+		Embedding:    func() *pgvector.Vector { v := generateMockEmbedding(); return &v }(),
 	}
 }
 
@@ -172,7 +172,7 @@ func createTweetContent(text, author string) models.ContentItem {
 		LikeCount:   rand.Intn(500) + 10,
 		ShareCount:  rand.Intn(50) + 1,
 		PublishedAt: &now,
-		Embedding:   generateMockEmbedding(),
+		Embedding:   func() *pgvector.Vector { v := generateMockEmbedding(); return &v }(),
 	}
 }
 
@@ -187,7 +187,7 @@ func createCommentContent(text, author string) models.ContentItem {
 		Author:      &author,
 		LikeCount:   rand.Intn(100) + 1,
 		PublishedAt: &now,
-		Embedding:   generateMockEmbedding(),
+		Embedding:   func() *pgvector.Vector { v := generateMockEmbedding(); return &v }(),
 	}
 }
 
