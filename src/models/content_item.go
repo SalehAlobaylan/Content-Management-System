@@ -72,7 +72,7 @@ type ContentItem struct {
 
 	// Tags & AI
 	TopicTags pq.StringArray  `gorm:"type:text[]" json:"topic_tags,omitempty"`
-	Embedding pgvector.Vector `gorm:"type:vector(384)" json:"-"`
+	Embedding *pgvector.Vector `gorm:"type:vector(384)" json:"-"`
 	Metadata  datatypes.JSON  `gorm:"type:jsonb" json:"metadata,omitempty"`
 
 	// Transcript link (optional)

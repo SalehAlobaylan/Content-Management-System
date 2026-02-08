@@ -323,7 +323,8 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		return
 	}
 
-	item.Embedding = pgvector.NewVector(req.Embedding)
+	vec := pgvector.NewVector(req.Embedding)
+	item.Embedding = &vec
 	if len(req.TopicTags) > 0 {
 		item.TopicTags = req.TopicTags
 	}
