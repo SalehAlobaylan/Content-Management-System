@@ -118,6 +118,7 @@ func createVideoContent(title, sourceName, author string, duration int) models.C
 	thumbnailURL := "https://cdn.wahb.app/thumbnails/" + uuid.New().String() + ".jpg"
 
 	return models.ContentItem{
+		TenantID:     GetDefaultTenantID(),
 		Type:         models.ContentTypeVideo,
 		Source:       models.SourceTypePodcast,
 		Status:       models.ContentStatusReady,
@@ -142,6 +143,7 @@ func createArticleContent(title, excerpt, sourceName, author string) models.Cont
 	originalURL := "https://source.wahb.app/articles/" + uuid.New().String()
 
 	return models.ContentItem{
+		TenantID:     GetDefaultTenantID(),
 		Type:         models.ContentTypeArticle,
 		Source:       models.SourceTypeRSS,
 		Status:       models.ContentStatusReady,
@@ -164,6 +166,7 @@ func createTweetContent(text, author string) models.ContentItem {
 	now := time.Now().Add(-time.Duration(rand.Intn(24)) * time.Hour)
 
 	return models.ContentItem{
+		TenantID:    GetDefaultTenantID(),
 		Type:        models.ContentTypeTweet,
 		Source:      models.SourceTypeManual,
 		Status:      models.ContentStatusReady,
@@ -180,6 +183,7 @@ func createCommentContent(text, author string) models.ContentItem {
 	now := time.Now().Add(-time.Duration(rand.Intn(12)) * time.Hour)
 
 	return models.ContentItem{
+		TenantID:    GetDefaultTenantID(),
 		Type:        models.ContentTypeComment,
 		Source:      models.SourceTypeManual,
 		Status:      models.ContentStatusReady,

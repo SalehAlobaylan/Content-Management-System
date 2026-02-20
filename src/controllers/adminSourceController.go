@@ -95,6 +95,11 @@ var contentSourceQueryConfig = utils.QueryConfig{
 
 // ListContentSources handles GET /admin/sources
 func ListContentSources(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 
 	params, err := utils.ParseQueryParams(c, contentSourceQueryConfig)
@@ -106,7 +111,7 @@ func ListContentSources(c *gin.Context) {
 		return
 	}
 
-	query := db.Model(&models.ContentSource{})
+	query := db.Model(&models.ContentSource{}).Where("tenant_id = ?", principal.TenantID)
 	query = utils.ApplyQuery(query, params, contentSourceQueryConfig)
 
 	var sources []models.ContentSource
@@ -135,6 +140,11 @@ func ListContentSources(c *gin.Context) {
 
 // GetContentSource handles GET /admin/sources/:id
 func GetContentSource(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -147,7 +157,7 @@ func GetContentSource(c *gin.Context) {
 	}
 
 	var source models.ContentSource
-	if err := db.Where("public_id = ?", id).First(&source).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&source).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Source not found",
 			Code:    "NOT_FOUND",
@@ -160,6 +170,11 @@ func GetContentSource(c *gin.Context) {
 
 // CreateContentSource handles POST /admin/sources
 func CreateContentSource(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	var req createContentSourceRequest
 
@@ -224,6 +239,7 @@ func CreateContentSource(c *gin.Context) {
 	}
 
 	source := models.ContentSource{
+		TenantID:             principal.TenantID,
 		Name:                 name,
 		Type:                 models.SourceType(strings.ToUpper(sourceType)),
 		FeedURL:              req.FeedURL,
@@ -246,6 +262,11 @@ func CreateContentSource(c *gin.Context) {
 
 // UpdateContentSource handles PUT /admin/sources/:id
 func UpdateContentSource(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -267,7 +288,7 @@ func UpdateContentSource(c *gin.Context) {
 	}
 
 	var source models.ContentSource
-	if err := db.Where("public_id = ?", id).First(&source).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&source).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Source not found",
 			Code:    "NOT_FOUND",
@@ -355,6 +376,11 @@ func UpdateContentSource(c *gin.Context) {
 
 // DeleteContentSource handles DELETE /admin/sources/:id
 func DeleteContentSource(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -367,7 +393,7 @@ func DeleteContentSource(c *gin.Context) {
 	}
 
 	var source models.ContentSource
-	if err := db.Where("public_id = ?", id).First(&source).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&source).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Source not found",
 			Code:    "NOT_FOUND",
@@ -388,6 +414,11 @@ func DeleteContentSource(c *gin.Context) {
 
 // RunContentSource handles POST /admin/sources/:id/run
 func RunContentSource(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -400,7 +431,7 @@ func RunContentSource(c *gin.Context) {
 	}
 
 	var source models.ContentSource
-	if err := db.Where("public_id = ?", id).First(&source).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&source).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Source not found",
 			Code:    "NOT_FOUND",

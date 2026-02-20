@@ -87,6 +87,11 @@ var contentAdminQueryConfig = utils.QueryConfig{
 
 // ListContentItems handles GET /admin/content
 func ListContentItems(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 
 	params, err := utils.ParseQueryParams(c, contentAdminQueryConfig)
@@ -98,7 +103,7 @@ func ListContentItems(c *gin.Context) {
 		return
 	}
 
-	query := db.Model(&models.ContentItem{})
+	query := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
 	query = utils.ApplyQuery(query, params, contentAdminQueryConfig)
 
 	var items []models.ContentItem
@@ -127,6 +132,11 @@ func ListContentItems(c *gin.Context) {
 
 // GetAdminContentItem handles GET /admin/content/:id
 func GetAdminContentItem(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -139,7 +149,7 @@ func GetAdminContentItem(c *gin.Context) {
 	}
 
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Content not found",
 			Code:    "NOT_FOUND",
@@ -152,6 +162,11 @@ func GetAdminContentItem(c *gin.Context) {
 
 // UpdateContentStatus handles PATCH /admin/content/:id/status
 func UpdateContentStatus(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
 	id, err := uuid.Parse(publicID)
@@ -182,7 +197,7 @@ func UpdateContentStatus(c *gin.Context) {
 	}
 
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Content not found",
 			Code:    "NOT_FOUND",

@@ -104,7 +104,7 @@ func AdminLogin(c *gin.Context) {
 		return
 	}
 
-	token, err := utils.GenerateJWT(user.PublicID.String(), user.Email, user.Role, []string(user.Permissions))
+	token, err := utils.GenerateJWT(user.PublicID.String(), user.Email, user.TenantID, user.Role, []string(user.Permissions))
 	if err != nil {
 		respondAuthError(c, http.StatusInternalServerError, "Internal server error", "INTERNAL_SERVER_ERROR")
 		return
@@ -122,27 +122,16 @@ func AdminLogin(c *gin.Context) {
 
 // AdminMe handles GET /admin/me
 func AdminMe(c *gin.Context) {
-	value, exists := c.Get("admin_user")
-	if !exists {
-		respondAuthError(c, http.StatusUnauthorized, "Unauthorized", "UNAUTHORIZED")
-		return
-	}
-
-	user, ok := value.(models.AdminUser)
+	principal, ok := utils.GetAdminPrincipal(c)
 	if !ok {
 		respondAuthError(c, http.StatusUnauthorized, "Unauthorized", "UNAUTHORIZED")
 		return
 	}
 
-	permissions := []string{}
-	if user.Permissions != nil {
-		permissions = []string(user.Permissions)
-	}
-
 	c.JSON(http.StatusOK, meResponse{
-		ID:          user.PublicID.String(),
-		Email:       user.Email,
-		Role:        user.Role,
-		Permissions: permissions,
+		ID:          principal.UserID,
+		Email:       principal.Email,
+		Role:        principal.Role,
+		Permissions: principal.Permissions,
 	})
 }

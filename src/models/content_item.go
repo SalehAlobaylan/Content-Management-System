@@ -46,6 +46,7 @@ const (
 type ContentItem struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_content_items_public_id" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_items_tenant_id" json:"tenant_id"`
 
 	// Classification
 	Type   ContentType   `gorm:"type:varchar(20);not null" json:"type"`
@@ -71,9 +72,9 @@ type ContentItem struct {
 	SourceFeedURL *string `gorm:"type:text" json:"-"`
 
 	// Tags & AI
-	TopicTags pq.StringArray  `gorm:"type:text[]" json:"topic_tags,omitempty"`
+	TopicTags pq.StringArray   `gorm:"type:text[]" json:"topic_tags,omitempty"`
 	Embedding *pgvector.Vector `gorm:"type:vector(384)" json:"-"`
-	Metadata  datatypes.JSON  `gorm:"type:jsonb" json:"metadata,omitempty"`
+	Metadata  datatypes.JSON   `gorm:"type:jsonb" json:"metadata,omitempty"`
 
 	// Transcript link (optional)
 	TranscriptID *uuid.UUID `gorm:"type:uuid" json:"transcript_id,omitempty"`
