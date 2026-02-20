@@ -107,7 +107,7 @@ func TestAdminMeSuccess(t *testing.T) {
 	password := "ChangeMe123!"
 	user := seedAdminUser(t, email, password)
 
-	token, err := utils.GenerateJWT(user.PublicID.String(), user.Email, user.Role, []string(user.Permissions))
+	token, err := utils.GenerateJWT(user.PublicID.String(), user.Email, user.TenantID, user.Role, []string(user.Permissions))
 	if err != nil {
 		t.Fatalf("failed to generate token: %v", err)
 	}

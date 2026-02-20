@@ -141,6 +141,7 @@ func SeedAdminUser(db *gorm.DB) error {
 
 	user := models.AdminUser{
 		Email:        adminEmail,
+		TenantID:     GetDefaultTenantID(),
 		Role:         adminRole,
 		PasswordHash: hash,
 		IsActive:     true,

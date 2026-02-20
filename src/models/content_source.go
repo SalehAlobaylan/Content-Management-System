@@ -11,6 +11,7 @@ import (
 type ContentSource struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_sources_tenant_id" json:"tenant_id"`
 
 	// Source identification
 	Name string     `gorm:"type:varchar(255);not null" json:"name"`

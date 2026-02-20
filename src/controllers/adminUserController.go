@@ -60,26 +60,12 @@ func mapAdminUserResponse(user models.AdminUser) adminUserResponse {
 	}
 }
 
-func requireAdminRole(c *gin.Context) (*models.AdminUser, bool) {
-	value, exists := c.Get("admin_user")
+func requireAdminRole(c *gin.Context) (*utils.AdminPrincipal, bool) {
+	principal, exists := requireAdminPrincipal(c)
 	if !exists {
-		c.JSON(http.StatusUnauthorized, authErrorResponse{
-			Message: "Unauthorized",
-			Code:    "UNAUTHORIZED",
-		})
 		return nil, false
 	}
-
-	user, ok := value.(models.AdminUser)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, authErrorResponse{
-			Message: "Unauthorized",
-			Code:    "UNAUTHORIZED",
-		})
-		return nil, false
-	}
-
-	if strings.ToLower(user.Role) != "admin" {
+	if !principal.HasRole("admin") {
 		c.JSON(http.StatusForbidden, authErrorResponse{
 			Message: "Forbidden",
 			Code:    "FORBIDDEN",
@@ -87,18 +73,19 @@ func requireAdminRole(c *gin.Context) (*models.AdminUser, bool) {
 		return nil, false
 	}
 
-	return &user, true
+	return &principal, true
 }
 
 // ListAdminUsers handles GET /admin/users
 func ListAdminUsers(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
 	db := c.MustGet("db").(*gorm.DB)
 
-	query := db.Model(&models.AdminUser{})
+	query := db.Model(&models.AdminUser{}).Where("tenant_id = ?", principal.TenantID)
 
 	params, err := utils.ParseQueryParams(c, adminUserQueryConfig)
 	if err != nil {
@@ -137,7 +124,8 @@ func ListAdminUsers(c *gin.Context) {
 
 // GetAdminUser handles GET /admin/users/:id
 func GetAdminUser(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
@@ -145,7 +133,7 @@ func GetAdminUser(c *gin.Context) {
 	publicID := c.Param("id")
 
 	var user models.AdminUser
-	if err := db.Where("public_id = ?", publicID).First(&user).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", publicID, principal.TenantID).First(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Admin user not found",
 			Code:    "NOT_FOUND",
@@ -158,7 +146,8 @@ func GetAdminUser(c *gin.Context) {
 
 // CreateAdminUser handles POST /admin/users
 func CreateAdminUser(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
@@ -216,6 +205,7 @@ func CreateAdminUser(c *gin.Context) {
 	}
 
 	user := models.AdminUser{
+		TenantID:     principal.TenantID,
 		Email:        email,
 		Role:         strings.ToLower(req.Role),
 		PasswordHash: hash,
@@ -244,7 +234,8 @@ func CreateAdminUser(c *gin.Context) {
 
 // UpdateAdminUser handles PUT /admin/users/:id
 func UpdateAdminUser(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
@@ -261,7 +252,7 @@ func UpdateAdminUser(c *gin.Context) {
 	}
 
 	var user models.AdminUser
-	if err := db.Where("public_id = ?", publicID).First(&user).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", publicID, principal.TenantID).First(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Admin user not found",
 			Code:    "NOT_FOUND",
@@ -303,7 +294,8 @@ func UpdateAdminUser(c *gin.Context) {
 
 // DeleteAdminUser handles DELETE /admin/users/:id
 func DeleteAdminUser(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
@@ -311,7 +303,7 @@ func DeleteAdminUser(c *gin.Context) {
 	publicID := c.Param("id")
 
 	var user models.AdminUser
-	if err := db.Where("public_id = ?", publicID).First(&user).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", publicID, principal.TenantID).First(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Admin user not found",
 			Code:    "NOT_FOUND",
@@ -332,7 +324,8 @@ func DeleteAdminUser(c *gin.Context) {
 
 // ResetAdminUserPassword handles POST /admin/users/:id/password
 func ResetAdminUserPassword(c *gin.Context) {
-	if _, ok := requireAdminRole(c); !ok {
+	principal, ok := requireAdminRole(c)
+	if !ok {
 		return
 	}
 
@@ -356,7 +349,7 @@ func ResetAdminUserPassword(c *gin.Context) {
 	}
 
 	var user models.AdminUser
-	if err := db.Where("public_id = ?", publicID).First(&user).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", publicID, principal.TenantID).First(&user).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{
 			Message: "Admin user not found",
 			Code:    "NOT_FOUND",

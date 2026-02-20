@@ -11,6 +11,7 @@ import (
 type AdminUser struct {
 	ID           uint           `gorm:"primaryKey" json:"-"`
 	PublicID     uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_admin_users_public_id" json:"id"`
+	TenantID     string         `gorm:"type:varchar(64);not null;default:default;index:idx_admin_users_tenant_id" json:"tenant_id"`
 	Email        string         `gorm:"type:varchar(255);uniqueIndex;not null" json:"email"`
 	Role         string         `gorm:"type:varchar(50);not null" json:"role"`
 	PasswordHash string         `gorm:"type:text;not null" json:"-"`
