@@ -7,6 +7,7 @@ import (
 
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	// "fmt"
@@ -137,10 +138,47 @@ func main() {
 
 	SetupRoutes(router, db)
 	routes.SetupAdminAuthRoutes(router, db)
+	logCMSAuthConfig()
 
 	log.Println("Starting server on :8080...")
 	if err := router.Run(":8080"); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 
+}
+
+func logCMSAuthConfig() {
+	jwtIssuer := strings.TrimSpace(os.Getenv("JWT_ISSUER"))
+	if jwtIssuer == "" {
+		jwtIssuer = "cms-service"
+	}
+
+	allowedIssuers := strings.TrimSpace(os.Getenv("JWT_ALLOWED_ISSUERS"))
+	if allowedIssuers == "" {
+		allowedIssuers = "cms-service,iam-authorization-service"
+	}
+
+	requireTenant := strings.TrimSpace(os.Getenv("JWT_REQUIRE_TENANT_ID"))
+	if requireTenant == "" {
+		requireTenant = "false"
+	}
+
+	defaultTenant := strings.TrimSpace(os.Getenv("DEFAULT_TENANT_ID"))
+	if defaultTenant == "" {
+		defaultTenant = "default"
+	}
+
+	normalizedAllowlist := strings.ToLower(allowedIssuers)
+	mode := "compatibility (accepts CMS + IAM issuers)"
+	if strings.Contains(normalizedAllowlist, "iam-authorization-service") && !strings.Contains(normalizedAllowlist, "cms-service") {
+		mode = "IAM verifier-only"
+	}
+
+	log.Println("[CMS] Auth verifier config")
+	log.Printf("[CMS] - JWT_ISSUER=%s", jwtIssuer)
+	log.Printf("[CMS] - JWT_ALLOWED_ISSUERS=%s", allowedIssuers)
+	log.Printf("[CMS] - JWT_REQUIRE_TENANT_ID=%s", requireTenant)
+	log.Printf("[CMS] - DEFAULT_TENANT_ID=%s", defaultTenant)
+	log.Printf("[CMS] - Verifier mode=%s", mode)
+	log.Println("[CMS] - /admin/login route is currently enabled (legacy compatibility path)")
 }
