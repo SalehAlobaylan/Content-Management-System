@@ -196,11 +196,13 @@ func logCMSConnectionTargets() {
 	whisperURL := strings.TrimSpace(os.Getenv("WHISPER_API_URL"))
 	storageEndpoint := strings.TrimSpace(os.Getenv("STORAGE_ENDPOINT"))
 	storagePublicURL := strings.TrimSpace(os.Getenv("STORAGE_PUBLIC_URL"))
+	aggregationBaseURL := strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL"))
 
 	log.Println("[CMS] Connection targets")
 	log.Printf("[CMS] - Server bind: %s", cmsServerAddress())
 	log.Printf("[CMS] - Database: %s", cmsDatabaseTarget(dbURL))
 	log.Printf("[CMS] - Whisper API: %s", emptyOr(whisperURL, "(not set)"))
+	log.Printf("[CMS] - Aggregation API: %s", emptyOr(aggregationBaseURL, "(not set)"))
 	log.Printf("[CMS] - Storage endpoint: %s", emptyOr(storageEndpoint, "(not set)"))
 	log.Printf("[CMS] - Storage public URL: %s", emptyOr(storagePublicURL, "(not set)"))
 	log.Println("[CMS] - CORS mode: AllowAllOrigins=true")

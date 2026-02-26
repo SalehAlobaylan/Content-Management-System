@@ -1,10 +1,13 @@
 package controllers
 
 import (
+	"bytes"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -59,6 +62,19 @@ type updateContentSourceRequest struct {
 type runSourceResponse struct {
 	Message string `json:"message"`
 	JobID   string `json:"job_id,omitempty"`
+}
+
+type aggregationTriggerRequest struct {
+	SourceType string                 `json:"sourceType"`
+	URL        string                 `json:"url"`
+	Name       string                 `json:"name,omitempty"`
+	Settings   map[string]interface{} `json:"settings,omitempty"`
+}
+
+type aggregationTriggerResponse struct {
+	Success bool   `json:"success"`
+	JobID   string `json:"jobId,omitempty"`
+	Message string `json:"message"`
 }
 
 var contentSourceQueryConfig = utils.QueryConfig{
@@ -439,12 +455,52 @@ func RunContentSource(c *gin.Context) {
 		return
 	}
 
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{
+			Message: "Aggregation service URL is not configured",
+			Code:    "AGGREGATION_NOT_CONFIGURED",
+		})
+		return
+	}
+
+	sourceURL, err := extractSourceRunURL(source)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "SOURCE_URL_REQUIRED",
+		})
+		return
+	}
+
+	settings, _ := parseSourceAPIConfig(source.APIConfig)
+	triggerReq := aggregationTriggerRequest{
+		SourceType: string(source.Type),
+		URL:        sourceURL,
+		Name:       source.Name,
+		Settings:   settings,
+	}
+
+	triggerRes, err := triggerAggregationSourceRun(
+		aggregationBaseURL,
+		c.GetHeader("Authorization"),
+		triggerReq,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{
+			Message: "Failed to trigger aggregation run: " + err.Error(),
+			Code:    "AGGREGATION_TRIGGER_FAILED",
+		})
+		return
+	}
+
 	now := time.Now().UTC()
 	source.LastFetchedAt = &now
 	_ = db.Save(&source).Error
 
 	c.JSON(http.StatusOK, runSourceResponse{
-		Message: "Source run queued",
+		Message: triggerRes.Message,
+		JobID:   triggerRes.JobID,
 	})
 }
 
@@ -479,4 +535,94 @@ func mapToJSON(value map[string]interface{}) (datatypes.JSON, error) {
 		return nil, err
 	}
 	return datatypes.JSON(bytes), nil
+}
+
+func parseSourceAPIConfig(raw datatypes.JSON) (map[string]interface{}, error) {
+	if len(raw) == 0 {
+		return map[string]interface{}{}, nil
+	}
+
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		cfg = map[string]interface{}{}
+	}
+	return cfg, nil
+}
+
+func extractSourceRunURL(source models.ContentSource) (string, error) {
+	if source.FeedURL != nil {
+		if value := strings.TrimSpace(*source.FeedURL); value != "" {
+			return value, nil
+		}
+	}
+
+	cfg, err := parseSourceAPIConfig(source.APIConfig)
+	if err != nil {
+		return "", fmt.Errorf("invalid source api_config")
+	}
+
+	candidateKeys := []string{
+		"url", "feed_url", "feedUrl", "channel_url", "channelUrl",
+		"channel_id", "channelId", "playlist_id", "playlistId", "subreddit",
+	}
+	for _, key := range candidateKeys {
+		if raw, ok := cfg[key]; ok {
+			if value, ok := raw.(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("source URL is required for type %s", source.Type)
+}
+
+func triggerAggregationSourceRun(
+	aggregationBaseURL string,
+	authorizationHeader string,
+	payload aggregationTriggerRequest,
+) (aggregationTriggerResponse, error) {
+	requestBody, err := json.Marshal(payload)
+	if err != nil {
+		return aggregationTriggerResponse{}, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, aggregationBaseURL+"/admin/trigger", bytes.NewReader(requestBody))
+	if err != nil {
+		return aggregationTriggerResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(authorizationHeader) != "" {
+		req.Header.Set("Authorization", authorizationHeader)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return aggregationTriggerResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	var body aggregationTriggerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return aggregationTriggerResponse{}, fmt.Errorf("invalid aggregation response")
+	}
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		if strings.TrimSpace(body.Message) == "" {
+			body.Message = fmt.Sprintf("aggregation responded with status %d", resp.StatusCode)
+		}
+		return aggregationTriggerResponse{}, fmt.Errorf("%s", body.Message)
+	}
+
+	if !body.Success {
+		if strings.TrimSpace(body.Message) == "" {
+			body.Message = "aggregation rejected trigger request"
+		}
+		return aggregationTriggerResponse{}, fmt.Errorf("%s", body.Message)
+	}
+
+	return body, nil
 }
