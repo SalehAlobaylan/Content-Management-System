@@ -78,6 +78,11 @@ func main() {
 	}
 	log.Println("Successfully connected to database")
 
+	if err := utils.EnsureTenantScopeColumns(db); err != nil {
+		log.Fatalf("Failed to apply tenant scope schema patch: %v", err)
+	}
+	log.Println("Tenant scope schema patch verified")
+
 	sqlDB, err := db.DB()
 	if err != nil {
 		log.Fatalf("Failed to get database instance: %v", err)
