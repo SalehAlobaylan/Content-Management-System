@@ -6,6 +6,7 @@ import (
 	"content-management-system/src/utils"
 
 	"log"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -69,6 +70,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 func main() {
 	log.Println("Starting Content Management System...")
 	log.Printf("Environment: %s", os.Getenv("ENV"))
+	logCMSConnectionTargets()
 
 	db, err := utils.ConnectDB()
 	if err != nil {
@@ -181,4 +183,40 @@ func logCMSAuthConfig() {
 	log.Printf("[CMS] - DEFAULT_TENANT_ID=%s", defaultTenant)
 	log.Printf("[CMS] - Verifier mode=%s", mode)
 	log.Println("[CMS] - /admin/login route is currently enabled (legacy compatibility path)")
+}
+
+func logCMSConnectionTargets() {
+	dbURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	whisperURL := strings.TrimSpace(os.Getenv("WHISPER_API_URL"))
+	storageEndpoint := strings.TrimSpace(os.Getenv("STORAGE_ENDPOINT"))
+	storagePublicURL := strings.TrimSpace(os.Getenv("STORAGE_PUBLIC_URL"))
+
+	log.Println("[CMS] Connection targets")
+	log.Printf("[CMS] - Database: %s", cmsDatabaseTarget(dbURL))
+	log.Printf("[CMS] - Whisper API: %s", emptyOr(whisperURL, "(not set)"))
+	log.Printf("[CMS] - Storage endpoint: %s", emptyOr(storageEndpoint, "(not set)"))
+	log.Printf("[CMS] - Storage public URL: %s", emptyOr(storagePublicURL, "(not set)"))
+	log.Println("[CMS] - CORS mode: AllowAllOrigins=true")
+}
+
+func cmsDatabaseTarget(dsn string) string {
+	if dsn == "" {
+		return "(not set)"
+	}
+	parsed, err := url.Parse(dsn)
+	if err == nil && parsed.Host != "" {
+		dbName := strings.TrimPrefix(parsed.Path, "/")
+		if dbName == "" {
+			dbName = "(default)"
+		}
+		return parsed.Host + "/" + dbName
+	}
+	return "(unparsed DSN)"
+}
+
+func emptyOr(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
