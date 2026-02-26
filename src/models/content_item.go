@@ -53,7 +53,7 @@ type ContentItem struct {
 	Source SourceType    `gorm:"type:varchar(20);not null" json:"source,omitempty"`
 	Status ContentStatus `gorm:"type:varchar(20);default:'READY'" json:"status,omitempty"`
 	// Idempotency
-	IdempotencyKey *string `gorm:"type:varchar(128);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
+	IdempotencyKey *string `gorm:"type:varchar(512);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
 
 	// Content
 	Title    *string `gorm:"type:text" json:"title,omitempty"`

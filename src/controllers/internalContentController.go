@@ -2,11 +2,14 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -74,6 +77,19 @@ type internalLinkTranscriptRequest struct {
 	TranscriptID string `json:"transcript_id"`
 }
 
+const maxIdempotencyKeyLength = 512
+
+func normalizeIdempotencyKey(key string) string {
+	normalized := strings.TrimSpace(key)
+	if utf8.RuneCountInString(normalized) <= maxIdempotencyKeyLength {
+		return normalized
+	}
+
+	// Keep deterministic de-duplication for very long URLs/keys without DB length errors.
+	sum := sha256.Sum256([]byte(normalized))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 // InternalCreateContentItem handles POST /internal/content-items
 func InternalCreateContentItem(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -84,14 +100,16 @@ func InternalCreateContentItem(c *gin.Context) {
 		return
 	}
 
-	if req.IdempotencyKey == "" || req.Type == "" || req.Source == "" || req.Status == "" || req.Title == "" || req.OriginalURL == "" || req.SourceName == "" {
+	if strings.TrimSpace(req.IdempotencyKey) == "" || req.Type == "" || req.Source == "" || req.Status == "" || req.Title == "" || req.OriginalURL == "" || req.SourceName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required fields"})
 		return
 	}
 
+	idempotencyKey := normalizeIdempotencyKey(req.IdempotencyKey)
+
 	// Check for existing item by idempotency key
 	var existing models.ContentItem
-	if err := db.Where("idempotency_key = ?", req.IdempotencyKey).First(&existing).Error; err == nil {
+	if err := db.Where("idempotency_key = ?", idempotencyKey).First(&existing).Error; err == nil {
 		c.JSON(http.StatusOK, internalCreateContentItemResponse{
 			ID:        existing.PublicID.String(),
 			Status:    string(existing.Status),
@@ -117,7 +135,7 @@ func InternalCreateContentItem(c *gin.Context) {
 		Type:           models.ContentType(strings.ToUpper(req.Type)),
 		Source:         models.SourceType(strings.ToUpper(req.Source)),
 		Status:         models.ContentStatus(strings.ToUpper(req.Status)),
-		IdempotencyKey: &req.IdempotencyKey,
+		IdempotencyKey: &idempotencyKey,
 		Title:          &req.Title,
 		BodyText:       req.BodyText,
 		Excerpt:        req.Excerpt,

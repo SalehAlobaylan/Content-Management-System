@@ -48,6 +48,7 @@ func EnsureTenantScopeColumns(db *gorm.DB) error {
 		"ALTER TABLE IF EXISTS admin_users ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
 		"ALTER TABLE IF EXISTS content_sources ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
 		"ALTER TABLE IF EXISTS content_items ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
+		"ALTER TABLE IF EXISTS content_items ALTER COLUMN idempotency_key TYPE VARCHAR(512)",
 		"UPDATE admin_users SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
 		"UPDATE content_sources SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
 		"UPDATE content_items SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
