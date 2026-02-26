@@ -26,7 +26,10 @@ func ConnectDB() (*gorm.DB, error) {
 		}
 	}
 
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		DSN:                  dsn,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -86,7 +89,10 @@ func ensureDatabaseExistsFromURL(dsn string) error {
 		return fmt.Errorf("could not parse database connection string")
 	}
 
-	adminDB, err := gorm.Open(postgres.Open(adminDSN), &gorm.Config{})
+	adminDB, err := gorm.Open(postgres.New(postgres.Config{
+		DSN:                  adminDSN,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{})
 	if err != nil {
 		return err
 	}
