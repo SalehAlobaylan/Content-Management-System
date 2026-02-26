@@ -142,8 +142,9 @@ func main() {
 	routes.SetupAdminAuthRoutes(router, db)
 	logCMSAuthConfig()
 
-	log.Println("Starting server on :8080...")
-	if err := router.Run(":8080"); err != nil {
+	serverAddr := cmsServerAddress()
+	log.Printf("Starting server on %s...", serverAddr)
+	if err := router.Run(serverAddr); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 
@@ -192,6 +193,7 @@ func logCMSConnectionTargets() {
 	storagePublicURL := strings.TrimSpace(os.Getenv("STORAGE_PUBLIC_URL"))
 
 	log.Println("[CMS] Connection targets")
+	log.Printf("[CMS] - Server bind: %s", cmsServerAddress())
 	log.Printf("[CMS] - Database: %s", cmsDatabaseTarget(dbURL))
 	log.Printf("[CMS] - Whisper API: %s", emptyOr(whisperURL, "(not set)"))
 	log.Printf("[CMS] - Storage endpoint: %s", emptyOr(storageEndpoint, "(not set)"))
@@ -219,4 +221,18 @@ func emptyOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func cmsServerAddress() string {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		port = "8080"
+	}
+
+	host := strings.TrimSpace(os.Getenv("HOST"))
+	if host == "" || host == "0.0.0.0" {
+		return ":" + port
+	}
+
+	return host + ":" + port
 }
