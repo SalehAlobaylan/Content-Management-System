@@ -60,6 +60,23 @@ type updateContentSourceRequest struct {
 	Metadata             map[string]interface{} `json:"metadata,omitempty"`
 }
 
+type bulkCreateContentSourcesRequest struct {
+	Sources []createContentSourceRequest `json:"sources"`
+}
+
+type bulkCreateFailure struct {
+	Index   int    `json:"index"`
+	Name    string `json:"name,omitempty"`
+	Message string `json:"message"`
+}
+
+type bulkCreateContentSourcesResponse struct {
+	Created  []contentSourceResponse `json:"created"`
+	Failed   []bulkCreateFailure     `json:"failed"`
+	Total    int                     `json:"total"`
+	Accepted int                     `json:"accepted"`
+}
+
 type runSourceResponse struct {
 	Message string `json:"message"`
 	JobID   string `json:"job_id,omitempty"`
@@ -319,6 +336,116 @@ func CreateContentSource(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, mapContentSourceResponse(source))
+}
+
+// BulkCreateContentSources handles POST /admin/sources/bulk
+func BulkCreateContentSources(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+	var req bulkCreateContentSourcesRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Sources) == 0 {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "sources array is required",
+			Code:    "INVALID_BULK_REQUEST",
+		})
+		return
+	}
+
+	created := make([]contentSourceResponse, 0, len(req.Sources))
+	failed := make([]bulkCreateFailure, 0)
+
+	for index, sourceReq := range req.Sources {
+		name := strings.TrimSpace(sourceReq.Name)
+		sourceType := strings.TrimSpace(sourceReq.Type)
+
+		if name == "" {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    sourceReq.Name,
+				Message: "Name is required",
+			})
+			continue
+		}
+		if sourceType == "" {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    name,
+				Message: "Type is required",
+			})
+			continue
+		}
+
+		apiConfig, err := mapToJSON(sourceReq.APIConfig)
+		if err != nil {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    name,
+				Message: "Invalid api_config",
+			})
+			continue
+		}
+
+		metadata, err := mapToJSON(sourceReq.Metadata)
+		if err != nil {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    name,
+				Message: "Invalid metadata",
+			})
+			continue
+		}
+
+		isActive := true
+		if sourceReq.IsActive != nil {
+			isActive = *sourceReq.IsActive
+		}
+
+		fetchInterval := 60
+		if sourceReq.FetchIntervalMinutes != nil {
+			if *sourceReq.FetchIntervalMinutes <= 0 {
+				failed = append(failed, bulkCreateFailure{
+					Index:   index,
+					Name:    name,
+					Message: "Fetch interval must be greater than zero",
+				})
+				continue
+			}
+			fetchInterval = *sourceReq.FetchIntervalMinutes
+		}
+
+		source := models.ContentSource{
+			TenantID:             principal.TenantID,
+			Name:                 name,
+			Type:                 models.SourceType(strings.ToUpper(sourceType)),
+			FeedURL:              sourceReq.FeedURL,
+			APIConfig:            apiConfig,
+			IsActive:             isActive,
+			FetchIntervalMinutes: fetchInterval,
+			Metadata:             metadata,
+		}
+
+		if err := db.Create(&source).Error; err != nil {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    name,
+				Message: "Failed to create source",
+			})
+			continue
+		}
+
+		created = append(created, mapContentSourceResponse(source))
+	}
+
+	c.JSON(http.StatusOK, bulkCreateContentSourcesResponse{
+		Created:  created,
+		Failed:   failed,
+		Total:    len(req.Sources),
+		Accepted: len(created),
+	})
 }
 
 // UpdateContentSource handles PUT /admin/sources/:id

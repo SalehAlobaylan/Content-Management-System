@@ -24,6 +24,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	adminGroup.GET("/sources", controllers.ListContentSources)
 	adminGroup.POST("/sources", controllers.CreateContentSource)
+	adminGroup.POST("/sources/bulk", controllers.BulkCreateContentSources)
 	adminGroup.POST("/sources/discover", controllers.DiscoverSourceFeeds)
 	adminGroup.POST("/sources/preview", controllers.PreviewSource)
 	adminGroup.GET("/sources/:id", controllers.GetContentSource)
