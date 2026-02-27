@@ -6,6 +6,7 @@ import (
 	"content-management-system/src/utils"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -62,6 +63,50 @@ type updateContentSourceRequest struct {
 type runSourceResponse struct {
 	Message string `json:"message"`
 	JobID   string `json:"job_id,omitempty"`
+}
+
+type discoverFeedsRequest struct {
+	URL string `json:"url"`
+}
+
+type discoverFeedItem struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Type  string `json:"type"`
+}
+
+type discoverFeedsResponse struct {
+	Success bool               `json:"success"`
+	Feeds   []discoverFeedItem `json:"feeds"`
+	Message string             `json:"message"`
+}
+
+type previewSourceRequest struct {
+	SourceType string                 `json:"sourceType"`
+	URL        string                 `json:"url"`
+	Name       string                 `json:"name,omitempty"`
+	Settings   map[string]interface{} `json:"settings,omitempty"`
+	Limit      int                    `json:"limit,omitempty"`
+}
+
+type previewSourceItem struct {
+	IdempotencyKey string  `json:"idempotencyKey"`
+	Type           string  `json:"type"`
+	Title          string  `json:"title"`
+	Excerpt        *string `json:"excerpt,omitempty"`
+	Author         *string `json:"author,omitempty"`
+	OriginalURL    string  `json:"originalUrl"`
+	PublishedAt    *string `json:"publishedAt,omitempty"`
+}
+
+type previewSourceResponse struct {
+	Success    bool                `json:"success"`
+	Message    string              `json:"message"`
+	Fetched    int                 `json:"fetched"`
+	Normalized int                 `json:"normalized"`
+	Skipped    int                 `json:"skipped"`
+	Errors     int                 `json:"errors"`
+	Items      []previewSourceItem `json:"items"`
 }
 
 type aggregationTriggerRequest struct {
@@ -504,6 +549,146 @@ func RunContentSource(c *gin.Context) {
 	})
 }
 
+// DiscoverSourceFeeds handles POST /admin/sources/discover
+func DiscoverSourceFeeds(c *gin.Context) {
+	_, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	var req discoverFeedsRequest
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "url is required",
+			Code:    "URL_REQUIRED",
+		})
+		return
+	}
+
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{
+			Message: "Aggregation service URL is not configured",
+			Code:    "AGGREGATION_NOT_CONFIGURED",
+		})
+		return
+	}
+
+	responseBody, statusCode, err := proxyAggregationRequest(
+		aggregationBaseURL,
+		"/admin/discover",
+		c.GetHeader("Authorization"),
+		req,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{
+			Message: "Failed to discover source feeds: " + err.Error(),
+			Code:    "AGGREGATION_DISCOVERY_FAILED",
+		})
+		return
+	}
+
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		var aggErr discoverFeedsResponse
+		_ = json.Unmarshal(responseBody, &aggErr)
+		msg := strings.TrimSpace(aggErr.Message)
+		if msg == "" {
+			msg = "Aggregation rejected discover request"
+		}
+		c.JSON(statusCode, authErrorResponse{
+			Message: msg,
+			Code:    "AGGREGATION_DISCOVERY_REJECTED",
+		})
+		return
+	}
+
+	var result discoverFeedsResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{
+			Message: "Invalid response from aggregation service",
+			Code:    "INVALID_AGGREGATION_RESPONSE",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+// PreviewSource handles POST /admin/sources/preview
+func PreviewSource(c *gin.Context) {
+	_, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	var req previewSourceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid request body",
+			Code:    "INVALID_REQUEST",
+		})
+		return
+	}
+
+	req.SourceType = strings.ToUpper(strings.TrimSpace(req.SourceType))
+	req.URL = strings.TrimSpace(req.URL)
+	if req.SourceType == "" || req.URL == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "sourceType and url are required",
+			Code:    "SOURCE_TYPE_AND_URL_REQUIRED",
+		})
+		return
+	}
+
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{
+			Message: "Aggregation service URL is not configured",
+			Code:    "AGGREGATION_NOT_CONFIGURED",
+		})
+		return
+	}
+
+	responseBody, statusCode, err := proxyAggregationRequest(
+		aggregationBaseURL,
+		"/admin/preview",
+		c.GetHeader("Authorization"),
+		req,
+	)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{
+			Message: "Failed to preview source: " + err.Error(),
+			Code:    "AGGREGATION_PREVIEW_FAILED",
+		})
+		return
+	}
+
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		var aggErr previewSourceResponse
+		_ = json.Unmarshal(responseBody, &aggErr)
+		msg := strings.TrimSpace(aggErr.Message)
+		if msg == "" {
+			msg = "Aggregation rejected preview request"
+		}
+		c.JSON(statusCode, authErrorResponse{
+			Message: msg,
+			Code:    "AGGREGATION_PREVIEW_REJECTED",
+		})
+		return
+	}
+
+	var result previewSourceResponse
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{
+			Message: "Invalid response from aggregation service",
+			Code:    "INVALID_AGGREGATION_RESPONSE",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
 func mapContentSourceResponse(source models.ContentSource) contentSourceResponse {
 	var lastFetched *string
 	if source.LastFetchedAt != nil {
@@ -584,35 +769,24 @@ func triggerAggregationSourceRun(
 	authorizationHeader string,
 	payload aggregationTriggerRequest,
 ) (aggregationTriggerResponse, error) {
-	requestBody, err := json.Marshal(payload)
+	requestBody, statusCode, err := proxyAggregationRequest(
+		aggregationBaseURL,
+		"/admin/trigger",
+		authorizationHeader,
+		payload,
+	)
 	if err != nil {
 		return aggregationTriggerResponse{}, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, aggregationBaseURL+"/admin/trigger", bytes.NewReader(requestBody))
-	if err != nil {
-		return aggregationTriggerResponse{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if strings.TrimSpace(authorizationHeader) != "" {
-		req.Header.Set("Authorization", authorizationHeader)
-	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return aggregationTriggerResponse{}, err
-	}
-	defer resp.Body.Close()
 
 	var body aggregationTriggerResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(requestBody, &body); err != nil {
 		return aggregationTriggerResponse{}, fmt.Errorf("invalid aggregation response")
 	}
 
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
 		if strings.TrimSpace(body.Message) == "" {
-			body.Message = fmt.Sprintf("aggregation responded with status %d", resp.StatusCode)
+			body.Message = fmt.Sprintf("aggregation responded with status %d", statusCode)
 		}
 		return aggregationTriggerResponse{}, fmt.Errorf("%s", body.Message)
 	}
@@ -625,4 +799,40 @@ func triggerAggregationSourceRun(
 	}
 
 	return body, nil
+}
+
+func proxyAggregationRequest(
+	aggregationBaseURL string,
+	path string,
+	authorizationHeader string,
+	payload interface{},
+) ([]byte, int, error) {
+	requestBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, aggregationBaseURL+path, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(authorizationHeader) != "" {
+		req.Header.Set("Authorization", authorizationHeader)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return body, resp.StatusCode, nil
 }
