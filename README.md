@@ -55,6 +55,7 @@ ADMIN_ROLE=admin
 
 - `GET /api/v1/feed/foryou` - For You feed
 - `GET /api/v1/feed/news` - News feed
+- `GET /api/v1/feed/rss.xml` - RSS 2.0 output feed (`type`, `topic`, `limit`)
 - `GET /api/v1/content/:id` - Content item details
 - `GET /api/v1/interactions` - User interactions
 - `GET /api/v1/interactions/bookmarks` - Bookmarked content
@@ -72,6 +73,18 @@ ADMIN_ROLE=admin
 - `PUT /admin/users/:id` - Update admin user
 - `DELETE /admin/users/:id` - Delete admin user
 - `POST /admin/users/:id/password` - Reset admin password
+- `GET /admin/sources` - List content sources
+- `POST /admin/sources` - Create content source
+- `POST /admin/sources/bulk` - Bulk create content sources (OPML import flow)
+- `POST /admin/sources/discover` - Discover feed URLs via Aggregation
+- `POST /admin/sources/preview` - Preview source ingestion via Aggregation
+- `GET /admin/sources/:id` - Get content source
+- `PUT /admin/sources/:id` - Update content source
+- `DELETE /admin/sources/:id` - Delete content source
+- `POST /admin/sources/:id/run` - Trigger source ingestion
+- `GET /admin/content` - List ingested content
+- `GET /admin/content/:id` - Get content details
+- `PATCH /admin/content/:id/status` - Update content status (moderation/archive)
 
 ## Testing
 
