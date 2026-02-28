@@ -180,6 +180,10 @@ func ListContentSources(c *gin.Context) {
 
 	db := c.MustGet("db").(*gorm.DB)
 
+	limitParam := c.Query("limit")
+	pageParam := c.Query("page")
+	fmt.Printf("[DEBUG] ListContentSources: limit=%s, page=%s\n", limitParam, pageParam)
+
 	params, err := utils.ParseQueryParams(c, contentSourceQueryConfig)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
@@ -188,6 +192,7 @@ func ListContentSources(c *gin.Context) {
 		})
 		return
 	}
+	fmt.Printf("[DEBUG] ListContentSources: parsed params.Page=%d, params.Limit=%d\n", params.Pagination.Page, params.Pagination.Limit)
 
 	query := db.Model(&models.ContentSource{}).Where("tenant_id = ?", principal.TenantID)
 	query = utils.ApplyQuery(query, params, contentSourceQueryConfig)
