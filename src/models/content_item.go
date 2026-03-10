@@ -24,12 +24,13 @@ const (
 type SourceType string
 
 const (
-	SourceTypeRSS     SourceType = "RSS"
-	SourceTypeWebsite SourceType = "WEBSITE"
-	SourceTypePodcast SourceType = "PODCAST"
-	SourceTypeYouTube SourceType = "YOUTUBE"
-	SourceTypeUpload  SourceType = "UPLOAD"
-	SourceTypeManual  SourceType = "MANUAL"
+	SourceTypeRSS      SourceType = "RSS"
+	SourceTypeWebsite  SourceType = "WEBSITE"
+	SourceTypeTelegram SourceType = "TELEGRAM"
+	SourceTypePodcast  SourceType = "PODCAST"
+	SourceTypeYouTube  SourceType = "YOUTUBE"
+	SourceTypeUpload   SourceType = "UPLOAD"
+	SourceTypeManual   SourceType = "MANUAL"
 )
 
 // ContentStatus enum

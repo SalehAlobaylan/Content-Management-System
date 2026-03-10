@@ -122,7 +122,13 @@ func GetForYouFeed(c *gin.Context) {
 	// Get last item for cursor
 	if len(items) > 0 && hasMore {
 		lastItem := items[len(items)-1]
-		cursor := utils.EncodeCursor(*lastItem.PublishedAt, lastItem.PublicID)
+		var ts time.Time
+		if lastItem.PublishedAt != nil {
+			ts = *lastItem.PublishedAt
+		} else {
+			ts = lastItem.CreatedAt
+		}
+		cursor := utils.EncodeCursor(ts, lastItem.PublicID)
 		nextCursor = &cursor
 	}
 
@@ -204,7 +210,13 @@ func GetNewsFeed(c *gin.Context) {
 	// Get last item for cursor
 	if len(featuredItems) > 0 && hasMore {
 		lastItem := featuredItems[len(featuredItems)-1]
-		cursor := utils.EncodeCursor(*lastItem.PublishedAt, lastItem.PublicID)
+		var ts time.Time
+		if lastItem.PublishedAt != nil {
+			ts = *lastItem.PublishedAt
+		} else {
+			ts = lastItem.CreatedAt
+		}
+		cursor := utils.EncodeCursor(ts, lastItem.PublicID)
 		nextCursor = &cursor
 	}
 

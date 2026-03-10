@@ -13,6 +13,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal := router.Group("/internal")
 	internal.Use(utils.InternalAuthMiddleware())
 
+	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)
 	internal.PUT("/content-items/:id", controllers.InternalUpdateContentItem)
 	internal.PATCH("/content-items/:id/status", controllers.InternalUpdateContentStatus)

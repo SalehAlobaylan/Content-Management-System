@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -391,4 +392,79 @@ func InternalLinkTranscript(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+type internalListContentItemResponse struct {
+	ID          string                 `json:"id"`
+	Type        string                 `json:"type"`
+	Source      string                 `json:"source"`
+	Status      string                 `json:"status"`
+	OriginalURL string                 `json:"original_url"`
+	Metadata    map[string]interface{} `json:"metadata"`
+}
+
+// InternalListContentItems handles GET /internal/content-items
+// Supports ?status=FAILED&source=TELEGRAM&limit=100&page=1
+func InternalListContentItems(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	status := strings.ToUpper(strings.TrimSpace(c.Query("status")))
+	source := strings.ToUpper(strings.TrimSpace(c.Query("source")))
+
+	limit := 100
+	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 && l <= 500 {
+		limit = l
+	}
+	page := 1
+	if p, err := strconv.Atoi(c.Query("page")); err == nil && p > 0 {
+		page = p
+	}
+	offset := (page - 1) * limit
+
+	query := db.Model(&models.ContentItem{})
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+	if source != "" {
+		query = query.Where("source = ?", source)
+	}
+
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count content items"})
+		return
+	}
+
+	var items []models.ContentItem
+	if err := query.Offset(offset).Limit(limit).Order("created_at DESC").Find(&items).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list content items"})
+		return
+	}
+
+	data := make([]internalListContentItemResponse, 0, len(items))
+	for _, item := range items {
+		var meta map[string]interface{}
+		if item.Metadata != nil {
+			_ = json.Unmarshal(item.Metadata, &meta)
+		}
+		originalURL := ""
+		if item.OriginalURL != nil {
+			originalURL = *item.OriginalURL
+		}
+		data = append(data, internalListContentItemResponse{
+			ID:          item.PublicID.String(),
+			Type:        string(item.Type),
+			Source:      string(item.Source),
+			Status:      string(item.Status),
+			OriginalURL: originalURL,
+			Metadata:    meta,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":  data,
+		"total": total,
+		"page":  page,
+		"limit": limit,
+	})
 }
