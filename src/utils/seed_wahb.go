@@ -27,7 +27,7 @@ func SeedWahbData(db *gorm.DB) error {
 	forYouItems := []models.ContentItem{
 		createVideoContent("The Future of AI in 2026", "Thamanyah Podcast", "Radio Thamanyah", 185),
 		createVideoContent("Building Scalable Systems", "Tech Talk", "Ahmed Hassan", 240),
-		createVideoContent("Startup Stories: From Zero to IPO", "Entrepreneurship Weekly", "Sarah Al-Rashid", 320),
+		createVideoContent("Startup Related: From Zero to IPO", "Entrepreneurship Weekly", "Sarah Al-Rashid", 320),
 		createVideoContent("The Art of Product Design", "Design Matters", "Maya Thompson", 195),
 		createVideoContent("Understanding Blockchain Technology", "Crypto Explained", "Omar Farouk", 280),
 		createVideoContent("Mastering Remote Work", "Future of Work", "Lina Khoury", 165),
@@ -37,7 +37,7 @@ func SeedWahbData(db *gorm.DB) error {
 		createVideoContent("Investing for Beginners", "Money Moves", "Hana Ibrahim", 290),
 		createVideoContent("Arabic Literature Renaissance", "Cultural Corner", "Nadia Saleh", 225),
 		createVideoContent("Space Exploration Updates", "Cosmic News", "Karim Mansour", 200),
-		createVideoContent("Cooking Authentic Arab Cuisine", "Kitchen Stories", "Chef Layla Abbas", 340),
+		createVideoContent("Cooking Authentic Arab Cuisine", "Kitchen Related", "Chef Layla Abbas", 340),
 		createVideoContent("Learning Languages Fast", "Polyglot Tips", "Rami Khalil", 155),
 		createVideoContent("Photography Masterclass", "Visual Arts", "Dina Osman", 310),
 	}

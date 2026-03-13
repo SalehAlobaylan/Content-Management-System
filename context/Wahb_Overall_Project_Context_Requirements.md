@@ -25,7 +25,7 @@ Wahb has two feeds:
 2. News (editorial)
 
 - Each slide contains exactly 1 featured item and 3 related items.
-- Related items provide context or reaction to the main story.
+- Related items provide context or reaction to the main item.
 - A News scroll unit is a slide, and a For You scroll unit is a card.
 
 Interaction model (MVP): like, bookmark, share, view, complete. Views are tracked via visibility and completes are tracked when media finishes.

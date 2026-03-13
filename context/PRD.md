@@ -29,7 +29,7 @@ Wahb has dual feeds: For You and News.
 
 - A vertical feed of curated news slides.
 - Each slide contains exactly 1 featured item and 3 related briefs.
-- Experience is “magazine-like reading,” where related items provide context or reaction to the main story.
+- Experience is “magazine-like reading,” where related items provide context or reaction to the main item.
 
 Scroll units:
 
