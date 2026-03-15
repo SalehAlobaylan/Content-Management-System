@@ -35,4 +35,5 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/content", controllers.ListContentItems)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
+	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
 }

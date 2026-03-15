@@ -258,3 +258,88 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 		Metadata:     metadata,
 	}
 }
+
+type bulkDeleteContentRequest struct {
+	Status        string `json:"status"`
+	SourceName    string `json:"source_name"`
+	CreatedBefore string `json:"created_before"`
+	DryRun        bool   `json:"dry_run"`
+}
+
+type bulkDeleteContentResponse struct {
+	DeletedCount int64  `json:"deleted_count"`
+	Message      string `json:"message"`
+}
+
+// BulkDeleteContent handles POST /admin/content/bulk-delete
+func BulkDeleteContent(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req bulkDeleteContentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid request: " + err.Error(),
+			Code:    "INVALID_REQUEST",
+		})
+		return
+	}
+
+	if req.Status == "" && req.SourceName == "" && req.CreatedBefore == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "At least one filter is required (status, source_name, or created_before)",
+			Code:    "FILTER_REQUIRED",
+		})
+		return
+	}
+
+	query := db.Where("tenant_id = ?", principal.TenantID)
+
+	if req.Status != "" {
+		query = query.Where("status = ?", strings.ToUpper(req.Status))
+	}
+
+	if req.SourceName != "" {
+		query = query.Where("source_name = ?", req.SourceName)
+	}
+
+	if req.CreatedBefore != "" {
+		parsedTime, err := time.Parse(time.RFC3339, req.CreatedBefore)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
+				Code:    "INVALID_DATE",
+			})
+			return
+		}
+		query = query.Where("created_at < ?", parsedTime)
+	}
+
+	if req.DryRun {
+		var count int64
+		query.Model(&models.ContentItem{}).Count(&count)
+		c.JSON(http.StatusOK, bulkDeleteContentResponse{
+			DeletedCount: count,
+			Message:      "Dry run - no items deleted",
+		})
+		return
+	}
+
+	result := query.Delete(&models.ContentItem{})
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to delete content: " + result.Error.Error(),
+			Code:    "DELETE_FAILED",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, bulkDeleteContentResponse{
+		DeletedCount: result.RowsAffected,
+		Message:      "Successfully deleted content items",
+	})
+}
