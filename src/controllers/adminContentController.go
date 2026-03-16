@@ -271,6 +271,25 @@ type bulkDeleteContentResponse struct {
 	Message      string `json:"message"`
 }
 
+// ListDistinctSourceNames handles GET /admin/content/source-names
+func ListDistinctSourceNames(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+
+	var names []string
+	db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND source_name IS NOT NULL AND source_name != ''", principal.TenantID).
+		Distinct("source_name").
+		Order("source_name").
+		Pluck("source_name", &names)
+
+	c.JSON(http.StatusOK, gin.H{"source_names": names})
+}
+
 // BulkDeleteContent handles POST /admin/content/bulk-delete
 func BulkDeleteContent(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)

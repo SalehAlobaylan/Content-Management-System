@@ -33,6 +33,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/sources/:id/run", controllers.RunContentSource)
 
 	adminGroup.GET("/content", controllers.ListContentItems)
+	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
