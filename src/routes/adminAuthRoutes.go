@@ -30,4 +30,31 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
+
+	// Intelligence — Ranking Config
+	adminGroup.GET("/intelligence/ranking", controllers.GetRankingConfig)
+	adminGroup.PUT("/intelligence/ranking", controllers.UpdateRankingConfig)
+
+	// Intelligence — Content Flags
+	adminGroup.GET("/intelligence/flags", controllers.ListContentFlags)
+	adminGroup.GET("/intelligence/flags/:content_id", controllers.GetContentFlag)
+	adminGroup.PUT("/intelligence/flags/:content_id", controllers.UpsertContentFlag)
+	adminGroup.DELETE("/intelligence/flags/:content_id", controllers.DeleteContentFlag)
+	adminGroup.POST("/intelligence/flags/bulk", controllers.BulkSetFlags)
+
+	// Intelligence — Embeddings Explorer
+	adminGroup.GET("/intelligence/embeddings/clusters", controllers.GetEmbeddingClusters)
+	adminGroup.GET("/intelligence/embeddings/similar/:content_id", controllers.GetSimilarContent)
+	adminGroup.GET("/intelligence/embeddings/stats", controllers.GetEmbeddingStats)
+
+	// Intelligence — Analytics
+	adminGroup.GET("/intelligence/analytics/score-distribution", controllers.GetScoreDistribution)
+	adminGroup.GET("/intelligence/analytics/velocity", controllers.GetVelocityLeaderboard)
+	adminGroup.GET("/intelligence/analytics/trending", controllers.GetTrendingItems)
+	adminGroup.GET("/intelligence/analytics/source-performance", controllers.GetSourcePerformance)
+	adminGroup.GET("/intelligence/analytics/signal-health", controllers.GetSignalHealth)
+
+	// Intelligence — Feed Preview
+	adminGroup.GET("/intelligence/preview/foryou", controllers.PreviewForYouFeed)
+	adminGroup.GET("/intelligence/preview/news", controllers.PreviewNewsFeed)
 }

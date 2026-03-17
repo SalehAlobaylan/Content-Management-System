@@ -108,6 +108,9 @@ func main() {
 			&models.Transcript{},
 			&models.UserInteraction{},
 			&models.ContentSource{},
+			// Intelligence / Ranking
+			&models.RankingConfig{},
+			&models.ContentFlag{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
