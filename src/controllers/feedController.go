@@ -88,6 +88,84 @@ func GetForYouFeed(c *gin.Context) {
 	sessionID := c.Query("session_id")
 	userIDStr := c.Query("user_id")
 
+	// Load ranking config (uses "default" tenant for public feeds)
+	config := loadTenantConfig(db, "default")
+
+	// ------ Ranked path (when intelligence is active) ------
+	if config.IsActive {
+		// Fetch a broader window for ranking
+		var allItems []models.ContentItem
+		broadQuery := db.Model(&models.ContentItem{}).
+			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+			Where("status = ?", models.ContentStatusReady).
+			Where("published_at > ?", time.Now().AddDate(0, 0, -7)).
+			Order("published_at DESC").
+			Limit(200)
+		if err := broadQuery.Find(&allItems).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to fetch feed: " + err.Error()})
+			return
+		}
+
+		// Score items
+		contentIDs := extractPublicIDs(allItems)
+		flagMap := LoadContentFlags(db, "default", contentIDs)
+		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
+		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
+
+		// Apply cursor-based pagination over scored results
+		startIdx := 0
+		if !pagination.Timestamp.IsZero() {
+			for i, s := range scored {
+				if s.Item.PublicID == pagination.LastID {
+					startIdx = i + 1
+					break
+				}
+			}
+		}
+
+		endIdx := startIdx + pagination.Limit
+		var nextCursor *string
+		hasMore := endIdx < len(scored)
+		if endIdx > len(scored) {
+			endIdx = len(scored)
+		}
+
+		pageItems := scored[startIdx:endIdx]
+		if hasMore && len(pageItems) > 0 {
+			lastItem := pageItems[len(pageItems)-1].Item
+			var ts time.Time
+			if lastItem.PublishedAt != nil {
+				ts = *lastItem.PublishedAt
+			} else {
+				ts = lastItem.CreatedAt
+			}
+			cursor := utils.EncodeCursor(ts, lastItem.PublicID)
+			nextCursor = &cursor
+		}
+
+		// Extract items for interaction lookup
+		items := make([]models.ContentItem, len(pageItems))
+		for i, s := range pageItems {
+			items[i] = s.Item
+		}
+
+		likedMap := make(map[uuid.UUID]bool)
+		bookmarkedMap := make(map[uuid.UUID]bool)
+		if sessionID != "" || userIDStr != "" {
+			likedMap, bookmarkedMap = getInteractionStatus(db, items, sessionID, userIDStr)
+		}
+
+		responseItems := make([]ForYouItem, len(items))
+		for i, item := range items {
+			responseItems[i] = mapToForYouItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
+		}
+
+		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems})
+		return
+	}
+
+	// ------ Chronological path (default, unchanged) ------
+
 	// Query for VIDEO and PODCAST content
 	query := db.Model(&models.ContentItem{}).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
@@ -176,39 +254,67 @@ func GetNewsFeed(c *gin.Context) {
 		slideLimit = 10
 	}
 
-	// Query for ARTICLE content (featured items)
-	query := db.Model(&models.ContentItem{}).
-		Where("type = ?", models.ContentTypeArticle).
-		Where("status = ?", models.ContentStatusReady).
-		Order("published_at DESC, id DESC")
+	// Load ranking config
+	config := loadTenantConfig(db, "default")
 
-	// Apply cursor if provided
-	if !pagination.Timestamp.IsZero() {
-		query = query.Where(
-			"(published_at < ? OR (published_at = ? AND public_id < ?))",
-			pagination.Timestamp, pagination.Timestamp, pagination.LastID,
-		)
-	}
-
-	// Fetch featured articles + 1 to check for next page
 	var featuredItems []models.ContentItem
-	if err := query.Limit(slideLimit + 1).Find(&featuredItems).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Code:    http.StatusInternalServerError,
-			Message: "Failed to fetch feed: " + err.Error(),
-		})
-		return
+
+	if config.IsActive {
+		// ------ Ranked path ------
+		var allArticles []models.ContentItem
+		db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady).
+			Where("published_at > ?", time.Now().AddDate(0, 0, -7)).
+			Order("published_at DESC").Limit(200).Find(&allArticles)
+
+		contentIDs := extractPublicIDs(allArticles)
+		flagMap := LoadContentFlags(db, "default", contentIDs)
+		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
+		scored := ScoreItems(allArticles, config, flagMap, velocityData, time.Now())
+
+		// Extract items in ranked order, respecting cursor
+		startIdx := 0
+		if !pagination.Timestamp.IsZero() {
+			for i, s := range scored {
+				if s.Item.PublicID == pagination.LastID {
+					startIdx = i + 1
+					break
+				}
+			}
+		}
+		endIdx := startIdx + slideLimit
+		if endIdx > len(scored) {
+			endIdx = len(scored)
+		}
+		for _, s := range scored[startIdx:endIdx] {
+			featuredItems = append(featuredItems, s.Item)
+		}
+	} else {
+		// ------ Chronological path (default) ------
+		query := db.Model(&models.ContentItem{}).
+			Where("type = ?", models.ContentTypeArticle).
+			Where("status = ?", models.ContentStatusReady).
+			Order("published_at DESC, id DESC")
+
+		if !pagination.Timestamp.IsZero() {
+			query = query.Where(
+				"(published_at < ? OR (published_at = ? AND public_id < ?))",
+				pagination.Timestamp, pagination.Timestamp, pagination.LastID,
+			)
+		}
+
+		var fetched []models.ContentItem
+		query.Limit(slideLimit + 1).Find(&fetched)
+
+		if len(fetched) > slideLimit {
+			featuredItems = fetched[:slideLimit]
+		} else {
+			featuredItems = fetched
+		}
 	}
 
-	// Determine if there's a next page
+	// Determine next cursor
 	var nextCursor *string
-	hasMore := len(featuredItems) > slideLimit
-	if hasMore {
-		featuredItems = featuredItems[:slideLimit]
-	}
-
-	// Get last item for cursor
-	if len(featuredItems) > 0 && hasMore {
+	if len(featuredItems) == slideLimit {
 		lastItem := featuredItems[len(featuredItems)-1]
 		var ts time.Time
 		if lastItem.PublishedAt != nil {

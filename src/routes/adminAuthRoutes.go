@@ -8,19 +8,12 @@ import (
 	"gorm.io/gorm"
 )
 
-// SetupAdminAuthRoutes registers admin auth routes
+// SetupAdminAuthRoutes registers admin auth routes.
+// Authentication is handled by IAM — CMS only validates IAM-issued JWTs.
 func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
-	router.POST("/admin/login", controllers.AdminLogin)
-
 	adminGroup := router.Group("/admin")
 	adminGroup.Use(utils.AdminAuthMiddleware(db))
 	adminGroup.GET("/me", controllers.AdminMe)
-	adminGroup.GET("/users", controllers.ListAdminUsers)
-	adminGroup.POST("/users", controllers.CreateAdminUser)
-	adminGroup.GET("/users/:id", controllers.GetAdminUser)
-	adminGroup.PUT("/users/:id", controllers.UpdateAdminUser)
-	adminGroup.DELETE("/users/:id", controllers.DeleteAdminUser)
-	adminGroup.POST("/users/:id/password", controllers.ResetAdminUserPassword)
 
 	adminGroup.GET("/sources", controllers.ListContentSources)
 	adminGroup.POST("/sources", controllers.CreateContentSource)
@@ -37,4 +30,31 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
+
+	// Intelligence — Ranking Config
+	adminGroup.GET("/intelligence/ranking", controllers.GetRankingConfig)
+	adminGroup.PUT("/intelligence/ranking", controllers.UpdateRankingConfig)
+
+	// Intelligence — Content Flags
+	adminGroup.GET("/intelligence/flags", controllers.ListContentFlags)
+	adminGroup.GET("/intelligence/flags/:content_id", controllers.GetContentFlag)
+	adminGroup.PUT("/intelligence/flags/:content_id", controllers.UpsertContentFlag)
+	adminGroup.DELETE("/intelligence/flags/:content_id", controllers.DeleteContentFlag)
+	adminGroup.POST("/intelligence/flags/bulk", controllers.BulkSetFlags)
+
+	// Intelligence — Embeddings Explorer
+	adminGroup.GET("/intelligence/embeddings/clusters", controllers.GetEmbeddingClusters)
+	adminGroup.GET("/intelligence/embeddings/similar/:content_id", controllers.GetSimilarContent)
+	adminGroup.GET("/intelligence/embeddings/stats", controllers.GetEmbeddingStats)
+
+	// Intelligence — Analytics
+	adminGroup.GET("/intelligence/analytics/score-distribution", controllers.GetScoreDistribution)
+	adminGroup.GET("/intelligence/analytics/velocity", controllers.GetVelocityLeaderboard)
+	adminGroup.GET("/intelligence/analytics/trending", controllers.GetTrendingItems)
+	adminGroup.GET("/intelligence/analytics/source-performance", controllers.GetSourcePerformance)
+	adminGroup.GET("/intelligence/analytics/signal-health", controllers.GetSignalHealth)
+
+	// Intelligence — Feed Preview
+	adminGroup.GET("/intelligence/preview/foryou", controllers.PreviewForYouFeed)
+	adminGroup.GET("/intelligence/preview/news", controllers.PreviewNewsFeed)
 }

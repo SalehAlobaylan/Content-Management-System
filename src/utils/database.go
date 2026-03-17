@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"content-management-system/src/models"
 	"fmt"
 	"net/url"
 	"os"
@@ -147,42 +146,4 @@ func AutoMigrate(db *gorm.DB, models ...interface{}) error {
 func SeedData(db *gorm.DB) error {
 	// Placeholder for original CMS seed data
 	return nil
-}
-
-// SeedAdminUser ensures a default admin user exists for development/testing
-func SeedAdminUser(db *gorm.DB) error {
-	if os.Getenv("ENV") == "production" {
-		return nil
-	}
-
-	adminEmail := strings.ToLower(os.Getenv("ADMIN_EMAIL"))
-	adminPassword := os.Getenv("ADMIN_PASSWORD")
-	adminRole := os.Getenv("ADMIN_ROLE")
-	if adminRole == "" {
-		adminRole = "admin"
-	}
-
-	if adminEmail == "" || adminPassword == "" {
-		return nil
-	}
-
-	var existing models.AdminUser
-	if err := db.Where("email = ?", adminEmail).First(&existing).Error; err == nil {
-		return nil
-	}
-
-	hash, err := HashPassword(adminPassword)
-	if err != nil {
-		return err
-	}
-
-	user := models.AdminUser{
-		Email:        adminEmail,
-		TenantID:     GetDefaultTenantID(),
-		Role:         adminRole,
-		PasswordHash: hash,
-		IsActive:     true,
-	}
-
-	return db.Create(&user).Error
 }

@@ -57,7 +57,6 @@ func setup() {
 		&models.Transcript{},
 		&models.UserInteraction{},
 		&models.ContentSource{},
-		&models.AdminUser{},
 	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
@@ -92,7 +91,6 @@ func cleanup() {
 	_ = m.DropTable(&models.Transcript{})
 	_ = m.DropTable(&models.ContentItem{})
 	_ = m.DropTable(&models.ContentSource{})
-	_ = m.DropTable(&models.AdminUser{})
 	// Original CMS tables
 	_ = m.DropTable("post_media")
 	_ = m.DropTable(&models.Post{})
@@ -124,7 +122,6 @@ func clearTables() {
 	if testDB == nil {
 		return
 	}
-	_ = testDB.Exec("DELETE FROM admin_users").Error
 	_ = testDB.Exec("DELETE FROM post_media").Error
 	_ = testDB.Exec("DELETE FROM posts").Error
 	_ = testDB.Exec("DELETE FROM media").Error

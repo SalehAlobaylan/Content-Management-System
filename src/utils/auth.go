@@ -5,16 +5,14 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // JWTClaims defines token claims accepted by CMS admin middleware.
-// It supports both legacy CMS-issued tokens and IAM-issued canonical tokens.
+// Tokens are issued by the IAM Authorization Service.
 type JWTClaims struct {
 	UserID      string   `json:"user_id,omitempty"`
 	Email       string   `json:"email"`
@@ -44,38 +42,12 @@ var (
 	ErrTokenSignatureInvalid = errors.New("token signature invalid")
 )
 
-func HashPassword(password string) (string, error) {
-	hashed, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	return string(hashed), nil
-}
-
-func CheckPassword(hash string, password string) bool {
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
-}
-
 func GetJWTSecret() ([]byte, error) {
 	secret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
 	if secret == "" {
 		return nil, fmt.Errorf("JWT_SECRET is not set")
 	}
 	return []byte(secret), nil
-}
-
-func GetJWTIssuer() string {
-	if issuer := strings.TrimSpace(os.Getenv("JWT_ISSUER")); issuer != "" {
-		return issuer
-	}
-	return "cms-service"
-}
-
-func GetJWTAudience() string {
-	if audience := strings.TrimSpace(os.Getenv("JWT_AUDIENCE")); audience != "" {
-		return audience
-	}
-	return "platform-console"
 }
 
 func GetJWTAllowedIssuers() []string {
@@ -109,54 +81,6 @@ func GetDefaultTenantID() string {
 		return tenantID
 	}
 	return "default"
-}
-
-func GetJWTExpiration() time.Duration {
-	hoursValue := os.Getenv("JWT_EXPIRATION_HOURS")
-	if hoursValue == "" {
-		return 24 * time.Hour
-	}
-	hours, err := strconv.Atoi(hoursValue)
-	if err != nil || hours <= 0 {
-		return 24 * time.Hour
-	}
-	return time.Duration(hours) * time.Hour
-}
-
-func GenerateJWT(userID, email, tenantID, role string, permissions []string) (string, error) {
-	secret, err := GetJWTSecret()
-	if err != nil {
-		return "", err
-	}
-
-	normalizedRole := strings.ToLower(strings.TrimSpace(role))
-	if normalizedRole == "" {
-		normalizedRole = "user"
-	}
-	normalizedTenant := strings.TrimSpace(tenantID)
-	if normalizedTenant == "" {
-		normalizedTenant = GetDefaultTenantID()
-	}
-
-	now := time.Now()
-	claims := JWTClaims{
-		UserID:      userID,
-		Email:       strings.ToLower(strings.TrimSpace(email)),
-		TenantID:    normalizedTenant,
-		Role:        normalizedRole,
-		Roles:       []string{normalizedRole},
-		Permissions: normalizePermissions(permissions),
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID,
-			Issuer:    GetJWTIssuer(),
-			Audience:  []string{GetJWTAudience()},
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(GetJWTExpiration())),
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(secret)
 }
 
 func ParseJWT(tokenString string, secret []byte) (*JWTClaims, error) {
