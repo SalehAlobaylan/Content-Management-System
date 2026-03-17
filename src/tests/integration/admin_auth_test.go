@@ -1,92 +1,40 @@
 package integration
 
 import (
-	"bytes"
-	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
-	"github.com/google/uuid"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-func seedAdminUser(t *testing.T, email string, password string) models.AdminUser {
+// generateTestJWT creates a JWT token compatible with CMS's ParseJWT for testing.
+func generateTestJWT(t *testing.T, userID, email, role string, permissions []string) string {
 	t.Helper()
-	hash, err := utils.HashPassword(password)
+	now := time.Now()
+	claims := utils.JWTClaims{
+		UserID:      userID,
+		Email:       email,
+		TenantID:    "default",
+		Role:        role,
+		Roles:       []string{role},
+		Permissions: permissions,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			Issuer:    "iam-authorization-service",
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(1 * time.Hour)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte("test_secret"))
 	if err != nil {
-		t.Fatalf("failed to hash password: %v", err)
+		t.Fatalf("failed to sign test JWT: %v", err)
 	}
-
-	user := models.AdminUser{
-		PublicID:     uuid.New(),
-		Email:        email,
-		Role:         "admin",
-		PasswordHash: hash,
-		IsActive:     true,
-	}
-
-	if err := testDB.Create(&user).Error; err != nil {
-		t.Fatalf("failed to create admin user: %v", err)
-	}
-
-	return user
-}
-
-func TestAdminLoginSuccess(t *testing.T) {
-	clearTables()
-	email := "admin@login.test"
-	password := "ChangeMe123!"
-	seedAdminUser(t, email, password)
-
-	payload := map[string]string{
-		"email":    email,
-		"password": password,
-	}
-	body, _ := json.Marshal(payload)
-
-	req := httptest.NewRequest(http.MethodPost, "/admin/login", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-
-	router.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.Code)
-	}
-
-	var result map[string]any
-	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-
-	if result["token"] == nil {
-		t.Fatalf("expected token in response")
-	}
-}
-
-func TestAdminLoginInvalidPassword(t *testing.T) {
-	clearTables()
-	email := "admin@invalid.test"
-	password := "ChangeMe123!"
-	seedAdminUser(t, email, password)
-
-	payload := map[string]string{
-		"email":    email,
-		"password": "wrong",
-	}
-	body, _ := json.Marshal(payload)
-
-	req := httptest.NewRequest(http.MethodPost, "/admin/login", bytes.NewBuffer(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp := httptest.NewRecorder()
-
-	router.ServeHTTP(resp, req)
-
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %d", resp.Code)
-	}
+	return signed
 }
 
 func TestAdminMeUnauthorized(t *testing.T) {
@@ -103,14 +51,7 @@ func TestAdminMeUnauthorized(t *testing.T) {
 
 func TestAdminMeSuccess(t *testing.T) {
 	clearTables()
-	email := "admin@me.test"
-	password := "ChangeMe123!"
-	user := seedAdminUser(t, email, password)
-
-	token, err := utils.GenerateJWT(user.PublicID.String(), user.Email, user.TenantID, user.Role, []string(user.Permissions))
-	if err != nil {
-		t.Fatalf("failed to generate token: %v", err)
-	}
+	token := generateTestJWT(t, "550e8400-e29b-41d4-a716-446655440000", "admin@me.test", "admin", []string{"content:read", "content:write"})
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/me", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -119,6 +60,18 @@ func TestAdminMeSuccess(t *testing.T) {
 	router.ServeHTTP(resp, req)
 
 	if resp.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.Code)
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if result["email"] != "admin@me.test" {
+		t.Fatalf("expected email admin@me.test, got %v", result["email"])
+	}
+	if result["role"] != "admin" {
+		t.Fatalf("expected role admin, got %v", result["role"])
 	}
 }
