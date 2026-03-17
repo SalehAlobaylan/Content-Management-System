@@ -86,6 +86,37 @@ ADMIN_ROLE=admin
 - `GET /admin/content/:id` - Get content details
 - `PATCH /admin/content/:id/status` - Update content status (moderation/archive)
 
+### Content Intelligence Endpoints (`/admin/intelligence`)
+
+**Ranking Config**
+- `GET /admin/intelligence/ranking` - Get current ranking config (weights, decay params, active state)
+- `PUT /admin/intelligence/ranking` - Update ranking config (validates weights sum ≈ 1.0)
+
+**Content Flags** — editorial overrides per content item
+- `GET /admin/intelligence/flags` - List all flags (paginated, filterable by type)
+- `GET /admin/intelligence/flags/:id` - Get flag for a specific content item
+- `POST /admin/intelligence/flags/:id` - Upsert flag (boost / suppress / pin / exclude)
+- `DELETE /admin/intelligence/flags/:id` - Remove flag
+- `POST /admin/intelligence/flags/bulk` - Bulk set flags on multiple items
+
+**Embedding & Cluster Analytics**
+- `GET /admin/intelligence/embeddings/clusters` - Topic clusters from `topic_tags` (UNNEST + AVG engagement)
+- `GET /admin/intelligence/embeddings/similar/:id` - pgvector cosine neighbors for a content item
+- `GET /admin/intelligence/embeddings/stats` - Embedding coverage by content type
+
+**Feed Analytics**
+- `GET /admin/intelligence/analytics/score-distribution` - Histogram of ranking scores
+- `GET /admin/intelligence/analytics/velocity` - Top items by interaction rate (rolling window)
+- `GET /admin/intelligence/analytics/trending` - Trending items (spike detection vs. baseline)
+- `GET /admin/intelligence/analytics/sources` - Engagement performance by source
+- `GET /admin/intelligence/analytics/signal-health` - % coverage per signal across all READY content
+
+**Feed Preview**
+- `GET /admin/intelligence/preview/foryou` - Ranked For You feed preview with score breakdown
+- `GET /admin/intelligence/preview/news` - Ranked News feed preview with score breakdown
+
+> Both preview endpoints accept query params to override weights temporarily (e.g. `?freshness_weight=0.5`) without saving to the config.
+
 ## Testing
 
 ```
