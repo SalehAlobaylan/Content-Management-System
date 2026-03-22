@@ -31,7 +31,11 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
 
-	// Intelligence — Ranking Config
+	// Intelligence — Modes
+	adminGroup.GET("/intelligence/modes", controllers.GetModes)
+	adminGroup.PUT("/intelligence/mode", controllers.SetMode)
+
+	// Intelligence — Ranking Config (advanced)
 	adminGroup.GET("/intelligence/ranking", controllers.GetRankingConfig)
 	adminGroup.PUT("/intelligence/ranking", controllers.UpdateRankingConfig)
 

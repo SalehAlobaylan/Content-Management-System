@@ -3,6 +3,7 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -93,17 +94,28 @@ func GetForYouFeed(c *gin.Context) {
 
 	// ------ Ranked path (when intelligence is active) ------
 	if config.IsActive {
-		// Fetch a broader window for ranking
+		// Fetch items for ranking — try time window first, then fall back to all
 		var allItems []models.ContentItem
-		broadQuery := db.Model(&models.ContentItem{}).
+		baseQuery := db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-			Where("status = ?", models.ContentStatusReady).
-			Where("published_at > ?", time.Now().AddDate(0, 0, -7)).
-			Order("published_at DESC").
-			Limit(200)
+			Where("status = ?", models.ContentStatusReady)
+
+		// First try: items from the configured freshness window (minimum 30 days)
+		windowDays := config.FreshnessDecayHours / 24
+		if windowDays < 30 {
+			windowDays = 30
+		}
+		broadQuery := baseQuery.Session(&gorm.Session{}).
+			Where("published_at > ?", time.Now().AddDate(0, 0, -windowDays)).
+			Order("published_at DESC").Limit(200)
 		if err := broadQuery.Find(&allItems).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to fetch feed: " + err.Error()})
 			return
+		}
+
+		// Fallback: if too few items in the window, fetch all READY items
+		if len(allItems) < pagination.Limit {
+			baseQuery.Session(&gorm.Session{}).Order("published_at DESC").Limit(200).Find(&allItems)
 		}
 
 		// Score items
@@ -262,9 +274,19 @@ func GetNewsFeed(c *gin.Context) {
 	if config.IsActive {
 		// ------ Ranked path ------
 		var allArticles []models.ContentItem
+		windowDays := config.FreshnessDecayHours / 24
+		if windowDays < 30 {
+			windowDays = 30
+		}
 		db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady).
-			Where("published_at > ?", time.Now().AddDate(0, 0, -7)).
+			Where("published_at > ?", time.Now().AddDate(0, 0, -windowDays)).
 			Order("published_at DESC").Limit(200).Find(&allArticles)
+
+		// Fallback: if too few articles, fetch all READY articles
+		if len(allArticles) < slideLimit {
+			db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady).
+				Order("published_at DESC").Limit(200).Find(&allArticles)
+		}
 
 		contentIDs := extractPublicIDs(allArticles)
 		flagMap := LoadContentFlags(db, "default", contentIDs)
@@ -326,28 +348,10 @@ func GetNewsFeed(c *gin.Context) {
 		nextCursor = &cursor
 	}
 
-	// Query for related items (TWEET, COMMENT)
-	var relatedItems []models.ContentItem
-	if err := db.Model(&models.ContentItem{}).
-		Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
-		Where("status = ?", models.ContentStatusReady).
-		Order("published_at DESC").
-		Limit(slideLimit * 3). // 3 related per slide
-		Find(&relatedItems).Error; err != nil {
-		// Non-fatal: continue with empty related
-		relatedItems = []models.ContentItem{}
-	}
-
-	// Build slides
+	// Build slides — fetch semantically related items per featured article
 	slides := make([]NewsSlide, len(featuredItems))
 	for i, featured := range featuredItems {
-		// Get 3 related items for this slide
-		related := make([]NewsRelated, 0, 3)
-		startIdx := i * 3
-		for j := 0; j < 3 && startIdx+j < len(relatedItems); j++ {
-			related = append(related, mapToNewsRelated(relatedItems[startIdx+j]))
-		}
-
+		related := fetchRelatedItems(db, featured, 3)
 		slides[i] = NewsSlide{
 			SlideID:  uuid.New(),
 			Featured: mapToNewsFeatured(featured),
@@ -383,12 +387,18 @@ func getInteractionStatus(db *gorm.DB, items []models.ContentItem, sessionID, us
 		Where("content_item_id IN ?", contentIDs).
 		Where("type IN ?", []models.InteractionType{models.InteractionTypeLike, models.InteractionTypeBookmark})
 
-	if sessionID != "" {
-		query = query.Where("session_id = ?", sessionID)
-	}
-	if userIDStr != "" {
+	// Build identity condition: match session_id OR user_id (both scoped to content_item_id IN above)
+	if sessionID != "" && userIDStr != "" {
 		if userID, err := uuid.Parse(userIDStr); err == nil {
-			query = query.Or("user_id = ?", userID)
+			query = query.Where("session_id = ? OR user_id = ?", sessionID, userID)
+		} else {
+			query = query.Where("session_id = ?", sessionID)
+		}
+	} else if sessionID != "" {
+		query = query.Where("session_id = ?", sessionID)
+	} else if userIDStr != "" {
+		if userID, err := uuid.Parse(userIDStr); err == nil {
+			query = query.Where("user_id = ?", userID)
 		}
 	}
 
@@ -487,4 +497,60 @@ func mapToNewsRelated(item models.ContentItem) NewsRelated {
 	}
 
 	return result
+}
+
+// fetchRelatedItems returns up to `limit` TWEET/COMMENT items semantically related to the
+// featured article. If the article has an embedding, uses pgvector cosine similarity (<=>).
+// Falls back to date-ordered if no embedding is available.
+func fetchRelatedItems(db *gorm.DB, featured models.ContentItem, limit int) []NewsRelated {
+	var items []models.ContentItem
+
+	if featured.Embedding != nil {
+		// Semantic path: order by cosine distance to article embedding
+		embStr := pgvectorToLiteral(featured.Embedding.Slice())
+		err := db.Model(&models.ContentItem{}).
+			Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
+			Where("status = ?", models.ContentStatusReady).
+			Where("embedding IS NOT NULL").
+			Order(fmt.Sprintf("embedding <=> '%s'", embStr)).
+			Limit(limit).
+			Find(&items).Error
+		if err != nil || len(items) == 0 {
+			// fall through to date fallback
+			items = nil
+		}
+	}
+
+	// Fallback: date-ordered
+	if len(items) == 0 {
+		db.Model(&models.ContentItem{}).
+			Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
+			Where("status = ?", models.ContentStatusReady).
+			Order("published_at DESC").
+			Limit(limit).
+			Find(&items)
+	}
+
+	result := make([]NewsRelated, 0, len(items))
+	for _, item := range items {
+		result = append(result, mapToNewsRelated(item))
+	}
+	return result
+}
+
+// pgvectorToLiteral converts a float32 slice to a PostgreSQL vector literal string.
+// e.g. [0.1, 0.2, 0.3] → '[0.1,0.2,0.3]'
+func pgvectorToLiteral(v []float32) string {
+	if len(v) == 0 {
+		return "[]"
+	}
+	s := "["
+	for i, f := range v {
+		if i > 0 {
+			s += ","
+		}
+		s += fmt.Sprintf("%g", f)
+	}
+	s += "]"
+	return s
 }

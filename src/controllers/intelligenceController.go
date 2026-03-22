@@ -94,6 +94,7 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.RecirculationEnabled = req.RecirculationEnabled
 	existing.RecirculationMaxAgeDays = req.RecirculationMaxAgeDays
 	existing.EngagementNormalization = req.EngagementNormalization
+	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive
 
 	if err := db.Save(&existing).Error; err != nil {
@@ -101,6 +102,68 @@ func UpdateRankingConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, existing)
+}
+
+// ================================================================
+// Mode endpoints
+// ================================================================
+
+// GetModes handles GET /admin/intelligence/modes
+func GetModes(c *gin.Context) {
+	_, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	c.JSON(http.StatusOK, models.ModeDefinitions())
+}
+
+// SetMode handles PUT /admin/intelligence/mode
+func SetMode(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req struct {
+		Mode string `json:"mode" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
+		return
+	}
+
+	// Load or create config
+	var config models.RankingConfig
+	if err := db.Where("tenant_id = ?", principal.TenantID).First(&config).Error; err != nil {
+		config = models.DefaultRankingConfig(principal.TenantID)
+	}
+
+	// Apply the preset
+	if !config.ApplyPreset(req.Mode) {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: fmt.Sprintf("Unknown mode: %s", req.Mode),
+			Code:    "UNKNOWN_MODE",
+		})
+		return
+	}
+	config.IsActive = true
+
+	// Upsert
+	if config.ID == 0 {
+		config.TenantID = principal.TenantID
+		if err := db.Create(&config).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create config", Code: "CREATE_FAILED"})
+			return
+		}
+	} else {
+		if err := db.Save(&config).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update config", Code: "UPDATE_FAILED"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, config)
 }
 
 // ================================================================
