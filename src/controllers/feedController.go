@@ -34,6 +34,7 @@ type ForYouItem struct {
 	PublishedAt  time.Time `json:"published_at"`
 	IsLiked      bool      `json:"is_liked"`
 	IsBookmarked bool      `json:"is_bookmarked"`
+	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
 // NewsResponse is the API response for the News feed
@@ -88,6 +89,13 @@ func GetForYouFeed(c *gin.Context) {
 	// Get session/user ID for interaction status (optional)
 	sessionID := c.Query("session_id")
 	userIDStr := c.Query("user_id")
+	excludeSeen := c.Query("exclude_seen") == "true"
+
+	// Pre-fetch IDs the user has already viewed (used by both paths below)
+	var seenIDs []uuid.UUID
+	if excludeSeen && (sessionID != "" || userIDStr != "") {
+		seenIDs = fetchSeenIDs(db, sessionID, userIDStr)
+	}
 
 	// Load ranking config (uses "default" tenant for public feeds)
 	config := loadTenantConfig(db, "default")
@@ -98,7 +106,8 @@ func GetForYouFeed(c *gin.Context) {
 		var allItems []models.ContentItem
 		baseQuery := db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-			Where("status = ?", models.ContentStatusReady)
+			Where("status = ?", models.ContentStatusReady).
+			Where("media_url IS NOT NULL AND media_url != ''")
 
 		// First try: items from the configured freshness window (minimum 30 days)
 		windowDays := config.FreshnessDecayHours / 24
@@ -106,16 +115,16 @@ func GetForYouFeed(c *gin.Context) {
 			windowDays = 30
 		}
 		broadQuery := baseQuery.Session(&gorm.Session{}).
-			Where("published_at > ?", time.Now().AddDate(0, 0, -windowDays)).
-			Order("published_at DESC").Limit(200)
+			Where("COALESCE(published_at, created_at) > ?", time.Now().AddDate(0, 0, -windowDays)).
+			Order("COALESCE(published_at, created_at) DESC").Limit(200)
 		if err := broadQuery.Find(&allItems).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to fetch feed: " + err.Error()})
 			return
 		}
 
-		// Fallback: if too few items in the window, fetch all READY items
-		if len(allItems) < pagination.Limit {
-			baseQuery.Session(&gorm.Session{}).Order("published_at DESC").Limit(200).Find(&allItems)
+		// Fallback: if not enough items to fill multiple pages, fetch all READY items
+		if len(allItems) < 200 {
+			baseQuery.Session(&gorm.Session{}).Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allItems)
 		}
 
 		// Score items
@@ -124,13 +133,46 @@ func GetForYouFeed(c *gin.Context) {
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
 
+		// Filter out already-seen items
+		if len(seenIDs) > 0 {
+			seenSet := make(map[uuid.UUID]bool, len(seenIDs))
+			for _, id := range seenIDs {
+				seenSet[id] = true
+			}
+			filtered := scored[:0]
+			for _, s := range scored {
+				if !seenSet[s.Item.PublicID] {
+					filtered = append(filtered, s)
+				}
+			}
+			scored = filtered
+		}
+
 		// Apply cursor-based pagination over scored results
 		startIdx := 0
 		if !pagination.Timestamp.IsZero() {
+			found := false
 			for i, s := range scored {
 				if s.Item.PublicID == pagination.LastID {
 					startIdx = i + 1
+					found = true
 					break
+				}
+			}
+			// Fallback: if the cursor item wasn't found (scores shifted between requests),
+			// find the closest position by timestamp to avoid restarting from page 1
+			if !found {
+				for i, s := range scored {
+					var itemTs time.Time
+					if s.Item.PublishedAt != nil {
+						itemTs = *s.Item.PublishedAt
+					} else {
+						itemTs = s.Item.CreatedAt
+					}
+					if !itemTs.After(pagination.Timestamp) {
+						startIdx = i
+						break
+					}
 				}
 			}
 		}
@@ -176,20 +218,28 @@ func GetForYouFeed(c *gin.Context) {
 		return
 	}
 
-	// ------ Chronological path (default, unchanged) ------
+	// ------ Chronological path (default) ------
 
-	// Query for VIDEO and PODCAST content
+	// Query for VIDEO and PODCAST content with a valid media URL.
+	// Use COALESCE(published_at, created_at) so items with NULL published_at
+	// are still ordered and reachable by cursor pagination.
 	query := db.Model(&models.ContentItem{}).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("status = ?", models.ContentStatusReady).
-		Order("published_at DESC, id DESC")
+		Where("media_url IS NOT NULL AND media_url != ''").
+		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 
 	// Apply cursor if provided
 	if !pagination.Timestamp.IsZero() {
 		query = query.Where(
-			"(published_at < ? OR (published_at = ? AND public_id < ?))",
+			"(COALESCE(published_at, created_at) < ? OR (COALESCE(published_at, created_at) = ? AND public_id < ?))",
 			pagination.Timestamp, pagination.Timestamp, pagination.LastID,
 		)
+	}
+
+	// Exclude already-seen items
+	if len(seenIDs) > 0 {
+		query = query.Where("public_id NOT IN ?", seenIDs)
 	}
 
 	// Fetch items + 1 to check for next page
@@ -266,6 +316,15 @@ func GetNewsFeed(c *gin.Context) {
 		slideLimit = 10
 	}
 
+	sessionID := c.Query("session_id")
+	userIDStr := c.Query("user_id")
+	excludeSeen := c.Query("exclude_seen") == "true"
+
+	var seenIDs []uuid.UUID
+	if excludeSeen && (sessionID != "" || userIDStr != "") {
+		seenIDs = fetchSeenIDs(db, sessionID, userIDStr)
+	}
+
 	// Load ranking config
 	config := loadTenantConfig(db, "default")
 
@@ -278,14 +337,16 @@ func GetNewsFeed(c *gin.Context) {
 		if windowDays < 30 {
 			windowDays = 30
 		}
-		db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady).
-			Where("published_at > ?", time.Now().AddDate(0, 0, -windowDays)).
-			Order("published_at DESC").Limit(200).Find(&allArticles)
+		baseQuery := db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady)
 
-		// Fallback: if too few articles, fetch all READY articles
-		if len(allArticles) < slideLimit {
-			db.Where("type = ? AND status = ?", models.ContentTypeArticle, models.ContentStatusReady).
-				Order("published_at DESC").Limit(200).Find(&allArticles)
+		baseQuery.Session(&gorm.Session{}).
+			Where("COALESCE(published_at, created_at) > ?", time.Now().AddDate(0, 0, -windowDays)).
+			Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allArticles)
+
+		// Fallback: if not enough articles to fill multiple pages, fetch all READY articles
+		if len(allArticles) < 200 {
+			baseQuery.Session(&gorm.Session{}).
+				Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allArticles)
 		}
 
 		contentIDs := extractPublicIDs(allArticles)
@@ -293,13 +354,44 @@ func GetNewsFeed(c *gin.Context) {
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allArticles, config, flagMap, velocityData, time.Now())
 
-		// Extract items in ranked order, respecting cursor
+		// Filter out already-seen slides
+		if len(seenIDs) > 0 {
+			seenSet := make(map[uuid.UUID]bool, len(seenIDs))
+			for _, id := range seenIDs {
+				seenSet[id] = true
+			}
+			filtered := scored[:0]
+			for _, s := range scored {
+				if !seenSet[s.Item.PublicID] {
+					filtered = append(filtered, s)
+				}
+			}
+			scored = filtered
+		}
+
+		// Cursor-based pagination with fallback when order shifts between requests
 		startIdx := 0
 		if !pagination.Timestamp.IsZero() {
+			found := false
 			for i, s := range scored {
 				if s.Item.PublicID == pagination.LastID {
 					startIdx = i + 1
+					found = true
 					break
+				}
+			}
+			if !found {
+				for i, s := range scored {
+					var itemTs time.Time
+					if s.Item.PublishedAt != nil {
+						itemTs = *s.Item.PublishedAt
+					} else {
+						itemTs = s.Item.CreatedAt
+					}
+					if !itemTs.After(pagination.Timestamp) {
+						startIdx = i
+						break
+					}
 				}
 			}
 		}
@@ -311,17 +403,21 @@ func GetNewsFeed(c *gin.Context) {
 			featuredItems = append(featuredItems, s.Item)
 		}
 	} else {
-		// ------ Chronological path (default) ------
+		// ------ Chronological path ------
 		query := db.Model(&models.ContentItem{}).
 			Where("type = ?", models.ContentTypeArticle).
 			Where("status = ?", models.ContentStatusReady).
-			Order("published_at DESC, id DESC")
+			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 
 		if !pagination.Timestamp.IsZero() {
 			query = query.Where(
-				"(published_at < ? OR (published_at = ? AND public_id < ?))",
+				"(COALESCE(published_at, created_at) < ? OR (COALESCE(published_at, created_at) = ? AND public_id < ?))",
 				pagination.Timestamp, pagination.Timestamp, pagination.LastID,
 			)
+		}
+
+		if len(seenIDs) > 0 {
+			query = query.Where("public_id NOT IN ?", seenIDs)
 		}
 
 		var fetched []models.ContentItem
@@ -447,6 +543,10 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 	}
 	if item.PublishedAt != nil {
 		result.PublishedAt = *item.PublishedAt
+	}
+	if item.TranscriptID != nil {
+		tid := item.TranscriptID.String()
+		result.TranscriptID = &tid
 	}
 
 	return result

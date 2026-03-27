@@ -67,7 +67,7 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		RecirculationMaxAgeDays:     30,
 		EngagementNormalization:     "log",
 		Mode:                        "balanced",
-		IsActive:                    false,
+		IsActive:                    true,
 	}
 }
 

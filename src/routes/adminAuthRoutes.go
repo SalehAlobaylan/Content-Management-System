@@ -27,9 +27,11 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	adminGroup.GET("/content", controllers.ListContentItems)
 	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
+	adminGroup.GET("/content/status-counts", controllers.GetStatusCounts)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
+	adminGroup.POST("/content/bulk-status", controllers.BulkStatusChange)
 
 	// Intelligence — Modes
 	adminGroup.GET("/intelligence/modes", controllers.GetModes)
@@ -61,4 +63,11 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Intelligence — Feed Preview
 	adminGroup.GET("/intelligence/preview/foryou", controllers.PreviewForYouFeed)
 	adminGroup.GET("/intelligence/preview/news", controllers.PreviewNewsFeed)
+
+	// Enrichment — On-demand enrichment management
+	adminGroup.GET("/enrichment/stats", controllers.GetEnrichmentStats)
+	adminGroup.GET("/enrichment/missing", controllers.GetMissingEnrichments)
+	adminGroup.POST("/enrichment/trigger/:id", controllers.TriggerEnrichment)
+	adminGroup.POST("/enrichment/trigger-batch", controllers.TriggerBatchEnrichment)
+	adminGroup.GET("/enrichment/health", controllers.GetEnrichmentServiceHealth)
 }

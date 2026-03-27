@@ -15,6 +15,10 @@ func SetupInteractionRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// Get user's bookmarked content
 	group.GET("/interactions/bookmarks", controllers.GetBookmarks)
 
+	// Watch history — list and clear
+	group.GET("/interactions/history", controllers.GetWatchHistory)
+	group.DELETE("/interactions/history", controllers.DeleteWatchHistory)
+
 	// Delete an interaction (unlike, unbookmark)
 	group.DELETE("/interactions/:id", controllers.DeleteInteraction)
 }

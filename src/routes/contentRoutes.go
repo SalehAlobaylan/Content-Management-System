@@ -11,4 +11,7 @@ import (
 func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// Get a single content item by ID
 	group.GET("/content/:id", controllers.GetContentItem)
+
+	// User-triggered transcription (JWT-authenticated, rate-limited)
+	group.POST("/content/:id/transcribe", controllers.UserAuthMiddleware(), controllers.RequestTranscription)
 }

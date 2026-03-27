@@ -33,6 +33,7 @@ type ContentItemResponse struct {
 	CreatedAt    string    `json:"created_at"`
 	IsLiked      bool      `json:"is_liked"`
 	IsBookmarked bool      `json:"is_bookmarked"`
+	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
 // GetContentItem returns a single content item by ID
@@ -155,6 +156,10 @@ func mapToContentItemResponse(item models.ContentItem, isLiked, isBookmarked boo
 	}
 	if item.PublishedAt != nil {
 		response.PublishedAt = item.PublishedAt.Format("2006-01-02T15:04:05Z")
+	}
+	if item.TranscriptID != nil {
+		tid := item.TranscriptID.String()
+		response.TranscriptID = &tid
 	}
 
 	return response

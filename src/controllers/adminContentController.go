@@ -362,3 +362,160 @@ func BulkDeleteContent(c *gin.Context) {
 		Message:      "Successfully deleted content items",
 	})
 }
+
+// GetStatusCounts handles GET /admin/content/status-counts
+// Returns a map of status → count for all content items in the tenant.
+func GetStatusCounts(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+
+	type statusRow struct {
+		Status string `gorm:"column:status"`
+		Count  int64  `gorm:"column:count"`
+	}
+
+	var rows []statusRow
+	if err := db.Model(&models.ContentItem{}).
+		Select("status, COUNT(*) as count").
+		Where("tenant_id = ?", principal.TenantID).
+		Group("status").
+		Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to fetch status counts",
+			Code:    "FETCH_FAILED",
+		})
+		return
+	}
+
+	counts := map[string]int64{
+		"PENDING":    0,
+		"PROCESSING": 0,
+		"READY":      0,
+		"FAILED":     0,
+		"ARCHIVED":   0,
+	}
+	for _, row := range rows {
+		counts[row.Status] = row.Count
+	}
+
+	c.JSON(http.StatusOK, counts)
+}
+
+type bulkStatusChangeRequest struct {
+	FromStatus string `json:"from_status" binding:"required"`
+	ToStatus   string `json:"to_status" binding:"required"`
+	SourceName string `json:"source_name"`
+	Type       string `json:"type"`
+	Limit      int    `json:"limit"`
+	DryRun     bool   `json:"dry_run"`
+}
+
+type bulkStatusChangeResponse struct {
+	UpdatedCount int64  `json:"updated_count"`
+	Message      string `json:"message"`
+}
+
+// BulkStatusChange handles POST /admin/content/bulk-status
+// Changes the status of content items matching the given filters.
+func BulkStatusChange(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req bulkStatusChangeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid request: from_status and to_status are required",
+			Code:    "INVALID_REQUEST",
+		})
+		return
+	}
+
+	fromStatus := strings.ToUpper(strings.TrimSpace(req.FromStatus))
+	toStatus := strings.ToUpper(strings.TrimSpace(req.ToStatus))
+
+	validStatuses := map[string]bool{
+		"PENDING": true, "PROCESSING": true, "READY": true, "FAILED": true, "ARCHIVED": true,
+	}
+	if !validStatuses[fromStatus] || !validStatuses[toStatus] {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid status value. Must be one of: PENDING, PROCESSING, READY, FAILED, ARCHIVED",
+			Code:    "INVALID_STATUS",
+		})
+		return
+	}
+	if fromStatus == toStatus {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "from_status and to_status must be different",
+			Code:    "SAME_STATUS",
+		})
+		return
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	query := db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND status = ?", principal.TenantID, fromStatus)
+
+	if req.SourceName != "" {
+		query = query.Where("source_name = ?", req.SourceName)
+	}
+	if req.Type != "" {
+		query = query.Where("type = ?", strings.ToUpper(req.Type))
+	}
+
+	if req.DryRun {
+		var count int64
+		query.Count(&count)
+		if int64(limit) < count {
+			count = int64(limit)
+		}
+		c.JSON(http.StatusOK, bulkStatusChangeResponse{
+			UpdatedCount: count,
+			Message:      "Dry run — no items updated",
+		})
+		return
+	}
+
+	// Use a subquery to limit the number of rows updated
+	subQuery := db.Model(&models.ContentItem{}).
+		Select("id").
+		Where("tenant_id = ? AND status = ?", principal.TenantID, fromStatus)
+	if req.SourceName != "" {
+		subQuery = subQuery.Where("source_name = ?", req.SourceName)
+	}
+	if req.Type != "" {
+		subQuery = subQuery.Where("type = ?", strings.ToUpper(req.Type))
+	}
+	subQuery = subQuery.Limit(limit)
+
+	result := db.Model(&models.ContentItem{}).
+		Where("id IN (?)", subQuery).
+		Update("status", toStatus)
+
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to update status: " + result.Error.Error(),
+			Code:    "UPDATE_FAILED",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, bulkStatusChangeResponse{
+		UpdatedCount: result.RowsAffected,
+		Message:      "Updated " + strings.ToLower(req.FromStatus) + " items to " + strings.ToLower(req.ToStatus),
+	})
+}
