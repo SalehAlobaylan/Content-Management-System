@@ -235,6 +235,92 @@ func DeleteInteraction(c *gin.Context) {
 	})
 }
 
+// DeleteInteractionByContext removes an interaction by content + type + user/session.
+// DELETE /api/v1/interactions?content_item_id=...&type=like|bookmark&user_id=...|session_id=...
+func DeleteInteractionByContext(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	contentItemIDStr := c.Query("content_item_id")
+	interactionTypeStr := c.Query("type")
+	sessionID := c.Query("session_id")
+	userIDStr := c.Query("user_id")
+
+	if contentItemIDStr == "" || interactionTypeStr == "" {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "content_item_id and type are required",
+		})
+		return
+	}
+
+	if sessionID == "" && userIDStr == "" {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "session_id or user_id is required",
+		})
+		return
+	}
+
+	contentItemID, err := uuid.Parse(contentItemIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid content_item_id",
+		})
+		return
+	}
+
+	interactionType := models.InteractionType(interactionTypeStr)
+	if interactionType != models.InteractionTypeLike && interactionType != models.InteractionTypeBookmark {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "type must be like or bookmark",
+		})
+		return
+	}
+
+	query := db.Where("content_item_id = ?", contentItemID).
+		Where("type = ?", interactionType)
+
+	if userIDStr != "" {
+		userID, err := uuid.Parse(userIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{
+				Code:    http.StatusBadRequest,
+				Message: "Invalid user_id",
+			})
+			return
+		}
+		query = query.Where("user_id = ?", userID)
+	} else {
+		query = query.Where("session_id = ?", sessionID)
+	}
+
+	var interaction models.UserInteraction
+	if err := query.First(&interaction).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{
+			Code:    http.StatusNotFound,
+			Message: "Interaction not found",
+		})
+		return
+	}
+
+	updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1)
+
+	if err := db.Delete(&interaction).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code:    http.StatusInternalServerError,
+			Message: "Failed to delete interaction: " + err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Interaction deleted successfully",
+	})
+}
+
 // HistoryItem is a single entry in the user's watch history
 type HistoryItem struct {
 	ContentID    uuid.UUID  `json:"content_id"`

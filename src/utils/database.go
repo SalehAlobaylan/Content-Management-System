@@ -43,28 +43,58 @@ func ConnectDB() (*gorm.DB, error) {
 // EnsureTenantScopeColumns applies an idempotent tenant-scope patch for legacy schemas.
 // It keeps production instances aligned with tenant-aware query paths.
 func EnsureTenantScopeColumns(db *gorm.DB) error {
-	statements := []string{
-		"ALTER TABLE IF EXISTS admin_users ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
-		"ALTER TABLE IF EXISTS content_sources ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
-		"ALTER TABLE IF EXISTS content_items ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
-		"ALTER TABLE IF EXISTS content_items ALTER COLUMN idempotency_key TYPE VARCHAR(512)",
-		"UPDATE admin_users SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
-		"UPDATE content_sources SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
-		"UPDATE content_items SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
-		"ALTER TABLE IF EXISTS admin_users ALTER COLUMN tenant_id SET DEFAULT 'default'",
-		"ALTER TABLE IF EXISTS content_sources ALTER COLUMN tenant_id SET DEFAULT 'default'",
-		"ALTER TABLE IF EXISTS content_items ALTER COLUMN tenant_id SET DEFAULT 'default'",
-		"ALTER TABLE IF EXISTS admin_users ALTER COLUMN tenant_id SET NOT NULL",
-		"ALTER TABLE IF EXISTS content_sources ALTER COLUMN tenant_id SET NOT NULL",
-		"ALTER TABLE IF EXISTS content_items ALTER COLUMN tenant_id SET NOT NULL",
-		"CREATE INDEX IF NOT EXISTS idx_admin_users_tenant_id ON admin_users(tenant_id)",
-		"CREATE INDEX IF NOT EXISTS idx_content_sources_tenant_id ON content_sources(tenant_id)",
-		"CREATE INDEX IF NOT EXISTS idx_content_items_tenant_id ON content_items(tenant_id)",
+	if err := db.Exec("ALTER TABLE IF EXISTS admin_users ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)").Error; err != nil {
+		return fmt.Errorf("tenant scope patch failed (admin_users add tenant_id): %w", err)
+	}
+	if err := db.Exec("ALTER TABLE IF EXISTS content_sources ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)").Error; err != nil {
+		return fmt.Errorf("tenant scope patch failed (content_sources add tenant_id): %w", err)
+	}
+	if err := db.Exec("ALTER TABLE IF EXISTS content_items ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)").Error; err != nil {
+		return fmt.Errorf("tenant scope patch failed (content_items add tenant_id): %w", err)
+	}
+	if err := db.Exec("ALTER TABLE IF EXISTS content_items ALTER COLUMN idempotency_key TYPE VARCHAR(512)").Error; err != nil {
+		return fmt.Errorf("tenant scope patch failed (content_items idempotency_key): %w", err)
 	}
 
-	for _, stmt := range statements {
-		if err := db.Exec(stmt).Error; err != nil {
-			return fmt.Errorf("tenant scope patch failed (%s): %w", stmt, err)
+	if db.Migrator().HasTable("admin_users") {
+		statements := []string{
+			"UPDATE admin_users SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
+			"ALTER TABLE admin_users ALTER COLUMN tenant_id SET DEFAULT 'default'",
+			"ALTER TABLE admin_users ALTER COLUMN tenant_id SET NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_admin_users_tenant_id ON admin_users(tenant_id)",
+		}
+		for _, stmt := range statements {
+			if err := db.Exec(stmt).Error; err != nil {
+				return fmt.Errorf("tenant scope patch failed (%s): %w", stmt, err)
+			}
+		}
+	}
+
+	if db.Migrator().HasTable("content_sources") {
+		statements := []string{
+			"UPDATE content_sources SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
+			"ALTER TABLE content_sources ALTER COLUMN tenant_id SET DEFAULT 'default'",
+			"ALTER TABLE content_sources ALTER COLUMN tenant_id SET NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_content_sources_tenant_id ON content_sources(tenant_id)",
+		}
+		for _, stmt := range statements {
+			if err := db.Exec(stmt).Error; err != nil {
+				return fmt.Errorf("tenant scope patch failed (%s): %w", stmt, err)
+			}
+		}
+	}
+
+	if db.Migrator().HasTable("content_items") {
+		statements := []string{
+			"UPDATE content_items SET tenant_id = 'default' WHERE tenant_id IS NULL OR tenant_id = ''",
+			"ALTER TABLE content_items ALTER COLUMN tenant_id SET DEFAULT 'default'",
+			"ALTER TABLE content_items ALTER COLUMN tenant_id SET NOT NULL",
+			"CREATE INDEX IF NOT EXISTS idx_content_items_tenant_id ON content_items(tenant_id)",
+		}
+		for _, stmt := range statements {
+			if err := db.Exec(stmt).Error; err != nil {
+				return fmt.Errorf("tenant scope patch failed (%s): %w", stmt, err)
+			}
 		}
 	}
 

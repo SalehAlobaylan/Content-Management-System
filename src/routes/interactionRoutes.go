@@ -20,5 +20,6 @@ func SetupInteractionRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	group.DELETE("/interactions/history", controllers.DeleteWatchHistory)
 
 	// Delete an interaction (unlike, unbookmark)
+	group.DELETE("/interactions", controllers.DeleteInteractionByContext)
 	group.DELETE("/interactions/:id", controllers.DeleteInteraction)
 }
