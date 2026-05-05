@@ -4,6 +4,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -260,11 +261,14 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 }
 
 type bulkDeleteContentRequest struct {
-	Status        string `json:"status"`
-	SourceName    string `json:"source_name"`
-	CreatedBefore string `json:"created_before"`
-	DryRun        bool   `json:"dry_run"`
+	Status        string   `json:"status"`
+	SourceName    string   `json:"source_name"`
+	CreatedBefore string   `json:"created_before"`
+	IDs           []string `json:"ids"`
+	DryRun        bool     `json:"dry_run"`
 }
+
+const bulkDeleteIDsLimit = 500
 
 type bulkDeleteContentResponse struct {
 	DeletedCount int64  `json:"deleted_count"`
@@ -308,34 +312,49 @@ func BulkDeleteContent(c *gin.Context) {
 		return
 	}
 
-	if req.Status == "" && req.SourceName == "" && req.CreatedBefore == "" {
+	hasIDs := len(req.IDs) > 0
+	if !hasIDs && req.Status == "" && req.SourceName == "" && req.CreatedBefore == "" {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "At least one filter is required (status, source_name, or created_before)",
+			Message: "At least one filter is required (ids, status, source_name, or created_before)",
 			Code:    "FILTER_REQUIRED",
+		})
+		return
+	}
+
+	if hasIDs && len(req.IDs) > bulkDeleteIDsLimit {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: fmt.Sprintf("Too many ids; maximum is %d", bulkDeleteIDsLimit),
+			Code:    "TOO_MANY_IDS",
 		})
 		return
 	}
 
 	query := db.Where("tenant_id = ?", principal.TenantID)
 
-	if req.Status != "" {
-		query = query.Where("status = ?", strings.ToUpper(req.Status))
-	}
-
-	if req.SourceName != "" {
-		query = query.Where("source_name = ?", req.SourceName)
-	}
-
-	if req.CreatedBefore != "" {
-		parsedTime, err := time.Parse(time.RFC3339, req.CreatedBefore)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, authErrorResponse{
-				Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
-				Code:    "INVALID_DATE",
-			})
-			return
+	if hasIDs {
+		// When ids are provided, ignore the other filters — they're an
+		// explicit row-selection from the UI.
+		query = query.Where("public_id IN ?", req.IDs)
+	} else {
+		if req.Status != "" {
+			query = query.Where("status = ?", strings.ToUpper(req.Status))
 		}
-		query = query.Where("created_at < ?", parsedTime)
+
+		if req.SourceName != "" {
+			query = query.Where("source_name = ?", req.SourceName)
+		}
+
+		if req.CreatedBefore != "" {
+			parsedTime, err := time.Parse(time.RFC3339, req.CreatedBefore)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, authErrorResponse{
+					Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
+					Code:    "INVALID_DATE",
+				})
+				return
+			}
+			query = query.Where("created_at < ?", parsedTime)
+		}
 	}
 
 	if req.DryRun {
