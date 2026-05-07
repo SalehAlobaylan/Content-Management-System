@@ -87,6 +87,29 @@ type ContentItem struct {
 	ShareCount   int `gorm:"default:0" json:"share_count"`
 	ViewCount    int `gorm:"default:0" json:"view_count"`
 
+	// Storage accounting (set by Aggregation on upload, cleared by storage circulation)
+	FileSizeBytes    int64      `gorm:"type:bigint;default:0" json:"file_size_bytes"`
+	ArchivedAt       *time.Time `gorm:"type:timestamp" json:"archived_at,omitempty"`
+	LastStorageCheck *time.Time `gorm:"type:timestamp" json:"last_storage_check,omitempty"`
+	LastRestoredAt   *time.Time `gorm:"type:timestamp" json:"last_restored_at,omitempty"`
+
+	// Storage tier — which configured S3 backend currently holds the artifacts.
+	// NULL = primary (default). 'cold' = moved to the secondary bucket.
+	StorageTier *string `gorm:"type:varchar(16)" json:"storage_tier,omitempty"`
+
+	// Quality accounting (set by Aggregation on first ingest, updated on re-encode).
+	// CurrentQualityProfileID points at quality_profiles.id; NULL = unknown / never re-encoded.
+	// OriginalSizeBytes/OriginalBitrateKbps capture the as-ingested values exactly once.
+	// CurrentBitrateKbps tracks the current encode after any re-encode passes.
+	CurrentQualityProfileID *uint  `gorm:"index" json:"current_quality_profile_id,omitempty"`
+	OriginalSizeBytes       *int64 `gorm:"type:bigint" json:"original_size_bytes,omitempty"`
+	OriginalBitrateKbps     *int   `gorm:"type:int" json:"original_bitrate_kbps,omitempty"`
+	CurrentBitrateKbps      *int   `gorm:"type:int" json:"current_bitrate_kbps,omitempty"`
+
+	// MediaVersion increments on each re-encode so the worker can derive the next
+	// versioned key (`content/{id}/processed.v{N}.mp4`) without a S3 LIST.
+	MediaVersion int `gorm:"default:1" json:"media_version"`
+
 	// Timestamps
 	PublishedAt *time.Time `gorm:"type:timestamp" json:"published_at,omitempty"`
 	CreatedAt   time.Time  `gorm:"autoCreateTime" json:"created_at"`

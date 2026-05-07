@@ -14,4 +14,7 @@ func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
 
 	// User-triggered transcription (JWT-authenticated, rate-limited)
 	group.POST("/content/:id/transcribe", controllers.UserAuthMiddleware(), controllers.RequestTranscription)
+
+	// User-triggered restore for archived items
+	group.POST("/content/:id/request-restore", controllers.RequestRestore)
 }

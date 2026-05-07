@@ -112,8 +112,19 @@ func main() {
 			// Intelligence / Ranking
 			&models.RankingConfig{},
 			&models.ContentFlag{},
+			// Storage management
+			&models.StoragePolicy{},
+			&models.StorageSweepRun{},
+			// Quality management
+			&models.QualityProfile{},
+			&models.QualityRule{},
+			&models.QualityHistory{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
+		}
+		// Seed default quality profiles if the table is empty.
+		if err := utils.SeedDefaultQualityProfiles(db); err != nil {
+			log.Fatalf("Failed to seed quality profiles: %v", err)
 		}
 		// Seed development data
 		if env == "development" || env == "dev" {

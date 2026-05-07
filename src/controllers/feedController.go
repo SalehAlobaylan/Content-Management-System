@@ -34,6 +34,7 @@ type ForYouItem struct {
 	PublishedAt  time.Time `json:"published_at"`
 	IsLiked      bool      `json:"is_liked"`
 	IsBookmarked bool      `json:"is_bookmarked"`
+	IsArchived   bool      `json:"is_archived"`
 	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
@@ -59,6 +60,7 @@ type NewsFeatured struct {
 	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
 	Author       string    `json:"author,omitempty"`
 	PublishedAt  time.Time `json:"published_at"`
+	IsArchived   bool      `json:"is_archived"`
 }
 
 // NewsRelated is a related item in a news slide
@@ -106,8 +108,8 @@ func GetForYouFeed(c *gin.Context) {
 		var allItems []models.ContentItem
 		baseQuery := db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-			Where("status = ?", models.ContentStatusReady).
-			Where("media_url IS NOT NULL AND media_url != ''")
+			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+			Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')")
 
 		// First try: items from the configured freshness window (minimum 30 days)
 		windowDays := config.FreshnessDecayHours / 24
@@ -225,8 +227,8 @@ func GetForYouFeed(c *gin.Context) {
 	// are still ordered and reachable by cursor pagination.
 	query := db.Model(&models.ContentItem{}).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("status = ?", models.ContentStatusReady).
-		Where("media_url IS NOT NULL AND media_url != ''").
+		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')").
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 
 	// Apply cursor if provided
@@ -521,6 +523,7 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 		ShareCount:   item.ShareCount,
 		IsLiked:      isLiked,
 		IsBookmarked: isBookmarked,
+		IsArchived:   item.Status == models.ContentStatusArchived,
 	}
 
 	if item.Title != nil {
@@ -554,8 +557,9 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 
 func mapToNewsFeatured(item models.ContentItem) NewsFeatured {
 	result := NewsFeatured{
-		ID:   item.PublicID,
-		Type: string(item.Type),
+		ID:         item.PublicID,
+		Type:       string(item.Type),
+		IsArchived: item.Status == models.ContentStatusArchived,
 	}
 
 	if item.Title != nil {

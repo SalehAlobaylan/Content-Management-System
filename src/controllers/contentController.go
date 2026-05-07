@@ -4,6 +4,8 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -33,6 +35,7 @@ type ContentItemResponse struct {
 	CreatedAt    string    `json:"created_at"`
 	IsLiked      bool      `json:"is_liked"`
 	IsBookmarked bool      `json:"is_bookmarked"`
+	IsArchived   bool      `json:"is_archived"`
 	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
@@ -122,6 +125,7 @@ func mapToContentItemResponse(item models.ContentItem, isLiked, isBookmarked boo
 		CreatedAt:    item.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		IsLiked:      isLiked,
 		IsBookmarked: isBookmarked,
+		IsArchived:   item.Status == models.ContentStatusArchived,
 	}
 
 	if item.Title != nil {
@@ -163,4 +167,77 @@ func mapToContentItemResponse(item models.ContentItem, isLiked, isBookmarked boo
 	}
 
 	return response
+}
+
+// -----------------------------------------------------------------------------
+// Public restore-request — archived items can be re-fetched on demand by users.
+// Debounced per content_id to prevent re-ingest floods on popular archived content.
+// -----------------------------------------------------------------------------
+
+const restoreRequestCooldown = 24 * time.Hour
+
+var (
+	restoreRequestMu       sync.Mutex
+	restoreRequestLastSeen = map[uuid.UUID]time.Time{}
+)
+
+type requestRestoreResponse struct {
+	Status     string `json:"status"`
+	Message    string `json:"message"`
+	RetryAfter int    `json:"retry_after_seconds,omitempty"`
+}
+
+// RequestRestore handles POST /api/v1/content/:id/request-restore
+// Triggers Aggregation to re-ingest an archived item. Rate-limited per content_id.
+func RequestRestore(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid content ID"})
+		return
+	}
+
+	var item models.ContentItem
+	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Content not found"})
+		return
+	}
+
+	if item.Status != models.ContentStatusArchived {
+		c.JSON(http.StatusOK, requestRestoreResponse{Status: "available", Message: "Content is already available"})
+		return
+	}
+
+	restoreRequestMu.Lock()
+	last, seen := restoreRequestLastSeen[item.PublicID]
+	now := time.Now().UTC()
+	if seen && now.Sub(last) < restoreRequestCooldown {
+		retryAfter := int((restoreRequestCooldown - now.Sub(last)).Seconds())
+		restoreRequestMu.Unlock()
+		c.JSON(http.StatusTooManyRequests, requestRestoreResponse{
+			Status:     "throttled",
+			Message:    "Restore already requested recently",
+			RetryAfter: retryAfter,
+		})
+		return
+	}
+	restoreRequestLastSeen[item.PublicID] = now
+	restoreRequestMu.Unlock()
+
+	item.Status = models.ContentStatusPending
+	item.ArchivedAt = nil
+	item.LastRestoredAt = &now
+	if err := db.Save(&item).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to flip status"})
+		return
+	}
+
+	go func() {
+		_, _ = callAggregationRetryPending("", 1)
+	}()
+
+	c.JSON(http.StatusOK, requestRestoreResponse{
+		Status:  "pending",
+		Message: "Restore requested. The content will be re-fetched shortly.",
+	})
 }

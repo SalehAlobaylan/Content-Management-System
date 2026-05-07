@@ -70,4 +70,33 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/enrichment/trigger/:id", controllers.TriggerEnrichment)
 	adminGroup.POST("/enrichment/trigger-batch", controllers.TriggerBatchEnrichment)
 	adminGroup.GET("/enrichment/health", controllers.GetEnrichmentServiceHealth)
+
+	// Storage management
+	adminGroup.GET("/storage/stats", controllers.GetStorageStats)
+	adminGroup.GET("/storage/candidates", controllers.GetStorageCandidates)
+	adminGroup.POST("/storage/purge", controllers.PurgeStorage)
+	adminGroup.POST("/storage/restore/:id", controllers.RestoreStorageItem)
+	adminGroup.GET("/storage/policy", controllers.GetStoragePolicy)
+	adminGroup.PUT("/storage/policy", controllers.UpdateStoragePolicy)
+	adminGroup.POST("/storage/policy/run-now", controllers.RunSweepNow)
+	adminGroup.GET("/storage/preview", controllers.GetSweepPreview)
+	adminGroup.GET("/storage/policy/overrides", controllers.ListStoragePolicyOverrides)
+	adminGroup.DELETE("/storage/policy/overrides/:tenant_id", controllers.DeleteStoragePolicyOverride)
+	adminGroup.GET("/storage/sweep-runs", controllers.ListSweepRuns)
+	adminGroup.POST("/storage/reconcile", controllers.ReconcileStorage)
+
+	// Quality management
+	adminGroup.GET("/quality/profiles", controllers.ListQualityProfiles)
+	adminGroup.POST("/quality/profiles", controllers.CreateQualityProfile)
+	adminGroup.PUT("/quality/profiles/:id", controllers.UpdateQualityProfile)
+	adminGroup.DELETE("/quality/profiles/:id", controllers.DeleteQualityProfile)
+	adminGroup.GET("/quality/rules", controllers.ListQualityRules)
+	adminGroup.POST("/quality/rules", controllers.CreateQualityRule)
+	adminGroup.PUT("/quality/rules/:id", controllers.UpdateQualityRule)
+	adminGroup.DELETE("/quality/rules/:id", controllers.DeleteQualityRule)
+	adminGroup.GET("/quality/candidates", controllers.GetQualityCandidates)
+	adminGroup.POST("/quality/re-encode", controllers.TriggerReEncode)
+	adminGroup.POST("/quality/probe/:id", controllers.ProbeContentItem)
+	adminGroup.GET("/quality/history", controllers.ListQualityHistory)
+	adminGroup.GET("/quality/stats", controllers.GetQualityStats)
 }

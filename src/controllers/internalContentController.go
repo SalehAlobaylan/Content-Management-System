@@ -64,9 +64,18 @@ type internalUpdateStatusRequest struct {
 }
 
 type internalUpdateArtifactsRequest struct {
-	MediaURL     *string `json:"media_url"`
-	ThumbnailURL *string `json:"thumbnail_url"`
-	DurationSec  *int    `json:"duration_sec"`
+	MediaURL      *string `json:"media_url"`
+	ThumbnailURL  *string `json:"thumbnail_url"`
+	DurationSec   *int    `json:"duration_sec"`
+	FileSizeBytes *int64  `json:"file_size_bytes"`
+	StorageTier   *string `json:"storage_tier"`
+
+	// Quality bookkeeping. These are recorded once per item at first ingest;
+	// the controller writes them only if the existing column is NULL.
+	OriginalSizeBytes       *int64 `json:"original_size_bytes"`
+	OriginalBitrateKbps     *int   `json:"original_bitrate_kbps"`
+	CurrentBitrateKbps      *int   `json:"current_bitrate_kbps"`
+	CurrentQualityProfileID *uint  `json:"current_quality_profile_id"`
 }
 
 type internalUpdateEmbeddingRequest struct {
@@ -305,6 +314,37 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	}
 	if req.DurationSec != nil {
 		item.DurationSec = req.DurationSec
+	}
+	if req.FileSizeBytes != nil {
+		item.FileSizeBytes = *req.FileSizeBytes
+	}
+	if req.StorageTier != nil {
+		val := strings.ToLower(strings.TrimSpace(*req.StorageTier))
+		if val == "" || val == "primary" {
+			item.StorageTier = nil
+		} else {
+			item.StorageTier = &val
+		}
+	}
+
+	// Quality bookkeeping. Original* fields are write-once at first ingest.
+	// Current* fields and the profile pointer can be updated freely (e.g. by
+	// the quality re-encode worker).
+	if req.OriginalSizeBytes != nil && item.OriginalSizeBytes == nil {
+		v := *req.OriginalSizeBytes
+		item.OriginalSizeBytes = &v
+	}
+	if req.OriginalBitrateKbps != nil && item.OriginalBitrateKbps == nil {
+		v := *req.OriginalBitrateKbps
+		item.OriginalBitrateKbps = &v
+	}
+	if req.CurrentBitrateKbps != nil {
+		v := *req.CurrentBitrateKbps
+		item.CurrentBitrateKbps = &v
+	}
+	if req.CurrentQualityProfileID != nil {
+		v := *req.CurrentQualityProfileID
+		item.CurrentQualityProfileID = &v
 	}
 
 	if err := db.Save(&item).Error; err != nil {
