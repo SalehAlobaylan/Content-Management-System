@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -66,7 +67,11 @@ func ListQualityProfiles(c *gin.Context) {
 	var profiles []models.QualityProfile
 	if err := q.Order("tenant_id NULLS FIRST, source_type NULLS FIRST, name ASC").
 		Find(&profiles).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to list profiles", Code: "LIST_FAILED"})
+		log.Printf("[CMS] ListQualityProfiles failed: %v (tenant=%s scope=%s)", err, principal.TenantID, scope)
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to list profiles: " + err.Error(),
+			Code:    "LIST_FAILED",
+		})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": profiles})
