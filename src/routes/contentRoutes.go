@@ -9,6 +9,11 @@ import (
 
 // SetupContentRoutes registers the content API routes
 func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
+	// User-submitted content (JWT-authenticated). Registered BEFORE the
+	// /content/:id catch-all so Gin matches the literal segments first.
+	group.GET("/content/mine", controllers.UserAuthMiddleware(), controllers.GetMyContent)
+	group.POST("/content/submit", controllers.UserAuthMiddleware(), controllers.SubmitUserContent)
+
 	// Get a single content item by ID
 	group.GET("/content/:id", controllers.GetContentItem)
 

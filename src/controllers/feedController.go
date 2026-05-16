@@ -113,7 +113,7 @@ func GetForYouFeed(c *gin.Context) {
 		baseQuery := db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-			Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')")
+			Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
 
 		// First try: items from the configured freshness window (minimum 30 days)
 		windowDays := config.FreshnessDecayHours / 24
@@ -236,7 +236,7 @@ func GetForYouFeed(c *gin.Context) {
 	query := db.Model(&models.ContentItem{}).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-		Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')").
+		Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''").
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 
 	// Apply cursor if provided
@@ -265,7 +265,7 @@ func GetForYouFeed(c *gin.Context) {
 		query = db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-			Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')").
+			Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''").
 			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 		if err := query.Limit(pagination.Limit + 1).Find(&items).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, utils.HTTPError{

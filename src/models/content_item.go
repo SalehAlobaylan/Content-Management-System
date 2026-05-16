@@ -69,9 +69,12 @@ type ContentItem struct {
 	DurationSec  *int    `gorm:"type:integer" json:"duration_sec,omitempty"`
 
 	// Attribution
-	Author        *string `gorm:"type:varchar(255)" json:"author,omitempty"`
-	SourceName    *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`
-	SourceFeedURL *string `gorm:"type:text" json:"-"`
+	Author        *string    `gorm:"type:varchar(255)" json:"author,omitempty"`
+	SourceName    *string    `gorm:"type:varchar(255)" json:"source_name,omitempty"`
+	SourceFeedURL *string    `gorm:"type:text" json:"-"`
+	// AuthorID points at the IAM user who submitted user-generated content.
+	// NULL for ingested content (RSS, scrapes, etc.) — keeps backwards-compat.
+	AuthorID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_author_id" json:"author_id,omitempty"`
 
 	// Tags & AI
 	TopicTags pq.StringArray   `gorm:"type:text[]" json:"topic_tags,omitempty"`

@@ -73,6 +73,10 @@ func main() {
 	log.Printf("Environment: %s", os.Getenv("ENV"))
 	logCMSConnectionTargets()
 
+	if _, err := utils.GetJWTSecret(); err != nil {
+		log.Fatalf("Refusing to start: %v. Set JWT_SECRET to the shared value used by IAM.", err)
+	}
+
 	db, err := utils.ConnectDB()
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
