@@ -14,6 +14,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.Use(utils.InternalAuthMiddleware())
 
 	internal.GET("/content-items", controllers.InternalListContentItems)
+	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)
 	internal.PUT("/content-items/:id", controllers.InternalUpdateContentItem)
 	internal.PATCH("/content-items/:id/status", controllers.InternalUpdateContentStatus)
@@ -29,12 +30,13 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.POST("/storage/archive", controllers.InternalArchiveItems)
 	internal.POST("/storage/move-to-cold", controllers.InternalMoveItemsToCold)
 	internal.POST("/storage/sweep-runs", controllers.InternalCreateSweepRun)
+	internal.POST("/storage/op-metrics", controllers.InternalWriteOpMetrics)
+	internal.GET("/storage/op-budget", controllers.InternalGetStorageOpBudget)
 
-	// Quality management — used by Aggregation's quality worker
-	internal.GET("/quality/rules", controllers.InternalListQualityRules)
-	internal.GET("/quality/profiles/default", controllers.InternalGetDefaultQualityProfile)
+	// Quality / Ingest configuration — used by Aggregation media worker
+	// (resolves the profile per ingest job) and the re-encode worker
+	// invoked from Storage sweeps.
+	internal.GET("/quality/profiles/resolve", controllers.InternalResolveQualityProfile)
 	internal.GET("/quality/profiles/:id", controllers.InternalGetQualityProfile)
-	internal.GET("/quality/candidates", controllers.InternalListQualityCandidates)
-	internal.POST("/quality/history", controllers.InternalWriteQualityHistory)
 	internal.PATCH("/content-items/:id/quality", controllers.InternalUpdateContentItemQuality)
 }

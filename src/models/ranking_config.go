@@ -32,6 +32,9 @@ type RankingConfig struct {
 	RecirculationEnabled    bool `gorm:"default:false" json:"recirculation_enabled"`
 	RecirculationMaxAgeDays int  `gorm:"type:integer;default:30" json:"recirculation_max_age_days"`
 
+	// Feed exhaustion behavior: recycle watched items when no unseen For You items remain
+	ShowWatchedWhenUnseenExhausted bool `gorm:"default:true" json:"show_watched_when_unseen_exhausted"`
+
 	// Engagement normalization strategy
 	EngagementNormalization string `gorm:"type:varchar(20);default:'log'" json:"engagement_normalization"`
 
@@ -52,31 +55,32 @@ func (RankingConfig) TableName() string {
 // DefaultRankingConfig returns a config with default values for a tenant.
 func DefaultRankingConfig(tenantID string) RankingConfig {
 	return RankingConfig{
-		TenantID:                    tenantID,
-		FreshnessWeight:             0.25,
-		EngagementWeight:            0.20,
-		VelocityWeight:              0.15,
-		SimilarityWeight:            0.15,
-		QualityWeight:               0.10,
-		DiversityWeight:             0.10,
-		TrendingWeight:              0.05,
-		FreshnessDecayHours:         72,
-		VelocityWindowHours:         6,
-		TrendingThresholdMultiplier: 2.0,
-		RecirculationEnabled:        false,
-		RecirculationMaxAgeDays:     30,
-		EngagementNormalization:     "log",
-		Mode:                        "balanced",
-		IsActive:                    true,
+		TenantID:                       tenantID,
+		FreshnessWeight:                0.25,
+		EngagementWeight:               0.20,
+		VelocityWeight:                 0.15,
+		SimilarityWeight:               0.15,
+		QualityWeight:                  0.10,
+		DiversityWeight:                0.10,
+		TrendingWeight:                 0.05,
+		FreshnessDecayHours:            72,
+		VelocityWindowHours:            6,
+		TrendingThresholdMultiplier:    2.0,
+		RecirculationEnabled:           false,
+		RecirculationMaxAgeDays:        30,
+		ShowWatchedWhenUnseenExhausted: true,
+		EngagementNormalization:        "log",
+		Mode:                           "balanced",
+		IsActive:                       true,
 	}
 }
 
 // ModeDefinition describes a ranking mode for the frontend.
 type ModeDefinition struct {
-	Mode        string  `json:"mode"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
-	Icon        string  `json:"icon"`
+	Mode        string             `json:"mode"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Icon        string             `json:"icon"`
 	Weights     map[string]float64 `json:"weights"`
 }
 
@@ -84,31 +88,31 @@ type ModeDefinition struct {
 func ModePresets() map[string]RankingConfig {
 	return map[string]RankingConfig{
 		"fresh_first": {
-			FreshnessWeight:  0.50, EngagementWeight: 0.10, VelocityWeight: 0.10,
+			FreshnessWeight: 0.50, EngagementWeight: 0.10, VelocityWeight: 0.10,
 			SimilarityWeight: 0.05, QualityWeight: 0.10, DiversityWeight: 0.10, TrendingWeight: 0.05,
 			FreshnessDecayHours: 24, VelocityWindowHours: 6, TrendingThresholdMultiplier: 2.0,
 			EngagementNormalization: "log",
 		},
 		"trending": {
-			FreshnessWeight:  0.10, EngagementWeight: 0.15, VelocityWeight: 0.30,
+			FreshnessWeight: 0.10, EngagementWeight: 0.15, VelocityWeight: 0.30,
 			SimilarityWeight: 0.05, QualityWeight: 0.05, DiversityWeight: 0.05, TrendingWeight: 0.30,
 			FreshnessDecayHours: 72, VelocityWindowHours: 3, TrendingThresholdMultiplier: 1.5,
 			EngagementNormalization: "log",
 		},
 		"most_relevant": {
-			FreshnessWeight:  0.10, EngagementWeight: 0.15, VelocityWeight: 0.05,
+			FreshnessWeight: 0.10, EngagementWeight: 0.15, VelocityWeight: 0.05,
 			SimilarityWeight: 0.35, QualityWeight: 0.15, DiversityWeight: 0.15, TrendingWeight: 0.05,
 			FreshnessDecayHours: 72, VelocityWindowHours: 6, TrendingThresholdMultiplier: 2.0,
 			EngagementNormalization: "log",
 		},
 		"ai_curated": {
-			FreshnessWeight:  0.15, EngagementWeight: 0.15, VelocityWeight: 0.10,
+			FreshnessWeight: 0.15, EngagementWeight: 0.15, VelocityWeight: 0.10,
 			SimilarityWeight: 0.20, QualityWeight: 0.15, DiversityWeight: 0.15, TrendingWeight: 0.10,
 			FreshnessDecayHours: 72, VelocityWindowHours: 6, TrendingThresholdMultiplier: 2.0,
 			EngagementNormalization: "log",
 		},
 		"balanced": {
-			FreshnessWeight:  0.25, EngagementWeight: 0.20, VelocityWeight: 0.15,
+			FreshnessWeight: 0.25, EngagementWeight: 0.20, VelocityWeight: 0.15,
 			SimilarityWeight: 0.15, QualityWeight: 0.10, DiversityWeight: 0.10, TrendingWeight: 0.05,
 			FreshnessDecayHours: 72, VelocityWindowHours: 6, TrendingThresholdMultiplier: 2.0,
 			EngagementNormalization: "log",
@@ -122,7 +126,7 @@ func ModeDefinitions() []ModeDefinition {
 		{
 			Mode: "fresh_first", Name: "Fresh First",
 			Description: "Prioritizes the newest content. Best for breaking news and time-sensitive feeds.",
-			Icon: "clock",
+			Icon:        "clock",
 			Weights: map[string]float64{
 				"freshness": 0.50, "engagement": 0.10, "velocity": 0.10,
 				"similarity": 0.05, "quality": 0.10, "diversity": 0.10, "trending": 0.05,
@@ -131,7 +135,7 @@ func ModeDefinitions() []ModeDefinition {
 		{
 			Mode: "trending", Name: "Trending",
 			Description: "Surfaces viral content with interaction spikes. Best for discovering what's hot right now.",
-			Icon: "trending-up",
+			Icon:        "trending-up",
 			Weights: map[string]float64{
 				"freshness": 0.10, "engagement": 0.15, "velocity": 0.30,
 				"similarity": 0.05, "quality": 0.05, "diversity": 0.05, "trending": 0.30,
@@ -140,7 +144,7 @@ func ModeDefinitions() []ModeDefinition {
 		{
 			Mode: "most_relevant", Name: "Most Relevant",
 			Description: "Personalizes feeds using user preferences, topics, and content similarity.",
-			Icon: "user-check",
+			Icon:        "user-check",
 			Weights: map[string]float64{
 				"freshness": 0.10, "engagement": 0.15, "velocity": 0.05,
 				"similarity": 0.35, "quality": 0.15, "diversity": 0.15, "trending": 0.05,
@@ -149,7 +153,7 @@ func ModeDefinitions() []ModeDefinition {
 		{
 			Mode: "ai_curated", Name: "AI Curated",
 			Description: "AI-driven ranking that balances all signals intelligently. Coming soon.",
-			Icon: "sparkles",
+			Icon:        "sparkles",
 			Weights: map[string]float64{
 				"freshness": 0.15, "engagement": 0.15, "velocity": 0.10,
 				"similarity": 0.20, "quality": 0.15, "diversity": 0.15, "trending": 0.10,
@@ -158,7 +162,7 @@ func ModeDefinitions() []ModeDefinition {
 		{
 			Mode: "balanced", Name: "Balanced",
 			Description: "Equal mix of all ranking signals. A good default for general-purpose feeds.",
-			Icon: "scale",
+			Icon:        "scale",
 			Weights: map[string]float64{
 				"freshness": 0.25, "engagement": 0.20, "velocity": 0.15,
 				"similarity": 0.15, "quality": 0.10, "diversity": 0.10, "trending": 0.05,

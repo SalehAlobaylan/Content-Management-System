@@ -38,6 +38,10 @@ type ForYouItem struct {
 	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
+func hasCursor(pagination *utils.CursorPagination) bool {
+	return pagination != nil && pagination.Cursor != ""
+}
+
 // NewsResponse is the API response for the News feed
 type NewsResponse struct {
 	Cursor *string     `json:"cursor"`
@@ -134,6 +138,7 @@ func GetForYouFeed(c *gin.Context) {
 		flagMap := LoadContentFlags(db, "default", contentIDs)
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
+		unfilteredScored := append([]ScoredItem(nil), scored...)
 
 		// Filter out already-seen items
 		if len(seenIDs) > 0 {
@@ -148,6 +153,9 @@ func GetForYouFeed(c *gin.Context) {
 				}
 			}
 			scored = filtered
+		}
+		if config.ShowWatchedWhenUnseenExhausted && len(scored) == 0 && len(unfilteredScored) > 0 && !hasCursor(pagination) {
+			scored = unfilteredScored
 		}
 
 		// Apply cursor-based pagination over scored results
@@ -252,6 +260,20 @@ func GetForYouFeed(c *gin.Context) {
 			Message: "Failed to fetch feed: " + err.Error(),
 		})
 		return
+	}
+	if config.ShowWatchedWhenUnseenExhausted && len(items) == 0 && len(seenIDs) > 0 && !hasCursor(pagination) {
+		query = db.Model(&models.ContentItem{}).
+			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+			Where("(media_url IS NOT NULL AND media_url != '') OR (thumbnail_url IS NOT NULL AND thumbnail_url != '')").
+			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
+		if err := query.Limit(pagination.Limit + 1).Find(&items).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{
+				Code:    http.StatusInternalServerError,
+				Message: "Failed to fetch feed fallback: " + err.Error(),
+			})
+			return
+		}
 	}
 
 	// Determine if there's a next page

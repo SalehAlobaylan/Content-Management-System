@@ -93,6 +93,7 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.TrendingThresholdMultiplier = req.TrendingThresholdMultiplier
 	existing.RecirculationEnabled = req.RecirculationEnabled
 	existing.RecirculationMaxAgeDays = req.RecirculationMaxAgeDays
+	existing.ShowWatchedWhenUnseenExhausted = req.ShowWatchedWhenUnseenExhausted
 	existing.EngagementNormalization = req.EngagementNormalization
 	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive
@@ -424,11 +425,11 @@ func BulkSetFlags(c *gin.Context) {
 // ================================================================
 
 type clusterResult struct {
-	Topic          string  `json:"topic"`
-	Count          int64   `json:"count"`
-	AvgLikes       float64 `json:"avg_likes"`
-	AvgViews       float64 `json:"avg_views"`
-	AvgShares      float64 `json:"avg_shares"`
+	Topic     string  `json:"topic"`
+	Count     int64   `json:"count"`
+	AvgLikes  float64 `json:"avg_likes"`
+	AvgViews  float64 `json:"avg_views"`
+	AvgShares float64 `json:"avg_shares"`
 }
 
 // GetEmbeddingClusters handles GET /admin/intelligence/embeddings/clusters
@@ -507,10 +508,10 @@ func GetSimilarContent(c *gin.Context) {
 }
 
 type embeddingStats struct {
-	TotalReady     int64             `json:"total_ready"`
-	WithEmbedding  int64             `json:"with_embedding"`
-	Percentage     float64           `json:"percentage"`
-	ByType         []typeEmbedStat   `json:"by_type"`
+	TotalReady    int64           `json:"total_ready"`
+	WithEmbedding int64           `json:"with_embedding"`
+	Percentage    float64         `json:"percentage"`
+	ByType        []typeEmbedStat `json:"by_type"`
 }
 
 type typeEmbedStat struct {

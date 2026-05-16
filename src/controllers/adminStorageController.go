@@ -612,6 +612,17 @@ type updatePolicyRequest struct {
 	ProtectTopNByViews      *int    `json:"protect_top_n_by_views"`
 	ProtectTopNWindowDays   *int    `json:"protect_top_n_window_days"`
 	ArchiveAction           *string `json:"archive_action"`
+	// Re-encode target — which QualityProfile id to shrink down to when
+	// ArchiveAction='re_encode'. NULL means "auto" (each item uses its own
+	// resolved ingest profile by source_type).
+	ReEncodeTargetProfileID *uint `json:"re_encode_target_profile_id"`
+	// Operation budget fields
+	ClassAFreeBudget *int64 `json:"class_a_free_budget"`
+	ClassBFreeBudget *int64 `json:"class_b_free_budget"`
+	ClassAWarnPct    *int   `json:"class_a_warn_pct"`
+	ClassACapPct     *int   `json:"class_a_cap_pct"`
+	ClassBWarnPct    *int   `json:"class_b_warn_pct"`
+	ClassBCapPct     *int   `json:"class_b_cap_pct"`
 }
 
 // UpdateStoragePolicy handles PUT /admin/storage/policy
@@ -680,14 +691,84 @@ func UpdateStoragePolicy(c *gin.Context) {
 	}
 	if req.ArchiveAction != nil {
 		action := strings.ToLower(strings.TrimSpace(*req.ArchiveAction))
-		if action != "delete" && action != "move_to_cold" {
+		if action != "delete" && action != "move_to_cold" && action != "re_encode" {
 			c.JSON(http.StatusBadRequest, authErrorResponse{
-				Message: "archive_action must be 'delete' or 'move_to_cold'",
+				Message: "archive_action must be 'delete', 'move_to_cold', or 're_encode'",
 				Code:    "INVALID_ACTION",
 			})
 			return
 		}
+		// re_encode requires either an explicit target or at least one global
+		// ingest profile to fall back on. Reject early if neither exists —
+		// otherwise the worker would have nothing to use and silently skip.
+		//
+		// IMPORTANT: the Console sends `re_encode_target_profile_id: 0` to
+		// mean "switch to Auto". A pointer-to-zero is NOT nil, so we must
+		// normalise here — otherwise the guard passes and the policy saves
+		// in a broken state (action=re_encode + target=NULL + no global).
+		if action == "re_encode" {
+			var effectiveTarget *uint = p.ReEncodeTargetProfileID
+			if req.ReEncodeTargetProfileID != nil {
+				if *req.ReEncodeTargetProfileID == 0 {
+					effectiveTarget = nil
+				} else {
+					effectiveTarget = req.ReEncodeTargetProfileID
+				}
+			}
+			if effectiveTarget == nil {
+				var globalCount int64
+				db.Model(&models.QualityProfile{}).
+					Where("tenant_id IS NULL AND source_type IS NULL AND is_active = TRUE").
+					Count(&globalCount)
+				if globalCount == 0 {
+					c.JSON(http.StatusBadRequest, authErrorResponse{
+						Message: "archive_action='re_encode' requires either re_encode_target_profile_id or at least one active global ingest profile (tenant_id=NULL, source_type=NULL)",
+						Code:    "NO_REENCODE_TARGET",
+					})
+					return
+				}
+			}
+		}
 		p.ArchiveAction = action
+	}
+
+	// Re-encode target profile id — accepts an id or 0/null to clear (auto).
+	if req.ReEncodeTargetProfileID != nil {
+		if *req.ReEncodeTargetProfileID == 0 {
+			p.ReEncodeTargetProfileID = nil
+		} else {
+			// Confirm the target exists.
+			var qp models.QualityProfile
+			if err := db.First(&qp, *req.ReEncodeTargetProfileID).Error; err != nil {
+				c.JSON(http.StatusBadRequest, authErrorResponse{
+					Message: "re_encode_target_profile_id does not match any QualityProfile",
+					Code:    "INVALID_REENCODE_TARGET",
+				})
+				return
+			}
+			v := *req.ReEncodeTargetProfileID
+			p.ReEncodeTargetProfileID = &v
+		}
+	}
+
+	// Operation budgets — 0 disables the soft cap entirely.
+	if req.ClassAFreeBudget != nil && *req.ClassAFreeBudget >= 0 {
+		p.ClassAFreeBudget = *req.ClassAFreeBudget
+	}
+	if req.ClassBFreeBudget != nil && *req.ClassBFreeBudget >= 0 {
+		p.ClassBFreeBudget = *req.ClassBFreeBudget
+	}
+	if req.ClassAWarnPct != nil {
+		p.ClassAWarnPct = clampInt(*req.ClassAWarnPct, 0, 100)
+	}
+	if req.ClassACapPct != nil {
+		p.ClassACapPct = clampInt(*req.ClassACapPct, 0, 100)
+	}
+	if req.ClassBWarnPct != nil {
+		p.ClassBWarnPct = clampInt(*req.ClassBWarnPct, 0, 100)
+	}
+	if req.ClassBCapPct != nil {
+		p.ClassBCapPct = clampInt(*req.ClassBCapPct, 0, 100)
 	}
 
 	if err := db.Save(&p).Error; err != nil {
@@ -921,6 +1002,13 @@ func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 		ProtectTopNByViews:      50,
 		ProtectTopNWindowDays:   30,
 		ArchiveAction:           "delete",
+		// R2 free-tier defaults — admin can override per tenant.
+		ClassAFreeBudget: 1_000_000,
+		ClassBFreeBudget: 10_000_000,
+		ClassAWarnPct:    80,
+		ClassACapPct:     95,
+		ClassBWarnPct:    80,
+		ClassBCapPct:     95,
 	}
 	_ = db.Create(&p).Error
 	return p
@@ -945,6 +1033,12 @@ func loadOrCreateTenantPolicy(db *gorm.DB, tenantID string) models.StoragePolicy
 		ProtectTopNByViews:      base.ProtectTopNByViews,
 		ProtectTopNWindowDays:   base.ProtectTopNWindowDays,
 		ArchiveAction:           base.ArchiveAction,
+		ClassAFreeBudget:        base.ClassAFreeBudget,
+		ClassBFreeBudget:        base.ClassBFreeBudget,
+		ClassAWarnPct:           base.ClassAWarnPct,
+		ClassACapPct:            base.ClassACapPct,
+		ClassBWarnPct:           base.ClassBWarnPct,
+		ClassBCapPct:            base.ClassBCapPct,
 	}
 	_ = db.Create(&p).Error
 	return p

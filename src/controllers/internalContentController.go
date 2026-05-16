@@ -508,3 +508,38 @@ func InternalListContentItems(c *gin.Context) {
 		"limit": limit,
 	})
 }
+
+// InternalGetContentItem handles GET /internal/content-items/:id
+// Returns the fields the Aggregation quality worker needs to drive a
+// re-encode: tier, current media URL, version, active profile id (for
+// idempotency), current bitrate and duration. Auth: InternalAuthMiddleware.
+func InternalGetContentItem(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid id"})
+		return
+	}
+	var item models.ContentItem
+	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"id":                         item.PublicID.String(),
+		"tenant_id":                  item.TenantID,
+		// source_type is required by the quality re-encode auto-resolve path
+		// — without it the resolver can never pick a source-scoped ingest
+		// profile (e.g. "YouTube items use mobile-720p"). Stringified so
+		// callers can match against the string values in QualityProfile.SourceType.
+		"source_type":                string(item.Source),
+		"media_url":                  item.MediaURL,
+		"thumbnail_url":              item.ThumbnailURL,
+		"storage_tier":               item.StorageTier, // nil = primary
+		"media_version":              item.MediaVersion,
+		"file_size_bytes":            item.FileSizeBytes,
+		"current_quality_profile_id": item.CurrentQualityProfileID,
+		"current_bitrate_kbps":       item.CurrentBitrateKbps,
+		"duration_sec":               item.DurationSec,
+	})
+}

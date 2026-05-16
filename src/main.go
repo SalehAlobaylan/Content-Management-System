@@ -115,10 +115,12 @@ func main() {
 			// Storage management
 			&models.StoragePolicy{},
 			&models.StorageSweepRun{},
-			// Quality management
+			&models.StorageOpMetric{},
+			// Quality management — ingest configuration only.
+			// quality_rules and quality_history were removed in Phase 7;
+			// re-encoding is now driven by storage policies (archive_action='re_encode').
+			// The two tables remain in the dev DB for now — drop manually after confirming.
 			&models.QualityProfile{},
-			&models.QualityRule{},
-			&models.QualityHistory{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}

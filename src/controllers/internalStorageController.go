@@ -280,13 +280,15 @@ func InternalMoveItemsToCold(c *gin.Context) {
 }
 
 type internalSweepRunRequest struct {
-	TenantID     string  `json:"tenant_id"`
-	StartedAt    string  `json:"started_at"`
-	FinishedAt   *string `json:"finished_at"`
-	DeletedCount int     `json:"deleted_count"`
-	FreedBytes   int64   `json:"freed_bytes"`
-	Trigger      string  `json:"trigger"`
-	Error        string  `json:"error,omitempty"`
+	TenantID         string  `json:"tenant_id"`
+	StartedAt        string  `json:"started_at"`
+	FinishedAt       *string `json:"finished_at"`
+	DeletedCount     int     `json:"deleted_count"`
+	MovedToColdCount int     `json:"moved_to_cold_count"`
+	ReEncodedCount   int     `json:"re_encoded_count"`
+	FreedBytes       int64   `json:"freed_bytes"`
+	Trigger          string  `json:"trigger"`
+	Error            string  `json:"error,omitempty"`
 }
 
 // InternalCreateSweepRun handles POST /internal/storage/sweep-runs
@@ -315,13 +317,15 @@ func InternalCreateSweepRun(c *gin.Context) {
 	}
 
 	run := models.StorageSweepRun{
-		TenantID:     req.TenantID,
-		StartedAt:    started,
-		FinishedAt:   finished,
-		DeletedCount: req.DeletedCount,
-		FreedBytes:   req.FreedBytes,
-		Trigger:      trigger,
-		Error:        req.Error,
+		TenantID:         req.TenantID,
+		StartedAt:        started,
+		FinishedAt:       finished,
+		DeletedCount:     req.DeletedCount,
+		MovedToColdCount: req.MovedToColdCount,
+		ReEncodedCount:   req.ReEncodedCount,
+		FreedBytes:       req.FreedBytes,
+		Trigger:          trigger,
+		Error:            req.Error,
 	}
 	if err := db.Create(&run).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record sweep run"})

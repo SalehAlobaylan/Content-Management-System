@@ -84,19 +84,17 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.DELETE("/storage/policy/overrides/:tenant_id", controllers.DeleteStoragePolicyOverride)
 	adminGroup.GET("/storage/sweep-runs", controllers.ListSweepRuns)
 	adminGroup.POST("/storage/reconcile", controllers.ReconcileStorage)
+	adminGroup.GET("/storage/operations", controllers.GetStorageOperations)
 
-	// Quality management
+	// Quality / Ingest configuration. Phase 7: this is now a pure config
+	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).
+	// Re-encoding old content moved to the Storage system as
+	// archive_action='re_encode' — there are no rules/candidates/history
+	// endpoints here anymore.
 	adminGroup.GET("/quality/profiles", controllers.ListQualityProfiles)
 	adminGroup.POST("/quality/profiles", controllers.CreateQualityProfile)
 	adminGroup.PUT("/quality/profiles/:id", controllers.UpdateQualityProfile)
 	adminGroup.DELETE("/quality/profiles/:id", controllers.DeleteQualityProfile)
-	adminGroup.GET("/quality/rules", controllers.ListQualityRules)
-	adminGroup.POST("/quality/rules", controllers.CreateQualityRule)
-	adminGroup.PUT("/quality/rules/:id", controllers.UpdateQualityRule)
-	adminGroup.DELETE("/quality/rules/:id", controllers.DeleteQualityRule)
-	adminGroup.GET("/quality/candidates", controllers.GetQualityCandidates)
-	adminGroup.POST("/quality/re-encode", controllers.TriggerReEncode)
-	adminGroup.POST("/quality/probe/:id", controllers.ProbeContentItem)
-	adminGroup.GET("/quality/history", controllers.ListQualityHistory)
-	adminGroup.GET("/quality/stats", controllers.GetQualityStats)
+	adminGroup.GET("/quality/profiles/resolve", controllers.ResolveQualityProfile)
+	adminGroup.POST("/quality/probe-item/:id", controllers.ProbeContentItem)
 }
