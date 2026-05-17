@@ -97,4 +97,11 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.DELETE("/quality/profiles/:id", controllers.DeleteQualityProfile)
 	adminGroup.GET("/quality/profiles/resolve", controllers.ResolveQualityProfile)
 	adminGroup.POST("/quality/probe-item/:id", controllers.ProbeContentItem)
+
+	// Audit log — records admin-executed actions from Platform-Console.
+	adminGroup.POST("/audit", controllers.CreateAuditLog)
+	adminGroup.GET("/audit", controllers.ListAuditLogs)
+
+	// Self-restart — exits the process so the supervisor restarts the service.
+	adminGroup.POST("/restart", controllers.RestartService)
 }

@@ -125,6 +125,8 @@ func main() {
 			// re-encoding is now driven by storage policies (archive_action='re_encode').
 			// The two tables remain in the dev DB for now — drop manually after confirming.
 			&models.QualityProfile{},
+			// Audit log — admin actions executed from Platform-Console
+			&models.AuditLog{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
