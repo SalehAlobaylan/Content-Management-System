@@ -77,9 +77,13 @@ type ContentItem struct {
 	AuthorID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_author_id" json:"author_id,omitempty"`
 
 	// Tags & AI
-	TopicTags pq.StringArray   `gorm:"type:text[]" json:"topic_tags,omitempty"`
-	Embedding *pgvector.Vector `gorm:"type:vector(384)" json:"-"`
-	Metadata  datatypes.JSON   `gorm:"type:jsonb" json:"metadata,omitempty"`
+	TopicTags      pq.StringArray   `gorm:"type:text[]" json:"topic_tags,omitempty"`
+	Embedding      *pgvector.Vector `gorm:"type:vector(384)" json:"-"`
+	// ImageEmbedding is a CLIP-ViT-B-32 image vector (512-dim), populated by
+	// Enrichment when content has a hero image or video thumbnail. Independent
+	// from Embedding (text-only, 384-dim) — both can coexist on the same row.
+	ImageEmbedding *pgvector.Vector `gorm:"type:vector(512)" json:"-"`
+	Metadata       datatypes.JSON   `gorm:"type:jsonb" json:"metadata,omitempty"`
 
 	// Transcript link (optional)
 	TranscriptID *uuid.UUID `gorm:"type:uuid" json:"transcript_id,omitempty"`

@@ -20,6 +20,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.PATCH("/content-items/:id/status", controllers.InternalUpdateContentStatus)
 	internal.PATCH("/content-items/:id/artifacts", controllers.InternalUpdateContentArtifacts)
 	internal.PATCH("/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
+	internal.PATCH("/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
 	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
 
 	internal.POST("/transcripts", controllers.InternalCreateTranscript)

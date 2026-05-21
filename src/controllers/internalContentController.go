@@ -83,6 +83,10 @@ type internalUpdateEmbeddingRequest struct {
 	TopicTags []string  `json:"topic_tags"`
 }
 
+type internalUpdateImageEmbeddingRequest struct {
+	Embedding []float32 `json:"embedding"`
+}
+
 type internalLinkTranscriptRequest struct {
 	TranscriptID string `json:"transcript_id"`
 }
@@ -390,6 +394,49 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 
 	if err := db.Save(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update embedding"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// InternalUpdateContentImageEmbedding handles PATCH /internal/content-items/:id/image-embedding.
+// Stores a CLIP-ViT-B-32 image embedding (512-dim) on the content item.
+// Independent from text Embedding (384-dim) — both can coexist.
+func InternalUpdateContentImageEmbedding(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	publicID := c.Param("id")
+	id, err := uuid.Parse(publicID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content ID"})
+		return
+	}
+
+	var req internalUpdateImageEmbeddingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	if len(req.Embedding) != 512 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Image embedding must be 512-dim (got " +
+				strconv.Itoa(len(req.Embedding)) + ")",
+		})
+		return
+	}
+
+	var item models.ContentItem
+	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+
+	vec := pgvector.NewVector(req.Embedding)
+	item.ImageEmbedding = &vec
+
+	if err := db.Save(&item).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update image embedding"})
 		return
 	}
 
