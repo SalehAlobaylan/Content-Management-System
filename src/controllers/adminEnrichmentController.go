@@ -363,29 +363,54 @@ func TriggerBatchEnrichment(c *gin.Context) {
 }
 
 // ── GET /admin/enrichment/health ────────────────────────────
+//
+// After the Media-Service split, this endpoint reports the health of BOTH
+// AI services so Platform-Console can render a unified card. The legacy
+// top-level "status"/"models"/"dependencies" fields are preserved for the
+// Enrichment-Service so older console builds keep working; the new
+// "services" map is the canonical shape.
 
 func GetEnrichmentServiceHealth(c *gin.Context) {
-	health, err := checkEnrichmentHealth()
-	if err != nil {
-		c.JSON(http.StatusOK, utils.ResponseMessage{
-			Code:    http.StatusOK,
-			Message: "Enrichment service status",
-			Data: gin.H{
-				"status":  "unreachable",
-				"error":   err.Error(),
-				"models":  nil,
-			},
-		})
-		return
+	type perServiceView struct {
+		Status       string          `json:"status"`
+		Error        string          `json:"error,omitempty"`
+		Models       map[string]bool `json:"models"`
+		Dependencies map[string]bool `json:"dependencies,omitempty"`
 	}
 
+	view := func(h *serviceHealthResponse, err error) perServiceView {
+		if err != nil {
+			return perServiceView{Status: "unreachable", Error: err.Error()}
+		}
+		return perServiceView{
+			Status:       h.Status,
+			Models:       h.Models,
+			Dependencies: h.Dependencies,
+		}
+	}
+
+	enrichment := view(checkEnrichmentHealth())
+	media := view(checkMediaHealth())
+
+	// Aggregate top-level status: ok only when both are ok.
+	overallStatus := "ok"
+	if enrichment.Status != "ok" || media.Status != "ok" {
+		overallStatus = "not_ready"
+	}
+
+	// Legacy fields surface the Enrichment-Service so the existing Console
+	// build keeps rendering even before the dual-service UI update lands.
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
-		Message: "Enrichment service status",
+		Message: "AI services status",
 		Data: gin.H{
-			"status":       health.Status,
-			"models":       health.Models,
-			"dependencies": health.Dependencies,
+			"status":       overallStatus,
+			"models":       enrichment.Models,
+			"dependencies": enrichment.Dependencies,
+			"services": gin.H{
+				"media":      media,
+				"enrichment": enrichment,
+			},
 		},
 	})
 }
