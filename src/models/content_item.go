@@ -77,11 +77,17 @@ type ContentItem struct {
 	AuthorID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_author_id" json:"author_id,omitempty"`
 
 	// Tags & AI
-	TopicTags      pq.StringArray   `gorm:"type:text[]" json:"topic_tags,omitempty"`
-	Embedding      *pgvector.Vector `gorm:"type:vector(384)" json:"-"`
+	TopicTags pq.StringArray `gorm:"type:text[]" json:"topic_tags,omitempty"`
+	// Embedding is the BAAI/bge-m3 dense text vector (1024-dim), populated by
+	// Enrichment-Service. Multilingual — performs well on Arabic + English.
+	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
+	// EmbeddingSparse is BGE-M3's learned sparse output (250002-dim sparsevec),
+	// added for forward compatibility with hybrid retrieval (Slice A). Stays
+	// NULL until Slice A wires FlagEmbedding into the embedder.
+	EmbeddingSparse *pgvector.SparseVector `gorm:"type:sparsevec(250002)" json:"-"`
 	// ImageEmbedding is a CLIP-ViT-B-32 image vector (512-dim), populated by
-	// Enrichment when content has a hero image or video thumbnail. Independent
-	// from Embedding (text-only, 384-dim) — both can coexist on the same row.
+	// Media-Service when content has a hero image or video thumbnail.
+	// Independent from Embedding (text, 1024-dim) — both can coexist.
 	ImageEmbedding *pgvector.Vector `gorm:"type:vector(512)" json:"-"`
 	Metadata       datatypes.JSON   `gorm:"type:jsonb" json:"metadata,omitempty"`
 

@@ -80,8 +80,21 @@ type internalUpdateArtifactsRequest struct {
 
 type internalUpdateEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
-	TopicTags []string  `json:"topic_tags"`
+	// EmbeddingSparse is BGE-M3's learned sparse output: {token_id_string: weight}.
+	// Optional — Slice 0 only sets the dense vector; Slice A starts populating
+	// sparse once FlagEmbedding lands. JSON keys are stringified token IDs
+	// (BGE-M3 returns them that way); converted to pgvector.SparseVector below.
+	EmbeddingSparse map[string]float32 `json:"embedding_sparse"`
+	TopicTags       []string           `json:"topic_tags"`
 }
+
+// bgeM3SparseDim is BGE-M3's vocabulary size — the dimension of its sparse
+// output. Must match the sparsevec(N) column type in the schema.
+const bgeM3SparseDim int32 = 250002
+
+// textEmbeddingDim is the dense embedding length BGE-M3 produces. Mirrors
+// the strict-dimension check on image embeddings (CLIP at 512).
+const textEmbeddingDim = 1024
 
 type internalUpdateImageEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
@@ -375,8 +388,11 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		return
 	}
 
-	if len(req.Embedding) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Embedding is required"})
+	if len(req.Embedding) != textEmbeddingDim {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Text embedding must be " + strconv.Itoa(textEmbeddingDim) +
+				"-dim (got " + strconv.Itoa(len(req.Embedding)) + ")",
+		})
 		return
 	}
 
@@ -388,6 +404,25 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 
 	vec := pgvector.NewVector(req.Embedding)
 	item.Embedding = &vec
+
+	// Sparse output is optional (Slice A populates it). Convert BGE-M3's
+	// {token_id_string: weight} map to pgvector.SparseVector if supplied.
+	if len(req.EmbeddingSparse) > 0 {
+		elements := make(map[int32]float32, len(req.EmbeddingSparse))
+		for k, v := range req.EmbeddingSparse {
+			idx, parseErr := strconv.ParseInt(k, 10, 32)
+			if parseErr != nil {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "embedding_sparse key '" + k + "' is not a valid token id",
+				})
+				return
+			}
+			elements[int32(idx)] = v
+		}
+		sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
+		item.EmbeddingSparse = &sparse
+	}
+
 	if len(req.TopicTags) > 0 {
 		item.TopicTags = req.TopicTags
 	}
