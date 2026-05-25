@@ -664,19 +664,10 @@ func fetchRelatedItems(db *gorm.DB, featured models.ContentItem, limit int) []Ne
 	return result
 }
 
-// pgvectorToLiteral converts a float32 slice to a PostgreSQL vector literal string.
-// e.g. [0.1, 0.2, 0.3] → '[0.1,0.2,0.3]'
+// pgvectorToLiteral is a thin alias kept for in-file callers; the shared
+// implementation lives in src/utils/pgvector_literal.go so the new
+// InternalKNNDense handler can use the same converter without an import
+// cycle through the controllers package.
 func pgvectorToLiteral(v []float32) string {
-	if len(v) == 0 {
-		return "[]"
-	}
-	s := "["
-	for i, f := range v {
-		if i > 0 {
-			s += ","
-		}
-		s += fmt.Sprintf("%g", f)
-	}
-	s += "]"
-	return s
+	return utils.PgvectorToLiteral(v)
 }

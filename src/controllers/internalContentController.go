@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -476,6 +477,215 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// ─── Slice A: hybrid retrieval endpoints ────────────────────────────
+//
+// Three internal endpoints support Enrichment-Service's /v1/related:
+//   1. InternalGetContentEmbeddings — fetch the (dense, sparse) tuple for
+//      an anchor content_id so /v1/related can run hybrid kNN without
+//      re-embedding what's already stored.
+//   2. InternalKNNDense  — pgvector cosine kNN against `embedding`.
+//   3. InternalKNNSparse — sparsevec inner-product kNN against
+//      `embedding_sparse`.
+//
+// All three are POST (kNN payloads carry 1024-dim or larger vectors that
+// don't belong in query strings) except the embeddings fetch, which is GET.
+// Filtering by content_type and excluding the anchor + already-shown ids
+// is built in.
+
+type internalKNNDenseRequest struct {
+	Embedding  []float32 `json:"embedding"`
+	Types      []string  `json:"types"`       // optional — when empty, no type filter
+	K          int       `json:"k"`           // required, >0
+	ExcludeIDs []string  `json:"exclude_ids"` // optional public_ids to skip
+}
+
+type internalKNNSparseRequest struct {
+	EmbeddingSparse map[string]float32 `json:"embedding_sparse"` // {token_id_str: weight}
+	Types           []string           `json:"types"`
+	K               int                `json:"k"`
+	ExcludeIDs      []string           `json:"exclude_ids"`
+}
+
+type internalKNNHit struct {
+	ID    string  `json:"id"`     // public_id (UUID string)
+	Type  string  `json:"type"`   // ContentType (TWEET, COMMENT, ARTICLE, ...)
+	Score float64 `json:"score"`  // 1 - cosine_distance (dense); 1/(1+ip_distance) (sparse)
+}
+
+type internalKNNResponse struct {
+	Hits []internalKNNHit `json:"hits"`
+}
+
+type internalEmbeddingsResponse struct {
+	Embedding       []float32          `json:"embedding"`        // 1024 dense, null if missing
+	EmbeddingSparse map[string]float32 `json:"embedding_sparse"` // BGE-M3 sparse, null if missing
+}
+
+// InternalGetContentEmbeddings handles GET /internal/content-items/:id/embeddings.
+// Returns the dense + sparse vectors for one content item so the caller
+// (Enrichment /v1/related) can skip re-embedding when given an anchor id.
+func InternalGetContentEmbeddings(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	publicID := c.Param("id")
+	id, err := uuid.Parse(publicID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content ID"})
+		return
+	}
+
+	var item models.ContentItem
+	if err := db.Where("public_id = ?", id).
+		Select("embedding", "embedding_sparse").
+		First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+
+	resp := internalEmbeddingsResponse{}
+	if item.Embedding != nil {
+		resp.Embedding = item.Embedding.Slice()
+	}
+	if item.EmbeddingSparse != nil {
+		// Convert pgvector.SparseVector → BGE-M3 wire format {token_id_str: weight}.
+		indices := item.EmbeddingSparse.Indices()
+		values := item.EmbeddingSparse.Values()
+		sparse := make(map[string]float32, len(indices))
+		for i, idx := range indices {
+			sparse[strconv.FormatInt(int64(idx), 10)] = values[i]
+		}
+		resp.EmbeddingSparse = sparse
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// InternalKNNDense handles POST /internal/content-items/knn.
+// Runs cosine-similarity kNN against the `embedding` HNSW index added in
+// migration 20260522000000_bge_m3_retrieval.sql.
+func InternalKNNDense(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req internalKNNDenseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if len(req.Embedding) != textEmbeddingDim {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "Embedding must be " + strconv.Itoa(textEmbeddingDim) +
+				"-dim (got " + strconv.Itoa(len(req.Embedding)) + ")",
+		})
+		return
+	}
+	if req.K <= 0 || req.K > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "k must be in [1, 200]"})
+		return
+	}
+
+	hits := runKNNQuery(db, "embedding", utils.PgvectorToLiteral(req.Embedding),
+		req.Types, req.K, req.ExcludeIDs)
+	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
+}
+
+// InternalKNNSparse handles POST /internal/content-items/knn-sparse.
+// Runs inner-product kNN against the `embedding_sparse` HNSW index. Sparse
+// inputs are sent in BGE-M3's wire format ({token_id_str: weight}) — same
+// shape InternalUpdateContentEmbedding accepts.
+func InternalKNNSparse(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req internalKNNSparseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if len(req.EmbeddingSparse) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "embedding_sparse is required"})
+		return
+	}
+	if req.K <= 0 || req.K > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "k must be in [1, 200]"})
+		return
+	}
+
+	// Convert BGE-M3 sparse map → pgvector.SparseVector (same conversion as
+	// InternalUpdateContentEmbedding) then serialize to the literal form
+	// pgvector accepts in raw SQL: '{idx1:val1,idx2:val2,…}/N'.
+	elements := make(map[int32]float32, len(req.EmbeddingSparse))
+	for k, v := range req.EmbeddingSparse {
+		idx, parseErr := strconv.ParseInt(k, 10, 32)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "embedding_sparse key '" + k + "' is not a valid token id",
+			})
+			return
+		}
+		elements[int32(idx)] = v
+	}
+	sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
+
+	hits := runKNNQuery(db, "embedding_sparse", sparse.String(),
+		req.Types, req.K, req.ExcludeIDs)
+	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
+}
+
+// runKNNQuery is the shared GORM body for dense + sparse kNN.
+// column is "embedding" or "embedding_sparse" — both indexes already exist.
+// vecLiteral is the pgvector literal form (dense `[…]` or sparse `{…}/N`).
+//
+// Uses `<=>` (cosine distance) regardless of mode — pgvector's cosine
+// operator works on both vector and sparsevec when the matching ops class
+// is on the index. The RRF fusion in Enrichment only uses RANK, not raw
+// scores, so cross-mode score scales don't need to match.
+func runKNNQuery(db *gorm.DB, column, vecLiteral string, types []string, k int, excludeIDs []string) []internalKNNHit {
+	q := db.Model(&models.ContentItem{}).
+		Where("status = ?", models.ContentStatusReady).
+		Where(column + " IS NOT NULL")
+
+	if len(types) > 0 {
+		q = q.Where("type IN ?", types)
+	}
+	if len(excludeIDs) > 0 {
+		// Parse UUIDs once; skip invalid ones silently.
+		parsed := make([]uuid.UUID, 0, len(excludeIDs))
+		for _, s := range excludeIDs {
+			if u, err := uuid.Parse(s); err == nil {
+				parsed = append(parsed, u)
+			}
+		}
+		if len(parsed) > 0 {
+			q = q.Where("public_id NOT IN ?", parsed)
+		}
+	}
+
+	type row struct {
+		PublicID uuid.UUID
+		Type     string
+		Distance float64
+	}
+	var rows []row
+
+	// Distance via the cosine operator; convert to score = 1 - distance so
+	// higher is better. Both columns + their HNSW indexes are guarded by
+	// `<column> IS NOT NULL`, so the planner uses the index.
+	err := q.Select("public_id, type, (" + column + " <=> '" + vecLiteral + "') AS distance").
+		Order(column + " <=> '" + vecLiteral + "'").
+		Limit(k).
+		Scan(&rows).Error
+	if err != nil {
+		return nil
+	}
+
+	hits := make([]internalKNNHit, 0, len(rows))
+	for _, r := range rows {
+		hits = append(hits, internalKNNHit{
+			ID:    r.PublicID.String(),
+			Type:  r.Type,
+			Score: 1.0 - r.Distance,
+		})
+	}
+	return hits
 }
 
 // InternalLinkTranscript handles PATCH /internal/content-items/:id/transcript

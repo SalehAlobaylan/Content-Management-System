@@ -23,6 +23,14 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.PATCH("/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
 	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
 
+	// Slice A hybrid retrieval — used by Enrichment-Service's /v1/related.
+	// GET /:id/embeddings: fetch (dense, sparse) for an anchor.
+	// POST /knn:           cosine kNN against `embedding` (1024-dim BGE-M3 dense).
+	// POST /knn-sparse:    inner-product kNN against `embedding_sparse` (sparsevec).
+	internal.GET("/content-items/:id/embeddings", controllers.InternalGetContentEmbeddings)
+	internal.POST("/content-items/knn", controllers.InternalKNNDense)
+	internal.POST("/content-items/knn-sparse", controllers.InternalKNNSparse)
+
 	internal.POST("/transcripts", controllers.InternalCreateTranscript)
 
 	// Storage management — used by Aggregation's storage worker
