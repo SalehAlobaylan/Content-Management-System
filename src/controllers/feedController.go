@@ -3,8 +3,8 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
-	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -469,15 +469,23 @@ func GetNewsFeed(c *gin.Context) {
 	}
 
 	// Build slides — fetch semantically related items per featured article
+	// in parallel. Serial calls × 5s Enrichment timeout × N slides stalled
+	// the handler past upstream proxy budgets during reranker cold start.
 	slides := make([]NewsSlide, len(featuredItems))
+	var wg sync.WaitGroup
 	for i, featured := range featuredItems {
-		related := fetchRelatedItems(db, featured, 3)
-		slides[i] = NewsSlide{
-			SlideID:  uuid.New(),
-			Featured: mapToNewsFeatured(featured),
-			Related:  related,
-		}
+		wg.Add(1)
+		go func(idx int, f models.ContentItem) {
+			defer wg.Done()
+			related := fetchRelatedItems(db, f, 3)
+			slides[idx] = NewsSlide{
+				SlideID:  uuid.New(),
+				Featured: mapToNewsFeatured(f),
+				Related:  related,
+			}
+		}(i, featured)
 	}
+	wg.Wait()
 
 	c.JSON(http.StatusOK, NewsResponse{
 		Cursor: nextCursor,
@@ -625,37 +633,44 @@ func mapToNewsRelated(item models.ContentItem) NewsRelated {
 	return result
 }
 
-// fetchRelatedItems returns up to `limit` TWEET/COMMENT items semantically related to the
-// featured article. If the article has an embedding, uses pgvector cosine similarity (<=>).
-// Falls back to date-ordered if no embedding is available.
+// fetchRelatedItems returns up to `limit` TWEET/COMMENT items semantically
+// related to the featured article.
+//
+// Slice B: delegates to Enrichment-Service's /v1/feed/news/slide endpoint,
+// which runs hybrid retrieval + cross-encoder rerank + editorial ranking
+// rules (freshness / source diversity / type quotas). Single source of
+// truth for News-feed retrieval.
+//
+// Falls back to date-ordered ONLY when Enrichment is unreachable (err != nil).
+// A successful empty response is a legitimate answer — "no semantically
+// related items" — and is honored rather than masked with unrelated recent
+// global content.
 func fetchRelatedItems(db *gorm.DB, featured models.ContentItem, limit int) []NewsRelated {
-	var items []models.ContentItem
-
-	if featured.Embedding != nil {
-		// Semantic path: order by cosine distance to article embedding
-		embStr := pgvectorToLiteral(featured.Embedding.Slice())
-		err := db.Model(&models.ContentItem{}).
-			Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
-			Where("status = ?", models.ContentStatusReady).
-			Where("embedding IS NOT NULL").
-			Order(fmt.Sprintf("embedding <=> '%s'", embStr)).
-			Limit(limit).
-			Find(&items).Error
-		if err != nil || len(items) == 0 {
-			// fall through to date fallback
-			items = nil
+	// Primary path: Enrichment hybrid + rerank + rules.
+	related, err := fetchNewsSlideViaEnrichment(featured.PublicID.String(), limit)
+	if err == nil {
+		// Empty is a legit answer — return [] rather than attaching
+		// unrelated date-ordered content.
+		if len(related) == 0 {
+			return []NewsRelated{}
 		}
+		hydrated := hydrateNewsRelated(db, related)
+		if len(hydrated) > 0 {
+			return hydrated
+		}
+		// All ids failed to hydrate (race between retrieval and a delete);
+		// fall through to fallback to keep the slide non-empty.
 	}
 
-	// Fallback: date-ordered
-	if len(items) == 0 {
-		db.Model(&models.ContentItem{}).
-			Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
-			Where("status = ?", models.ContentStatusReady).
-			Order("published_at DESC").
-			Limit(limit).
-			Find(&items)
-	}
+	// Fallback: date-ordered. Enrichment unavailable, or returned items
+	// that all failed to hydrate.
+	var items []models.ContentItem
+	db.Model(&models.ContentItem{}).
+		Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
+		Where("status = ?", models.ContentStatusReady).
+		Order("published_at DESC").
+		Limit(limit).
+		Find(&items)
 
 	result := make([]NewsRelated, 0, len(items))
 	for _, item := range items {
@@ -664,10 +679,53 @@ func fetchRelatedItems(db *gorm.DB, featured models.ContentItem, limit int) []Ne
 	return result
 }
 
-// pgvectorToLiteral is a thin alias kept for in-file callers; the shared
-// implementation lives in src/utils/pgvector_literal.go so the new
-// InternalKNNDense handler can use the same converter without an import
-// cycle through the controllers package.
-func pgvectorToLiteral(v []float32) string {
-	return utils.PgvectorToLiteral(v)
+// hydrateNewsRelated converts Enrichment's response (ids + scores) into
+// NewsRelated by fetching the full content items from CMS storage in one
+// query. Preserves the order Enrichment returned (which embeds the
+// ranking rules' final ordering).
+func hydrateNewsRelated(
+	db *gorm.DB, enrichmentItems []enrichmentRelatedItem,
+) []NewsRelated {
+	if len(enrichmentItems) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(enrichmentItems))
+	for _, e := range enrichmentItems {
+		if u, err := uuid.Parse(e.ContentID); err == nil {
+			ids = append(ids, u)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	var items []models.ContentItem
+	if err := db.Model(&models.ContentItem{}).
+		Where("public_id IN ?", ids).
+		Find(&items).Error; err != nil {
+		return nil
+	}
+
+	byID := make(map[uuid.UUID]models.ContentItem, len(items))
+	for _, item := range items {
+		byID[item.PublicID] = item
+	}
+
+	// Preserve Enrichment's order (the ranking rules already applied).
+	result := make([]NewsRelated, 0, len(enrichmentItems))
+	for _, e := range enrichmentItems {
+		u, err := uuid.Parse(e.ContentID)
+		if err != nil {
+			continue
+		}
+		if item, ok := byID[u]; ok {
+			result = append(result, mapToNewsRelated(item))
+		}
+	}
+	return result
 }
+
+// Note: the inline pgvector cosine query that used to live here was
+// removed in Slice B — fetchRelatedItems now delegates to Enrichment-Service's
+// /v1/feed/news/slide for News-feed retrieval. The shared utils.PgvectorToLiteral
+// helper is still used by InternalKNNDense in internalContentController.

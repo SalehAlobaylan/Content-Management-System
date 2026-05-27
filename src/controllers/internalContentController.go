@@ -509,9 +509,15 @@ type internalKNNSparseRequest struct {
 }
 
 type internalKNNHit struct {
-	ID    string  `json:"id"`     // public_id (UUID string)
-	Type  string  `json:"type"`   // ContentType (TWEET, COMMENT, ARTICLE, ...)
-	Score float64 `json:"score"`  // 1 - cosine_distance (dense); 1/(1+ip_distance) (sparse)
+	ID          string  `json:"id"`   // public_id (UUID string)
+	Type        string  `json:"type"` // ContentType (TWEET, COMMENT, ARTICLE, ...)
+	Score       float64 `json:"score"`
+	// SourceName + PublishedAt let downstream ranking rules (source
+	// diversity, freshness decay) run on the kNN results directly,
+	// without a second round-trip to /internal/content-items/batch-text.
+	// Critical for the rerank-disabled path where batch-text is skipped.
+	SourceName  *string `json:"source_name,omitempty"`
+	PublishedAt *string `json:"published_at,omitempty"`
 }
 
 type internalKNNResponse struct {
@@ -630,6 +636,109 @@ func InternalKNNSparse(c *gin.Context) {
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
+// ─── Slice B: batch text fetch for the reranker stage ────────────────
+//
+// Reranker needs candidate text. kNN handlers return only {id, type, score}
+// to keep the search payload lean; this endpoint fans the resulting id list
+// back out into the full (title, excerpt, body_text, source_name, published_at)
+// tuple for the small post-RRF candidate set (typically top-30).
+
+type internalBatchTextRequest struct {
+	IDs []string `json:"ids"`
+}
+
+type internalBatchTextItem struct {
+	ID          string  `json:"id"`           // public_id (UUID string)
+	Type        string  `json:"type"`
+	Title       *string `json:"title"`
+	Excerpt     *string `json:"excerpt"`
+	BodyText    *string `json:"body_text"`
+	SourceName  *string `json:"source_name"`
+	PublishedAt *string `json:"published_at"` // ISO-8601, nil if missing
+}
+
+type internalBatchTextResponse struct {
+	Items []internalBatchTextItem `json:"items"`
+}
+
+// Cap on a single batch — high enough to cover post-RRF candidate pools
+// (RERANK_INPUT_K=30 by default) but low enough to bound payload size.
+const batchTextMaxIDs = 200
+
+// InternalBatchText handles POST /internal/content-items/batch-text.
+// Returns text + metadata for the requested ids, used by Enrichment's
+// reranker stage (Slice B). Order of items in the response is unspecified;
+// caller looks them up by id.
+func InternalBatchText(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req internalBatchTextRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if len(req.IDs) == 0 {
+		c.JSON(http.StatusOK, internalBatchTextResponse{Items: []internalBatchTextItem{}})
+		return
+	}
+	if len(req.IDs) > batchTextMaxIDs {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "ids exceeds maximum batch size of " + strconv.Itoa(batchTextMaxIDs),
+		})
+		return
+	}
+
+	// Parse UUIDs; skip malformed ones silently. Caller may interleave
+	// invalid ids without us bailing on the whole batch.
+	parsed := make([]uuid.UUID, 0, len(req.IDs))
+	for _, s := range req.IDs {
+		if u, err := uuid.Parse(s); err == nil {
+			parsed = append(parsed, u)
+		}
+	}
+	if len(parsed) == 0 {
+		c.JSON(http.StatusOK, internalBatchTextResponse{Items: []internalBatchTextItem{}})
+		return
+	}
+
+	type row struct {
+		PublicID    uuid.UUID
+		Type        string
+		Title       *string
+		Excerpt     *string
+		BodyText    *string
+		SourceName  *string
+		PublishedAt *time.Time
+	}
+	var rows []row
+	if err := db.Model(&models.ContentItem{}).
+		Where("public_id IN ?", parsed).
+		Select("public_id, type, title, excerpt, body_text, source_name, published_at").
+		Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch batch text"})
+		return
+	}
+
+	items := make([]internalBatchTextItem, 0, len(rows))
+	for _, r := range rows {
+		var publishedAtStr *string
+		if r.PublishedAt != nil {
+			s := r.PublishedAt.UTC().Format(time.RFC3339)
+			publishedAtStr = &s
+		}
+		items = append(items, internalBatchTextItem{
+			ID:          r.PublicID.String(),
+			Type:        r.Type,
+			Title:       r.Title,
+			Excerpt:     r.Excerpt,
+			BodyText:    r.BodyText,
+			SourceName:  r.SourceName,
+			PublishedAt: publishedAtStr,
+		})
+	}
+	c.JSON(http.StatusOK, internalBatchTextResponse{Items: items})
+}
+
 // runKNNQuery is the shared GORM body for dense + sparse kNN.
 // column is "embedding" or "embedding_sparse" — both indexes already exist.
 // vecLiteral is the pgvector literal form (dense `[…]` or sparse `{…}/N`).
@@ -660,16 +769,20 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral string, types []string, k int, 
 	}
 
 	type row struct {
-		PublicID uuid.UUID
-		Type     string
-		Distance float64
+		PublicID    uuid.UUID
+		Type        string
+		Distance    float64
+		SourceName  *string
+		PublishedAt *time.Time
 	}
 	var rows []row
 
 	// Distance via the cosine operator; convert to score = 1 - distance so
 	// higher is better. Both columns + their HNSW indexes are guarded by
-	// `<column> IS NOT NULL`, so the planner uses the index.
-	err := q.Select("public_id, type, (" + column + " <=> '" + vecLiteral + "') AS distance").
+	// `<column> IS NOT NULL`, so the planner uses the index. source_name
+	// + published_at are pulled so callers can run freshness + diversity
+	// rules without a second round-trip.
+	err := q.Select("public_id, type, source_name, published_at, (" + column + " <=> '" + vecLiteral + "') AS distance").
 		Order(column + " <=> '" + vecLiteral + "'").
 		Limit(k).
 		Scan(&rows).Error
@@ -679,10 +792,17 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral string, types []string, k int, 
 
 	hits := make([]internalKNNHit, 0, len(rows))
 	for _, r := range rows {
+		var publishedAt *string
+		if r.PublishedAt != nil {
+			s := r.PublishedAt.UTC().Format(time.RFC3339)
+			publishedAt = &s
+		}
 		hits = append(hits, internalKNNHit{
-			ID:    r.PublicID.String(),
-			Type:  r.Type,
-			Score: 1.0 - r.Distance,
+			ID:          r.PublicID.String(),
+			Type:        r.Type,
+			Score:       1.0 - r.Distance,
+			SourceName:  r.SourceName,
+			PublishedAt: publishedAt,
 		})
 	}
 	return hits
@@ -817,18 +937,33 @@ func InternalGetContentItem(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
+	// Serialize published_at as RFC3339 UTC so Enrichment's ISO parser
+	// (datetime.fromisoformat after a Z→+00:00 swap) gets an aware datetime.
+	var publishedAt *string
+	if item.PublishedAt != nil {
+		s := item.PublishedAt.UTC().Format(time.RFC3339)
+		publishedAt = &s
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"id":                         item.PublicID.String(),
-		"tenant_id":                  item.TenantID,
+		"id":        item.PublicID.String(),
+		"tenant_id": item.TenantID,
+		// Content type (TWEET/ARTICLE/…) — distinct from source_type below.
+		// FeedNewsService anchors read this; without it the slide anchor's
+		// type field is the empty string.
+		"type": string(item.Type),
 		// source_type is required by the quality re-encode auto-resolve path
 		// — without it the resolver can never pick a source-scoped ingest
 		// profile (e.g. "YouTube items use mobile-720p"). Stringified so
 		// callers can match against the string values in QualityProfile.SourceType.
-		"source_type":                string(item.Source),
-		"media_url":                  item.MediaURL,
-		"thumbnail_url":              item.ThumbnailURL,
-		"storage_tier":               item.StorageTier, // nil = primary
-		"media_version":              item.MediaVersion,
+		"source_type":   string(item.Source),
+		"title":         item.Title,
+		"excerpt":       item.Excerpt,
+		"source_name":   item.SourceName,
+		"published_at":  publishedAt,
+		"media_url":     item.MediaURL,
+		"thumbnail_url": item.ThumbnailURL,
+		"storage_tier":  item.StorageTier, // nil = primary
+		"media_version": item.MediaVersion,
 		"file_size_bytes":            item.FileSizeBytes,
 		"current_quality_profile_id": item.CurrentQualityProfileID,
 		"current_bitrate_kbps":       item.CurrentBitrateKbps,

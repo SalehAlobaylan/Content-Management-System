@@ -31,6 +31,10 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.POST("/content-items/knn", controllers.InternalKNNDense)
 	internal.POST("/content-items/knn-sparse", controllers.InternalKNNSparse)
 
+	// Slice B — batch-fetch text for a small set of ids (typically the
+	// post-RRF candidate pool that the cross-encoder reranker scores).
+	internal.POST("/content-items/batch-text", controllers.InternalBatchText)
+
 	internal.POST("/transcripts", controllers.InternalCreateTranscript)
 
 	// Storage management — used by Aggregation's storage worker

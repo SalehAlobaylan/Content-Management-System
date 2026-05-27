@@ -153,6 +153,90 @@ func triggerTranscription(mediaURL string, contentID string) error {
 	return nil
 }
 
+// ─── Slice B: News-feed slide assembly ──────────────────────
+//
+// fetchNewsSlideViaEnrichment delegates News-feed related-item assembly to
+// Enrichment-Service's /v1/feed/news/slide. The endpoint runs hybrid
+// retrieval + reranker + ranking rules (freshness/diversity/quotas) and
+// returns the final list ready for the feed. Callers (feedController) keep
+// the legacy date-ordered query as a fallback when Enrichment is
+// unreachable.
+
+type enrichmentRelatedItem struct {
+	ContentID    string   `json:"content_id"`
+	Score        float64  `json:"score"`
+	ContentType  string   `json:"content_type"`
+	Sources      []string `json:"sources"`
+	RerankScore  *float64 `json:"rerank_score"`
+	PublishedAt  *string  `json:"published_at"`
+	SourceName   *string  `json:"source_name"`
+}
+
+type enrichmentNewsSlideResponse struct {
+	Anchor  map[string]interface{}  `json:"anchor"`
+	Related []enrichmentRelatedItem `json:"related"`
+}
+
+// fetchNewsSlideViaEnrichment calls POST /v1/feed/news/slide and returns
+// the related items in display order. Returns (nil, err) on any failure;
+// the caller (feedController.fetchRelatedItems) falls back to its
+// date-ordered query when this fails — preserves availability on Enrichment
+// outage.
+func fetchNewsSlideViaEnrichment(anchorID string, limit int) ([]enrichmentRelatedItem, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+	token := enrichmentServiceToken()
+	if token == "" {
+		return nil, fmt.Errorf("enrichment service token is not configured")
+	}
+
+	payload := map[string]interface{}{
+		"anchor_content_id": anchorID,
+		"k":                 limit,
+		"types":             []string{"TWEET", "COMMENT"},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal news-slide request: %w", err)
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		baseURL+"/v1/feed/news/slide",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build news-slide request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// /v1/feed/news/slide does kNN + rerank + rules — target p95 ~500ms,
+	// allow 5s to absorb cold-start variance + reranker first-batch latency.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("enrichment news-slide request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf(
+			"enrichment news-slide returned status %d: %s",
+			resp.StatusCode, string(respBody),
+		)
+	}
+
+	var decoded enrichmentNewsSlideResponse
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode news-slide response: %w", err)
+	}
+	return decoded.Related, nil
+}
+
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
 func triggerEmbedding(text string, contentID string) error {
