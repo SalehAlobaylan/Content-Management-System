@@ -15,12 +15,16 @@ import (
 // ── Response types ──────────────────────────────────────────
 
 type enrichmentStatsResponse struct {
-	TotalMedia        int64 `json:"total_media"`
-	WithTranscript    int64 `json:"with_transcript"`
-	MissingTranscript int64 `json:"missing_transcript"`
-	WithEmbedding     int64 `json:"with_embedding"`
-	MissingEmbedding  int64 `json:"missing_embedding"`
-	TotalReady        int64 `json:"total_ready"`
+	TotalMedia            int64 `json:"total_media"`
+	WithTranscript        int64 `json:"with_transcript"`
+	MissingTranscript     int64 `json:"missing_transcript"`
+	WithEmbedding         int64 `json:"with_embedding"`
+	MissingEmbedding      int64 `json:"missing_embedding"`
+	WithSparse            int64 `json:"with_sparse"`
+	MissingSparse         int64 `json:"missing_sparse"`
+	WithImageEmbedding    int64 `json:"with_image_embedding"`
+	MissingImageEmbedding int64 `json:"missing_image_embedding"`
+	TotalReady            int64 `json:"total_ready"`
 }
 
 type missingEnrichmentItem struct {
@@ -65,6 +69,10 @@ func GetEnrichmentStats(c *gin.Context) {
 			COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NULL AND status = 'READY') as missing_transcript,
 			COUNT(*) FILTER (WHERE embedding IS NOT NULL) as with_embedding,
 			COUNT(*) FILTER (WHERE embedding IS NULL AND status = 'READY') as missing_embedding,
+			COUNT(*) FILTER (WHERE embedding_sparse IS NOT NULL) as with_sparse,
+			COUNT(*) FILTER (WHERE embedding IS NOT NULL AND embedding_sparse IS NULL AND status = 'READY') as missing_sparse,
+			COUNT(*) FILTER (WHERE image_embedding IS NOT NULL) as with_image_embedding,
+			COUNT(*) FILTER (WHERE thumbnail_url IS NOT NULL AND image_embedding IS NULL AND status = 'READY') as missing_image_embedding,
 			COUNT(*) FILTER (WHERE status = 'READY') as total_ready
 		FROM content_items
 		WHERE status != 'ARCHIVED'
@@ -76,6 +84,10 @@ func GetEnrichmentStats(c *gin.Context) {
 		&stats.MissingTranscript,
 		&stats.WithEmbedding,
 		&stats.MissingEmbedding,
+		&stats.WithSparse,
+		&stats.MissingSparse,
+		&stats.WithImageEmbedding,
+		&stats.MissingImageEmbedding,
 		&stats.TotalReady,
 	); err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
