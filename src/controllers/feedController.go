@@ -662,13 +662,23 @@ func fetchRelatedItems(db *gorm.DB, featured models.ContentItem, limit int) []Ne
 		// fall through to fallback to keep the slide non-empty.
 	}
 
-	// Fallback: date-ordered. Enrichment unavailable, or returned items
-	// that all failed to hydrate.
+	// Fallback: recency-ordered (used only when Enrichment is unreachable or
+	// every retrieved id failed to hydrate). Includes ARTICLE — the corpus is
+	// article-heavy and a TWEET/COMMENT-only fallback returns nothing. Excludes
+	// the anchor itself, and uses COALESCE because Telegram articles have NULL
+	// published_at. NOTE: this is recency, NOT topical relevance — real related
+	// items come from the Enrichment hybrid+rerank path above, which requires
+	// the anchor to have an embedding.
 	var items []models.ContentItem
 	db.Model(&models.ContentItem{}).
-		Where("type IN ?", []models.ContentType{models.ContentTypeTweet, models.ContentTypeComment}).
+		Where("type IN ?", []models.ContentType{
+			models.ContentTypeArticle,
+			models.ContentTypeTweet,
+			models.ContentTypeComment,
+		}).
 		Where("status = ?", models.ContentStatusReady).
-		Order("published_at DESC").
+		Where("public_id != ?", featured.PublicID).
+		Order("COALESCE(published_at, created_at) DESC").
 		Limit(limit).
 		Find(&items)
 

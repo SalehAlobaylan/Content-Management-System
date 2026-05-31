@@ -438,7 +438,7 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 
 // InternalUpdateContentImageEmbedding handles PATCH /internal/content-items/:id/image-embedding.
 // Stores a CLIP-ViT-B-32 image embedding (512-dim) on the content item.
-// Independent from text Embedding (384-dim) — both can coexist.
+// Independent from the text Embedding (1024-dim BGE-M3) — both can coexist.
 func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
@@ -716,6 +716,62 @@ func InternalBatchText(c *gin.Context) {
 		Select("public_id, type, title, excerpt, body_text, source_name, published_at").
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch batch text"})
+		return
+	}
+
+	items := make([]internalBatchTextItem, 0, len(rows))
+	for _, r := range rows {
+		var publishedAtStr *string
+		if r.PublishedAt != nil {
+			s := r.PublishedAt.UTC().Format(time.RFC3339)
+			publishedAtStr = &s
+		}
+		items = append(items, internalBatchTextItem{
+			ID:          r.PublicID.String(),
+			Type:        r.Type,
+			Title:       r.Title,
+			Excerpt:     r.Excerpt,
+			BodyText:    r.BodyText,
+			SourceName:  r.SourceName,
+			PublishedAt: publishedAtStr,
+		})
+	}
+	c.JSON(http.StatusOK, internalBatchTextResponse{Items: items})
+}
+
+// ── GET /internal/content-items/missing-embedding ───────────
+//
+// Returns READY items that have no dense embedding yet (oldest first), so the
+// Aggregation reconciliation sweep can re-enqueue embedding-only AI jobs. Same
+// query shape as the admin GetMissingEnrichments, but on the service-token
+// internal API and returning the text fields needed to rebuild the embedding
+// input. Reuses internalBatchTextItem/Response (same field set).
+func InternalListMissingEmbedding(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	type row struct {
+		PublicID    uuid.UUID
+		Type        string
+		Title       *string
+		Excerpt     *string
+		BodyText    *string
+		SourceName  *string
+		PublishedAt *time.Time
+	}
+	var rows []row
+	if err := db.Model(&models.ContentItem{}).
+		Where("status = ?", models.ContentStatusReady).
+		Where("embedding IS NULL").
+		Order("created_at ASC").
+		Limit(limit).
+		Select("public_id, type, title, excerpt, body_text, source_name, published_at").
+		Scan(&rows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list missing-embedding items"})
 		return
 	}
 

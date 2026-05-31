@@ -28,15 +28,18 @@ type enrichmentStatsResponse struct {
 }
 
 type missingEnrichmentItem struct {
-	ID            string `json:"id"`
-	Title         string `json:"title"`
-	Type          string `json:"type"`
-	SourceName    string `json:"source_name"`
-	Status        string `json:"status"`
-	HasTranscript bool   `json:"has_transcript"`
-	HasEmbedding  bool   `json:"has_embedding"`
-	MediaURL      string `json:"media_url"`
-	CreatedAt     string `json:"created_at"`
+	ID                string `json:"id"`
+	Title             string `json:"title"`
+	Type              string `json:"type"`
+	SourceName        string `json:"source_name"`
+	Status            string `json:"status"`
+	HasTranscript     bool   `json:"has_transcript"`
+	HasEmbedding      bool   `json:"has_embedding"`
+	HasSparse         bool   `json:"has_sparse"`
+	HasImageEmbedding bool   `json:"has_image_embedding"`
+	MediaURL          string `json:"media_url"`
+	ThumbnailURL      string `json:"thumbnail_url"`
+	CreatedAt         string `json:"created_at"`
 }
 
 type triggerEnrichmentRequest struct {
@@ -135,7 +138,13 @@ func GetMissingEnrichments(c *gin.Context) {
 	}
 
 	if contentType != "" {
-		query = query.Where("type = ?", contentType)
+		// Accept a comma-separated list so a panel can scope to several types
+		// at once (e.g. the Videos panel queries VIDEO,PODCAST together).
+		types := strings.Split(contentType, ",")
+		for i := range types {
+			types[i] = strings.TrimSpace(types[i])
+		}
+		query = query.Where("type IN ?", types)
 	}
 
 	// Filter by what's missing
@@ -146,6 +155,12 @@ func GetMissingEnrichments(c *gin.Context) {
 			conditions = append(conditions, "transcript_id IS NULL AND type IN ('VIDEO','PODCAST')")
 		case "embedding":
 			conditions = append(conditions, "embedding IS NULL")
+		case "sparse":
+			// Has a dense vector but no sparse lexical weights.
+			conditions = append(conditions, "embedding IS NOT NULL AND embedding_sparse IS NULL")
+		case "image":
+			// Has a thumbnail but no CLIP image embedding.
+			conditions = append(conditions, "image_embedding IS NULL AND thumbnail_url IS NOT NULL")
 		}
 	}
 
@@ -166,12 +181,14 @@ func GetMissingEnrichments(c *gin.Context) {
 	responseItems := make([]missingEnrichmentItem, 0, len(items))
 	for _, item := range items {
 		resp := missingEnrichmentItem{
-			ID:            item.PublicID.String(),
-			Type:          string(item.Type),
-			Status:        string(item.Status),
-			HasTranscript: item.TranscriptID != nil,
-			HasEmbedding:  item.Embedding != nil,
-			CreatedAt:     item.CreatedAt.Format("2006-01-02T15:04:05Z"),
+			ID:                item.PublicID.String(),
+			Type:              string(item.Type),
+			Status:            string(item.Status),
+			HasTranscript:     item.TranscriptID != nil,
+			HasEmbedding:      item.Embedding != nil,
+			HasSparse:         item.EmbeddingSparse != nil,
+			HasImageEmbedding: item.ImageEmbedding != nil,
+			CreatedAt:         item.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		}
 		if item.Title != nil {
 			resp.Title = *item.Title
@@ -181,6 +198,9 @@ func GetMissingEnrichments(c *gin.Context) {
 		}
 		if item.MediaURL != nil {
 			resp.MediaURL = *item.MediaURL
+		}
+		if item.ThumbnailURL != nil {
+			resp.ThumbnailURL = *item.ThumbnailURL
 		}
 		responseItems = append(responseItems, resp)
 	}
@@ -266,10 +286,43 @@ func TriggerEnrichment(c *gin.Context) {
 				errors = append(errors, "embedding: no text content available")
 				continue
 			}
-			if err := triggerEmbedding(text, item.PublicID.String()); err != nil {
+			// extract_sparse=true → populates dense + sparse together.
+			if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
 				errors = append(errors, "embedding: "+err.Error())
 			} else {
 				results = append(results, "embedding: triggered")
+			}
+
+		case "sparse":
+			if item.EmbeddingSparse != nil {
+				results = append(results, "sparse: already exists")
+				continue
+			}
+			text := buildEmbeddingText(&item)
+			if text == "" {
+				errors = append(errors, "sparse: no text content available")
+				continue
+			}
+			// Re-embed with sparse on — re-writes dense too (harmless, same value).
+			if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
+				errors = append(errors, "sparse: "+err.Error())
+			} else {
+				results = append(results, "sparse: triggered")
+			}
+
+		case "image":
+			if item.ImageEmbedding != nil {
+				results = append(results, "image: already exists")
+				continue
+			}
+			if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
+				errors = append(errors, "image: no thumbnail_url available")
+				continue
+			}
+			if err := triggerImageEmbedding(*item.ThumbnailURL, item.PublicID.String()); err != nil {
+				errors = append(errors, "image: "+err.Error())
+			} else {
+				results = append(results, "image: triggered")
 			}
 		}
 	}
@@ -350,8 +403,33 @@ func TriggerBatchEnrichment(c *gin.Context) {
 					itemErrors = append(itemErrors, "no text for embedding")
 					continue
 				}
-				if err := triggerEmbedding(text, item.PublicID.String()); err != nil {
+				if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
 					itemErrors = append(itemErrors, "embedding: "+err.Error())
+				}
+
+			case "sparse":
+				if item.EmbeddingSparse != nil {
+					continue // already has sparse
+				}
+				text := buildEmbeddingText(&item)
+				if text == "" {
+					itemErrors = append(itemErrors, "no text for sparse")
+					continue
+				}
+				if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
+					itemErrors = append(itemErrors, "sparse: "+err.Error())
+				}
+
+			case "image":
+				if item.ImageEmbedding != nil {
+					continue // already has image embedding
+				}
+				if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
+					itemErrors = append(itemErrors, "no thumbnail_url")
+					continue
+				}
+				if err := triggerImageEmbedding(*item.ThumbnailURL, item.PublicID.String()); err != nil {
+					itemErrors = append(itemErrors, "image: "+err.Error())
 				}
 			}
 		}

@@ -259,7 +259,12 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		q = q.Where("id NOT IN (?)", protectedIDs)
 	}
 
-	return q
+	// Return a fresh session so callers can run several finishers off this base
+	// (Count, SUM(...).Scan, Order(...).Find) without clauses leaking between
+	// them. Without this, the ORDER BY view_count from the Find chain bleeds
+	// into the aggregate SUM query and Postgres rejects it with
+	// "column must appear in the GROUP BY clause" (SQLSTATE 42803).
+	return q.Session(&gorm.Session{})
 }
 
 // filterFromPolicy is the canonical filter the worker uses for an auto sweep.

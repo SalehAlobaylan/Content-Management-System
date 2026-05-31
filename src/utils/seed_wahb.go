@@ -195,9 +195,12 @@ func createCommentContent(text, author string) models.ContentItem {
 	}
 }
 
-// generateMockEmbedding creates a random 384-dimension vector for testing
+// generateMockEmbedding creates a random 1024-dimension vector for testing.
+// Must match the BGE-M3 `embedding vector(1024)` column (migration
+// 20260522000000_bge_m3_retrieval) — a 384-dim vector is rejected by Postgres
+// with a dimension-mismatch error on insert.
 func generateMockEmbedding() pgvector.Vector {
-	dims := 384
+	dims := 1024
 	vec := make([]float32, dims)
 	for i := 0; i < dims; i++ {
 		vec[i] = rand.Float32()*2 - 1 // Random values between -1 and 1

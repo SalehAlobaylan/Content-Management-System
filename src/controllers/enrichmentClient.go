@@ -153,6 +153,49 @@ func triggerTranscription(mediaURL string, contentID string) error {
 	return nil
 }
 
+// triggerImageEmbedding sends a CLIP image-embedding request to Media-Service
+// for the item's thumbnail/hero image. Same multipart shape as
+// triggerTranscription; Media writes the 512-dim vector back to CMS.
+func triggerImageEmbedding(imageURL string, contentID string) error {
+	baseURL := mediaBaseURL()
+	if baseURL == "" {
+		return fmt.Errorf("MEDIA_BASE_URL is not configured")
+	}
+
+	token := mediaServiceToken()
+	if token == "" {
+		return fmt.Errorf("media service token is not configured")
+	}
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	writer.WriteField("url", imageURL)
+	writer.WriteField("content_id", contentID)
+	writer.Close()
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/embed/image", &buf)
+	if err != nil {
+		return fmt.Errorf("failed to create image-embed request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("media image-embed request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
 // ─── Slice B: News-feed slide assembly ──────────────────────
 //
 // fetchNewsSlideViaEnrichment delegates News-feed related-item assembly to
@@ -163,13 +206,13 @@ func triggerTranscription(mediaURL string, contentID string) error {
 // unreachable.
 
 type enrichmentRelatedItem struct {
-	ContentID    string   `json:"content_id"`
-	Score        float64  `json:"score"`
-	ContentType  string   `json:"content_type"`
-	Sources      []string `json:"sources"`
-	RerankScore  *float64 `json:"rerank_score"`
-	PublishedAt  *string  `json:"published_at"`
-	SourceName   *string  `json:"source_name"`
+	ContentID   string   `json:"content_id"`
+	Score       float64  `json:"score"`
+	ContentType string   `json:"content_type"`
+	Sources     []string `json:"sources"`
+	RerankScore *float64 `json:"rerank_score"`
+	PublishedAt *string  `json:"published_at"`
+	SourceName  *string  `json:"source_name"`
 }
 
 type enrichmentNewsSlideResponse struct {
@@ -195,7 +238,13 @@ func fetchNewsSlideViaEnrichment(anchorID string, limit int) ([]enrichmentRelate
 	payload := map[string]interface{}{
 		"anchor_content_id": anchorID,
 		"k":                 limit,
-		"types":             []string{"TWEET", "COMMENT"},
+		// Relate to ARTICLE as well as TWEET/COMMENT. The corpus today is
+		// articles + videos (no tweets/comments yet), so restricting to
+		// TWEET/COMMENT left the related slot empty and fell back to
+		// date-ordered. Including ARTICLE makes "related" = topically-similar
+		// news now, and tweets/comments fold in automatically once ingested.
+		// The anchor itself is excluded by Enrichment's slide service.
+		"types": []string{"ARTICLE", "TWEET", "COMMENT"},
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -239,7 +288,7 @@ func fetchNewsSlideViaEnrichment(anchorID string, limit int) ([]enrichmentRelate
 
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
-func triggerEmbedding(text string, contentID string) error {
+func triggerEmbedding(text string, contentID string, extractSparse bool) error {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -250,9 +299,14 @@ func triggerEmbedding(text string, contentID string) error {
 		return fmt.Errorf("enrichment service token is not configured")
 	}
 
+	// extract_sparse populates BGE-M3 lexical weights (hybrid retrieval) in the
+	// same forward pass — free. extract_tags is deliberately OFF for admin
+	// triggers: it hits the rate-limited LLM and would stall bulk re-embeds;
+	// topic tags are populated by the normal ingest path instead.
 	payload := map[string]interface{}{
-		"texts":       []string{text},
-		"content_ids": []string{contentID},
+		"texts":          []string{text},
+		"content_ids":    []string{contentID},
+		"extract_sparse": extractSparse,
 	}
 
 	payloadBytes, err := json.Marshal(payload)

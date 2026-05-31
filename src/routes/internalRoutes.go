@@ -35,6 +35,9 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	// post-RRF candidate pool that the cross-encoder reranker scores).
 	internal.POST("/content-items/batch-text", controllers.InternalBatchText)
 
+	// Reconciliation sweep — READY items still missing a dense embedding.
+	internal.GET("/content-items/missing-embedding", controllers.InternalListMissingEmbedding)
+
 	internal.POST("/transcripts", controllers.InternalCreateTranscript)
 
 	// Storage management — used by Aggregation's storage worker
