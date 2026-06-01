@@ -188,12 +188,12 @@ func triggerImageEmbedding(imageURL string, contentID string) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	return nil
+	return checkWriteBack(body)
 }
 
 // ─── Slice B: News-feed slide assembly ──────────────────────
@@ -262,9 +262,13 @@ func fetchNewsSlideViaEnrichment(anchorID string, limit int) ([]enrichmentRelate
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	// /v1/feed/news/slide does kNN + rerank + rules — target p95 ~500ms,
-	// allow 5s to absorb cold-start variance + reranker first-batch latency.
-	client := &http.Client{Timeout: 5 * time.Second}
+	// /v1/feed/news/slide does kNN + rerank + rules. Warm (slide-cache hit) it's
+	// ~10ms, but a COLD cross-encoder rerank of the candidate pool is ~5s on CPU
+	// — and several cold anchors can queue behind the single reranker process.
+	// A 5s timeout made cold slides time out and silently fall back to
+	// date-ordered "related" (the same recent items on every slide). 30s gives
+	// the cold path comfortable headroom; the cache keeps the warm path fast.
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("enrichment news-slide request failed: %w", err)
@@ -284,6 +288,68 @@ func fetchNewsSlideViaEnrichment(anchorID string, limit int) ([]enrichmentRelate
 		return nil, fmt.Errorf("decode news-slide response: %w", err)
 	}
 	return decoded.Related, nil
+}
+
+// ─── On-demand URL extraction (News "Add by URL") ───────────
+//
+// extractURLViaEnrichment delegates single-article extraction to
+// Enrichment-Service's stealth web extraction endpoint (POST /v1/extract).
+// Used by the admin News "Add by URL" tab to prefill the compose form — it
+// only reads the page and returns the parsed fields; nothing is written.
+
+type extractURLResult struct {
+	Title       *string `json:"title"`
+	Text        string  `json:"text"`
+	Excerpt     *string `json:"excerpt"`
+	Author      *string `json:"author"`
+	PublishedAt *string `json:"published_at"`
+	SiteName    *string `json:"site_name"`
+	ImageURL    *string `json:"image_url"`
+	WordCount   int     `json:"word_count"`
+}
+
+func extractURLViaEnrichment(url string) (*extractURLResult, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+
+	token := enrichmentServiceToken()
+	if token == "" {
+		return nil, fmt.Errorf("enrichment service token is not configured")
+	}
+
+	payload := map[string]interface{}{"url": url}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal extract request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/extract", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build extract request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// Stealth fetch of an arbitrary page can be slow — allow 20s.
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("enrichment extract request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("enrichment extract returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var decoded extractURLResult
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode extract response: %w", err)
+	}
+	return &decoded, nil
 }
 
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
@@ -329,10 +395,32 @@ func triggerEmbedding(text string, contentID string, extractSparse bool) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("enrichment returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// A 200 only means the vector was *computed*. Enrichment writes it back to
+	// CMS separately and reports that outcome inline — surface a write-back
+	// failure as an error so the trigger paths (single/batch/bulk) don't report
+	// false success when nothing was persisted (e.g. a dimension mismatch).
+	return checkWriteBack(body)
+}
+
+// checkWriteBack returns an error when an AI service computed a result but its
+// write-back to CMS failed. Both /v1/embed and /v1/embed/image carry the same
+// write_back_status / write_back_error fields.
+func checkWriteBack(body []byte) error {
+	var r struct {
+		WriteBackStatus string `json:"write_back_status"`
+		WriteBackError  string `json:"write_back_error"`
+	}
+	if err := json.Unmarshal(body, &r); err == nil && r.WriteBackStatus == "failed" {
+		msg := r.WriteBackError
+		if msg == "" {
+			msg = "write-back to CMS failed"
+		}
+		return fmt.Errorf("write-back failed: %s", msg)
+	}
 	return nil
 }

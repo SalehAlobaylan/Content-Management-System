@@ -26,6 +26,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/sources/:id/run", controllers.RunContentSource)
 
 	adminGroup.GET("/content", controllers.ListContentItems)
+	adminGroup.POST("/content", controllers.CreateAdminContent)
+	adminGroup.POST("/content/extract-url", controllers.ExtractContentURL)
 	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
 	adminGroup.GET("/content/status-counts", controllers.GetStatusCounts)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
@@ -69,6 +71,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/enrichment/missing", controllers.GetMissingEnrichments)
 	adminGroup.POST("/enrichment/trigger/:id", controllers.TriggerEnrichment)
 	adminGroup.POST("/enrichment/trigger-batch", controllers.TriggerBatchEnrichment)
+	adminGroup.POST("/enrichment/trigger-all", controllers.TriggerAllEnrichment)
+	adminGroup.GET("/enrichment/bulk-status", controllers.GetBulkEnrichStatus)
 	adminGroup.GET("/enrichment/health", controllers.GetEnrichmentServiceHealth)
 
 	// Storage management

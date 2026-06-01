@@ -263,6 +263,7 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 type bulkDeleteContentRequest struct {
 	Status        string   `json:"status"`
 	SourceName    string   `json:"source_name"`
+	Type          string   `json:"type"`
 	CreatedBefore string   `json:"created_before"`
 	IDs           []string `json:"ids"`
 	DryRun        bool     `json:"dry_run"`
@@ -313,9 +314,9 @@ func BulkDeleteContent(c *gin.Context) {
 	}
 
 	hasIDs := len(req.IDs) > 0
-	if !hasIDs && req.Status == "" && req.SourceName == "" && req.CreatedBefore == "" {
+	if !hasIDs && req.Status == "" && req.SourceName == "" && req.Type == "" && req.CreatedBefore == "" {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "At least one filter is required (ids, status, source_name, or created_before)",
+			Message: "At least one filter is required (ids, status, type, source_name, or created_before)",
 			Code:    "FILTER_REQUIRED",
 		})
 		return
@@ -342,6 +343,10 @@ func BulkDeleteContent(c *gin.Context) {
 
 		if req.SourceName != "" {
 			query = query.Where("source_name = ?", req.SourceName)
+		}
+
+		if req.Type != "" {
+			query = query.Where("type = ?", strings.ToUpper(req.Type))
 		}
 
 		if req.CreatedBefore != "" {
@@ -425,21 +430,39 @@ func GetStatusCounts(c *gin.Context) {
 }
 
 type bulkStatusChangeRequest struct {
-	FromStatus string `json:"from_status" binding:"required"`
-	ToStatus   string `json:"to_status" binding:"required"`
-	SourceName string `json:"source_name"`
-	Type       string `json:"type"`
-	Limit      int    `json:"limit"`
-	DryRun     bool   `json:"dry_run"`
+	// Selection mode A — explicit rows from the UI. When ids are present the
+	// filter fields (from_status/source_name/type/created_before) are ignored.
+	IDs []string `json:"ids"`
+
+	// Selection mode B — filter-based. from_status is required in this mode;
+	// created_before enables age-based rotation (e.g. archive news older than N
+	// days), mirroring bulk-delete.
+	FromStatus    string `json:"from_status"`
+	SourceName    string `json:"source_name"`
+	Type          string `json:"type"`
+	CreatedBefore string `json:"created_before"`
+
+	// Always required — the status to move matching items into.
+	ToStatus string `json:"to_status" binding:"required"`
+
+	Limit  int  `json:"limit"`
+	DryRun bool `json:"dry_run"`
 }
+
+const bulkStatusIDsLimit = 500
 
 type bulkStatusChangeResponse struct {
 	UpdatedCount int64  `json:"updated_count"`
 	Message      string `json:"message"`
 }
 
+var validContentStatuses = map[string]bool{
+	"PENDING": true, "PROCESSING": true, "READY": true, "FAILED": true, "ARCHIVED": true,
+}
+
 // BulkStatusChange handles POST /admin/content/bulk-status
-// Changes the status of content items matching the given filters.
+// Moves content items into to_status, selected either by explicit ids or by a
+// filter (from_status [+ source_name/type/created_before]).
 func BulkStatusChange(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -451,21 +474,65 @@ func BulkStatusChange(c *gin.Context) {
 	var req bulkStatusChangeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "Invalid request: from_status and to_status are required",
+			Message: "Invalid request: to_status is required",
 			Code:    "INVALID_REQUEST",
 		})
 		return
 	}
 
-	fromStatus := strings.ToUpper(strings.TrimSpace(req.FromStatus))
 	toStatus := strings.ToUpper(strings.TrimSpace(req.ToStatus))
-
-	validStatuses := map[string]bool{
-		"PENDING": true, "PROCESSING": true, "READY": true, "FAILED": true, "ARCHIVED": true,
-	}
-	if !validStatuses[fromStatus] || !validStatuses[toStatus] {
+	if !validContentStatuses[toStatus] {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "Invalid status value. Must be one of: PENDING, PROCESSING, READY, FAILED, ARCHIVED",
+			Message: "Invalid to_status. Must be one of: PENDING, PROCESSING, READY, FAILED, ARCHIVED",
+			Code:    "INVALID_STATUS",
+		})
+		return
+	}
+
+	// ── Mode A: explicit ids (UI row selection) ──────────────────
+	if len(req.IDs) > 0 {
+		if len(req.IDs) > bulkStatusIDsLimit {
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: fmt.Sprintf("Too many ids; maximum is %d", bulkStatusIDsLimit),
+				Code:    "TOO_MANY_IDS",
+			})
+			return
+		}
+
+		query := db.Model(&models.ContentItem{}).
+			Where("tenant_id = ? AND public_id IN ?", principal.TenantID, req.IDs)
+
+		if req.DryRun {
+			var count int64
+			query.Count(&count)
+			c.JSON(http.StatusOK, bulkStatusChangeResponse{
+				UpdatedCount: count,
+				Message:      "Dry run — no items updated",
+			})
+			return
+		}
+
+		result := query.Update("status", toStatus)
+		if result.Error != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{
+				Message: "Failed to update status: " + result.Error.Error(),
+				Code:    "UPDATE_FAILED",
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, bulkStatusChangeResponse{
+			UpdatedCount: result.RowsAffected,
+			Message:      "Updated selected items to " + strings.ToLower(toStatus),
+		})
+		return
+	}
+
+	// ── Mode B: filter-based selection ───────────────────────────
+	fromStatus := strings.ToUpper(strings.TrimSpace(req.FromStatus))
+	if !validContentStatuses[fromStatus] {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid from_status. Must be one of: PENDING, PROCESSING, READY, FAILED, ARCHIVED",
 			Code:    "INVALID_STATUS",
 		})
 		return
@@ -478,6 +545,19 @@ func BulkStatusChange(c *gin.Context) {
 		return
 	}
 
+	var createdBefore *time.Time
+	if strings.TrimSpace(req.CreatedBefore) != "" {
+		parsed, err := time.Parse(time.RFC3339, req.CreatedBefore)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
+				Code:    "INVALID_DATE",
+			})
+			return
+		}
+		createdBefore = &parsed
+	}
+
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 100
@@ -486,19 +566,23 @@ func BulkStatusChange(c *gin.Context) {
 		limit = 500
 	}
 
-	query := db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND status = ?", principal.TenantID, fromStatus)
-
-	if req.SourceName != "" {
-		query = query.Where("source_name = ?", req.SourceName)
-	}
-	if req.Type != "" {
-		query = query.Where("type = ?", strings.ToUpper(req.Type))
+	applyFilters := func(q *gorm.DB) *gorm.DB {
+		q = q.Where("tenant_id = ? AND status = ?", principal.TenantID, fromStatus)
+		if req.SourceName != "" {
+			q = q.Where("source_name = ?", req.SourceName)
+		}
+		if req.Type != "" {
+			q = q.Where("type = ?", strings.ToUpper(req.Type))
+		}
+		if createdBefore != nil {
+			q = q.Where("created_at < ?", *createdBefore)
+		}
+		return q
 	}
 
 	if req.DryRun {
 		var count int64
-		query.Count(&count)
+		applyFilters(db.Model(&models.ContentItem{})).Count(&count)
 		if int64(limit) < count {
 			count = int64(limit)
 		}
@@ -509,17 +593,8 @@ func BulkStatusChange(c *gin.Context) {
 		return
 	}
 
-	// Use a subquery to limit the number of rows updated
-	subQuery := db.Model(&models.ContentItem{}).
-		Select("id").
-		Where("tenant_id = ? AND status = ?", principal.TenantID, fromStatus)
-	if req.SourceName != "" {
-		subQuery = subQuery.Where("source_name = ?", req.SourceName)
-	}
-	if req.Type != "" {
-		subQuery = subQuery.Where("type = ?", strings.ToUpper(req.Type))
-	}
-	subQuery = subQuery.Limit(limit)
+	// Use a subquery to bound the number of rows updated.
+	subQuery := applyFilters(db.Model(&models.ContentItem{}).Select("id")).Limit(limit)
 
 	result := db.Model(&models.ContentItem{}).
 		Where("id IN (?)", subQuery).
@@ -535,6 +610,6 @@ func BulkStatusChange(c *gin.Context) {
 
 	c.JSON(http.StatusOK, bulkStatusChangeResponse{
 		UpdatedCount: result.RowsAffected,
-		Message:      "Updated " + strings.ToLower(req.FromStatus) + " items to " + strings.ToLower(req.ToStatus),
+		Message:      "Updated " + strings.ToLower(fromStatus) + " items to " + strings.ToLower(toStatus),
 	})
 }

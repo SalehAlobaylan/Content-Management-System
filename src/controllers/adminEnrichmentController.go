@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -128,46 +130,8 @@ func GetMissingEnrichments(c *gin.Context) {
 		offset = 0
 	}
 
-	missingTypes := strings.Split(missingParam, ",")
-
-	// Build query
-	query := db.Model(&models.ContentItem{}).Where("status != ?", "ARCHIVED")
-
-	if status != "" {
-		query = query.Where("status = ?", status)
-	}
-
-	if contentType != "" {
-		// Accept a comma-separated list so a panel can scope to several types
-		// at once (e.g. the Videos panel queries VIDEO,PODCAST together).
-		types := strings.Split(contentType, ",")
-		for i := range types {
-			types[i] = strings.TrimSpace(types[i])
-		}
-		query = query.Where("type IN ?", types)
-	}
-
-	// Filter by what's missing
-	conditions := []string{}
-	for _, mt := range missingTypes {
-		switch strings.TrimSpace(mt) {
-		case "transcript":
-			conditions = append(conditions, "transcript_id IS NULL AND type IN ('VIDEO','PODCAST')")
-		case "embedding":
-			conditions = append(conditions, "embedding IS NULL")
-		case "sparse":
-			// Has a dense vector but no sparse lexical weights.
-			conditions = append(conditions, "embedding IS NOT NULL AND embedding_sparse IS NULL")
-		case "image":
-			// Has a thumbnail but no CLIP image embedding.
-			conditions = append(conditions, "image_embedding IS NULL AND thumbnail_url IS NOT NULL")
-		}
-	}
-
-	if len(conditions) > 0 {
-		combined := "(" + strings.Join(conditions, " OR ") + ")"
-		query = query.Where(combined)
-	}
+	// Build the filtered query (shared with the bulk trigger endpoint).
+	query := buildMissingQuery(db, missingParam, contentType, status)
 
 	// Count total
 	var total int64
@@ -251,81 +215,7 @@ func TriggerEnrichment(c *gin.Context) {
 		return
 	}
 
-	results := make([]string, 0)
-	errors := make([]string, 0)
-
-	for _, enrichType := range req.Types {
-		switch enrichType {
-		case "transcript":
-			if item.TranscriptID != nil {
-				results = append(results, "transcript: already exists")
-				continue
-			}
-			if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
-				results = append(results, "transcript: skipped (not VIDEO/PODCAST)")
-				continue
-			}
-			if item.MediaURL == nil || *item.MediaURL == "" {
-				errors = append(errors, "transcript: no media_url available")
-				continue
-			}
-			if err := triggerTranscription(*item.MediaURL, item.PublicID.String()); err != nil {
-				errors = append(errors, "transcript: "+err.Error())
-			} else {
-				results = append(results, "transcript: triggered")
-			}
-
-		case "embedding":
-			if item.Embedding != nil {
-				results = append(results, "embedding: already exists")
-				continue
-			}
-			// Build text for embedding from available content
-			text := buildEmbeddingText(&item)
-			if text == "" {
-				errors = append(errors, "embedding: no text content available")
-				continue
-			}
-			// extract_sparse=true → populates dense + sparse together.
-			if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
-				errors = append(errors, "embedding: "+err.Error())
-			} else {
-				results = append(results, "embedding: triggered")
-			}
-
-		case "sparse":
-			if item.EmbeddingSparse != nil {
-				results = append(results, "sparse: already exists")
-				continue
-			}
-			text := buildEmbeddingText(&item)
-			if text == "" {
-				errors = append(errors, "sparse: no text content available")
-				continue
-			}
-			// Re-embed with sparse on — re-writes dense too (harmless, same value).
-			if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
-				errors = append(errors, "sparse: "+err.Error())
-			} else {
-				results = append(results, "sparse: triggered")
-			}
-
-		case "image":
-			if item.ImageEmbedding != nil {
-				results = append(results, "image: already exists")
-				continue
-			}
-			if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
-				errors = append(errors, "image: no thumbnail_url available")
-				continue
-			}
-			if err := triggerImageEmbedding(*item.ThumbnailURL, item.PublicID.String()); err != nil {
-				errors = append(errors, "image: "+err.Error())
-			} else {
-				results = append(results, "image: triggered")
-			}
-		}
-	}
+	results, errors := triggerItemArtifacts(&item, req.Types)
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -376,63 +266,7 @@ func TriggerBatchEnrichment(c *gin.Context) {
 			continue
 		}
 
-		itemErrors := []string{}
-		for _, enrichType := range req.Types {
-			switch enrichType {
-			case "transcript":
-				if item.TranscriptID != nil {
-					continue // already has transcript
-				}
-				if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
-					continue // not applicable
-				}
-				if item.MediaURL == nil || *item.MediaURL == "" {
-					itemErrors = append(itemErrors, "no media_url")
-					continue
-				}
-				if err := triggerTranscription(*item.MediaURL, item.PublicID.String()); err != nil {
-					itemErrors = append(itemErrors, "transcript: "+err.Error())
-				}
-
-			case "embedding":
-				if item.Embedding != nil {
-					continue // already has embedding
-				}
-				text := buildEmbeddingText(&item)
-				if text == "" {
-					itemErrors = append(itemErrors, "no text for embedding")
-					continue
-				}
-				if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
-					itemErrors = append(itemErrors, "embedding: "+err.Error())
-				}
-
-			case "sparse":
-				if item.EmbeddingSparse != nil {
-					continue // already has sparse
-				}
-				text := buildEmbeddingText(&item)
-				if text == "" {
-					itemErrors = append(itemErrors, "no text for sparse")
-					continue
-				}
-				if err := triggerEmbedding(text, item.PublicID.String(), true); err != nil {
-					itemErrors = append(itemErrors, "sparse: "+err.Error())
-				}
-
-			case "image":
-				if item.ImageEmbedding != nil {
-					continue // already has image embedding
-				}
-				if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
-					itemErrors = append(itemErrors, "no thumbnail_url")
-					continue
-				}
-				if err := triggerImageEmbedding(*item.ThumbnailURL, item.PublicID.String()); err != nil {
-					itemErrors = append(itemErrors, "image: "+err.Error())
-				}
-			}
-		}
+		_, itemErrors := triggerItemArtifacts(&item, req.Types)
 
 		if len(itemErrors) > 0 {
 			results = append(results, triggerResultItem{
@@ -526,4 +360,268 @@ func buildEmbeddingText(item *models.ContentItem) string {
 		parts = append(parts, body)
 	}
 	return strings.Join(parts, " ")
+}
+
+// ── Shared query + trigger helpers ──────────────────────────
+
+// missingEnrichmentClauses turns a comma-separated `missing` param into the
+// SQL OR-clauses used to find content lacking each artifact. Shared by the
+// missing-list endpoint and the bulk trigger so they stay in lock-step.
+func missingEnrichmentClauses(missingParam string) []string {
+	conditions := []string{}
+	for _, mt := range strings.Split(missingParam, ",") {
+		switch strings.TrimSpace(mt) {
+		case "transcript":
+			conditions = append(conditions, "transcript_id IS NULL AND type IN ('VIDEO','PODCAST')")
+		case "embedding":
+			conditions = append(conditions, "embedding IS NULL")
+		case "sparse":
+			// Has a dense vector but no sparse lexical weights.
+			conditions = append(conditions, "embedding IS NOT NULL AND embedding_sparse IS NULL")
+		case "image":
+			// Has a thumbnail but no CLIP image embedding.
+			conditions = append(conditions, "image_embedding IS NULL AND thumbnail_url IS NOT NULL")
+		}
+	}
+	return conditions
+}
+
+// buildMissingQuery applies the shared status + type + missing-artifact filters.
+// `contentType` accepts a comma-separated list (e.g. "VIDEO,PODCAST").
+func buildMissingQuery(db *gorm.DB, missingParam, contentType, status string) *gorm.DB {
+	query := db.Model(&models.ContentItem{}).Where("status != ?", "ARCHIVED")
+
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+
+	if contentType != "" {
+		types := strings.Split(contentType, ",")
+		for i := range types {
+			types[i] = strings.TrimSpace(types[i])
+		}
+		query = query.Where("type IN ?", types)
+	}
+
+	if conditions := missingEnrichmentClauses(missingParam); len(conditions) > 0 {
+		query = query.Where("(" + strings.Join(conditions, " OR ") + ")")
+	}
+
+	return query
+}
+
+// triggerItemArtifacts runs the requested enrichment passes for one item.
+// Already-present artifacts are reported as skips (in results), not errors.
+// Used by the single, batch, and bulk trigger paths so behaviour is identical.
+func triggerItemArtifacts(item *models.ContentItem, types []string) (results, errs []string) {
+	id := item.PublicID.String()
+	for _, enrichType := range types {
+		switch enrichType {
+		case "transcript":
+			if item.TranscriptID != nil {
+				results = append(results, "transcript: already exists")
+				continue
+			}
+			if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+				results = append(results, "transcript: skipped (not VIDEO/PODCAST)")
+				continue
+			}
+			if item.MediaURL == nil || *item.MediaURL == "" {
+				errs = append(errs, "transcript: no media_url available")
+				continue
+			}
+			if err := triggerTranscription(*item.MediaURL, id); err != nil {
+				errs = append(errs, "transcript: "+err.Error())
+			} else {
+				results = append(results, "transcript: triggered")
+			}
+
+		case "embedding":
+			if item.Embedding != nil {
+				results = append(results, "embedding: already exists")
+				continue
+			}
+			text := buildEmbeddingText(item)
+			if text == "" {
+				errs = append(errs, "embedding: no text content available")
+				continue
+			}
+			// extract_sparse=true → populates dense + sparse together.
+			if err := triggerEmbedding(text, id, true); err != nil {
+				errs = append(errs, "embedding: "+err.Error())
+			} else {
+				results = append(results, "embedding: triggered")
+			}
+
+		case "sparse":
+			if item.EmbeddingSparse != nil {
+				results = append(results, "sparse: already exists")
+				continue
+			}
+			text := buildEmbeddingText(item)
+			if text == "" {
+				errs = append(errs, "sparse: no text content available")
+				continue
+			}
+			// Re-embed with sparse on — re-writes dense too (harmless, same value).
+			if err := triggerEmbedding(text, id, true); err != nil {
+				errs = append(errs, "sparse: "+err.Error())
+			} else {
+				results = append(results, "sparse: triggered")
+			}
+
+		case "image":
+			if item.ImageEmbedding != nil {
+				results = append(results, "image: already exists")
+				continue
+			}
+			if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
+				errs = append(errs, "image: no thumbnail_url available")
+				continue
+			}
+			if err := triggerImageEmbedding(*item.ThumbnailURL, id); err != nil {
+				errs = append(errs, "image: "+err.Error())
+			} else {
+				results = append(results, "image: triggered")
+			}
+		}
+	}
+	return results, errs
+}
+
+// ── POST /admin/enrichment/trigger-all + GET /bulk-status ───
+//
+// "Enrich all missing" can span hundreds of items, each a synchronous model
+// call — far too long for one HTTP request. So trigger-all kicks off a single
+// background run and returns immediately; the UI polls bulk-status for a live
+// progress bar. State is in-memory (one run at a time); a CMS restart mid-run
+// just resets it — the reconcile sweep + re-trigger remain the backstop.
+
+type bulkEnrichStatus struct {
+	Running     bool       `json:"running"`
+	Total       int        `json:"total"`
+	Done        int        `json:"done"`
+	Failed      int        `json:"failed"`
+	Types       []string   `json:"types"`
+	ContentType string     `json:"content_type,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+}
+
+var (
+	bulkMu    sync.Mutex
+	bulkState bulkEnrichStatus
+)
+
+// bulkMaxItems caps a single run so a misclick can't enqueue a runaway job.
+const bulkMaxItems = 5000
+
+func TriggerAllEnrichment(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req struct {
+		Types []string `json:"types" binding:"required"`
+		Type  string   `json:"type"`
+		Max   int      `json:"max"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid request body: " + err.Error(),
+		})
+		return
+	}
+	if len(req.Types) == 0 {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "At least one artifact type is required",
+		})
+		return
+	}
+
+	limit := req.Max
+	if limit <= 0 || limit > bulkMaxItems {
+		limit = bulkMaxItems
+	}
+
+	bulkMu.Lock()
+	if bulkState.Running {
+		bulkMu.Unlock()
+		c.JSON(http.StatusConflict, utils.HTTPError{
+			Code:    http.StatusConflict,
+			Message: "A bulk enrichment run is already in progress",
+		})
+		return
+	}
+
+	// The missing-filter is derived from the artifacts being triggered, so we
+	// only load items that actually lack at least one of them.
+	missingParam := strings.Join(req.Types, ",")
+	var items []models.ContentItem
+	buildMissingQuery(db, missingParam, req.Type, "READY").
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&items)
+
+	if len(items) == 0 {
+		bulkMu.Unlock()
+		c.JSON(http.StatusOK, utils.ResponseMessage{
+			Code:    http.StatusOK,
+			Message: "Nothing missing to enrich",
+			Data:    gin.H{"started": false, "total": 0},
+		})
+		return
+	}
+
+	now := time.Now()
+	bulkState = bulkEnrichStatus{
+		Running:     true,
+		Total:       len(items),
+		Types:       req.Types,
+		ContentType: req.Type,
+		StartedAt:   &now,
+	}
+	bulkMu.Unlock()
+
+	go runBulkEnrich(items, req.Types)
+
+	c.JSON(http.StatusAccepted, utils.ResponseMessage{
+		Code:    http.StatusAccepted,
+		Message: "Bulk enrichment started",
+		Data:    gin.H{"started": true, "total": len(items)},
+	})
+}
+
+// runBulkEnrich processes the captured items sequentially in the background.
+// Sequential is intentional — it self-throttles the downstream AI services
+// (one model call at a time) instead of stampeding them.
+func runBulkEnrich(items []models.ContentItem, types []string) {
+	for i := range items {
+		_, errs := triggerItemArtifacts(&items[i], types)
+		bulkMu.Lock()
+		bulkState.Done++
+		if len(errs) > 0 {
+			bulkState.Failed++
+			bulkState.LastError = errs[len(errs)-1]
+		}
+		bulkMu.Unlock()
+	}
+	bulkMu.Lock()
+	bulkState.Running = false
+	fin := time.Now()
+	bulkState.FinishedAt = &fin
+	bulkMu.Unlock()
+}
+
+func GetBulkEnrichStatus(c *gin.Context) {
+	bulkMu.Lock()
+	snapshot := bulkState
+	bulkMu.Unlock()
+
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Bulk enrichment status",
+		Data:    snapshot,
+	})
 }
