@@ -433,6 +433,11 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		return
 	}
 
+	// Now that the dense embedding exists, classify the article into a
+	// first-class topic. Fire-and-forget — it calls Enrichment's LLM for new
+	// topic labels and must not block the embedding write-back.
+	go classifyContentTopic(db, item.PublicID)
+
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 

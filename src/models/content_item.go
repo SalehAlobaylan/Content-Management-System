@@ -78,6 +78,10 @@ type ContentItem struct {
 
 	// Tags & AI
 	TopicTags pq.StringArray `gorm:"type:text[]" json:"topic_tags,omitempty"`
+	// TopicID is the first-class topic this article is classified into
+	// (Enrichment LLM label + embedding centroid). NULL until classified.
+	// Distinct from the legacy free-form TopicTags above.
+	TopicID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_topic_id" json:"topic_id,omitempty"`
 	// Embedding is the BAAI/bge-m3 dense text vector (1024-dim), populated by
 	// Enrichment-Service. Multilingual — performs well on Arabic + English.
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`

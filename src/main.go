@@ -116,6 +116,8 @@ func main() {
 			// Intelligence / Ranking
 			&models.RankingConfig{},
 			&models.ContentFlag{},
+			// First-class topics (LLM-labeled + centroid embedding)
+			&models.Topic{},
 			// Storage management
 			&models.StoragePolicy{},
 			&models.StorageSweepRun{},

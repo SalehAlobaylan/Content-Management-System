@@ -107,6 +107,22 @@ func ListContentItems(c *gin.Context) {
 	query := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
 	query = utils.ApplyQuery(query, params, contentAdminQueryConfig)
 
+	// Topic filter — topic_tags is a text[] column not handled by the generic
+	// query builder, so apply array membership directly (same pattern as the
+	// public RSS feed controller).
+	if topic := strings.TrimSpace(c.Query("topic")); topic != "" {
+		query = query.Where("? = ANY(topic_tags)", topic)
+	}
+	// First-class topic filter (the News manager board fetches by topic_id).
+	// The sentinel "none" selects unclassified articles (topic_id IS NULL).
+	if topicID := strings.TrimSpace(c.Query("topic_id")); topicID != "" {
+		if strings.EqualFold(topicID, "none") {
+			query = query.Where("topic_id IS NULL")
+		} else {
+			query = query.Where("topic_id = ?", topicID)
+		}
+	}
+
 	var items []models.ContentItem
 	meta, err := utils.FetchWithPagination(query, params, &items)
 	if err != nil {
@@ -264,6 +280,8 @@ type bulkDeleteContentRequest struct {
 	Status        string   `json:"status"`
 	SourceName    string   `json:"source_name"`
 	Type          string   `json:"type"`
+	Topic         string   `json:"topic"`
+	TopicID       string   `json:"topic_id"`
 	CreatedBefore string   `json:"created_before"`
 	IDs           []string `json:"ids"`
 	DryRun        bool     `json:"dry_run"`
@@ -314,9 +332,9 @@ func BulkDeleteContent(c *gin.Context) {
 	}
 
 	hasIDs := len(req.IDs) > 0
-	if !hasIDs && req.Status == "" && req.SourceName == "" && req.Type == "" && req.CreatedBefore == "" {
+	if !hasIDs && req.Status == "" && req.SourceName == "" && req.Type == "" && req.Topic == "" && req.TopicID == "" && req.CreatedBefore == "" {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "At least one filter is required (ids, status, type, source_name, or created_before)",
+			Message: "At least one filter is required (ids, status, type, topic, topic_id, source_name, or created_before)",
 			Code:    "FILTER_REQUIRED",
 		})
 		return
@@ -347,6 +365,18 @@ func BulkDeleteContent(c *gin.Context) {
 
 		if req.Type != "" {
 			query = query.Where("type = ?", strings.ToUpper(req.Type))
+		}
+
+		if req.Topic != "" {
+			query = query.Where("? = ANY(topic_tags)", req.Topic)
+		}
+
+		if req.TopicID != "" {
+			if strings.EqualFold(req.TopicID, "none") {
+				query = query.Where("topic_id IS NULL")
+			} else {
+				query = query.Where("topic_id = ?", req.TopicID)
+			}
 		}
 
 		if req.CreatedBefore != "" {
@@ -440,6 +470,8 @@ type bulkStatusChangeRequest struct {
 	FromStatus    string `json:"from_status"`
 	SourceName    string `json:"source_name"`
 	Type          string `json:"type"`
+	Topic         string `json:"topic"`
+	TopicID       string `json:"topic_id"`
 	CreatedBefore string `json:"created_before"`
 
 	// Always required — the status to move matching items into.
@@ -558,12 +590,13 @@ func BulkStatusChange(c *gin.Context) {
 		createdBefore = &parsed
 	}
 
+	// Cap is applied ONLY when the caller passes an explicit positive limit.
+	// With no limit the whole matching set is updated in one statement — topic
+	// rotations routinely touch thousands of rows, so the old hardcoded 500 cap
+	// would silently leave most of a topic untouched.
 	limit := req.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 500 {
-		limit = 500
+	if limit < 0 {
+		limit = 0
 	}
 
 	applyFilters := func(q *gorm.DB) *gorm.DB {
@@ -574,6 +607,16 @@ func BulkStatusChange(c *gin.Context) {
 		if req.Type != "" {
 			q = q.Where("type = ?", strings.ToUpper(req.Type))
 		}
+		if req.Topic != "" {
+			q = q.Where("? = ANY(topic_tags)", req.Topic)
+		}
+		if req.TopicID != "" {
+			if strings.EqualFold(req.TopicID, "none") {
+				q = q.Where("topic_id IS NULL")
+			} else {
+				q = q.Where("topic_id = ?", req.TopicID)
+			}
+		}
 		if createdBefore != nil {
 			q = q.Where("created_at < ?", *createdBefore)
 		}
@@ -583,7 +626,7 @@ func BulkStatusChange(c *gin.Context) {
 	if req.DryRun {
 		var count int64
 		applyFilters(db.Model(&models.ContentItem{})).Count(&count)
-		if int64(limit) < count {
+		if limit > 0 && int64(limit) < count {
 			count = int64(limit)
 		}
 		c.JSON(http.StatusOK, bulkStatusChangeResponse{
@@ -593,12 +636,17 @@ func BulkStatusChange(c *gin.Context) {
 		return
 	}
 
-	// Use a subquery to bound the number of rows updated.
-	subQuery := applyFilters(db.Model(&models.ContentItem{}).Select("id")).Limit(limit)
-
-	result := db.Model(&models.ContentItem{}).
-		Where("id IN (?)", subQuery).
-		Update("status", toStatus)
+	var result *gorm.DB
+	if limit > 0 {
+		// Bounded update — subquery caps the number of rows touched.
+		subQuery := applyFilters(db.Model(&models.ContentItem{}).Select("id")).Limit(limit)
+		result = db.Model(&models.ContentItem{}).
+			Where("id IN (?)", subQuery).
+			Update("status", toStatus)
+	} else {
+		// Uncapped — update the entire matching set in a single statement.
+		result = applyFilters(db.Model(&models.ContentItem{})).Update("status", toStatus)
+	}
 
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{

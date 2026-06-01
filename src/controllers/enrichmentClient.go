@@ -352,6 +352,59 @@ func extractURLViaEnrichment(url string) (*extractURLResult, error) {
 	return &decoded, nil
 }
 
+// ─── Topic labeling (first-class topics) ────────────────────
+//
+// generateTopicLabelViaEnrichment asks Enrichment's LLM to write ONE concise,
+// meaningful topic title (in the content's language) for a cluster of article
+// snippets. Used by the classifier when no existing topic is close enough and a
+// new topic must be created.
+
+type topicLabelResult struct {
+	Label string `json:"label"`
+}
+
+func generateTopicLabelViaEnrichment(texts []string) (string, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+	token := enrichmentServiceToken()
+	if token == "" {
+		return "", fmt.Errorf("enrichment service token is not configured")
+	}
+
+	payload := map[string]interface{}{"texts": texts}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal topic-label request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/topics/label", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build topic-label request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("enrichment topic-label request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("enrichment topic-label returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var decoded topicLabelResult
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return "", fmt.Errorf("decode topic-label response: %w", err)
+	}
+	return decoded.Label, nil
+}
+
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
 func triggerEmbedding(text string, contentID string, extractSparse bool) error {

@@ -30,10 +30,21 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/content/extract-url", controllers.ExtractContentURL)
 	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
 	adminGroup.GET("/content/status-counts", controllers.GetStatusCounts)
+	adminGroup.GET("/content/topics", controllers.ListContentTopics)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)
 	adminGroup.POST("/content/bulk-delete", controllers.BulkDeleteContent)
 	adminGroup.POST("/content/bulk-status", controllers.BulkStatusChange)
+	adminGroup.POST("/content/bulk-tags", controllers.BulkEditTags)
+	adminGroup.POST("/content/bulk-topic", controllers.BulkAssignTopic)
+
+	// First-class topics (LLM-labeled) management
+	adminGroup.PATCH("/topics/:id", controllers.RenameTopic)
+	adminGroup.DELETE("/topics/:id", controllers.DeleteTopic)
+	adminGroup.POST("/topics/merge", controllers.MergeTopics)
+	adminGroup.POST("/topics/reclassify", controllers.ReclassifyTopics)
+	adminGroup.POST("/topics/recluster", controllers.ReclusterTopics)
+	adminGroup.POST("/topics/label-batch", controllers.LabelTopicsBatch)
 
 	// Intelligence — Modes
 	adminGroup.GET("/intelligence/modes", controllers.GetModes)
