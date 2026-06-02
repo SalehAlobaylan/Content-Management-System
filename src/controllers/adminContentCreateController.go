@@ -33,83 +33,68 @@ type createAdminContentRequest struct {
 	Metadata     map[string]interface{} `json:"metadata"`
 }
 
-// CreateAdminContent handles POST /admin/content.
-//
-// Admins (News rotation) create an editorial item directly — there is no source
-// to scrape. We mirror the InternalCreateContentItem create logic but scope the
-// row to the caller's tenant, force source=MANUAL, default to a published
-// (READY) ARTICLE, and kick off a fire-and-forget embedding so the News slide's
-// related-items semantic search works for hand-authored articles too.
-func CreateAdminContent(c *gin.Context) {
-	principal, ok := requireAdminPrincipal(c)
-	if !ok {
-		return
+// parseFlexibleTime parses a timestamp from the common web/feed formats
+// (RFC3339, RSS pubDate / RFC1123, plain dates).
+func parseFlexibleTime(s string) *time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
 	}
-
-	db := c.MustGet("db").(*gorm.DB)
-
-	var req createAdminContentRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "Invalid request",
-			Code:    "INVALID_REQUEST",
-		})
-		return
+	for _, layout := range []string{
+		time.RFC3339,
+		time.RFC1123Z,
+		time.RFC1123,
+		"2006-01-02T15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return &t
+		}
 	}
+	return nil
+}
 
+// createManualArticle creates — or returns the existing — manual content item
+// for a URL, keyed by a deterministic idempotency key. Returns (item, created,
+// err). Newly-created READY items get a fire-and-forget embedding, which in turn
+// triggers first-class topic classification. Shared by single create + feed import.
+func createManualArticle(db *gorm.DB, tenantID string, req createAdminContentRequest) (models.ContentItem, bool, error) {
 	title := strings.TrimSpace(req.Title)
 	originalURL := strings.TrimSpace(req.OriginalURL)
 	if title == "" || originalURL == "" {
-		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "title and original_url are required",
-			Code:    "MISSING_FIELDS",
-		})
-		return
+		return models.ContentItem{}, false, errors.New("title and original_url are required")
 	}
 
 	contentType := models.ContentTypeArticle
 	if t := strings.ToUpper(strings.TrimSpace(req.Type)); t != "" {
 		contentType = models.ContentType(t)
 	}
-
 	status := models.ContentStatusReady
 	if s := strings.ToUpper(strings.TrimSpace(req.Status)); s != "" {
 		status = models.ContentStatus(s)
 	}
-
 	sourceName := "Manual"
 	if req.SourceName != nil && strings.TrimSpace(*req.SourceName) != "" {
 		sourceName = strings.TrimSpace(*req.SourceName)
 	}
 
-	// Deterministic idempotency key keyed on the URL so an accidental
-	// double-submit of the same article doesn't create duplicate rows.
 	sum := sha256.Sum256([]byte("manual:" + strings.ToLower(originalURL)))
 	idempotencyKey := "manual:" + hex.EncodeToString(sum[:])
 
 	var existing models.ContentItem
-	if err := db.Where("idempotency_key = ? AND tenant_id = ?", idempotencyKey, principal.TenantID).
+	if err := db.Where("idempotency_key = ? AND tenant_id = ?", idempotencyKey, tenantID).
 		First(&existing).Error; err == nil {
-		// Already created for this URL — return the existing row so the UI is
-		// idempotent rather than erroring.
-		c.JSON(http.StatusOK, mapAdminContentItemResponse(existing))
-		return
+		return existing, false, nil
 	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to check idempotency",
-			Code:    "IDEMPOTENCY_CHECK_FAILED",
-		})
-		return
+		return models.ContentItem{}, false, err
 	}
 
-	// Default published_at to now so new editorial items surface at the top of
-	// the chronological News feed immediately.
-	var publishedAt *time.Time
-	if req.PublishedAt != nil && strings.TrimSpace(*req.PublishedAt) != "" {
-		if parsed, err := time.Parse(time.RFC3339, *req.PublishedAt); err == nil {
-			publishedAt = &parsed
-		}
+	pub := ""
+	if req.PublishedAt != nil {
+		pub = *req.PublishedAt
 	}
+	publishedAt := parseFlexibleTime(pub)
 	if publishedAt == nil {
 		now := time.Now().UTC()
 		publishedAt = &now
@@ -118,7 +103,7 @@ func CreateAdminContent(c *gin.Context) {
 	metadataJSON, _ := json.Marshal(req.Metadata)
 
 	item := models.ContentItem{
-		TenantID:       principal.TenantID,
+		TenantID:       tenantID,
 		Type:           contentType,
 		Source:         models.SourceTypeManual,
 		Status:         status,
@@ -134,18 +119,10 @@ func CreateAdminContent(c *gin.Context) {
 		Metadata:       datatypes.JSON(metadataJSON),
 		PublishedAt:    publishedAt,
 	}
-
 	if err := db.Create(&item).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to create content item",
-			Code:    "CREATE_FAILED",
-		})
-		return
+		return models.ContentItem{}, false, err
 	}
 
-	// Fire-and-forget embedding. Only meaningful once the item is READY; a
-	// failure here is non-fatal because the News slide falls back to
-	// date-ordered related items when an article has no embedding.
 	if status == models.ContentStatusReady {
 		if text := buildEmbeddingText(&item); strings.TrimSpace(text) != "" {
 			id := item.PublicID.String()
@@ -154,8 +131,120 @@ func CreateAdminContent(c *gin.Context) {
 			}()
 		}
 	}
+	return item, true, nil
+}
 
+// CreateAdminContent handles POST /admin/content — manual single-article create.
+func CreateAdminContent(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req createAdminContentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request", Code: "INVALID_REQUEST"})
+		return
+	}
+	if strings.TrimSpace(req.Title) == "" || strings.TrimSpace(req.OriginalURL) == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "title and original_url are required", Code: "MISSING_FIELDS"})
+		return
+	}
+
+	item, created, err := createManualArticle(db, principal.TenantID, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create content item: " + err.Error(), Code: "CREATE_FAILED"})
+		return
+	}
+	if !created {
+		c.JSON(http.StatusOK, mapAdminContentItemResponse(item))
+		return
+	}
 	c.JSON(http.StatusCreated, mapAdminContentItemResponse(item))
+}
+
+type importFeedRequest struct {
+	URL    string `json:"url"`
+	Status string `json:"status"`
+}
+
+type importFeedResponse struct {
+	IsFeed   bool   `json:"is_feed"`
+	Imported int    `json:"imported"`
+	Skipped  int    `json:"skipped"`
+	Total    int    `json:"total"`
+	SiteName string `json:"site_name"`
+}
+
+func optStr(s string) *string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	return &s
+}
+
+// ImportFeed handles POST /admin/content/import-feed — fetch an RSS/Atom feed
+// (stealth, via Enrichment) and bulk-create a content item for EVERY item.
+// Deduplicated by article URL; created READY items auto-classify into topics.
+func ImportFeed(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req importFeedRequest
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "url is required", Code: "URL_REQUIRED"})
+		return
+	}
+
+	feed, err := extractFeedViaEnrichment(strings.TrimSpace(req.URL))
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Failed to read feed: " + err.Error(), Code: "FEED_EXTRACT_FAILED"})
+		return
+	}
+
+	status := strings.ToUpper(strings.TrimSpace(req.Status))
+	if status == "" {
+		status = string(models.ContentStatusReady)
+	}
+
+	imported, skipped := 0, 0
+	for _, it := range feed.Items {
+		title := strings.TrimSpace(it.Title)
+		itemURL := strings.TrimSpace(it.URL)
+		if title == "" || itemURL == "" {
+			skipped++
+			continue
+		}
+		cr := createAdminContentRequest{
+			Title:        title,
+			OriginalURL:  itemURL,
+			Excerpt:      optStr(it.Excerpt),
+			BodyText:     optStr(it.Text),
+			ThumbnailURL: optStr(it.ImageURL),
+			Author:       optStr(it.Author),
+			SourceName:   optStr(feed.SiteName),
+			PublishedAt:  optStr(it.PublishedAt),
+			Type:         string(models.ContentTypeArticle),
+			Status:       status,
+		}
+		if _, wasCreated, cerr := createManualArticle(db, principal.TenantID, cr); cerr != nil || !wasCreated {
+			skipped++
+		} else {
+			imported++
+		}
+	}
+
+	c.JSON(http.StatusOK, importFeedResponse{
+		IsFeed:   feed.IsFeed,
+		Imported: imported,
+		Skipped:  skipped,
+		Total:    len(feed.Items),
+		SiteName: feed.SiteName,
+	})
 }
 
 // extractContentURLRequest is the payload for POST /admin/content/extract-url.

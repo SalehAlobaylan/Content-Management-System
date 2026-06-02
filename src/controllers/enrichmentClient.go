@@ -352,6 +352,69 @@ func extractURLViaEnrichment(url string) (*extractURLResult, error) {
 	return &decoded, nil
 }
 
+// ─── Whole-feed extraction (RSS/Atom import) ────────────────
+
+type feedExtractItem struct {
+	Title       string `json:"title"`
+	Text        string `json:"text"`
+	Excerpt     string `json:"excerpt"`
+	URL         string `json:"url"`
+	ImageURL    string `json:"image_url"`
+	PublishedAt string `json:"published_at"`
+	Author      string `json:"author"`
+}
+
+type feedExtractResult struct {
+	IsFeed   bool              `json:"is_feed"`
+	SiteName string            `json:"site_name"`
+	Items    []feedExtractItem `json:"items"`
+}
+
+// extractFeedViaEnrichment asks Enrichment to extract EVERY item from an
+// RSS/Atom feed (stealth fetch via Scrapling). Used by the News feed-import.
+func extractFeedViaEnrichment(url string) (*feedExtractResult, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+	token := enrichmentServiceToken()
+	if token == "" {
+		return nil, fmt.Errorf("enrichment service token is not configured")
+	}
+
+	payload := map[string]interface{}{"url": url}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal feed-extract request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/extract/feed", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build feed-extract request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// A feed can have many items behind a stealth fetch — allow 60s.
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("enrichment feed-extract request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("enrichment feed-extract returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var decoded feedExtractResult
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode feed-extract response: %w", err)
+	}
+	return &decoded, nil
+}
+
 // ─── Topic labeling (first-class topics) ────────────────────
 //
 // generateTopicLabelViaEnrichment asks Enrichment's LLM to write ONE concise,

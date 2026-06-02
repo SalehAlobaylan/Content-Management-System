@@ -118,6 +118,8 @@ func main() {
 			&models.ContentFlag{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
+			// Saved syndication feeds (RSS/Atom/JSON)
+			&models.RSSFeed{},
 			// Storage management
 			&models.StoragePolicy{},
 			&models.StorageSweepRun{},

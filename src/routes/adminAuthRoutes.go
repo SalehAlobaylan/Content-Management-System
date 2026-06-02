@@ -28,6 +28,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/content", controllers.ListContentItems)
 	adminGroup.POST("/content", controllers.CreateAdminContent)
 	adminGroup.POST("/content/extract-url", controllers.ExtractContentURL)
+	adminGroup.POST("/content/import-feed", controllers.ImportFeed)
 	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
 	adminGroup.GET("/content/status-counts", controllers.GetStatusCounts)
 	adminGroup.GET("/content/topics", controllers.ListContentTopics)
@@ -45,6 +46,12 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/topics/reclassify", controllers.ReclassifyTopics)
 	adminGroup.POST("/topics/recluster", controllers.ReclusterTopics)
 	adminGroup.POST("/topics/label-batch", controllers.LabelTopicsBatch)
+
+	// Saved syndication feeds (RSS/Atom/JSON output)
+	adminGroup.GET("/feeds", controllers.ListRSSFeeds)
+	adminGroup.POST("/feeds", controllers.CreateRSSFeed)
+	adminGroup.PUT("/feeds/:id", controllers.UpdateRSSFeed)
+	adminGroup.DELETE("/feeds/:id", controllers.DeleteRSSFeed)
 
 	// Intelligence — Modes
 	adminGroup.GET("/intelligence/modes", controllers.GetModes)
