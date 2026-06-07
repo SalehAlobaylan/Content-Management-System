@@ -22,6 +22,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.PATCH("/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
 	internal.PATCH("/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
 	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
+	// Auto-STT path (Aggregation AI worker) — guard-enforced (toggle + budget).
+	internal.POST("/content-items/:id/request-stt", controllers.InternalRequestSTT)
 
 	// Slice A hybrid retrieval — used by Enrichment-Service's /v1/related.
 	// GET /:id/embeddings: fetch (dense, sparse) for an anchor.

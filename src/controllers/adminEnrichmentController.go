@@ -46,6 +46,9 @@ type missingEnrichmentItem struct {
 
 type triggerEnrichmentRequest struct {
 	Types []string `json:"types" binding:"required"`
+	// Force bypasses the STT guard's toggle + state-machine checks (manual
+	// "Enrich with STT" upgrade). The budget cap still applies.
+	Force bool `json:"force"`
 }
 
 type triggerBatchRequest struct {
@@ -215,7 +218,7 @@ func TriggerEnrichment(c *gin.Context) {
 		return
 	}
 
-	results, errors := triggerItemArtifacts(&item, req.Types)
+	results, errors := triggerItemArtifacts(db, &item, req.Types, req.Force)
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -266,7 +269,7 @@ func TriggerBatchEnrichment(c *gin.Context) {
 			continue
 		}
 
-		_, itemErrors := triggerItemArtifacts(&item, req.Types)
+		_, itemErrors := triggerItemArtifacts(db, &item, req.Types, false)
 
 		if len(itemErrors) > 0 {
 			results = append(results, triggerResultItem{
@@ -413,12 +416,17 @@ func buildMissingQuery(db *gorm.DB, missingParam, contentType, status string) *g
 // triggerItemArtifacts runs the requested enrichment passes for one item.
 // Already-present artifacts are reported as skips (in results), not errors.
 // Used by the single, batch, and bulk trigger paths so behaviour is identical.
-func triggerItemArtifacts(item *models.ContentItem, types []string) (results, errs []string) {
+// `force` only affects the transcript (STT) pass: it bypasses the guard's
+// toggle + state-machine checks for a manual upgrade (budget cap still applies).
+func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string, force bool) (results, errs []string) {
 	id := item.PublicID.String()
 	for _, enrichType := range types {
 		switch enrichType {
 		case "transcript":
-			if item.TranscriptID != nil {
+			// When not forcing, an already-linked transcript is a skip. A forced
+			// manual upgrade is allowed to re-run (e.g. youtube_auto → STT); the
+			// guard's stt_done check still prevents wasteful re-billing.
+			if item.TranscriptID != nil && !force {
 				results = append(results, "transcript: already exists")
 				continue
 			}
@@ -430,8 +438,12 @@ func triggerItemArtifacts(item *models.ContentItem, types []string) (results, er
 				errs = append(errs, "transcript: no media_url available")
 				continue
 			}
-			if err := triggerTranscription(*item.MediaURL, id); err != nil {
-				errs = append(errs, "transcript: "+err.Error())
+			if err := triggerTranscription(item, db, force); err != nil {
+				if isSTTSkipped(err) {
+					results = append(results, "transcript: skipped ("+err.Error()+")")
+				} else {
+					errs = append(errs, "transcript: "+err.Error())
+				}
 			} else {
 				results = append(results, "transcript: triggered")
 			}
@@ -584,7 +596,7 @@ func TriggerAllEnrichment(c *gin.Context) {
 	}
 	bulkMu.Unlock()
 
-	go runBulkEnrich(items, req.Types)
+	go runBulkEnrich(db, items, req.Types)
 
 	c.JSON(http.StatusAccepted, utils.ResponseMessage{
 		Code:    http.StatusAccepted,
@@ -596,9 +608,9 @@ func TriggerAllEnrichment(c *gin.Context) {
 // runBulkEnrich processes the captured items sequentially in the background.
 // Sequential is intentional — it self-throttles the downstream AI services
 // (one model call at a time) instead of stampeding them.
-func runBulkEnrich(items []models.ContentItem, types []string) {
+func runBulkEnrich(db *gorm.DB, items []models.ContentItem, types []string) {
 	for i := range items {
-		_, errs := triggerItemArtifacts(&items[i], types)
+		_, errs := triggerItemArtifacts(db, &items[i], types, false)
 		bulkMu.Lock()
 		bulkState.Done++
 		if len(errs) > 0 {

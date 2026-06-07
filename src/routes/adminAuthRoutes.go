@@ -61,6 +61,10 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/intelligence/ranking", controllers.GetRankingConfig)
 	adminGroup.PUT("/intelligence/ranking", controllers.UpdateRankingConfig)
 
+	// Media — Transcription/STT config (auto-STT toggle + budget cap)
+	adminGroup.GET("/transcription-config", controllers.GetTranscriptionConfig)
+	adminGroup.PATCH("/transcription-config", controllers.UpdateTranscriptionConfig)
+
 	// Intelligence — Content Flags
 	adminGroup.GET("/intelligence/flags", controllers.ListContentFlags)
 	adminGroup.GET("/intelligence/flags/:content_id", controllers.GetContentFlag)

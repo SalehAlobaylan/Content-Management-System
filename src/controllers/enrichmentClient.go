@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"bytes"
+	"content-management-system/src/models"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // ─── Service URL + token resolution ─────────────────────────
@@ -107,10 +110,25 @@ func checkMediaHealth() (*serviceHealthResponse, error) {
 
 // ─── Trigger helpers (called by admin retry / batch endpoints) ──
 
-// triggerTranscription sends a transcription request to the Media-Service.
-// It uses multipart/form-data because Media's /v1/transcribe endpoint expects
-// Form fields. Media writes the transcript back to CMS via /internal endpoints.
-func triggerTranscription(mediaURL string, contentID string) error {
+// triggerTranscription sends a transcription request to the Media-Service for
+// the given item. It first runs the our-side STT guard (toggle + state machine +
+// budget cap) — when the guard declines, it returns a *sttSkippedError that
+// callers surface as "skipped" rather than a failure. On success it tracks the
+// estimated spend. Media writes the transcript back to CMS via /internal
+// endpoints (which set caption_state=stt_done + transcript_source).
+//
+// `force` bypasses the toggle + state-machine checks (manual admin upgrade) but
+// still honors the budget cap.
+func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) error {
+	if item.MediaURL == nil || *item.MediaURL == "" {
+		return fmt.Errorf("no media_url available")
+	}
+
+	// Guard: may return *sttSkippedError (idempotent / disabled / over budget).
+	if err := sttGuard(db, item, force); err != nil {
+		return err
+	}
+
 	baseURL := mediaBaseURL()
 	if baseURL == "" {
 		return fmt.Errorf("MEDIA_BASE_URL is not configured")
@@ -124,8 +142,8 @@ func triggerTranscription(mediaURL string, contentID string) error {
 	// Build multipart form body (Media /v1/transcribe expects Form fields)
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-	writer.WriteField("url", mediaURL)
-	writer.WriteField("content_id", contentID)
+	writer.WriteField("url", *item.MediaURL)
+	writer.WriteField("content_id", item.PublicID.String())
 	writer.WriteField("word_timestamps", "true")
 	writer.Close()
 
@@ -150,6 +168,8 @@ func triggerTranscription(mediaURL string, contentID string) error {
 		return fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	// Track estimated spend against the monthly budget window.
+	addTranscriptionSpend(db, item.TenantID, estimateSTTCostUSD(item.DurationSec))
 	return nil
 }
 

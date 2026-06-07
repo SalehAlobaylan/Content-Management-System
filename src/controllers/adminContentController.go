@@ -44,6 +44,10 @@ type adminContentItemResponse struct {
 	ViewCount    int                    `json:"view_count"`
 	ShareCount   int                    `json:"share_count"`
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	// Caption-first state (Media tab badges + STT action gating).
+	CaptionState     *string `json:"caption_state,omitempty"`
+	TranscriptSource *string `json:"transcript_source,omitempty"`
+	HasTranscript    bool    `json:"has_transcript"`
 }
 
 type updateContentStatusRequest struct {
@@ -269,10 +273,13 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 		PublishedAt:  publishedAt,
 		CreatedAt:    item.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:    item.UpdatedAt.UTC().Format(time.RFC3339),
-		LikeCount:    item.LikeCount,
-		ViewCount:    item.ViewCount,
-		ShareCount:   item.ShareCount,
-		Metadata:     metadata,
+		LikeCount:        item.LikeCount,
+		ViewCount:        item.ViewCount,
+		ShareCount:       item.ShareCount,
+		Metadata:         metadata,
+		CaptionState:     item.CaptionState,
+		TranscriptSource: item.TranscriptSource,
+		HasTranscript:    item.TranscriptID != nil,
 	}
 }
 

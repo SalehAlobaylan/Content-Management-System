@@ -116,6 +116,8 @@ func main() {
 			// Intelligence / Ranking
 			&models.RankingConfig{},
 			&models.ContentFlag{},
+			// Media — transcription/STT config (auto-STT toggle + budget)
+			&models.TranscriptionConfig{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
 			// Saved syndication feeds (RSS/Atom/JSON)

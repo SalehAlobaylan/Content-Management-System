@@ -98,6 +98,15 @@ type ContentItem struct {
 	// Transcript link (optional)
 	TranscriptID *uuid.UUID `gorm:"type:uuid" json:"transcript_id,omitempty"`
 
+	// Caption/transcript provenance — lightweight denormalized state for fast
+	// feed filtering + console badges WITHOUT joining the large Transcript row
+	// (decoupling). CaptionState drives the never-downgrade state machine
+	// (none → youtube_auto → stt_done; youtube_human terminal) and the
+	// idempotency/budget guard. TranscriptSource is the concrete source string
+	// (youtube_human|youtube_auto|stt_deepgram|stt_whisper). See models.CaptionState*.
+	CaptionState     *string `gorm:"type:varchar(20);index:idx_content_items_caption_state" json:"caption_state,omitempty"`
+	TranscriptSource *string `gorm:"type:varchar(32)" json:"transcript_source,omitempty"`
+
 	// Engagement counters
 	LikeCount    int `gorm:"default:0" json:"like_count"`
 	CommentCount int `gorm:"default:0" json:"comment_count"`
