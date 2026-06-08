@@ -65,6 +65,12 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/transcription-config", controllers.GetTranscriptionConfig)
 	adminGroup.PATCH("/transcription-config", controllers.UpdateTranscriptionConfig)
 
+	// Media Studio — per-item transcript + chapter editor
+	adminGroup.GET("/content/:id/studio", controllers.GetStudio)
+	adminGroup.POST("/content/:id/chapters/generate", controllers.GenerateChapters)
+	adminGroup.PUT("/content/:id/chapters", controllers.SaveChapters)
+	adminGroup.PUT("/content/:id/transcript", controllers.SaveTranscript)
+
 	// Intelligence — Content Flags
 	adminGroup.GET("/intelligence/flags", controllers.ListContentFlags)
 	adminGroup.GET("/intelligence/flags/:content_id", controllers.GetContentFlag)

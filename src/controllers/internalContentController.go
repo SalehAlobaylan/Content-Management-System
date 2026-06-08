@@ -77,6 +77,11 @@ type internalUpdateArtifactsRequest struct {
 	OriginalBitrateKbps     *int   `json:"original_bitrate_kbps"`
 	CurrentBitrateKbps      *int   `json:"current_bitrate_kbps"`
 	CurrentQualityProfileID *uint  `json:"current_quality_profile_id"`
+
+	// Download-time signals harvested from the yt-dlp info-json (heatmap,
+	// sponsor_segments, categories). MERGED into the existing metadata jsonb so
+	// fetcher-set keys (videoId, tags, categoryId, …) are preserved.
+	Metadata map[string]interface{} `json:"metadata"`
 }
 
 type internalUpdateEmbeddingRequest struct {
@@ -363,6 +368,21 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if req.CurrentQualityProfileID != nil {
 		v := *req.CurrentQualityProfileID
 		item.CurrentQualityProfileID = &v
+	}
+
+	// Merge download-time metadata keys without clobbering existing ones
+	// (same pattern as InternalUpdateContentStatus's failure_reason merge).
+	if len(req.Metadata) > 0 {
+		metadata := map[string]interface{}{}
+		if len(item.Metadata) > 0 {
+			_ = json.Unmarshal(item.Metadata, &metadata)
+		}
+		for k, v := range req.Metadata {
+			metadata[k] = v
+		}
+		if raw, err := json.Marshal(metadata); err == nil {
+			item.Metadata = datatypes.JSON(raw)
+		}
 	}
 
 	if err := db.Save(&item).Error; err != nil {

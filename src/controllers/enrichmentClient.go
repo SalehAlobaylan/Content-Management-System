@@ -488,6 +488,97 @@ func generateTopicLabelViaEnrichment(texts []string) (string, error) {
 	return decoded.Label, nil
 }
 
+// ─── Media Studio: LLM chapter generation ───────────────────
+//
+// generateChaptersViaEnrichment delegates chapter segmentation to Enrichment's
+// /v1/chapters/generate. CMS sends numbered transcript WINDOWS; the LLM returns
+// boundary window indices (+ title/summary). Stateless — CMS maps indices back
+// to timestamps and persists. Mirrors generateTopicLabelViaEnrichment.
+
+type chapterWindowPayload struct {
+	Index    int     `json:"index"`
+	StartSec float64 `json:"start_sec"`
+	Text     string  `json:"text"`
+}
+
+type chaptersGenOpts struct {
+	Mode              string `json:"mode"`
+	TargetCount       *int   `json:"target_count,omitempty"`
+	TargetDurationSec *int   `json:"target_duration_sec,omitempty"`
+	MinSec            *int   `json:"min_sec,omitempty"`
+	MaxSec            *int   `json:"max_sec,omitempty"`
+	WithSummary       bool   `json:"with_summary"`
+	Language          string `json:"language,omitempty"`
+}
+
+type generatedChapter struct {
+	StartIndex int     `json:"start_index"`
+	Title      string  `json:"title"`
+	Summary    *string `json:"summary"`
+}
+
+type chaptersGenerateResult struct {
+	Chapters []generatedChapter `json:"chapters"`
+}
+
+func generateChaptersViaEnrichment(
+	windows []chapterWindowPayload,
+	opts chaptersGenOpts,
+) ([]generatedChapter, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+	token := enrichmentServiceToken()
+	if token == "" {
+		return nil, fmt.Errorf("enrichment service token is not configured")
+	}
+
+	payload := map[string]interface{}{
+		"windows":             windows,
+		"mode":                opts.Mode,
+		"with_summary":        opts.WithSummary,
+		"target_count":        opts.TargetCount,
+		"target_duration_sec": opts.TargetDurationSec,
+		"min_sec":             opts.MinSec,
+		"max_sec":             opts.MaxSec,
+	}
+	if opts.Language != "" {
+		payload["language"] = opts.Language
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal chapters request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chapters/generate", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build chapters request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	// LLM segmentation over a long transcript — allow generous time.
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("enrichment chapters request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("enrichment chapters returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var decoded chaptersGenerateResult
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, fmt.Errorf("decode chapters response: %w", err)
+	}
+	return decoded.Chapters, nil
+}
+
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
 func triggerEmbedding(text string, contentID string, extractSparse bool) error {
