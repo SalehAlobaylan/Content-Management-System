@@ -293,6 +293,18 @@ func mapStudioContent(item *models.ContentItem) studioContentDTO {
 	if item.Title != nil {
 		dto.Title = *item.Title
 	}
+
+	// Surface download-time engagement signals stored in metadata jsonb.
+	if len(item.Metadata) > 0 {
+		var meta struct {
+			Heatmap         []heatmapPoint   `json:"heatmap"`
+			SponsorSegments []sponsorSegment `json:"sponsor_segments"`
+		}
+		if json.Unmarshal(item.Metadata, &meta) == nil {
+			dto.Heatmap = meta.Heatmap
+			dto.SponsorSegments = meta.SponsorSegments
+		}
+	}
 	return dto
 }
 

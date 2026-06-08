@@ -354,11 +354,12 @@ func buildEmbeddingText(item *models.ContentItem) string {
 		parts = append(parts, *item.Excerpt)
 	}
 	if item.BodyText != nil && *item.BodyText != "" {
-		// Truncate body text to first 500 runes for embedding (UTF-8 safe)
+		// Include the (fuller) description/body — capped for UTF-8 safety. Raised
+		// from 500 so a video's full YouTube description contributes to the vector.
 		body := *item.BodyText
 		runes := []rune(body)
-		if len(runes) > 500 {
-			body = string(runes[:500])
+		if len(runes) > 3000 {
+			body = string(runes[:3000])
 		}
 		parts = append(parts, body)
 	}
