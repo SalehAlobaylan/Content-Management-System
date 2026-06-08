@@ -4,6 +4,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,20 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// Embedding text cleanup: strip URLs + collapse whitespace so a noisy YouTube
+// description (links/affiliate/social CTAs) doesn't dilute the vector. Safe for
+// article bodies too.
+var (
+	embedURLRegex        = regexp.MustCompile(`https?://\S+`)
+	embedWhitespaceRegex = regexp.MustCompile(`\s+`)
+)
+
+func cleanForEmbedding(text string) string {
+	text = embedURLRegex.ReplaceAllString(text, " ")
+	text = embedWhitespaceRegex.ReplaceAllString(text, " ")
+	return strings.TrimSpace(text)
+}
 
 // ── Response types ──────────────────────────────────────────
 
@@ -354,9 +369,10 @@ func buildEmbeddingText(item *models.ContentItem) string {
 		parts = append(parts, *item.Excerpt)
 	}
 	if item.BodyText != nil && *item.BodyText != "" {
-		// Include the (fuller) description/body — capped for UTF-8 safety. Raised
-		// from 500 so a video's full YouTube description contributes to the vector.
-		body := *item.BodyText
+		// Clean (strip URLs / collapse whitespace) then cap — the fuller body
+		// contributes to the vector without its boilerplate/links. Capped for
+		// UTF-8 safety; raised from 500 so the description meaningfully counts.
+		body := cleanForEmbedding(*item.BodyText)
 		runes := []rune(body)
 		if len(runes) > 3000 {
 			body = string(runes[:3000])
