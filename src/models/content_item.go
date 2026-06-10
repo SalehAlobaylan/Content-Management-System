@@ -70,8 +70,8 @@ type ContentItem struct {
 	Type ContentType `gorm:"type:varchar(20);not null" json:"type"`
 	// Format sub-classifies a NEWS item (ARTICLE/TWEET/COMMENT). NULL for
 	// VIDEO/PODCAST media. Populated by the type→format migration + ingest.
-	Format *string    `gorm:"type:varchar(20)" json:"format,omitempty"`
-	Source SourceType `gorm:"type:varchar(20);not null" json:"source,omitempty"`
+	Format *string       `gorm:"type:varchar(20)" json:"format,omitempty"`
+	Source SourceType    `gorm:"type:varchar(20);not null" json:"source,omitempty"`
 	Status ContentStatus `gorm:"type:varchar(20);default:'READY'" json:"status,omitempty"`
 	// Idempotency
 	IdempotencyKey *string `gorm:"type:varchar(512);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
@@ -88,9 +88,9 @@ type ContentItem struct {
 	DurationSec  *int    `gorm:"type:integer" json:"duration_sec,omitempty"`
 
 	// Attribution
-	Author        *string    `gorm:"type:varchar(255)" json:"author,omitempty"`
-	SourceName    *string    `gorm:"type:varchar(255)" json:"source_name,omitempty"`
-	SourceFeedURL *string    `gorm:"type:text" json:"-"`
+	Author        *string `gorm:"type:varchar(255)" json:"author,omitempty"`
+	SourceName    *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`
+	SourceFeedURL *string `gorm:"type:text" json:"-"`
 	// AuthorID points at the IAM user who submitted user-generated content.
 	// NULL for ingested content (RSS, scrapes, etc.) — keeps backwards-compat.
 	AuthorID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_author_id" json:"author_id,omitempty"`
@@ -128,7 +128,8 @@ type ContentItem struct {
 	// (decoupling). CaptionState drives the never-downgrade state machine
 	// (none → youtube_auto → stt_done; youtube_human terminal) and the
 	// idempotency/budget guard. TranscriptSource is the concrete source string
-	// (youtube_human|youtube_auto|stt_deepgram|stt_whisper). See models.CaptionState*.
+	// (youtube_human|youtube_auto|stt_deepgram; stt_whisper is historical).
+	// See models.CaptionState*.
 	CaptionState     *string `gorm:"type:varchar(20);index:idx_content_items_caption_state" json:"caption_state,omitempty"`
 	TranscriptSource *string `gorm:"type:varchar(32)" json:"transcript_source,omitempty"`
 

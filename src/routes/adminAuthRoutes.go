@@ -67,6 +67,10 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Media — Transcription/STT config (auto-STT toggle + budget cap)
 	adminGroup.GET("/transcription-config", controllers.GetTranscriptionConfig)
 	adminGroup.PATCH("/transcription-config", controllers.UpdateTranscriptionConfig)
+	adminGroup.GET("/transcription/jobs", controllers.ListTranscriptionJobs)
+	adminGroup.POST("/transcription/jobs", controllers.CreateTranscriptionJob)
+	adminGroup.POST("/transcription/jobs/bulk", controllers.BulkCreateTranscriptionJobs)
+	adminGroup.GET("/transcription/quality", controllers.ListTranscriptQuality)
 
 	// Media Studio — per-item transcript + chapter editor
 	adminGroup.GET("/content/:id/studio", controllers.GetStudio)

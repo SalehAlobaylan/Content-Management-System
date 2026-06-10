@@ -568,9 +568,9 @@ type internalKNNSparseRequest struct {
 }
 
 type internalKNNHit struct {
-	ID          string  `json:"id"`   // public_id (UUID string)
-	Type        string  `json:"type"` // ContentType (TWEET, COMMENT, ARTICLE, ...)
-	Score       float64 `json:"score"`
+	ID    string  `json:"id"`   // public_id (UUID string)
+	Type  string  `json:"type"` // ContentType (TWEET, COMMENT, ARTICLE, ...)
+	Score float64 `json:"score"`
 	// SourceName + PublishedAt let downstream ranking rules (source
 	// diversity, freshness decay) run on the kNN results directly,
 	// without a second round-trip to /internal/content-items/batch-text.
@@ -707,7 +707,7 @@ type internalBatchTextRequest struct {
 }
 
 type internalBatchTextItem struct {
-	ID          string  `json:"id"`           // public_id (UUID string)
+	ID          string  `json:"id"` // public_id (UUID string)
 	Type        string  `json:"type"`
 	Title       *string `json:"title"`
 	Excerpt     *string `json:"excerpt"`
@@ -974,12 +974,13 @@ type internalListContentItemResponse struct {
 }
 
 // InternalListContentItems handles GET /internal/content-items
-// Supports ?status=FAILED&source=TELEGRAM&limit=100&page=1
+// Supports ?status=FAILED&source=TELEGRAM&ids=a,b&limit=100&page=1
 func InternalListContentItems(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
 	status := strings.ToUpper(strings.TrimSpace(c.Query("status")))
 	source := strings.ToUpper(strings.TrimSpace(c.Query("source")))
+	rawIDs := strings.TrimSpace(c.Query("ids"))
 
 	limit := 100
 	if l, err := strconv.Atoi(c.Query("limit")); err == nil && l > 0 && l <= 500 {
@@ -997,6 +998,20 @@ func InternalListContentItems(c *gin.Context) {
 	}
 	if source != "" {
 		query = query.Where("source = ?", source)
+	}
+	if rawIDs != "" {
+		ids := []uuid.UUID{}
+		for _, raw := range strings.Split(rawIDs, ",") {
+			id, err := uuid.Parse(strings.TrimSpace(raw))
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid ids parameter"})
+				return
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) > 0 {
+			query = query.Where("public_id IN ?", ids)
+		}
 	}
 
 	var total int64
@@ -1073,15 +1088,15 @@ func InternalGetContentItem(c *gin.Context) {
 		// — without it the resolver can never pick a source-scoped ingest
 		// profile (e.g. "YouTube items use mobile-720p"). Stringified so
 		// callers can match against the string values in QualityProfile.SourceType.
-		"source_type":   string(item.Source),
-		"title":         item.Title,
-		"excerpt":       item.Excerpt,
-		"source_name":   item.SourceName,
-		"published_at":  publishedAt,
-		"media_url":     item.MediaURL,
-		"thumbnail_url": item.ThumbnailURL,
-		"storage_tier":  item.StorageTier, // nil = primary
-		"media_version": item.MediaVersion,
+		"source_type":                string(item.Source),
+		"title":                      item.Title,
+		"excerpt":                    item.Excerpt,
+		"source_name":                item.SourceName,
+		"published_at":               publishedAt,
+		"media_url":                  item.MediaURL,
+		"thumbnail_url":              item.ThumbnailURL,
+		"storage_tier":               item.StorageTier, // nil = primary
+		"media_version":              item.MediaVersion,
 		"file_size_bytes":            item.FileSizeBytes,
 		"current_quality_profile_id": item.CurrentQualityProfileID,
 		"current_bitrate_kbps":       item.CurrentBitrateKbps,

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -87,9 +88,12 @@ type studioChapterDTO struct {
 }
 
 type studioResponse struct {
-	Content    studioContentDTO     `json:"content"`
-	Transcript *studioTranscriptDTO `json:"transcript"`
-	Chapters   []studioChapterDTO   `json:"chapters"`
+	Content                studioContentDTO           `json:"content"`
+	Transcript             *studioTranscriptDTO       `json:"transcript"`
+	Chapters               []studioChapterDTO         `json:"chapters"`
+	LatestTranscriptionJob *transcriptionJobResponse  `json:"latest_transcription_job,omitempty"`
+	TranscriptQuality      *transcriptQualityResponse `json:"transcript_quality,omitempty"`
+	TranscriptAudit        map[string]interface{}     `json:"transcript_audit,omitempty"`
 }
 
 // ─── Helpers ────────────────────────────────────────────────
@@ -271,7 +275,16 @@ func GetStudio(c *gin.Context) {
 		}
 		chapters := loadOrSeedChapters(db, principal.TenantID, transcript)
 		resp.Chapters = chaptersToDTO(chapters, durationMs(item))
+		if q := latestTranscriptQuality(db, item.PublicID); q != nil {
+			mapped := mapTranscriptQuality(*q)
+			resp.TranscriptQuality = &mapped
+		}
 	}
+	if job := latestTranscriptionJob(db, item.PublicID); job != nil {
+		mapped := mapTranscriptionJob(*job)
+		resp.LatestTranscriptionJob = &mapped
+	}
+	resp.TranscriptAudit = studioAuditSummary(db, principal.TenantID, item.PublicID.String())
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -509,6 +522,12 @@ func SaveChapters(c *gin.Context) {
 	}
 
 	durMs := durationMs(item)
+	var existingChapters []models.Chapter
+	db.Where("transcript_id = ? AND tenant_id = ?", transcript.PublicID, principal.TenantID).
+		Order("start_ms ASC").Find(&existingChapters)
+	rawExistingChapters, _ := json.Marshal(existingChapters)
+	previousChecksum := checksumTranscriptText(string(rawExistingChapters), nil)
+
 	rows := make([]models.Chapter, 0, len(req.Chapters))
 	for _, ch := range req.Chapters {
 		title := strings.TrimSpace(ch.Title)
@@ -569,6 +588,17 @@ func SaveChapters(c *gin.Context) {
 		})
 		return
 	}
+	sourceMix := map[string]int{}
+	for _, row := range rows {
+		sourceMix[row.Source]++
+	}
+	rawChapters, _ := json.Marshal(rows)
+	createStudioAudit(db, principal, "media_studio.chapters_save", item.PublicID.String(), "success", "", map[string]interface{}{
+		"chapter_count":     len(rows),
+		"source_mix":        sourceMix,
+		"previous_checksum": previousChecksum,
+		"new_checksum":      checksumTranscriptText(string(rawChapters), nil),
+	})
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -583,6 +613,7 @@ func SaveChapters(c *gin.Context) {
 
 type saveTranscriptRequest struct {
 	Segments []segmentData `json:"segments"`
+	Reason   string        `json:"reason"`
 }
 
 func SaveTranscript(c *gin.Context) {
@@ -622,6 +653,9 @@ func SaveTranscript(c *gin.Context) {
 	}
 	fullText := strings.Join(parts, " ")
 
+	previousSegments := extractSegments(transcript)
+	changedSegments := changedSegmentCount(previousSegments, req.Segments)
+	prevChecksum := checksumTranscriptText(transcript.FullText, transcript.Segments)
 	segJSON, _ := json.Marshal(req.Segments)
 	transcript.Segments = datatypes.JSON(segJSON)
 	transcript.FullText = fullText
@@ -631,6 +665,16 @@ func SaveTranscript(c *gin.Context) {
 		})
 		return
 	}
+	newChecksum := checksumTranscriptText(transcript.FullText, transcript.Segments)
+	createStudioAudit(db, principal, "media_studio.transcript_edit", item.PublicID.String(), "success", "", map[string]interface{}{
+		"segment_count":          len(req.Segments),
+		"previous_segment_count": len(previousSegments),
+		"changed_segment_count":  changedSegments,
+		"previous_checksum":      prevChecksum,
+		"new_checksum":           newChecksum,
+		"reason":                 strings.TrimSpace(req.Reason),
+	})
+	computeAndStoreTranscriptQuality(db, item, transcript, nil)
 
 	// Best-effort re-embed: the transcript text changed. Model-agnostic — calls
 	// whatever the embedding pipeline currently is. Fire-and-forget.
@@ -646,4 +690,54 @@ func SaveTranscript(c *gin.Context) {
 		Message: "Transcript saved",
 		Data:    gin.H{"full_text": fullText, "segments": req.Segments},
 	})
+}
+
+func changedSegmentCount(prev, next []segmentData) int {
+	maxLen := len(prev)
+	if len(next) > maxLen {
+		maxLen = len(next)
+	}
+	changed := 0
+	for i := 0; i < maxLen; i++ {
+		if i >= len(prev) || i >= len(next) {
+			changed++
+			continue
+		}
+		if prev[i].Start != next[i].Start || prev[i].End != next[i].End || strings.TrimSpace(prev[i].Text) != strings.TrimSpace(next[i].Text) {
+			changed++
+		}
+	}
+	return changed
+}
+
+func createStudioAudit(db *gorm.DB, principal utils.AdminPrincipal, action, resource, status, errorMessage string, payload map[string]interface{}) {
+	raw, _ := json.Marshal(payload)
+	entry := models.AuditLog{
+		TenantID:       principal.TenantID,
+		UserID:         principal.UserID,
+		UserEmail:      principal.Email,
+		Action:         action,
+		TargetService:  "cms",
+		TargetResource: resource,
+		Status:         status,
+		ErrorMessage:   errorMessage,
+		Payload:        datatypes.JSON(raw),
+	}
+	_ = db.Create(&entry).Error
+}
+
+func studioAuditSummary(db *gorm.DB, tenantID, contentID string) map[string]interface{} {
+	var last models.AuditLog
+	if err := db.Where("tenant_id = ? AND target_resource = ? AND action IN ?", tenantID, contentID, []string{
+		"media_studio.transcript_edit",
+		"media_studio.chapters_save",
+	}).Order("created_at DESC").First(&last).Error; err != nil {
+		return nil
+	}
+	return map[string]interface{}{
+		"last_action": last.Action,
+		"last_status": last.Status,
+		"last_at":     last.CreatedAt.UTC().Format(time.RFC3339),
+		"user_email":  last.UserEmail,
+	}
 }

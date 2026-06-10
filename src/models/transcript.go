@@ -17,7 +17,7 @@ const (
 	CaptionStateNone         = "none"          // no transcript/caption yet
 	CaptionStateYouTubeAuto  = "youtube_auto"  // YouTube auto-generated caption (weak; upgradeable)
 	CaptionStateYouTubeHuman = "youtube_human" // human-uploaded caption (trusted; terminal)
-	CaptionStateSTTDone      = "stt_done"      // upgraded by a paid/offline STT engine
+	CaptionStateSTTDone      = "stt_done"      // upgraded by a paid/hosted STT engine
 )
 
 // Transcript source values written by producers (Aggregation caption fetch,
@@ -65,8 +65,8 @@ type Transcript struct {
 	Segments datatypes.JSON `gorm:"type:jsonb" json:"segments,omitempty"`
 	Chapters datatypes.JSON `gorm:"type:jsonb" json:"chapters,omitempty"`
 
-	// Provenance: source = youtube_human|youtube_auto|stt_deepgram|stt_whisper;
-	// provider = concrete engine name (e.g. "deepgram", "faster-whisper").
+	// Provenance: source = youtube_human|youtube_auto|stt_deepgram|stt_whisper
+	// (historical); provider = concrete hosted engine name (e.g. "deepgram").
 	Source   *string `gorm:"type:varchar(32)" json:"source,omitempty"`
 	Provider *string `gorm:"type:varchar(64)" json:"provider,omitempty"`
 

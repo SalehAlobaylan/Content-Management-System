@@ -24,6 +24,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
 	// Auto-STT path (Aggregation AI worker) — guard-enforced (toggle + budget).
 	internal.POST("/content-items/:id/request-stt", controllers.InternalRequestSTT)
+	internal.PATCH("/transcription-jobs/:id", controllers.InternalUpdateTranscriptionJob)
+	internal.POST("/transcription-jobs/:id/complete", controllers.InternalCompleteTranscriptionJob)
 
 	// Slice A hybrid retrieval — used by Enrichment-Service's /v1/related.
 	// GET /:id/embeddings: fetch (dense, sparse) for an anchor.

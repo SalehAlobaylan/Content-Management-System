@@ -45,9 +45,11 @@ type adminContentItemResponse struct {
 	ShareCount   int                    `json:"share_count"`
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
 	// Caption-first state (Media tab badges + STT action gating).
-	CaptionState     *string `json:"caption_state,omitempty"`
-	TranscriptSource *string `json:"transcript_source,omitempty"`
-	HasTranscript    bool    `json:"has_transcript"`
+	CaptionState           *string                    `json:"caption_state,omitempty"`
+	TranscriptSource       *string                    `json:"transcript_source,omitempty"`
+	HasTranscript          bool                       `json:"has_transcript"`
+	LatestTranscriptionJob *transcriptionJobResponse  `json:"latest_transcription_job,omitempty"`
+	TranscriptQuality      *transcriptQualityResponse `json:"transcript_quality,omitempty"`
 }
 
 type updateContentStatusRequest struct {
@@ -129,6 +131,28 @@ func ListContentItems(c *gin.Context) {
 			query = query.Where("topic_id = ?", topicID)
 		}
 	}
+	if tStatus := strings.TrimSpace(c.Query("transcription_status")); tStatus != "" {
+		query = query.Where(`(
+			SELECT tj.status FROM transcription_jobs tj
+			WHERE tj.content_item_id = content_items.public_id
+			ORDER BY tj.created_at DESC
+			LIMIT 1
+		) = ?`, tStatus)
+	}
+	if tTrigger := strings.TrimSpace(c.Query("transcription_trigger")); tTrigger != "" {
+		query = query.Where(`(
+			SELECT tj.trigger_source FROM transcription_jobs tj
+			WHERE tj.content_item_id = content_items.public_id
+			ORDER BY tj.created_at DESC
+			LIMIT 1
+		) = ?`, tTrigger)
+	}
+	if qStatus := strings.TrimSpace(c.Query("quality_status")); qStatus != "" {
+		query = query.Where(`EXISTS (
+			SELECT 1 FROM transcript_quality tq
+			WHERE tq.content_item_id = content_items.public_id AND tq.status = ?
+		)`, qStatus)
+	}
 
 	var items []models.ContentItem
 	meta, err := utils.FetchWithPagination(query, params, &items)
@@ -142,7 +166,9 @@ func ListContentItems(c *gin.Context) {
 
 	data := make([]adminContentItemResponse, 0, len(items))
 	for _, item := range items {
-		data = append(data, mapAdminContentItemResponse(item))
+		row := mapAdminContentItemResponse(item)
+		populateAdminContentTranscription(db, item.PublicID, &row)
+		data = append(data, row)
 	}
 
 	c.JSON(http.StatusOK, adminContentListResponse{
@@ -181,7 +207,9 @@ func GetAdminContentItem(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, mapAdminContentItemResponse(item))
+	resp := mapAdminContentItemResponse(item)
+	populateAdminContentTranscription(db, item.PublicID, &resp)
+	c.JSON(http.StatusOK, resp)
 }
 
 // UpdateContentStatus handles PATCH /admin/content/:id/status
@@ -238,7 +266,20 @@ func UpdateContentStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, mapAdminContentItemResponse(item))
+	resp := mapAdminContentItemResponse(item)
+	populateAdminContentTranscription(db, item.PublicID, &resp)
+	c.JSON(http.StatusOK, resp)
+}
+
+func populateAdminContentTranscription(db *gorm.DB, contentID uuid.UUID, resp *adminContentItemResponse) {
+	if job := latestTranscriptionJob(db, contentID); job != nil {
+		mapped := mapTranscriptionJob(*job)
+		resp.LatestTranscriptionJob = &mapped
+	}
+	if q := latestTranscriptQuality(db, contentID); q != nil {
+		mapped := mapTranscriptQuality(*q)
+		resp.TranscriptQuality = &mapped
+	}
 }
 
 func mapAdminContentItemResponse(item models.ContentItem) adminContentItemResponse {
@@ -259,23 +300,23 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 	}
 
 	return adminContentItemResponse{
-		ID:           item.PublicID.String(),
-		Type:         string(item.Type),
-		Status:       string(item.Status),
-		Title:        title,
-		BodyText:     item.BodyText,
-		Excerpt:      item.Excerpt,
-		Author:       item.Author,
-		SourceID:     item.SourceFeedURL,
-		SourceName:   item.SourceName,
-		MediaURL:     item.MediaURL,
-		ThumbnailURL: item.ThumbnailURL,
-		OriginalURL:  item.OriginalURL,
-		DurationSec:  item.DurationSec,
-		TopicTags:    item.TopicTags,
-		PublishedAt:  publishedAt,
-		CreatedAt:    item.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:    item.UpdatedAt.UTC().Format(time.RFC3339),
+		ID:               item.PublicID.String(),
+		Type:             string(item.Type),
+		Status:           string(item.Status),
+		Title:            title,
+		BodyText:         item.BodyText,
+		Excerpt:          item.Excerpt,
+		Author:           item.Author,
+		SourceID:         item.SourceFeedURL,
+		SourceName:       item.SourceName,
+		MediaURL:         item.MediaURL,
+		ThumbnailURL:     item.ThumbnailURL,
+		OriginalURL:      item.OriginalURL,
+		DurationSec:      item.DurationSec,
+		TopicTags:        item.TopicTags,
+		PublishedAt:      publishedAt,
+		CreatedAt:        item.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:        item.UpdatedAt.UTC().Format(time.RFC3339),
 		LikeCount:        item.LikeCount,
 		ViewCount:        item.ViewCount,
 		ShareCount:       item.ShareCount,

@@ -37,8 +37,8 @@ func enrichmentServiceToken() string {
 	return strings.TrimSpace(os.Getenv("CMS_SERVICE_TOKEN"))
 }
 
-// mediaBaseURL returns the configured Media-Service URL (Whisper
-// transcription + CLIP image embedding). Default mirrors start.sh.
+// mediaBaseURL returns the configured Media-Service URL (hosted STT +
+// CLIP image embedding). Default mirrors start.sh.
 func mediaBaseURL() string {
 	if url := strings.TrimSpace(os.Getenv("MEDIA_BASE_URL")); url != "" {
 		return url
@@ -120,13 +120,23 @@ func checkMediaHealth() (*serviceHealthResponse, error) {
 // `force` bypasses the toggle + state-machine checks (manual admin upgrade) but
 // still honors the budget cap.
 func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) error {
+	trigger := models.TranscriptionTriggerIngestAuto
+	if force {
+		trigger = models.TranscriptionTriggerManual
+	}
+	job, triggered, reason, err := createTranscriptionJobForItem(db, item, trigger, force)
+	if err != nil {
+		return err
+	}
+	if !triggered {
+		return &sttSkippedError{reason: reason}
+	}
+	return triggerTranscriptionForJob(item, job.PublicID.String())
+}
+
+func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID string) error {
 	if item.MediaURL == nil || *item.MediaURL == "" {
 		return fmt.Errorf("no media_url available")
-	}
-
-	// Guard: may return *sttSkippedError (idempotent / disabled / over budget).
-	if err := sttGuard(db, item, force); err != nil {
-		return err
 	}
 
 	baseURL := mediaBaseURL()
@@ -139,15 +149,17 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) err
 		return fmt.Errorf("media service token is not configured")
 	}
 
-	// Build multipart form body (Media /v1/transcribe expects Form fields)
+	// Build multipart form body. CMS-originated jobs use Media's async route so
+	// long videos/podcasts are not tied to a CMS goroutine HTTP timeout.
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	writer.WriteField("url", *item.MediaURL)
 	writer.WriteField("content_id", item.PublicID.String())
+	writer.WriteField("transcription_job_id", transcriptionJobID)
 	writer.WriteField("word_timestamps", "true")
 	writer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/transcribe", &buf)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/transcribe/jobs", &buf)
 	if err != nil {
 		return fmt.Errorf("failed to create transcription request: %w", err)
 	}
@@ -155,8 +167,7 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) err
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	// Transcription can be slow — use a 120s timeout
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("media transcription request failed: %w", err)
@@ -167,9 +178,6 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) err
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
 	}
-
-	// Track estimated spend against the monthly budget window.
-	addTranscriptionSpend(db, item.TenantID, estimateSTTCostUSD(item.DurationSec))
 	return nil
 }
 
@@ -215,7 +223,6 @@ func triggerImageEmbedding(imageURL string, contentID string) error {
 
 	return checkWriteBack(body)
 }
-
 
 // ─── On-demand URL extraction (News "Add by URL") ───────────
 //

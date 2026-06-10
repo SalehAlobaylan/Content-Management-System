@@ -119,6 +119,9 @@ func main() {
 			&models.ContentFlag{},
 			// Media — transcription/STT config (auto-STT toggle + budget)
 			&models.TranscriptionConfig{},
+			&models.TranscriptionJob{},
+			&models.TranscriptQuality{},
+			&models.TranscriptVersion{},
 			// Media Studio — first-class editable chapters
 			&models.Chapter{},
 			// First-class topics (LLM-labeled + centroid embedding)

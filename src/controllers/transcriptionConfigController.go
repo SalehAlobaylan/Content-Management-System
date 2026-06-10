@@ -40,6 +40,7 @@ func getOrCreateTranscriptionConfig(db *gorm.DB, tenantID string) *models.Transc
 	}
 	if time.Since(cfg.MonthlyWindowStart) > 30*24*time.Hour {
 		cfg.MonthlySpendUsd = 0
+		cfg.MonthlyReservedUsd = 0
 		cfg.MonthlyWindowStart = time.Now()
 		db.Save(&cfg)
 	}
@@ -52,49 +53,6 @@ func estimateSTTCostUSD(durationSec *int) float64 {
 		return 0
 	}
 	return (float64(*durationSec) / 3600.0) * sttEstimatedCostPerHourUsd
-}
-
-// sttGuard decides whether STT may run for an item. Returns a *sttSkippedError
-// for non-failure declines. This is the single, our-side enforcement point for
-// the toggle + state machine + budget cap (never relies on the provider).
-func sttGuard(db *gorm.DB, item *models.ContentItem, force bool) error {
-	cfg := getOrCreateTranscriptionConfig(db, item.TenantID)
-
-	state := ""
-	if item.CaptionState != nil {
-		state = *item.CaptionState
-	}
-
-	if !force {
-		switch state {
-		case models.CaptionStateSTTDone:
-			return &sttSkippedError{"already upgraded by STT"}
-		case models.CaptionStateYouTubeHuman:
-			return &sttSkippedError{"human caption present (no STT needed)"}
-		case models.CaptionStateYouTubeAuto:
-			if !cfg.AutoSttEnabled {
-				return &sttSkippedError{"auto-STT disabled (manual trigger required)"}
-			}
-		}
-		// state none/empty (e.g. caption-less podcast): allowed by default.
-	}
-
-	// Budget cap applies to both auto + manual triggers.
-	est := estimateSTTCostUSD(item.DurationSec)
-	if cfg.MonthlyBudgetCapUsd > 0 && cfg.MonthlySpendUsd+est > cfg.MonthlyBudgetCapUsd {
-		return &sttSkippedError{"monthly STT budget cap reached"}
-	}
-	return nil
-}
-
-// addTranscriptionSpend increments the tenant's tracked monthly STT spend.
-func addTranscriptionSpend(db *gorm.DB, tenantID string, est float64) {
-	if est <= 0 {
-		return
-	}
-	db.Model(&models.TranscriptionConfig{}).
-		Where("tenant_id = ?", tenantID).
-		UpdateColumn("monthly_spend_usd", gorm.Expr("monthly_spend_usd + ?", est))
 }
 
 // ── GET /admin/transcription-config ─────────────────────────
@@ -119,9 +77,12 @@ func UpdateTranscriptionConfig(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
 	var req struct {
-		AutoSttEnabled      *bool    `json:"auto_stt_enabled"`
-		Provider            *string  `json:"provider"`
-		MonthlyBudgetCapUsd *float64 `json:"monthly_budget_cap_usd"`
+		AutoSttEnabled             *bool    `json:"auto_stt_enabled"`
+		Provider                   *string  `json:"provider"`
+		MonthlyBudgetCapUsd        *float64 `json:"monthly_budget_cap_usd"`
+		AutoRepairEnabled          *bool    `json:"auto_repair_enabled"`
+		QualityReviewThreshold     *float64 `json:"quality_review_threshold"`
+		QualityAutoRepairThreshold *float64 `json:"quality_auto_repair_threshold"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
@@ -141,6 +102,27 @@ func UpdateTranscriptionConfig(c *gin.Context) {
 			return
 		}
 		cfg.MonthlyBudgetCapUsd = *req.MonthlyBudgetCapUsd
+	}
+	if req.AutoRepairEnabled != nil {
+		cfg.AutoRepairEnabled = *req.AutoRepairEnabled
+	}
+	if req.QualityReviewThreshold != nil {
+		if *req.QualityReviewThreshold < 0 || *req.QualityReviewThreshold > 1 {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Review threshold must be between 0 and 1", Code: "INVALID_THRESHOLD"})
+			return
+		}
+		cfg.QualityReviewThreshold = *req.QualityReviewThreshold
+	}
+	if req.QualityAutoRepairThreshold != nil {
+		if *req.QualityAutoRepairThreshold < 0 || *req.QualityAutoRepairThreshold > 1 {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Auto-repair threshold must be between 0 and 1", Code: "INVALID_THRESHOLD"})
+			return
+		}
+		cfg.QualityAutoRepairThreshold = *req.QualityAutoRepairThreshold
+	}
+	if cfg.QualityAutoRepairThreshold > cfg.QualityReviewThreshold {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Auto-repair threshold cannot be higher than review threshold", Code: "INVALID_THRESHOLD"})
+		return
 	}
 
 	if err := db.Save(cfg).Error; err != nil {
@@ -179,16 +161,16 @@ func InternalRequestSTT(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&req) // body optional
 
-	if err := sttGuard(db, &item, req.Force); err != nil {
-		if isSTTSkipped(err) {
-			c.JSON(http.StatusOK, gin.H{"triggered": false, "reason": err.Error()})
-			return
-		}
+	job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerIngestAuto, req.Force)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"triggered": false, "error": err.Error()})
 		return
 	}
 
-	// Allowed — reserve the estimated cost so the budget reflects in-flight work.
-	addTranscriptionSpend(db, item.TenantID, estimateSTTCostUSD(item.DurationSec))
-	c.JSON(http.StatusOK, gin.H{"triggered": true})
+	c.JSON(http.StatusOK, gin.H{
+		"triggered": triggered,
+		"reason":    reason,
+		"job_id":    job.PublicID.String(),
+		"status":    job.Status,
+	})
 }

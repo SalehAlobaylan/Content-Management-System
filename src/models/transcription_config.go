@@ -32,6 +32,17 @@ type TranscriptionConfig struct {
 	// MonthlySpendUsd accumulates estimated STT cost in the current window.
 	MonthlySpendUsd float64 `gorm:"type:double precision;default:0" json:"monthly_spend_usd"`
 
+	// MonthlyReservedUsd tracks accepted/in-flight STT work. Terminal jobs move
+	// from reserved to actual spend, or release the reservation on failure/skip.
+	MonthlyReservedUsd float64 `gorm:"type:double precision;default:0" json:"monthly_reserved_usd"`
+
+	// AutoRepairEnabled lets CMS automatically upgrade weak transcripts inside
+	// the budget cap when quality scoring flags them as auto_repair.
+	AutoRepairEnabled bool `gorm:"default:true" json:"auto_repair_enabled"`
+
+	QualityReviewThreshold     float64 `gorm:"type:double precision;default:0.75" json:"quality_review_threshold"`
+	QualityAutoRepairThreshold float64 `gorm:"type:double precision;default:0.45" json:"quality_auto_repair_threshold"`
+
 	// MonthlyWindowStart marks when the current spend window opened; spend resets
 	// when now > start + 30d.
 	MonthlyWindowStart time.Time `gorm:"type:timestamp" json:"monthly_window_start"`
@@ -48,11 +59,15 @@ func (TranscriptionConfig) TableName() string {
 // auto-STT OFF (manual only), no budget cap, fresh spend window.
 func DefaultTranscriptionConfig(tenantID string) TranscriptionConfig {
 	return TranscriptionConfig{
-		TenantID:            tenantID,
-		AutoSttEnabled:      false,
-		Provider:            "deepgram",
-		MonthlyBudgetCapUsd: 0,
-		MonthlySpendUsd:     0,
-		MonthlyWindowStart:  time.Now(),
+		TenantID:                   tenantID,
+		AutoSttEnabled:             false,
+		Provider:                   "deepgram",
+		MonthlyBudgetCapUsd:        0,
+		MonthlySpendUsd:            0,
+		MonthlyReservedUsd:         0,
+		AutoRepairEnabled:          true,
+		QualityReviewThreshold:     0.75,
+		QualityAutoRepairThreshold: 0.45,
+		MonthlyWindowStart:         time.Now(),
 	}
 }

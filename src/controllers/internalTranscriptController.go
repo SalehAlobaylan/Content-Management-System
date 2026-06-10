@@ -19,11 +19,14 @@ type internalCreateTranscriptRequest struct {
 	Summary        *string                  `json:"summary"`
 	WordTimestamps []map[string]interface{} `json:"word_timestamps"`
 	// Caption-first additions (all optional for backward compat):
-	Segments []map[string]interface{} `json:"segments"` // [{start,end,text}]
-	Chapters []map[string]interface{} `json:"chapters"` // [{start,end,title,source}]
-	Source   *string                  `json:"source"`   // youtube_human|youtube_auto|stt_deepgram|stt_whisper
-	Provider *string                  `json:"provider"` // concrete engine name
-	Language *string                  `json:"language"`
+	Segments            []map[string]interface{} `json:"segments"` // [{start,end,text}]
+	Chapters            []map[string]interface{} `json:"chapters"` // [{start,end,title,source}]
+	Source              *string                  `json:"source"`   // youtube_human|youtube_auto|stt_deepgram|stt_whisper
+	Provider            *string                  `json:"provider"` // concrete engine name
+	Language            *string                  `json:"language"`
+	TranscriptionJobID  *string                  `json:"transcription_job_id"`
+	LanguageProbability *float64                 `json:"language_probability"`
+	DurationSec         *float64                 `json:"duration_sec"`
 }
 
 type internalCreateTranscriptResponse struct {
@@ -57,12 +60,25 @@ func InternalCreateTranscript(c *gin.Context) {
 		return
 	}
 
+	var item models.ContentItem
+	haveItem := db.Where("public_id = ?", contentUUID).First(&item).Error == nil
+
+	source := models.TranscriptSourceSTTDeepgram
+	if req.Source != nil && *req.Source != "" {
+		source = *req.Source
+	}
+	var previousTranscriptID *uuid.UUID
+	if haveItem && strings.HasPrefix(source, "stt_") && item.TranscriptID != nil {
+		idCopy := *item.TranscriptID
+		previousTranscriptID = &idCopy
+	}
+
 	transcript := models.Transcript{
 		ContentItemID: contentUUID,
 		FullText:      req.FullText,
 		Summary:       req.Summary,
 		Language:      req.Language,
-		Source:        req.Source,
+		Source:        &source,
 		Provider:      req.Provider,
 	}
 
@@ -86,23 +102,59 @@ func InternalCreateTranscript(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transcript"})
 		return
 	}
+	if haveItem && previousTranscriptID != nil {
+		snapshotTranscriptVersion(db, item.TenantID, &item, *previousTranscriptID)
+	}
 
 	// Link the transcript + set the lightweight caption_state/transcript_source on
 	// the content item so feed/console can filter+badge without joining transcripts.
 	// Derive source/state with a sane default for legacy callers (no source field).
-	source := models.TranscriptSourceSTTWhisper
-	if req.Source != nil && *req.Source != "" {
-		source = *req.Source
-	}
 	captionState := models.CaptionStateForSource(source)
 
-	var item models.ContentItem
-	if err := db.Where("public_id = ?", contentUUID).First(&item).Error; err == nil {
+	if haveItem {
 		tid := transcript.PublicID
 		item.TranscriptID = &tid
 		item.CaptionState = &captionState
 		item.TranscriptSource = &source
 		_ = db.Save(&item).Error
+		quality := computeAndStoreTranscriptQuality(db, &item, &transcript, req.LanguageProbability)
+
+		if req.TranscriptionJobID != nil && *req.TranscriptionJobID != "" {
+			status := models.TranscriptionJobStatusSucceeded
+			meta := map[string]interface{}{
+				"write_back_status": "ok",
+				"quality_status":    quality.Status,
+				"quality_score":     quality.Score,
+			}
+			if req.LanguageProbability != nil {
+				meta["language_probability"] = *req.LanguageProbability
+			}
+			jobReq := internalUpdateTranscriptionJobRequest{
+				Status:       &status,
+				TranscriptID: ptrString(transcript.PublicID.String()),
+				Language:     req.Language,
+				DurationSec:  req.DurationSec,
+				Metadata:     meta,
+			}
+			if req.Provider != nil {
+				jobReq.Provider = req.Provider
+			}
+			id, err := uuid.Parse(*req.TranscriptionJobID)
+			if err == nil {
+				var job models.TranscriptionJob
+				if db.Where("public_id = ?", id).First(&job).Error == nil {
+					wasTerminal := terminalTranscriptionStatus(job.Status) && job.CompletedAt != nil
+					updateTranscriptionJobFromRequest(db, &job, jobReq)
+					if err := db.Save(&job).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(job.Status) {
+						actual := job.ActualCostUsd
+						if actual == 0 {
+							actual = job.EstimatedCostUsd
+						}
+						settleTranscriptionBudget(db, job.TenantID, job.ReservedCostUsd, actual)
+					}
+				}
+			}
+		}
 
 		// Re-enrichment cascade (model-agnostic): when STT upgrades an ALREADY-READY
 		// item's transcript, re-trigger embedding so retrieval reflects the better
@@ -121,10 +173,25 @@ func InternalCreateTranscript(c *gin.Context) {
 				}
 			}()
 		}
+		if !strings.HasPrefix(source, "stt_") && quality.Status == models.TranscriptQualityAutoRepair {
+			if job, triggered, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false); err == nil && triggered {
+				itemCopy := item
+				jobID := job.PublicID.String()
+				go func() {
+					if err := triggerTranscriptionForJob(&itemCopy, jobID); err != nil {
+						_ = updateTranscriptionJobTerminal(db, jobID, models.TranscriptionJobStatusFailed, err.Error())
+					}
+				}()
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, internalCreateTranscriptResponse{
 		ID:        transcript.PublicID.String(),
 		CreatedAt: transcript.CreatedAt.UTC().Format(time.RFC3339),
 	})
+}
+
+func ptrString(s string) *string {
+	return &s
 }
