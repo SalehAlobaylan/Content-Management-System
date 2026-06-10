@@ -97,12 +97,51 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.EngagementNormalization = req.EngagementNormalization
 	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive
+	// Phase 13 — story + News-feed-mode knobs.
+	if req.StoryMatchThreshold > 0 {
+		existing.StoryMatchThreshold = req.StoryMatchThreshold
+	}
+	if req.NewsFeedMode != "" {
+		existing.NewsFeedMode = req.NewsFeedMode
+	}
+	existing.NewsRerankEnabled = req.NewsRerankEnabled
+	// Coupling: a precompute (static snapshot) feed never reranks — the
+	// cross-encoder is an on_demand-only stage.
+	if existing.NewsFeedMode != "on_demand" {
+		existing.NewsRerankEnabled = false
+	}
 
 	if err := db.Save(&existing).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update config", Code: "UPDATE_FAILED"})
 		return
 	}
 	c.JSON(http.StatusOK, existing)
+}
+
+// RefreshNewsSnapshot handles POST /admin/intelligence/news-snapshot/refresh —
+// rebuilds the precomputed story-slide snapshot for the tenant (the precompute
+// feed mode reads it off the request path). Safe to call from an external cron.
+func RefreshNewsSnapshot(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	// Kick the classification self-heal in the background — when it finds and
+	// classifies stragglers it rebuilds the snapshot again on completion, so a
+	// single Refresh click converges even after bulk re-embeds.
+	StartClassificationBackfill(db)
+
+	count, err := buildNewsSnapshot(db, principal.TenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to build snapshot: " + err.Error(),
+			Code:    "SNAPSHOT_FAILED",
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"slide_count": count, "built_at": time.Now()})
 }
 
 // ================================================================
@@ -882,8 +921,8 @@ func PreviewNewsFeed(c *gin.Context) {
 	applyWeightOverrides(c, &config)
 
 	var items []models.ContentItem
-	db.Where("type = ? AND status = ? AND tenant_id = ?",
-		models.ContentTypeArticle, models.ContentStatusReady, principal.TenantID).
+	db.Where("type = ? AND format = ? AND status = ? AND tenant_id = ?",
+		models.ContentTypeNews, models.ContentFormatArticle, models.ContentStatusReady, principal.TenantID).
 		Order("published_at DESC").
 		Limit(50).
 		Find(&items)

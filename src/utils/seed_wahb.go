@@ -144,7 +144,8 @@ func createArticleContent(title, excerpt, sourceName, author string) models.Cont
 
 	return models.ContentItem{
 		TenantID:     GetDefaultTenantID(),
-		Type:         models.ContentTypeArticle,
+		Type:         models.ContentTypeNews,
+		Format:       func() *string { f := string(models.ContentFormatArticle); return &f }(),
 		Source:       models.SourceTypeRSS,
 		Status:       models.ContentStatusReady,
 		Title:        &title,
@@ -167,7 +168,8 @@ func createTweetContent(text, author string) models.ContentItem {
 
 	return models.ContentItem{
 		TenantID:    GetDefaultTenantID(),
-		Type:        models.ContentTypeTweet,
+		Type:        models.ContentTypeNews,
+		Format:      func() *string { f := string(models.ContentFormatTweet); return &f }(),
 		Source:      models.SourceTypeManual,
 		Status:      models.ContentStatusReady,
 		BodyText:    &text,
@@ -184,7 +186,8 @@ func createCommentContent(text, author string) models.ContentItem {
 
 	return models.ContentItem{
 		TenantID:    GetDefaultTenantID(),
-		Type:        models.ContentTypeComment,
+		Type:        models.ContentTypeNews,
+		Format:      func() *string { f := string(models.ContentFormatComment); return &f }(),
 		Source:      models.SourceTypeManual,
 		Status:      models.ContentStatusReady,
 		BodyText:    &text,

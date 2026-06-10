@@ -57,6 +57,11 @@ func setup() {
 		&models.Transcript{},
 		&models.UserInteraction{},
 		&models.ContentSource{},
+		// Phase 13 — story feed
+		&models.RankingConfig{},
+		&models.ContentFlag{},
+		&models.Topic{},
+		&models.NewsSnapshot{},
 	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}

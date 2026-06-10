@@ -23,6 +23,7 @@ import (
 type internalCreateContentItemRequest struct {
 	IdempotencyKey string                 `json:"idempotency_key"`
 	Type           string                 `json:"type"`
+	Format         *string                `json:"format"`
 	Source         string                 `json:"source"`
 	Status         string                 `json:"status"`
 	Title          string                 `json:"title"`
@@ -92,6 +93,10 @@ type internalUpdateEmbeddingRequest struct {
 	// (BGE-M3 returns them that way); converted to pgvector.SparseVector below.
 	EmbeddingSparse map[string]float32 `json:"embedding_sparse"`
 	TopicTags       []string           `json:"topic_tags"`
+	// Model is the embedder that produced this vector (provenance). Optional
+	// for back-compat — when absent the row's embedding_model is cleared, which
+	// flags the vector for re-embedding by the reconcile sweep.
+	Model string `json:"model"`
 }
 
 // bgeM3SparseDim is BGE-M3's vocabulary size — the dimension of its sparse
@@ -164,8 +169,27 @@ func InternalCreateContentItem(c *gin.Context) {
 
 	metadataJSON, _ := json.Marshal(req.Metadata)
 
+	// Normalize kind + format. New callers send type='NEWS' with an explicit
+	// format. Back-compat: legacy callers may still send type=ARTICLE/TWEET/
+	// COMMENT — fold those into the NEWS kind with a format sub-classification.
+	kind := models.ContentType(strings.ToUpper(req.Type))
+	var format *string
+	if req.Format != nil && strings.TrimSpace(*req.Format) != "" {
+		f := strings.ToUpper(strings.TrimSpace(*req.Format))
+		format = &f
+	}
+	switch kind {
+	case models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
+		if format == nil {
+			f := string(kind)
+			format = &f
+		}
+		kind = models.ContentTypeNews
+	}
+
 	item := models.ContentItem{
-		Type:           models.ContentType(strings.ToUpper(req.Type)),
+		Type:           kind,
+		Format:         format,
 		Source:         models.SourceType(strings.ToUpper(req.Source)),
 		Status:         models.ContentStatus(strings.ToUpper(req.Status)),
 		IdempotencyKey: &idempotencyKey,
@@ -425,6 +449,16 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 
 	vec := pgvector.NewVector(req.Embedding)
 	item.Embedding = &vec
+
+	// Provenance follows the write: set when the caller names its model, cleared
+	// otherwise so a provenance-less overwrite is visibly suspect (and gets
+	// re-embedded by the reconcile sweep) instead of silently inheriting the
+	// previous model name.
+	if m := strings.TrimSpace(req.Model); m != "" {
+		item.EmbeddingModel = &m
+	} else {
+		item.EmbeddingModel = nil
+	}
 
 	// Sparse output is optional (Slice A populates it). Convert BGE-M3's
 	// {token_id_string: weight} map to pgvector.SparseVector if supplied.
@@ -789,9 +823,12 @@ func InternalListMissingEmbedding(c *gin.Context) {
 		PublishedAt *time.Time
 	}
 	var rows []row
+	// "Missing" = no vector at all, OR a vector without model provenance
+	// (written by a pre-provenance / wrong-deployment service) — both get
+	// re-embedded so the corpus converges on the current embedder.
 	if err := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).
-		Where("embedding IS NULL").
+		Where("embedding IS NULL OR embedding_model IS NULL").
 		Order("created_at ASC").
 		Limit(limit).
 		Select("public_id, type, title, excerpt, body_text, source_name, published_at").

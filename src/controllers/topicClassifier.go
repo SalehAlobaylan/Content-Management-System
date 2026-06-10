@@ -4,7 +4,10 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"errors"
+	"log"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
@@ -12,10 +15,20 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// topicMatchThreshold is the minimum cosine similarity for an article to join
-// an existing topic. Below it, a new topic is created (LLM-labeled). Code
-// default per Config Discipline — surface in admin tuning later if needed.
-const topicMatchThreshold = 0.60
+// storyMatchThresholdDefault is the fallback minimum cosine similarity for a
+// content item to join an existing story (topic) when the tenant's
+// RankingConfig.StoryMatchThreshold is unset/zero. Tuned for the Qwen3
+// embedding space, where related articles sit around ~0.65–0.75 cosine (vs
+// BGE-M3's higher distribution) — 0.70 clusters genuinely-related coverage into
+// event stories without over-merging. Admin-tunable via the ranking config.
+const storyMatchThresholdDefault = 0.70
+
+// storyActivityWindowDays bounds a story in time: an item only joins a story
+// whose most recent member published within this many days of the item's own
+// publish time (either direction — backfilled old items must not join current
+// stories either). Without it, stories absorb semantically-similar items
+// forever and decay into evergreen topics instead of events.
+const storyActivityWindowDays = 7
 
 // classifyContentTopic assigns a first-class topic to one content item from its
 // dense embedding: nearest existing topic by cosine, else a new LLM-labeled
@@ -35,7 +48,13 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	}
 	lit := utils.PgvectorToLiteral(emb)
 
-	// Nearest topic in this tenant by cosine distance.
+	// Nearest ACTIVE topic in this tenant by cosine distance. The activity
+	// window keeps stories event-bounded: only stories whose latest member
+	// published within ±storyActivityWindowDays of this item are candidates.
+	// NULL last_member_at (legacy rows) stays eligible.
+	itemT := itemTime(item)
+	windowStart := itemT.AddDate(0, 0, -storyActivityWindowDays)
+	windowEnd := itemT.AddDate(0, 0, storyActivityWindowDays)
 	type nearestRow struct {
 		PublicID uuid.UUID
 		Distance float64
@@ -44,20 +63,33 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	_ = db.Model(&models.Topic{}).
 		Select("public_id, (embedding <=> '"+lit+"') AS distance").
 		Where("tenant_id = ? AND embedding IS NOT NULL", item.TenantID).
+		Where("last_member_at IS NULL OR last_member_at BETWEEN ? AND ?", windowStart, windowEnd).
 		Order("embedding <=> '" + lit + "'").
 		Limit(1).
 		Scan(&nearest).Error
 
-	if nearest.PublicID != uuid.Nil && (1.0-nearest.Distance) >= topicMatchThreshold {
+	// Event-level threshold, admin-tunable per tenant via RankingConfig.
+	threshold := loadTenantConfig(db, item.TenantID).StoryMatchThreshold
+	if threshold <= 0 {
+		threshold = storyMatchThresholdDefault
+	}
+
+	if nearest.PublicID != uuid.Nil && (1.0-nearest.Distance) >= threshold {
 		assignTopicToItem(db, &item, nearest.PublicID, emb)
 		return
 	}
 
 	// No close topic — ask the LLM for a meaningful label and create one.
+	// Classification must NOT depend on LLM availability: on any labeling
+	// failure fall back to a placeholder label derived from the item itself
+	// (Labeled=false, renamed later by /admin/topics/label-batch). Returning
+	// without a topic would silently exclude the item from the News feed.
+	labeled := true
 	label, err := generateTopicLabelViaEnrichment(topicSeedTexts(&item))
 	label = strings.TrimSpace(label)
 	if err != nil || label == "" {
-		return
+		labeled = false
+		label = placeholderStoryLabel(&item)
 	}
 
 	var topic models.Topic
@@ -69,7 +101,8 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 			Label:        label,
 			Embedding:    &vec,
 			ArticleCount: 0,
-			Labeled:      true, // LLM-named at creation
+			Labeled:      labeled, // false = placeholder awaiting label-batch
+			LastMemberAt: &itemT,
 		}
 		if createErr := db.Create(&topic).Error; createErr != nil {
 			// Lost a create race on the unique (tenant,label) — fetch the winner.
@@ -111,12 +144,18 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 			}
 			newCentroid := runningMean(centroid, topic.ArticleCount, emb)
 			vec := pgvector.NewVector(newCentroid)
+			updates := map[string]interface{}{
+				"embedding":     &vec,
+				"article_count": topic.ArticleCount + 1,
+			}
+			// Advance the story's activity time when this member is newer —
+			// keeps the activity window tracking real event time.
+			if t := itemTime(*item); topic.LastMemberAt == nil || t.After(*topic.LastMemberAt) {
+				updates["last_member_at"] = t
+			}
 			if err := tx.Model(&models.Topic{}).
 				Where("public_id = ?", topicID).
-				Updates(map[string]interface{}{
-					"embedding":     &vec,
-					"article_count": topic.ArticleCount + 1,
-				}).Error; err != nil {
+				Updates(updates).Error; err != nil {
 				return err
 			}
 		}
@@ -146,6 +185,103 @@ func runningMean(centroid []float32, n int, e []float32) []float32 {
 		out[i] = (centroid[i]*fn + e[i]) / (fn + 1)
 	}
 	return out
+}
+
+// placeholderStoryLabel builds an LLM-free fallback label for a brand-new
+// story: the item's title (or body snippet), suffixed with a short id so the
+// (tenant, label) unique index can't accidentally merge two distinct events
+// that share a generic headline ("عاجل:"). label-batch renames these later.
+func placeholderStoryLabel(item *models.ContentItem) string {
+	base := ""
+	if item.Title != nil {
+		base = strings.TrimSpace(*item.Title)
+	}
+	if base == "" && item.BodyText != nil {
+		runes := []rune(strings.TrimSpace(*item.BodyText))
+		if len(runes) > 80 {
+			runes = runes[:80]
+		}
+		base = string(runes)
+	}
+	if base == "" {
+		base = "Story"
+	} else if runes := []rune(base); len(runes) > 120 {
+		base = string(runes[:120])
+	}
+	return base + " · " + item.PublicID.String()[:8]
+}
+
+// classificationBackfillRunning guards against concurrent backfill passes —
+// two passes classifying the same unclassified rows would race topic creation.
+var classificationBackfillRunning atomic.Bool
+
+// StartClassificationBackfill classifies every embedded-but-unclassified READY
+// NEWS item in the background, then rebuilds the precompute News snapshot so
+// the feed reflects the healed taxonomy. Called on CMS startup and from the
+// admin snapshot-refresh endpoint; no-ops if a pass is already running.
+//
+// This is the self-healing half of the classification contract: the embedding
+// write-back fires classification per item, and this sweep catches everything
+// that slipped through (LLM outages before the placeholder fallback existed,
+// crashed goroutines, bulk re-embeds, taxonomy wipes).
+func StartClassificationBackfill(db *gorm.DB) {
+	if !classificationBackfillRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer classificationBackfillRunning.Store(false)
+
+		const batchSize = 50
+		total := 0
+		prevRemaining := int64(-1)
+		for {
+			var remaining int64
+			db.Model(&models.ContentItem{}).
+				Where("type = ? AND status = ? AND embedding IS NOT NULL AND topic_id IS NULL",
+					models.ContentTypeNews, models.ContentStatusReady).
+				Count(&remaining)
+			if remaining == 0 {
+				break
+			}
+			// Stall guard: if a full pass made no progress (persistent DB
+			// errors), stop rather than spin forever; the next startup or
+			// snapshot refresh retries.
+			if remaining == prevRemaining {
+				log.Printf("[classification-backfill] stalled with %d unclassified items — giving up this pass", remaining)
+				break
+			}
+			prevRemaining = remaining
+
+			var ids []uuid.UUID
+			// Chronological by PUBLISH time — the story activity window assumes
+			// stories form in event order (an item only joins stories active
+			// near its own publish time), so backfill must replay history.
+			db.Model(&models.ContentItem{}).
+				Where("type = ? AND status = ? AND embedding IS NOT NULL AND topic_id IS NULL",
+					models.ContentTypeNews, models.ContentStatusReady).
+				Order("COALESCE(published_at, created_at) ASC").
+				Limit(batchSize).
+				Pluck("public_id", &ids)
+			for _, id := range ids {
+				classifyContentTopic(db, id)
+			}
+			total += len(ids)
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if total > 0 {
+			log.Printf("[classification-backfill] classified %d items", total)
+			// Refresh the precompute snapshot so the healed stories are served.
+			config := loadTenantConfig(db, "default")
+			if config.NewsFeedMode != "on_demand" {
+				if n, err := buildNewsSnapshot(db, "default"); err != nil {
+					log.Printf("[classification-backfill] snapshot rebuild failed: %v", err)
+				} else {
+					log.Printf("[classification-backfill] snapshot rebuilt (%d slides)", n)
+				}
+			}
+		}
+	}()
 }
 
 // topicSeedTexts builds the snippet list used to name a brand-new topic.

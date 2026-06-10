@@ -1,6 +1,7 @@
 package main
 
 import (
+	"content-management-system/src/controllers"
 	"content-management-system/src/models" // needs it for automigrate
 	"content-management-system/src/routes"
 	"content-management-system/src/utils"
@@ -122,6 +123,8 @@ func main() {
 			&models.Chapter{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
+			// Phase 13 — precomputed News-feed story-slide snapshot
+			&models.NewsSnapshot{},
 			// Saved syndication feeds (RSS/Atom/JSON)
 			&models.RSSFeed{},
 			// Storage management
@@ -172,6 +175,11 @@ func main() {
 	SetupRoutes(router, db)
 	routes.SetupAdminAuthRoutes(router, db)
 	logCMSAuthConfig()
+
+	// Self-heal classification drift: classify any embedded-but-unclassified
+	// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
+	// precompute News snapshot when done. Runs in the background.
+	controllers.StartClassificationBackfill(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

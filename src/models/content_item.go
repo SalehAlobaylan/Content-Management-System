@@ -13,11 +13,27 @@ import (
 type ContentType string
 
 const (
-	ContentTypeArticle ContentType = "ARTICLE"
+	// ContentTypeNews is the primary news-feed kind. NEWS items carry a Format
+	// sub-classification (ARTICLE/TWEET/COMMENT) describing the original content
+	// shape. VIDEO/PODCAST are the For-You media kinds.
+	ContentTypeNews    ContentType = "NEWS"
 	ContentTypeVideo   ContentType = "VIDEO"
+	ContentTypePodcast ContentType = "PODCAST"
+
+	// Legacy kinds — retained for the type→format migration mapping and
+	// historical references. New NEWS items use Format instead of these.
+	ContentTypeArticle ContentType = "ARTICLE"
 	ContentTypeTweet   ContentType = "TWEET"
 	ContentTypeComment ContentType = "COMMENT"
-	ContentTypePodcast ContentType = "PODCAST"
+)
+
+// ContentFormat sub-classifies a NEWS item by its original content shape.
+type ContentFormat string
+
+const (
+	ContentFormatArticle ContentFormat = "ARTICLE"
+	ContentFormatTweet   ContentFormat = "TWEET"
+	ContentFormatComment ContentFormat = "COMMENT"
 )
 
 // SourceType enum
@@ -51,8 +67,11 @@ type ContentItem struct {
 	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_items_tenant_id" json:"tenant_id"`
 
 	// Classification
-	Type   ContentType   `gorm:"type:varchar(20);not null" json:"type"`
-	Source SourceType    `gorm:"type:varchar(20);not null" json:"source,omitempty"`
+	Type ContentType `gorm:"type:varchar(20);not null" json:"type"`
+	// Format sub-classifies a NEWS item (ARTICLE/TWEET/COMMENT). NULL for
+	// VIDEO/PODCAST media. Populated by the type→format migration + ingest.
+	Format *string    `gorm:"type:varchar(20)" json:"format,omitempty"`
+	Source SourceType `gorm:"type:varchar(20);not null" json:"source,omitempty"`
 	Status ContentStatus `gorm:"type:varchar(20);default:'READY'" json:"status,omitempty"`
 	// Idempotency
 	IdempotencyKey *string `gorm:"type:varchar(512);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
@@ -89,6 +108,12 @@ type ContentItem struct {
 	// added for forward compatibility with hybrid retrieval (Slice A). Stays
 	// NULL until Slice A wires FlagEmbedding into the embedder.
 	EmbeddingSparse *pgvector.SparseVector `gorm:"type:sparsevec(250002)" json:"-"`
+	// EmbeddingModel records WHICH model produced the current Embedding
+	// (e.g. "Qwen/Qwen3-Embedding-0.6B"). Set by the write-back; NULL means the
+	// vector has no provenance (written by a pre-provenance service) and the
+	// reconcile sweep treats it as missing so it gets re-embedded. This is the
+	// guard against silently mixing embedding spaces across model migrations.
+	EmbeddingModel *string `gorm:"type:varchar(80)" json:"-"`
 	// ImageEmbedding is a CLIP-ViT-B-32 image vector (512-dim), populated by
 	// Media-Service when content has a hero image or video thumbnail.
 	// Independent from Embedding (text, 1024-dim) — both can coexist.

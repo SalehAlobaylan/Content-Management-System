@@ -3,8 +3,6 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
-	"fmt"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,7 +11,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
-	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
 )
 
@@ -59,7 +56,7 @@ func ListContentTopics(c *gin.Context) {
 
 	db := c.MustGet("db").(*gorm.DB)
 
-	contentType := strings.ToUpper(strings.TrimSpace(c.DefaultQuery("type", "ARTICLE")))
+	contentType := strings.ToUpper(strings.TrimSpace(c.DefaultQuery("type", "NEWS")))
 	search := strings.TrimSpace(c.Query("search"))
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -586,7 +583,7 @@ func ReclassifyTopics(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 	contentType := strings.ToUpper(strings.TrimSpace(req.Type))
 	if contentType == "" {
-		contentType = "ARTICLE"
+		contentType = "NEWS"
 	}
 	limit := req.Limit
 	if limit <= 0 {
@@ -628,11 +625,14 @@ type reclusterResponse struct {
 	Message  string `json:"message"`
 }
 
-// ReclusterTopics handles POST /admin/topics/recluster — a full re-cluster pass.
-// Loads every article embedding, k-means clusters them globally, then REBUILDS
-// the taxonomy: old topics are dropped, one new topic per non-empty cluster is
-// created (placeholder label, labeled=false) and every article is reassigned.
-// Naming is deferred to /admin/topics/label-batch so this stays fast.
+// ReclusterTopics handles POST /admin/topics/recluster — rebuilds the story
+// taxonomy from scratch. Phase 13: replaced the old global k-means pass (which
+// produced broad THEMATIC buckets) with the same threshold-based event
+// clustering the live classifier uses: wipe assignments + topics, then replay
+// every embedded item chronologically through classifyContentTopic (cosine ≥
+// StoryMatchThreshold within the story activity window). Runs in the
+// background via the classification backfill; the snapshot rebuilds when done.
+// The legacy `k` parameter is accepted and ignored.
 func ReclusterTopics(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -644,23 +644,13 @@ func ReclusterTopics(c *gin.Context) {
 	_ = c.ShouldBindJSON(&req)
 	contentType := strings.ToUpper(strings.TrimSpace(req.Type))
 	if contentType == "" {
-		contentType = "ARTICLE"
+		contentType = "NEWS"
 	}
 
-	type embRow struct {
-		PublicID  uuid.UUID
-		Embedding pgvector.Vector
-	}
-	var rows []embRow
-	if err := db.Model(&models.ContentItem{}).
-		Select("public_id, embedding").
+	var n int64
+	db.Model(&models.ContentItem{}).
 		Where("tenant_id = ? AND type = ? AND embedding IS NOT NULL", principal.TenantID, contentType).
-		Scan(&rows).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to load embeddings", Code: "LOAD_FAILED"})
-		return
-	}
-
-	n := len(rows)
+		Count(&n)
 	if n < 2 {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
 			Message: "Not enough embedded articles to cluster",
@@ -669,92 +659,26 @@ func ReclusterTopics(c *gin.Context) {
 		return
 	}
 
-	vectors := make([][]float32, n)
-	for i, r := range rows {
-		vectors[i] = r.Embedding.Slice()
-	}
-
-	// Pick k: caller's value, else ~1 topic per 30 articles, bounded.
-	k := req.K
-	if k <= 0 {
-		k = int(math.Ceil(float64(n) / 30.0))
-	}
-	if k < 2 {
-		k = 2
-	}
-	if k > 200 {
-		k = 200
-	}
-	if k > n {
-		k = n
-	}
-
-	assignments, centroids := utils.KMeans(vectors, k, 20, time.Now().UnixNano())
-
-	members := make([][]uuid.UUID, k)
-	for i, a := range assignments {
-		members[a] = append(members[a], rows[i].PublicID)
-	}
-
-	created := 0
+	// Wipe assignments + taxonomy, then let the threshold backfill rebuild.
 	err := db.Transaction(func(tx *gorm.DB) error {
-		// Clear assignments + drop the old taxonomy for this tenant.
 		if e := tx.Model(&models.ContentItem{}).
 			Where("tenant_id = ? AND type = ?", principal.TenantID, contentType).
 			Update("topic_id", nil).Error; e != nil {
 			return e
 		}
-		if e := tx.Where("tenant_id = ?", principal.TenantID).Delete(&models.Topic{}).Error; e != nil {
-			return e
-		}
-
-		for ci := 0; ci < k; ci++ {
-			ids := members[ci]
-			if len(ids) == 0 {
-				continue
-			}
-			created++
-			vec := pgvector.NewVector(centroids[ci])
-			topic := models.Topic{
-				TenantID:     principal.TenantID,
-				Label:        fmt.Sprintf("Cluster %d", created),
-				Embedding:    &vec,
-				ArticleCount: len(ids),
-				Labeled:      false,
-			}
-			if e := tx.Create(&topic).Error; e != nil {
-				return e
-			}
-			// GORM omits a zero-value (false) for a column declared with
-			// default:true, so the row would be inserted as labeled=true and
-			// never get named. Force it false so label-batch picks it up.
-			if e := tx.Model(&models.Topic{}).Where("public_id = ?", topic.PublicID).
-				UpdateColumn("labeled", false).Error; e != nil {
-				return e
-			}
-			for start := 0; start < len(ids); start += 1000 {
-				end := start + 1000
-				if end > len(ids) {
-					end = len(ids)
-				}
-				if e := tx.Model(&models.ContentItem{}).
-					Where("public_id IN ?", ids[start:end]).
-					Update("topic_id", topic.PublicID).Error; e != nil {
-					return e
-				}
-			}
-		}
-		return nil
+		return tx.Where("tenant_id = ?", principal.TenantID).Delete(&models.Topic{}).Error
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Re-cluster failed: " + err.Error(), Code: "RECLUSTER_FAILED"})
 		return
 	}
 
+	StartClassificationBackfill(db)
+
 	c.JSON(http.StatusOK, reclusterResponse{
-		Clusters: created,
-		Articles: n,
-		Message:  "Re-clustered — naming topics next",
+		Clusters: 0,
+		Articles: int(n),
+		Message:  "Rebuilding stories in the background (threshold clustering) — the snapshot refreshes automatically when done",
 	})
 }
 

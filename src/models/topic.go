@@ -21,6 +21,12 @@ type Topic struct {
 
 	ArticleCount int `gorm:"default:0" json:"article_count"`
 
+	// LastMemberAt is the publish time of the story's most recent member. It
+	// drives the story activity window: an item only joins a story that was
+	// active near the item's own publish time, so stories stay bounded to
+	// their event instead of absorbing semantically-similar items forever.
+	LastMemberAt *time.Time `gorm:"index:idx_topics_last_member_at" json:"last_member_at,omitempty"`
+
 	// Labeled is false for fresh clusters from a full re-cluster pass that still
 	// carry a placeholder name and await LLM labeling. Growing-taxonomy topics
 	// are labeled at creation, so they are true.

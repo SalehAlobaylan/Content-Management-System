@@ -66,9 +66,23 @@ func createManualArticle(db *gorm.DB, tenantID string, req createAdminContentReq
 		return models.ContentItem{}, false, errors.New("title and original_url are required")
 	}
 
-	contentType := models.ContentTypeArticle
+	// Default to a NEWS article. Legacy/explicit ARTICLE|TWEET|COMMENT fold into
+	// the NEWS kind with a format sub-classification; VIDEO/PODCAST/NEWS pass
+	// through with no format.
+	contentType := models.ContentTypeNews
+	defaultFormat := string(models.ContentFormatArticle)
+	contentFormat := &defaultFormat
 	if t := strings.ToUpper(strings.TrimSpace(req.Type)); t != "" {
-		contentType = models.ContentType(t)
+		switch models.ContentType(t) {
+		case models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
+			f := t
+			contentFormat = &f
+		case models.ContentTypeNews:
+			// keep the default article format
+		default:
+			contentType = models.ContentType(t)
+			contentFormat = nil
+		}
 	}
 	status := models.ContentStatusReady
 	if s := strings.ToUpper(strings.TrimSpace(req.Status)); s != "" {
@@ -105,6 +119,7 @@ func createManualArticle(db *gorm.DB, tenantID string, req createAdminContentReq
 	item := models.ContentItem{
 		TenantID:       tenantID,
 		Type:           contentType,
+		Format:         contentFormat,
 		Source:         models.SourceTypeManual,
 		Status:         status,
 		IdempotencyKey: &idempotencyKey,

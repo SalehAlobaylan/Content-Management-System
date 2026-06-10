@@ -44,6 +44,21 @@ type RankingConfig struct {
 	// Opt-in toggle: feeds stay chronological until enabled
 	IsActive bool `gorm:"default:false" json:"is_active"`
 
+	// ─── Phase 13 — NEWS-first stories feed ──────────────────────────────
+	// StoryMatchThreshold is the minimum cosine similarity for a content item
+	// to join an existing story (topic). Tuned for the Qwen3 embedding space
+	// (related articles ~0.65–0.75 cosine): 0.70 clusters genuinely-related
+	// coverage into event stories without over-merging.
+	StoryMatchThreshold float64 `gorm:"type:double precision;default:0.70" json:"story_match_threshold"`
+	// NewsFeedMode controls News-feed assembly: "precompute" serves a static
+	// snapshot off the read path (reranker off); "on_demand" assembles slides
+	// live and enables the cross-encoder reranker.
+	NewsFeedMode string `gorm:"type:varchar(20);default:'precompute'" json:"news_feed_mode"`
+	// NewsRerankEnabled mirrors NewsFeedMode=on_demand — when true the news
+	// slide assembly runs the cross-encoder reranker. Explicit flag so it can be
+	// toggled independently for debugging.
+	NewsRerankEnabled bool `gorm:"default:false" json:"news_rerank_enabled"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -72,6 +87,9 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		EngagementNormalization:        "log",
 		Mode:                           "balanced",
 		IsActive:                       true,
+		StoryMatchThreshold:            0.70,
+		NewsFeedMode:                   "precompute",
+		NewsRerankEnabled:              false,
 	}
 }
 

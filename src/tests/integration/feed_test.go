@@ -73,13 +73,17 @@ func TestFeedIntegration(t *testing.T) {
 			Slides []struct {
 				SlideID  string `json:"slide_id"`
 				Featured struct {
-					ID    string `json:"id"`
-					Type  string `json:"type"`
-					Title string `json:"title"`
+					StoryID string `json:"story_id"`
+					LeadID  string `json:"lead_id"`
+					Label   string `json:"label"`
+					Members []struct {
+						ID   string `json:"id"`
+						Type string `json:"type"`
+					} `json:"members"`
 				} `json:"featured"`
 				Related []struct {
-					ID   string `json:"id"`
-					Type string `json:"type"`
+					StoryID string `json:"story_id"`
+					LeadID  string `json:"lead_id"`
 				} `json:"related"`
 			} `json:"slides"`
 		}
@@ -93,10 +97,16 @@ func TestFeedIntegration(t *testing.T) {
 			t.Fatalf("expected at least one slide in News feed")
 		}
 
-		// Verify slide structure
+		// Verify story-slide structure: a featured story with members.
 		for _, slide := range response.Slides {
-			if slide.Featured.Type != "ARTICLE" {
-				t.Fatalf("expected ARTICLE type for featured, got %s", slide.Featured.Type)
+			if slide.Featured.StoryID == "" || slide.Featured.LeadID == "" {
+				t.Fatalf("expected featured story to have story_id + lead_id")
+			}
+			if len(slide.Featured.Members) == 0 {
+				t.Fatalf("expected featured story to have members")
+			}
+			if slide.Featured.Members[0].Type != "NEWS" {
+				t.Fatalf("expected NEWS members, got %s", slide.Featured.Members[0].Type)
 			}
 		}
 		fmt.Println("  ✅ News feed test passed")
@@ -246,7 +256,8 @@ func seedTestContent() {
 		pubTime := now.Add(-time.Duration(i*2) * time.Hour)
 
 		item := models.ContentItem{
-			Type:        models.ContentTypeArticle,
+			Type:        models.ContentTypeNews,
+			Format:      func() *string { f := string(models.ContentFormatArticle); return &f }(),
 			Source:      models.SourceTypeRSS,
 			Status:      models.ContentStatusReady,
 			Title:       &title,
@@ -264,7 +275,8 @@ func seedTestContent() {
 		pubTime := now.Add(-time.Duration(i*30) * time.Minute)
 
 		item := models.ContentItem{
-			Type:        models.ContentTypeTweet,
+			Type:        models.ContentTypeNews,
+			Format:      func() *string { f := string(models.ContentFormatTweet); return &f }(),
 			Source:      models.SourceTypeManual,
 			Status:      models.ContentStatusReady,
 			BodyText:    &text,
@@ -273,6 +285,20 @@ func seedTestContent() {
 		}
 		testDB.Create(&item)
 	}
+
+	// Phase 13: group the article fixtures under one story (topic) so the News
+	// feed (story-slides) has a populated story to render.
+	story := models.Topic{
+		TenantID:     utils.GetDefaultTenantID(),
+		Label:        "Test Story",
+		ArticleCount: 5,
+		Labeled:      true,
+		LastMemberAt: &now,
+	}
+	testDB.Create(&story)
+	testDB.Model(&models.ContentItem{}).
+		Where("type = ? AND format = ?", models.ContentTypeNews, string(models.ContentFormatArticle)).
+		Update("topic_id", story.PublicID)
 
 	fmt.Println("✅ Test content seeded")
 }

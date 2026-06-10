@@ -98,9 +98,14 @@ func SubmitUserContent(c *gin.Context) {
 	tenantID := utils.GetDefaultTenantID()
 
 	now := time.Now()
-	contentType := models.ContentTypeArticle
+	// Text submissions are NEWS/article; audio submissions are PODCAST media.
+	contentType := models.ContentTypeNews
+	var contentFormat *string
 	if audioHeader != nil {
 		contentType = models.ContentTypePodcast
+	} else {
+		f := string(models.ContentFormatArticle)
+		contentFormat = &f
 	}
 
 	status := models.ContentStatusReady
@@ -113,6 +118,7 @@ func SubmitUserContent(c *gin.Context) {
 	item := models.ContentItem{
 		TenantID:    tenantID,
 		Type:        contentType,
+		Format:      contentFormat,
 		Source:      models.SourceTypeUpload,
 		Status:      status,
 		Title:       &title,
