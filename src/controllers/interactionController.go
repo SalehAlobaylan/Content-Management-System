@@ -3,13 +3,24 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// maxCommentLength caps comment text to keep payloads and rendering sane.
+const maxCommentLength = 1000
+
+// commentMetadata is the expected Metadata shape for comment interactions.
+type commentMetadata struct {
+	Text   string `json:"text"`
+	Author string `json:"author,omitempty"`
+}
 
 // CreateInteraction records a user interaction (like, bookmark, view, share, complete)
 // POST /api/v1/interactions
@@ -43,6 +54,25 @@ func CreateInteraction(c *gin.Context) {
 			Message: "Content item not found",
 		})
 		return
+	}
+
+	// Comments must carry non-blank text (length-capped)
+	if req.InteractionType == models.InteractionTypeComment {
+		var meta commentMetadata
+		if err := json.Unmarshal(req.Metadata, &meta); err != nil || strings.TrimSpace(meta.Text) == "" {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{
+				Code:    http.StatusBadRequest,
+				Message: "Comment requires metadata.text",
+			})
+			return
+		}
+		if len([]rune(meta.Text)) > maxCommentLength {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{
+				Code:    http.StatusBadRequest,
+				Message: "Comment text exceeds maximum length",
+			})
+			return
+		}
 	}
 
 	// Build interaction
@@ -321,6 +351,99 @@ func DeleteInteractionByContext(c *gin.Context) {
 	})
 }
 
+// CommentItem is a single comment in a content item's comment list
+type CommentItem struct {
+	ID        uuid.UUID `json:"id"`
+	Text      string    `json:"text"`
+	Author    string    `json:"author,omitempty"`
+	IsMine    bool      `json:"is_mine"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// GetContentComments lists comments for a content item, newest first.
+// GET /api/v1/content/:id/comments?cursor=xxx&limit=20&session_id=xxx&user_id=xxx
+// session_id / user_id are optional and only used to mark the caller's own
+// comments (is_mine) so the client can label them.
+func GetContentComments(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	contentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid content ID",
+		})
+		return
+	}
+
+	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid cursor: " + err.Error(),
+		})
+		return
+	}
+
+	query := db.Model(&models.UserInteraction{}).
+		Where("content_item_id = ?", contentID).
+		Where("type = ?", models.InteractionTypeComment).
+		Order("created_at DESC")
+
+	if !pagination.Timestamp.IsZero() {
+		query = query.Where("created_at < ?", pagination.Timestamp)
+	}
+
+	var interactions []models.UserInteraction
+	if err := query.Limit(pagination.Limit + 1).Find(&interactions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code:    http.StatusInternalServerError,
+			Message: "Failed to fetch comments: " + err.Error(),
+		})
+		return
+	}
+
+	hasMore := len(interactions) > pagination.Limit
+	if hasMore {
+		interactions = interactions[:pagination.Limit]
+	}
+
+	sessionID := c.Query("session_id")
+	var callerUserID *uuid.UUID
+	if uid, err := uuid.Parse(c.Query("user_id")); err == nil {
+		callerUserID = &uid
+	}
+
+	items := make([]CommentItem, 0, len(interactions))
+	for _, in := range interactions {
+		var meta commentMetadata
+		if err := json.Unmarshal(in.Metadata, &meta); err != nil || strings.TrimSpace(meta.Text) == "" {
+			continue // skip malformed rows rather than failing the whole list
+		}
+		isMine := (callerUserID != nil && in.UserID != nil && *in.UserID == *callerUserID) ||
+			(sessionID != "" && in.SessionID != nil && *in.SessionID == sessionID)
+		items = append(items, CommentItem{
+			ID:        in.PublicID,
+			Text:      meta.Text,
+			Author:    meta.Author,
+			IsMine:    isMine,
+			CreatedAt: in.CreatedAt,
+		})
+	}
+
+	var nextCursor *string
+	if hasMore && len(interactions) > 0 {
+		last := interactions[len(interactions)-1]
+		cursor := utils.EncodeCursor(last.CreatedAt, last.PublicID)
+		nextCursor = &cursor
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"cursor": nextCursor,
+		"items":  items,
+	})
+}
+
 // HistoryItem is a single entry in the user's watch history
 type HistoryItem struct {
 	ContentID    uuid.UUID  `json:"content_id"`
@@ -505,6 +628,8 @@ func updateEngagementCount(db *gorm.DB, contentItemID uuid.UUID, interactionType
 		field = "share_count"
 	case models.InteractionTypeView:
 		field = "view_count"
+	case models.InteractionTypeComment:
+		field = "comment_count"
 	default:
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -49,7 +50,7 @@ const (
 // across a 1000-row pool that's megabytes of wire transfer for nothing.
 const storyFeedColumns = "id, public_id, tenant_id, type, format, source, status, " +
 	"title, LEFT(body_text, 600) AS body_text, excerpt, author, source_name, " +
-	"thumbnail_url, duration_sec, topic_tags, topic_id, transcript_id, " +
+	"thumbnail_url, duration_sec, topic_tags, topic_id, transcript_id, source_feed_url, " +
 	"like_count, comment_count, share_count, view_count, published_at, created_at"
 
 // topicMetaColumns omits the topic centroid (vector(1024) ≈ 12KB wire text per
@@ -69,20 +70,21 @@ const storyScoreColumns = "public_id, tenant_id, type, source, status, topic_id,
 
 // StoryMember is one post (NEWS item) inside a story.
 type StoryMember struct {
-	ID           uuid.UUID `json:"id"`
-	Type         string    `json:"type"`
-	Format       string    `json:"format,omitempty"`
-	Title        string    `json:"title,omitempty"`
-	Excerpt      string    `json:"excerpt,omitempty"`
-	BodyText     string    `json:"body_text,omitempty"`
-	Author       string    `json:"author,omitempty"`
-	SourceName   string    `json:"source_name,omitempty"`
-	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
-	PublishedAt  time.Time `json:"published_at"`
-	LikeCount    int       `json:"like_count"`
-	CommentCount int       `json:"comment_count"`
-	ShareCount   int       `json:"share_count"`
-	ViewCount    int       `json:"view_count"`
+	ID             uuid.UUID `json:"id"`
+	Type           string    `json:"type"`
+	Format         string    `json:"format,omitempty"`
+	Title          string    `json:"title,omitempty"`
+	Excerpt        string    `json:"excerpt,omitempty"`
+	BodyText       string    `json:"body_text,omitempty"`
+	Author         string    `json:"author,omitempty"`
+	SourceName     string    `json:"source_name,omitempty"`
+	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
+	SourceImageURL string    `json:"source_image_url,omitempty"`
+	PublishedAt    time.Time `json:"published_at"`
+	LikeCount      int       `json:"like_count"`
+	CommentCount   int       `json:"comment_count"`
+	ShareCount     int       `json:"share_count"`
+	ViewCount      int       `json:"view_count"`
 }
 
 // StorySummary renders a story for a slide: headline + image from the
@@ -90,19 +92,20 @@ type StoryMember struct {
 // that member's content id — clients open / like / bookmark against it (NOT the
 // StoryID, which is a topic id with no content row).
 type StorySummary struct {
-	StoryID      uuid.UUID `json:"story_id"`
-	LeadID       uuid.UUID `json:"lead_id"`
-	Label        string    `json:"label"`
-	Title        string    `json:"title,omitempty"`
-	Excerpt      string    `json:"excerpt,omitempty"`
-	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
-	SourceName   string    `json:"source_name,omitempty"`
-	PublishedAt  time.Time `json:"published_at"`
-	MemberCount  int       `json:"member_count"`
-	LikeCount    int       `json:"like_count"`
-	CommentCount int       `json:"comment_count"`
-	ShareCount   int       `json:"share_count"`
-	ViewCount    int       `json:"view_count"`
+	StoryID        uuid.UUID `json:"story_id"`
+	LeadID         uuid.UUID `json:"lead_id"`
+	Label          string    `json:"label"`
+	Title          string    `json:"title,omitempty"`
+	Excerpt        string    `json:"excerpt,omitempty"`
+	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
+	SourceName     string    `json:"source_name,omitempty"`
+	SourceImageURL string    `json:"source_image_url,omitempty"`
+	PublishedAt    time.Time `json:"published_at"`
+	MemberCount    int       `json:"member_count"`
+	LikeCount      int       `json:"like_count"`
+	CommentCount   int       `json:"comment_count"`
+	ShareCount     int       `json:"share_count"`
+	ViewCount      int       `json:"view_count"`
 }
 
 // StoryFeatured is the featured story of a slide: its summary plus its members.
@@ -335,6 +338,7 @@ func assembleStoryNewsFeed(
 			membersByStory[*m.TopicID] = append(membersByStory[*m.TopicID], m)
 		}
 	}
+	sourceImageByFeedURL := loadSourceImagesByFeedURL(db, tenantID, pageMembers)
 
 	slides := make([]StorySlide, len(page))
 	relCandidates := make([][]StorySummary, len(page))
@@ -350,7 +354,7 @@ func assembleStoryNewsFeed(
 				// at worst render text-light rather than dropping the slide.
 				storyMembers = ag.members
 			}
-			featured := buildStoryFeatured(topic, ag.storyID, storyMembers)
+			featured := buildStoryFeatured(topic, ag.storyID, storyMembers, sourceImageByFeedURL)
 			slides[idx] = StorySlide{SlideID: uuid.New(), Featured: featured}
 			relCandidates[idx] = buildRelatedStories(db, tenantID, topic, ag.storyID, topicByID, pageIDs)
 		}(i, a)
@@ -400,7 +404,7 @@ func topMember(members []models.ContentItem) models.ContentItem {
 	return best
 }
 
-func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.ContentItem) StoryFeatured {
+func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.ContentItem, sourceImageByFeedURL map[string]string) StoryFeatured {
 	// Newest-first members for display.
 	sort.SliceStable(members, func(i, j int) bool {
 		return itemTime(members[i]).After(itemTime(members[j]))
@@ -415,19 +419,20 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 		memberCount = len(members)
 	}
 	summary := StorySummary{
-		StoryID:      storyID,
-		LeadID:       top.PublicID,
-		Label:        topic.Label,
-		Title:        derefStr(top.Title),
-		Excerpt:      derefStr(top.Excerpt),
-		ThumbnailURL: derefStr(top.ThumbnailURL),
-		SourceName:   derefStr(top.SourceName),
-		PublishedAt:  itemTime(top),
-		MemberCount:  memberCount,
-		LikeCount:    top.LikeCount,
-		CommentCount: top.CommentCount,
-		ShareCount:   top.ShareCount,
-		ViewCount:    top.ViewCount,
+		StoryID:        storyID,
+		LeadID:         top.PublicID,
+		Label:          topic.Label,
+		Title:          derefStr(top.Title),
+		Excerpt:        derefStr(top.Excerpt),
+		ThumbnailURL:   derefStr(top.ThumbnailURL),
+		SourceName:     derefStr(top.SourceName),
+		SourceImageURL: sourceImageForItem(top, sourceImageByFeedURL),
+		PublishedAt:    itemTime(top),
+		MemberCount:    memberCount,
+		LikeCount:      top.LikeCount,
+		CommentCount:   top.CommentCount,
+		ShareCount:     top.ShareCount,
+		ViewCount:      top.ViewCount,
 	}
 
 	limit := len(members)
@@ -436,28 +441,118 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 	}
 	out := make([]StoryMember, 0, limit)
 	for _, m := range members[:limit] {
-		out = append(out, mapStoryMember(m))
+		out = append(out, mapStoryMember(m, sourceImageByFeedURL))
 	}
 	return StoryFeatured{StorySummary: summary, Members: out}
 }
 
-func mapStoryMember(m models.ContentItem) StoryMember {
+func mapStoryMember(m models.ContentItem, sourceImageByFeedURL map[string]string) StoryMember {
 	return StoryMember{
-		ID:           m.PublicID,
-		Type:         string(m.Type),
-		Format:       derefStr(m.Format),
-		Title:        derefStr(m.Title),
-		Excerpt:      derefStr(m.Excerpt),
-		BodyText:     derefStr(m.BodyText),
-		Author:       derefStr(m.Author),
-		SourceName:   derefStr(m.SourceName),
-		ThumbnailURL: derefStr(m.ThumbnailURL),
-		PublishedAt:  itemTime(m),
-		LikeCount:    m.LikeCount,
-		CommentCount: m.CommentCount,
-		ShareCount:   m.ShareCount,
-		ViewCount:    m.ViewCount,
+		ID:             m.PublicID,
+		Type:           string(m.Type),
+		Format:         derefStr(m.Format),
+		Title:          derefStr(m.Title),
+		Excerpt:        derefStr(m.Excerpt),
+		BodyText:       derefStr(m.BodyText),
+		Author:         derefStr(m.Author),
+		SourceName:     derefStr(m.SourceName),
+		ThumbnailURL:   derefStr(m.ThumbnailURL),
+		SourceImageURL: sourceImageForItem(m, sourceImageByFeedURL),
+		PublishedAt:    itemTime(m),
+		LikeCount:      m.LikeCount,
+		CommentCount:   m.CommentCount,
+		ShareCount:     m.ShareCount,
+		ViewCount:      m.ViewCount,
 	}
+}
+
+func loadSourceImagesByFeedURL(db *gorm.DB, tenantID string, items []models.ContentItem) map[string]string {
+	lookupKeys := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, it := range items {
+		for _, key := range sourceLookupKeys(derefStr(it.SourceFeedURL), derefStr(it.SourceName)) {
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			lookupKeys = append(lookupKeys, key)
+		}
+	}
+	if len(lookupKeys) == 0 {
+		return nil
+	}
+
+	var sources []models.ContentSource
+	db.Select("name, feed_url, image_url").
+		Where("tenant_id = ? AND image_url IS NOT NULL AND image_url != ''", tenantID).
+		Find(&sources)
+
+	out := make(map[string]string, len(sources))
+	for _, source := range sources {
+		value := strings.TrimSpace(derefStr(source.ImageURL))
+		if value == "" {
+			continue
+		}
+		for _, key := range sourceLookupKeys(derefStr(source.FeedURL), source.Name) {
+			if key != "" {
+				out[key] = value
+			}
+		}
+	}
+	return out
+}
+
+func sourceLookupKeys(rawURL string, sourceName string) []string {
+	keys := make([]string, 0, 4)
+	add := func(value string) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return
+		}
+		for _, existing := range keys {
+			if existing == value {
+				return
+			}
+		}
+		keys = append(keys, value)
+	}
+
+	add(rawURL)
+	add(sourceName)
+	if host := hostKey(rawURL); host != "" {
+		add(host)
+	}
+	if host := hostKey(sourceName); host != "" {
+		add(host)
+	}
+	return keys
+}
+
+func hostKey(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !strings.Contains(value, "://") {
+		value = "https://" + value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	return strings.TrimPrefix(strings.ToLower(parsed.Hostname()), "www.")
+}
+
+func sourceImageForItem(it models.ContentItem, sourceImageByFeedURL map[string]string) string {
+	if len(sourceImageByFeedURL) == 0 {
+		return ""
+	}
+	for _, key := range sourceLookupKeys(derefStr(it.SourceFeedURL), derefStr(it.SourceName)) {
+		if value := sourceImageByFeedURL[key]; value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // relatedCandidateIDs returns the ordered related-story id candidates for a
@@ -500,7 +595,7 @@ func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) [
 	db.Model(&models.Topic{}).
 		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND article_count > 0", tenantID, storyID).
 		Where("last_member_at IS NULL OR last_member_at > ?", relatedFloor).
-		Order("embedding <=> '" + lit + "'").
+		Order("embedding <=> '"+lit+"'").
 		Limit(limit).
 		Pluck("public_id", &relIDs)
 	return relIDs
@@ -528,6 +623,7 @@ func leadSummariesByStory(
 			" ORDER BY topic_id, like_count*3 + share_count*5 + comment_count*2 DESC",
 		tenantID, storyIDs, models.ContentStatusReady,
 	).Scan(&leads)
+	sourceImageByFeedURL := loadSourceImagesByFeedURL(db, tenantID, leads)
 	for _, top := range leads {
 		if top.TopicID == nil {
 			continue
@@ -536,19 +632,20 @@ func leadSummariesByStory(
 		t := topicByID[sid]
 		memberCount := t.ArticleCount
 		out[sid] = StorySummary{
-			StoryID:      sid,
-			LeadID:       top.PublicID,
-			Label:        t.Label,
-			Title:        derefStr(top.Title),
-			Excerpt:      derefStr(top.Excerpt),
-			ThumbnailURL: derefStr(top.ThumbnailURL),
-			SourceName:   derefStr(top.SourceName),
-			PublishedAt:  itemTime(top),
-			MemberCount:  memberCount,
-			LikeCount:    top.LikeCount,
-			CommentCount: top.CommentCount,
-			ShareCount:   top.ShareCount,
-			ViewCount:    top.ViewCount,
+			StoryID:        sid,
+			LeadID:         top.PublicID,
+			Label:          t.Label,
+			Title:          derefStr(top.Title),
+			Excerpt:        derefStr(top.Excerpt),
+			ThumbnailURL:   derefStr(top.ThumbnailURL),
+			SourceName:     derefStr(top.SourceName),
+			SourceImageURL: sourceImageForItem(top, sourceImageByFeedURL),
+			PublishedAt:    itemTime(top),
+			MemberCount:    memberCount,
+			LikeCount:      top.LikeCount,
+			CommentCount:   top.CommentCount,
+			ShareCount:     top.ShareCount,
+			ViewCount:      top.ViewCount,
 		}
 	}
 	return out

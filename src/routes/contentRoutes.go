@@ -17,6 +17,9 @@ func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// Get a single content item by ID
 	group.GET("/content/:id", controllers.GetContentItem)
 
+	// Comments on a content item (paginated, newest first)
+	group.GET("/content/:id/comments", controllers.GetContentComments)
+
 	// User-triggered transcription (JWT-authenticated, rate-limited)
 	group.POST("/content/:id/transcribe", controllers.UserAuthMiddleware(), controllers.RequestTranscription)
 

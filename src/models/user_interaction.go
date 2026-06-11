@@ -16,6 +16,9 @@ const (
 	InteractionTypeShare    InteractionType = "share"
 	InteractionTypeView     InteractionType = "view"
 	InteractionTypeComplete InteractionType = "complete"
+	// InteractionTypeComment stores the comment body in Metadata:
+	// {"text": "...", "author": "display name (optional)"}
+	InteractionTypeComment InteractionType = "comment"
 )
 
 // UserInteraction tracks user interactions with content items

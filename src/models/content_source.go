@@ -19,6 +19,7 @@ type ContentSource struct {
 
 	// Configuration
 	FeedURL   *string        `gorm:"type:text" json:"feed_url,omitempty"`
+	ImageURL  *string        `gorm:"type:text" json:"image_url,omitempty"`
 	APIConfig datatypes.JSON `gorm:"type:jsonb" json:"api_config,omitempty"`
 
 	// Status
