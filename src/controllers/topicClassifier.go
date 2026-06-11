@@ -169,6 +169,15 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 	})
 
 	item.TopicID = &topicID
+
+	if !alreadyMember {
+		// A story just gained a member — a news event the feed must reflect.
+		// Invalidate the read-through cache (next read assembles live) and
+		// recompute this story's related-story order at write time (debounced;
+		// cross-encoder reranked when NewsRerankEnabled).
+		markNewsSnapshotDirty(db, item.TenantID)
+		go refreshStoryRelated(db, item.TenantID, topicID)
+	}
 }
 
 // runningMean folds embedding e into a centroid of n existing members.
@@ -301,4 +310,39 @@ func topicSeedTexts(item *models.ContentItem) []string {
 		parts = append(parts, body)
 	}
 	return parts
+}
+
+// relatedBackfillRunning guards the one-time related_ids sweep per boot.
+var relatedBackfillRunning atomic.Bool
+
+// StartRelatedBackfill precomputes topics.related_ids for stories that predate
+// the write-time related feature (or whose refresh never landed). Without it,
+// every feed read falls back to a per-slide centroid fetch + kNN — the
+// centroid alone is ~12-17KB of wire text per slide against a WAN DB.
+// Sequential and bounded (refreshStoryRelated self-limits via
+// storyRelatedWorkers); a no-op when nothing is missing.
+func StartRelatedBackfill(db *gorm.DB) {
+	if !relatedBackfillRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer relatedBackfillRunning.Store(false)
+		type row struct {
+			PublicID uuid.UUID
+			TenantID string
+		}
+		var rows []row
+		db.Model(&models.Topic{}).
+			Select("public_id, tenant_id").
+			Where("related_ids IS NULL AND embedding IS NOT NULL AND article_count > 0").
+			Scan(&rows)
+		if len(rows) == 0 {
+			return
+		}
+		log.Printf("[related-backfill] computing related stories for %d topics", len(rows))
+		for _, r := range rows {
+			refreshStoryRelated(db, r.TenantID, r.PublicID)
+		}
+		log.Printf("[related-backfill] done (%d topics)", len(rows))
+	}()
 }

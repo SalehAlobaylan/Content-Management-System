@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -67,6 +68,24 @@ func UpdateRankingConfig(c *gin.Context) {
 		}
 	}
 
+	// Normalize the feed mode BEFORE the upsert so both the create and update
+	// paths share the validation — live is the product, cached_only the
+	// emergency escape hatch, legacy values fold into live.
+	if req.NewsFeedMode != "" {
+		switch req.NewsFeedMode {
+		case "live", "on_demand", "precompute":
+			req.NewsFeedMode = "live"
+		case "cached_only":
+			req.NewsFeedMode = "cached_only"
+		default:
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: "news_feed_mode must be 'live' or 'cached_only'",
+				Code:    "INVALID_FEED_MODE",
+			})
+			return
+		}
+	}
+
 	// Upsert
 	var existing models.RankingConfig
 	result := db.Where("tenant_id = ?", principal.TenantID).First(&existing)
@@ -76,6 +95,7 @@ func UpdateRankingConfig(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create config", Code: "CREATE_FAILED"})
 			return
 		}
+		invalidateTenantConfigCache()
 		c.JSON(http.StatusOK, req)
 		return
 	}
@@ -102,25 +122,24 @@ func UpdateRankingConfig(c *gin.Context) {
 		existing.StoryMatchThreshold = req.StoryMatchThreshold
 	}
 	if req.NewsFeedMode != "" {
-		existing.NewsFeedMode = req.NewsFeedMode
+		existing.NewsFeedMode = req.NewsFeedMode // normalized above
 	}
+	// NewsRerankEnabled is a pure quality knob (write-time related-story
+	// reranking) — intentionally independent of the feed mode.
 	existing.NewsRerankEnabled = req.NewsRerankEnabled
-	// Coupling: a precompute (static snapshot) feed never reranks — the
-	// cross-encoder is an on_demand-only stage.
-	if existing.NewsFeedMode != "on_demand" {
-		existing.NewsRerankEnabled = false
-	}
 
 	if err := db.Save(&existing).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update config", Code: "UPDATE_FAILED"})
 		return
 	}
+	invalidateTenantConfigCache()
 	c.JSON(http.StatusOK, existing)
 }
 
 // RefreshNewsSnapshot handles POST /admin/intelligence/news-snapshot/refresh —
-// rebuilds the precomputed story-slide snapshot for the tenant (the precompute
-// feed mode reads it off the request path). Safe to call from an external cron.
+// force-rebuilds the News-feed read-through cache for the tenant. Normally
+// unnecessary (the cache self-refreshes via SWR + ingest invalidation); kept
+// as a manual override and for external cron use in cached_only mode.
 func RefreshNewsSnapshot(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -202,6 +221,7 @@ func SetMode(c *gin.Context) {
 			return
 		}
 	}
+	invalidateTenantConfigCache()
 
 	c.JSON(http.StatusOK, config)
 }
@@ -934,11 +954,34 @@ func PreviewNewsFeed(c *gin.Context) {
 // Helpers
 // ================================================================
 
+// cachedTenantConfig is a short-TTL in-process copy of the ranking config —
+// it's read on every feed request and every classification, and a WAN DB
+// round-trip per read adds ~0.3-0.6s for a row that changes rarely. Admin
+// updates invalidate it in-process immediately (invalidateTenantConfigCache);
+// other instances converge within the TTL.
+type cachedTenantConfig struct {
+	tenantID  string
+	config    models.RankingConfig
+	fetchedAt time.Time
+}
+
+var tenantConfigMem atomic.Pointer[cachedTenantConfig]
+
+const tenantConfigTTL = 15 * time.Second
+
+func invalidateTenantConfigCache() {
+	tenantConfigMem.Store(nil)
+}
+
 func loadTenantConfig(db *gorm.DB, tenantID string) models.RankingConfig {
+	if c := tenantConfigMem.Load(); c != nil && c.tenantID == tenantID && time.Since(c.fetchedAt) < tenantConfigTTL {
+		return c.config
+	}
 	var config models.RankingConfig
 	if err := db.Where("tenant_id = ?", tenantID).First(&config).Error; err != nil {
 		return models.DefaultRankingConfig(tenantID)
 	}
+	tenantConfigMem.Store(&cachedTenantConfig{tenantID: tenantID, config: config, fetchedAt: time.Now()})
 	return config
 }
 

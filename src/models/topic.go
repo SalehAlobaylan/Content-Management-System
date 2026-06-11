@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
+	"gorm.io/datatypes"
 )
 
 // Topic is a first-class, meaningful news topic. The Label is an
@@ -26,6 +27,14 @@ type Topic struct {
 	// active near the item's own publish time, so stories stay bounded to
 	// their event instead of absorbing semantically-similar items forever.
 	LastMemberAt *time.Time `gorm:"index:idx_topics_last_member_at" json:"last_member_at,omitempty"`
+
+	// RelatedIDs is the WRITE-TIME-computed ordered list of related story ids
+	// (JSON array of UUID strings). Recomputed asynchronously whenever this
+	// story gains a member: centroid kNN candidates, cross-encoder reranked
+	// when NewsRerankEnabled. Keeps reranker quality entirely off the read
+	// path — the feed hydrates these ids fresh at serve time. NULL = not yet
+	// computed; readers fall back to a live kNN.
+	RelatedIDs datatypes.JSON `gorm:"type:jsonb" json:"related_ids,omitempty"`
 
 	// Labeled is false for fresh clusters from a full re-cluster pass that still
 	// carry a placeholder name and await LLM labeling. Growing-taxonomy topics

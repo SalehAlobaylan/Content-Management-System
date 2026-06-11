@@ -50,13 +50,19 @@ type RankingConfig struct {
 	// (related articles ~0.65–0.75 cosine): 0.70 clusters genuinely-related
 	// coverage into event stories without over-merging.
 	StoryMatchThreshold float64 `gorm:"type:double precision;default:0.70" json:"story_match_threshold"`
-	// NewsFeedMode controls News-feed assembly: "precompute" serves a static
-	// snapshot off the read path (reranker off); "on_demand" assembles slides
-	// live and enables the cross-encoder reranker.
-	NewsFeedMode string `gorm:"type:varchar(20);default:'precompute'" json:"news_feed_mode"`
-	// NewsRerankEnabled mirrors NewsFeedMode=on_demand — when true the news
-	// slide assembly runs the cross-encoder reranker. Explicit flag so it can be
-	// toggled independently for debugging.
+	// NewsFeedMode controls News-feed serving. "live" (the product default —
+	// PRD: "write-time intelligence, read-time freshness") assembles slides from
+	// current story state on every request, short-circuited by a freshness-
+	// bounded read-through cache (≤60s, invalidated the moment a story gains a
+	// member). "cached_only" is the emergency escape hatch: always serve the
+	// cache (SWR-refreshed), never assemble inline — for when the live path
+	// must be disabled operationally. Legacy values "precompute"/"on_demand"
+	// are folded into these on update.
+	NewsFeedMode string `gorm:"type:varchar(20);default:'live'" json:"news_feed_mode"`
+	// NewsRerankEnabled is a pure QUALITY knob, decoupled from feed mode: when
+	// true, a story's related-story list is reranked by the cross-encoder at
+	// WRITE time (when the story gains a member) and stored on the topic row —
+	// the read path never waits on the reranker either way.
 	NewsRerankEnabled bool `gorm:"default:false" json:"news_rerank_enabled"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
@@ -88,7 +94,7 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		Mode:                           "balanced",
 		IsActive:                       true,
 		StoryMatchThreshold:            0.70,
-		NewsFeedMode:                   "precompute",
+		NewsFeedMode:                   "live",
 		NewsRerankEnabled:              false,
 	}
 }

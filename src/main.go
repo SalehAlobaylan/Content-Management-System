@@ -101,9 +101,16 @@ func main() {
 		env = "development"
 	}
 
-	// Run migrations only in development environments
+	// Run migrations only in development environments — and only when
+	// AUTO_MIGRATE != "false". GORM's AutoMigrate introspects every column of
+	// every model (hundreds of information_schema round-trips); against a
+	// remote DB like Neon (~0.3-0.6s RTT each) that turns boot into multiple
+	// minutes and start.sh times out. Schema changes are tracked as SQL files
+	// in supabase/migrations and applied directly, so day-to-day boots can
+	// skip the sweep (set AUTO_MIGRATE=false in .env.local). Unset = migrate,
+	// the safe default for fresh setups.
 	// Note: In production, use manual migrations or migration tools to avoid conflicts
-	if env == "development" || env == "dev" {
+	if (env == "development" || env == "dev") && os.Getenv("AUTO_MIGRATE") != "false" {
 		log.Println("Migrating database...")
 		if err := utils.AutoMigrate(db,
 			&models.Page{},
@@ -183,6 +190,9 @@ func main() {
 	// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
 	// precompute News snapshot when done. Runs in the background.
 	controllers.StartClassificationBackfill(db)
+	// Precompute missing topics.related_ids (stories predating the write-time
+	// related feature) so feed reads never fall back to per-slide centroid kNN.
+	controllers.StartRelatedBackfill(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

@@ -306,29 +306,37 @@ func GetNewsFeed(c *gin.Context) {
 	}
 
 	// Session view-tracking — exclude_seen drops slides this session already saw
-	// (the client reports views against the slide's lead member id).
+	// (the client reports views against the slide's lead member id). Fetched
+	// concurrently with the cache lookup: both are WAN round-trips and
+	// independent, so serial execution doubles the floor latency.
 	sessionID := c.Query("session_id")
 	userIDStr := c.Query("user_id")
 	var seenIDs []uuid.UUID
+	seenDone := make(chan struct{})
 	if c.Query("exclude_seen") == "true" && (sessionID != "" || userIDStr != "") {
-		seenIDs = fetchSeenIDs(db, sessionID, userIDStr)
+		go func() {
+			defer close(seenDone)
+			seenIDs = fetchSeenIDs(db, sessionID, userIDStr)
+		}()
+	} else {
+		close(seenDone)
 	}
 
-	// Load ranking config (also carries the Phase-13 story + feed-mode knobs).
+	// Load ranking config (in-process cached; also carries the Phase-13 story
+	// + feed-mode knobs).
 	config := loadTenantConfig(db, "default")
 
-	// Phase 13: News feed = story-slides. precompute mode serves the snapshot
-	// off the read path (no ML on the request); on_demand assembles live and,
-	// when enabled, reranks each slide's related stories with the cross-encoder.
-	var slides []StorySlide
-	var nextCursor *string
-	if config.NewsFeedMode == "on_demand" {
-		slides, nextCursor = assembleStoryNewsFeed(
-			db, "default", config, pagination.Timestamp, pagination.LastID, slideLimit, seenIDs,
-		)
-	} else {
-		slides, nextCursor = serveNewsSnapshot(db, "default", pagination.Timestamp, pagination.LastID, slideLimit, seenIDs)
+	// News feed = story-slides, assembled LIVE by default ("write-time
+	// intelligence, read-time freshness") behind a freshness-bounded
+	// read-through cache. See serveStoryNewsFeed for the full policy. The seen
+	// resolver lets the cache lookup run concurrently with the seen query.
+	waitSeen := func() []uuid.UUID {
+		<-seenDone
+		return seenIDs
 	}
+	slides, nextCursor := serveStoryNewsFeed(
+		db, "default", config, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen,
+	)
 
 	c.JSON(http.StatusOK, StoryNewsResponse{
 		Cursor: nextCursor,
