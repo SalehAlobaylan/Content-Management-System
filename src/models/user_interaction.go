@@ -51,6 +51,9 @@ type CreateInteractionRequest struct {
 	ContentItemID   string          `json:"content_item_id" binding:"required"`
 	InteractionType InteractionType `json:"interaction_type" binding:"required"`
 	SessionID       *string         `json:"session_id,omitempty"`
-	UserID          *string         `json:"user_id,omitempty"`
-	Metadata        datatypes.JSON  `json:"metadata,omitempty"`
+	// Deprecated: ignored by the server. The acting user's identity is derived
+	// from the verified JWT (Authorization: Bearer …), never from this field.
+	// Kept only so older clients that still send it do not fail binding.
+	UserID   *string        `json:"user_id,omitempty"`
+	Metadata datatypes.JSON `json:"metadata,omitempty"`
 }

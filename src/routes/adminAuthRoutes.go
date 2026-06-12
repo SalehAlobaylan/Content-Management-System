@@ -70,6 +70,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/transcription/jobs", controllers.ListTranscriptionJobs)
 	adminGroup.POST("/transcription/jobs", controllers.CreateTranscriptionJob)
 	adminGroup.POST("/transcription/jobs/bulk", controllers.BulkCreateTranscriptionJobs)
+	adminGroup.POST("/transcription/batches", controllers.CreateTranscriptionBatch)
+	adminGroup.GET("/transcription/batches/:id", controllers.GetTranscriptionBatch)
+	adminGroup.POST("/transcription/batches/:id/cancel", controllers.CancelTranscriptionBatch)
 	adminGroup.GET("/transcription/quality", controllers.ListTranscriptQuality)
 
 	// Media Studio — per-item transcript + chapter editor
@@ -77,6 +80,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/content/:id/chapters/generate", controllers.GenerateChapters)
 	adminGroup.PUT("/content/:id/chapters", controllers.SaveChapters)
 	adminGroup.PUT("/content/:id/transcript", controllers.SaveTranscript)
+	adminGroup.POST("/content/:id/transcript/approve", controllers.ApproveTranscript)
+	adminGroup.DELETE("/content/:id/transcript/approve", controllers.UnapproveTranscript)
+	adminGroup.GET("/content/:id/transcripts/compare", controllers.CompareTranscripts)
 
 	// Intelligence — Content Flags
 	adminGroup.GET("/intelligence/flags", controllers.ListContentFlags)

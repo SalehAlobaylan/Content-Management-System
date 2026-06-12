@@ -131,22 +131,22 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) err
 	if !triggered {
 		return &sttSkippedError{reason: reason}
 	}
-	return triggerTranscriptionForJob(item, job.PublicID.String())
+	return submitTranscriptionJobToMedia(db, item, job.PublicID.String())
 }
 
-func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID string) error {
+func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID string) (string, error) {
 	if item.MediaURL == nil || *item.MediaURL == "" {
-		return fmt.Errorf("no media_url available")
+		return "", fmt.Errorf("no media_url available")
 	}
 
 	baseURL := mediaBaseURL()
 	if baseURL == "" {
-		return fmt.Errorf("MEDIA_BASE_URL is not configured")
+		return "", fmt.Errorf("MEDIA_BASE_URL is not configured")
 	}
 
 	token := mediaServiceToken()
 	if token == "" {
-		return fmt.Errorf("media service token is not configured")
+		return "", fmt.Errorf("media service token is not configured")
 	}
 
 	// Build multipart form body. CMS-originated jobs use Media's async route so
@@ -161,7 +161,7 @@ func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID str
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/transcribe/jobs", &buf)
 	if err != nil {
-		return fmt.Errorf("failed to create transcription request: %w", err)
+		return "", fmt.Errorf("failed to create transcription request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -170,13 +170,48 @@ func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID str
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("media transcription request failed: %w", err)
+		return "", fmt.Errorf("media transcription request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
+	}
+	var decoded struct {
+		JobID string `json:"job_id"`
+	}
+	_ = json.Unmarshal(body, &decoded)
+	return decoded.JobID, nil
+}
+
+func cancelMediaTranscriptionJob(mediaJobID string) error {
+	mediaJobID = strings.TrimSpace(mediaJobID)
+	if mediaJobID == "" {
+		return nil
+	}
+	baseURL := mediaBaseURL()
+	if baseURL == "" {
+		return fmt.Errorf("MEDIA_BASE_URL is not configured")
+	}
+	token := mediaServiceToken()
+	if token == "" {
+		return fmt.Errorf("media service token is not configured")
+	}
+	req, err := http.NewRequest(http.MethodDelete, baseURL+"/v1/transcribe/jobs/"+mediaJobID, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create media cancel request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("media cancel request failed: %w", err)
+	}
+	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("media returned status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("media cancel returned status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }

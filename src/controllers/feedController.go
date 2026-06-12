@@ -57,9 +57,11 @@ func GetForYouFeed(c *gin.Context) {
 		return
 	}
 
-	// Get session/user ID for interaction status (optional)
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
+	// Identity for interaction status / seen-filtering. Authenticated callers
+	// are scoped to their verified user id only; anonymous callers to their own
+	// session_id. A client-supplied ?user_id is never trusted, and an
+	// authenticated caller cannot pass ?session_id to read someone else's state.
+	userIDStr, sessionID := readIdentity(c)
 	excludeSeen := c.Query("exclude_seen") == "true"
 
 	// Pre-fetch IDs the user has already viewed (used by both paths below)
@@ -309,8 +311,7 @@ func GetNewsFeed(c *gin.Context) {
 	// (the client reports views against the slide's lead member id). Fetched
 	// concurrently with the cache lookup: both are WAN round-trips and
 	// independent, so serial execution doubles the floor latency.
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
+	userIDStr, sessionID := readIdentity(c)
 	var seenIDs []uuid.UUID
 	seenDone := make(chan struct{})
 	if c.Query("exclude_seen") == "true" && (sessionID != "" || userIDStr != "") {

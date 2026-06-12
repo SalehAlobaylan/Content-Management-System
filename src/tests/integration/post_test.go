@@ -22,6 +22,8 @@ func TestPostIntegration(t *testing.T) {
 		postBody := fmt.Sprintf(`{"title":"Post A","content":"Body","author":"Alice"}`)
 		req := httptest.NewRequest("POST", "/api/v1/posts", strings.NewReader(postBody))
 		req.Header.Set("Content-Type", "application/json")
+		// Post mutations require an admin JWT.
+		req.Header.Set("Authorization", "Bearer "+generateTestJWT(t, "550e8400-e29b-41d4-a716-446655440000", "admin@post.test", "admin", []string{"content:write"}))
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 

@@ -22,6 +22,8 @@ func TestMediaIntegration(t *testing.T) {
 		body := `{"url":"http://example.com/test.jpg","type":"image"}`
 		req := httptest.NewRequest("POST", "/api/v1/media", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
+		// Media mutations require an admin JWT.
+		req.Header.Set("Authorization", "Bearer "+generateTestJWT(t, "550e8400-e29b-41d4-a716-446655440000", "admin@media.test", "admin", []string{"content:write"}))
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 

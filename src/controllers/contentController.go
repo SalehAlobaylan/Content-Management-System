@@ -63,9 +63,11 @@ func GetContentItem(c *gin.Context) {
 		return
 	}
 
-	// Get interaction status if session/user provided
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
+	// Interaction status: authenticated callers scoped to their verified user
+	// id, anonymous callers to their own session_id. A client-supplied ?user_id
+	// is never trusted, and an authed caller cannot pass ?session_id to read
+	// another user's like/bookmark state.
+	userIDStr, sessionID := readIdentity(c)
 	isLiked, isBookmarked := false, false
 
 	if sessionID != "" || userIDStr != "" {

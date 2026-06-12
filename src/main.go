@@ -127,6 +127,8 @@ func main() {
 			// Media — transcription/STT config (auto-STT toggle + budget)
 			&models.TranscriptionConfig{},
 			&models.TranscriptionJob{},
+			&models.TranscriptionBatch{},
+			&models.TranscriptionBatchItem{},
 			&models.TranscriptQuality{},
 			&models.TranscriptVersion{},
 			// Media Studio — first-class editable chapters
@@ -169,6 +171,8 @@ func main() {
 	if env == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
+
+	controllers.ResumeTranscriptionBatches(db)
 
 	router := gin.Default()
 

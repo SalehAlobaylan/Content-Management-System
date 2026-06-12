@@ -102,6 +102,46 @@ func InternalCreateTranscript(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transcript"})
 		return
 	}
+
+	var transcriptionJob *models.TranscriptionJob
+	if req.TranscriptionJobID != nil && *req.TranscriptionJobID != "" {
+		if id, err := uuid.Parse(*req.TranscriptionJobID); err == nil {
+			var job models.TranscriptionJob
+			if db.Where("public_id = ?", id).First(&job).Error == nil {
+				transcriptionJob = &job
+			}
+		}
+	}
+	if transcriptionJob != nil && transcriptionJob.Canceled {
+		status := models.TranscriptionJobStatusCanceled
+		writebackStatus := "ignored_canceled"
+		jobReq := internalUpdateTranscriptionJobRequest{
+			Status:          &status,
+			TranscriptID:    ptrString(transcript.PublicID.String()),
+			Language:        req.Language,
+			DurationSec:     req.DurationSec,
+			WritebackStatus: &writebackStatus,
+			Metadata: map[string]interface{}{
+				"write_back_status":      "ignored_canceled",
+				"inactive_transcript_id": transcript.PublicID.String(),
+			},
+		}
+		if req.Provider != nil {
+			jobReq.Provider = req.Provider
+		}
+		wasTerminal := terminalTranscriptionStatus(transcriptionJob.Status) && transcriptionJob.CompletedAt != nil
+		updateTranscriptionJobFromRequest(db, transcriptionJob, jobReq)
+		if err := db.Save(transcriptionJob).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
+			actual := transcriptionJob.ActualCostUsd
+			settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
+			updateBatchItemForJob(db, transcriptionJob)
+		}
+		c.JSON(http.StatusOK, internalCreateTranscriptResponse{
+			ID:        transcript.PublicID.String(),
+			CreatedAt: transcript.CreatedAt.UTC().Format(time.RFC3339),
+		})
+		return
+	}
 	if haveItem && previousTranscriptID != nil {
 		snapshotTranscriptVersion(db, item.TenantID, &item, *previousTranscriptID)
 	}
@@ -121,6 +161,7 @@ func InternalCreateTranscript(c *gin.Context) {
 
 		if req.TranscriptionJobID != nil && *req.TranscriptionJobID != "" {
 			status := models.TranscriptionJobStatusSucceeded
+			writebackStatus := "ok"
 			meta := map[string]interface{}{
 				"write_back_status": "ok",
 				"quality_status":    quality.Status,
@@ -130,28 +171,26 @@ func InternalCreateTranscript(c *gin.Context) {
 				meta["language_probability"] = *req.LanguageProbability
 			}
 			jobReq := internalUpdateTranscriptionJobRequest{
-				Status:       &status,
-				TranscriptID: ptrString(transcript.PublicID.String()),
-				Language:     req.Language,
-				DurationSec:  req.DurationSec,
-				Metadata:     meta,
+				Status:          &status,
+				TranscriptID:    ptrString(transcript.PublicID.String()),
+				Language:        req.Language,
+				DurationSec:     req.DurationSec,
+				WritebackStatus: &writebackStatus,
+				Metadata:        meta,
 			}
 			if req.Provider != nil {
 				jobReq.Provider = req.Provider
 			}
-			id, err := uuid.Parse(*req.TranscriptionJobID)
-			if err == nil {
-				var job models.TranscriptionJob
-				if db.Where("public_id = ?", id).First(&job).Error == nil {
-					wasTerminal := terminalTranscriptionStatus(job.Status) && job.CompletedAt != nil
-					updateTranscriptionJobFromRequest(db, &job, jobReq)
-					if err := db.Save(&job).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(job.Status) {
-						actual := job.ActualCostUsd
-						if actual == 0 {
-							actual = job.EstimatedCostUsd
-						}
-						settleTranscriptionBudget(db, job.TenantID, job.ReservedCostUsd, actual)
+			if transcriptionJob != nil {
+				wasTerminal := terminalTranscriptionStatus(transcriptionJob.Status) && transcriptionJob.CompletedAt != nil
+				updateTranscriptionJobFromRequest(db, transcriptionJob, jobReq)
+				if err := db.Save(transcriptionJob).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
+					actual := transcriptionJob.ActualCostUsd
+					if actual == 0 {
+						actual = transcriptionJob.EstimatedCostUsd
 					}
+					settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
+					updateBatchItemForJob(db, transcriptionJob)
 				}
 			}
 		}
@@ -178,7 +217,7 @@ func InternalCreateTranscript(c *gin.Context) {
 				itemCopy := item
 				jobID := job.PublicID.String()
 				go func() {
-					if err := triggerTranscriptionForJob(&itemCopy, jobID); err != nil {
+					if err := submitTranscriptionJobToMedia(db, &itemCopy, jobID); err != nil {
 						_ = updateTranscriptionJobTerminal(db, jobID, models.TranscriptionJobStatusFailed, err.Error())
 					}
 				}()

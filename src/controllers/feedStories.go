@@ -100,9 +100,14 @@ type StorySummary struct {
 	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
 	SourceName     string    `json:"source_name,omitempty"`
 	SourceImageURL string    `json:"source_image_url,omitempty"`
-	PublishedAt    time.Time `json:"published_at"`
-	MemberCount    int       `json:"member_count"`
-	LikeCount      int       `json:"like_count"`
+	PublishedAt time.Time `json:"published_at"`
+	MemberCount int       `json:"member_count"`
+	// SourceCount is the number of DISTINCT sources among the story's hydrated
+	// members — the Radar-style "covered by N sources" signal. Computed for
+	// the featured story only (related cards show member_count); 0 = not
+	// computed.
+	SourceCount  int `json:"source_count,omitempty"`
+	LikeCount    int `json:"like_count"`
 	CommentCount   int       `json:"comment_count"`
 	ShareCount     int       `json:"share_count"`
 	ViewCount      int       `json:"view_count"`
@@ -418,6 +423,14 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 	if memberCount < len(members) {
 		memberCount = len(members)
 	}
+	// Distinct sources among the visible members — the "covered by N sources"
+	// aggregation signal. Free: members are already in hand.
+	distinctSources := make(map[string]bool, len(members))
+	for _, m := range members {
+		if s := derefStr(m.SourceName); s != "" {
+			distinctSources[s] = true
+		}
+	}
 	summary := StorySummary{
 		StoryID:        storyID,
 		LeadID:         top.PublicID,
@@ -429,6 +442,7 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 		SourceImageURL: sourceImageForItem(top, sourceImageByFeedURL),
 		PublishedAt:    itemTime(top),
 		MemberCount:    memberCount,
+		SourceCount:    len(distinctSources),
 		LikeCount:      top.LikeCount,
 		CommentCount:   top.CommentCount,
 		ShareCount:     top.ShareCount,

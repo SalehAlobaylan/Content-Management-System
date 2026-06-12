@@ -14,11 +14,14 @@ func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	group.GET("/content/mine", controllers.UserAuthMiddleware(), controllers.GetMyContent)
 	group.POST("/content/submit", controllers.UserAuthMiddleware(), controllers.SubmitUserContent)
 
-	// Get a single content item by ID
-	group.GET("/content/:id", controllers.GetContentItem)
+	// Get a single content item by ID. OptionalUserAuth lets the per-user
+	// interaction flags (is_liked / is_bookmarked) be derived from a verified
+	// JWT rather than a spoofable ?user_id query param.
+	group.GET("/content/:id", controllers.OptionalUserAuthMiddleware(), controllers.GetContentItem)
 
-	// Comments on a content item (paginated, newest first)
-	group.GET("/content/:id/comments", controllers.GetContentComments)
+	// Comments on a content item (paginated, newest first). OptionalUserAuth
+	// lets the is_mine flag be derived from the verified token.
+	group.GET("/content/:id/comments", controllers.OptionalUserAuthMiddleware(), controllers.GetContentComments)
 
 	// User-triggered transcription (JWT-authenticated, rate-limited)
 	group.POST("/content/:id/transcribe", controllers.UserAuthMiddleware(), controllers.RequestTranscription)

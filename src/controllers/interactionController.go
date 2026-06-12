@@ -22,6 +22,40 @@ type commentMetadata struct {
 	Author string `json:"author,omitempty"`
 }
 
+// authedUserID returns the authenticated user's UUID when the request carried a
+// valid JWT (set as "user_id" in the context by OptionalUserAuthMiddleware).
+// The bool reports whether the caller is authenticated. A client-supplied
+// user_id is never consulted here — authorization must derive identity only
+// from the verified token.
+func authedUserID(c *gin.Context) (uuid.UUID, bool) {
+	raw, ok := c.Get("user_id")
+	if !ok {
+		return uuid.Nil, false
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return uuid.Nil, false
+	}
+	uid, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.Nil, false
+	}
+	return uid, true
+}
+
+// readIdentity returns the (userIDStr, sessionID) pair a read handler should
+// scope personalization to. When the caller is authenticated, identity is the
+// verified user only and the client-supplied session_id is ignored — otherwise
+// an authenticated caller could pass ?session_id=<victim> to read another
+// (anonymous) user's session-scoped flags. Anonymous callers fall back to their
+// own session_id.
+func readIdentity(c *gin.Context) (userIDStr string, sessionID string) {
+	if uid, ok := authedUserID(c); ok {
+		return uid.String(), ""
+	}
+	return "", c.Query("session_id")
+}
+
 // CreateInteraction records a user interaction (like, bookmark, view, share, complete)
 // POST /api/v1/interactions
 func CreateInteraction(c *gin.Context) {
@@ -82,14 +116,19 @@ func CreateInteraction(c *gin.Context) {
 		Metadata:      req.Metadata,
 	}
 
-	// Set user/session
-	if req.SessionID != nil {
+	// Identity: prefer the authenticated user (verified JWT). Never trust the
+	// client-supplied req.UserID — it is ignored entirely. Anonymous callers
+	// fall back to a session id they provide.
+	if uid, ok := authedUserID(c); ok {
+		interaction.UserID = &uid
+	} else if req.SessionID != nil && strings.TrimSpace(*req.SessionID) != "" {
 		interaction.SessionID = req.SessionID
-	}
-	if req.UserID != nil {
-		if userID, err := uuid.Parse(*req.UserID); err == nil {
-			interaction.UserID = &userID
-		}
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication or session_id required",
+		})
+		return
 	}
 
 	// Check for duplicate (like/bookmark should be unique per user per content)
@@ -140,17 +179,6 @@ func CreateInteraction(c *gin.Context) {
 func GetBookmarks(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
-
-	if sessionID == "" && userIDStr == "" {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{
-			Code:    http.StatusBadRequest,
-			Message: "Either session_id or user_id is required",
-		})
-		return
-	}
-
 	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
@@ -160,18 +188,22 @@ func GetBookmarks(c *gin.Context) {
 		return
 	}
 
-	// Query bookmarks
+	// Query bookmarks, scoped strictly to the caller's own identity. Identity
+	// comes from the verified JWT when present, otherwise the caller's session.
 	query := db.Model(&models.UserInteraction{}).
 		Where("type = ?", models.InteractionTypeBookmark).
 		Order("created_at DESC")
 
-	if sessionID != "" {
+	if uid, ok := authedUserID(c); ok {
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID := c.Query("session_id"); sessionID != "" {
 		query = query.Where("session_id = ?", sessionID)
-	}
-	if userIDStr != "" {
-		if userID, err := uuid.Parse(userIDStr); err == nil {
-			query = query.Or("user_id = ?", userID)
-		}
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication or session_id required",
+		})
+		return
 	}
 
 	// Apply cursor
@@ -247,6 +279,27 @@ func DeleteInteraction(c *gin.Context) {
 		return
 	}
 
+	// Ownership check: the caller may only delete their own interaction. A 404
+	// (rather than 403) is returned on mismatch to avoid leaking existence.
+	if uid, ok := authedUserID(c); ok {
+		if interaction.UserID == nil || *interaction.UserID != uid {
+			c.JSON(http.StatusNotFound, utils.HTTPError{
+				Code:    http.StatusNotFound,
+				Message: "Interaction not found",
+			})
+			return
+		}
+	} else {
+		sessionID := c.Query("session_id")
+		if sessionID == "" || interaction.SessionID == nil || *interaction.SessionID != sessionID {
+			c.JSON(http.StatusNotFound, utils.HTTPError{
+				Code:    http.StatusNotFound,
+				Message: "Interaction not found",
+			})
+			return
+		}
+	}
+
 	// Decrement engagement counter
 	updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1)
 
@@ -272,21 +325,11 @@ func DeleteInteractionByContext(c *gin.Context) {
 
 	contentItemIDStr := c.Query("content_item_id")
 	interactionTypeStr := c.Query("type")
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
 
 	if contentItemIDStr == "" || interactionTypeStr == "" {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
 			Code:    http.StatusBadRequest,
 			Message: "content_item_id and type are required",
-		})
-		return
-	}
-
-	if sessionID == "" && userIDStr == "" {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{
-			Code:    http.StatusBadRequest,
-			Message: "session_id or user_id is required",
 		})
 		return
 	}
@@ -312,18 +355,17 @@ func DeleteInteractionByContext(c *gin.Context) {
 	query := db.Where("content_item_id = ?", contentItemID).
 		Where("type = ?", interactionType)
 
-	if userIDStr != "" {
-		userID, err := uuid.Parse(userIDStr)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, utils.HTTPError{
-				Code:    http.StatusBadRequest,
-				Message: "Invalid user_id",
-			})
-			return
-		}
-		query = query.Where("user_id = ?", userID)
-	} else {
+	// Scope deletion to the caller's own identity (verified JWT or session).
+	if uid, ok := authedUserID(c); ok {
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID := c.Query("session_id"); sessionID != "" {
 		query = query.Where("session_id = ?", sessionID)
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication or session_id required",
+		})
+		return
 	}
 
 	var interaction models.UserInteraction
@@ -410,7 +452,7 @@ func GetContentComments(c *gin.Context) {
 
 	sessionID := c.Query("session_id")
 	var callerUserID *uuid.UUID
-	if uid, err := uuid.Parse(c.Query("user_id")); err == nil {
+	if uid, ok := authedUserID(c); ok {
 		callerUserID = &uid
 	}
 
@@ -462,33 +504,27 @@ type HistoryItem struct {
 func GetWatchHistory(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
-
-	if sessionID == "" && userIDStr == "" {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{
-			Code:    http.StatusBadRequest,
-			Message: "session_id or user_id is required",
-		})
-		return
-	}
-
 	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid cursor: " + err.Error()})
 		return
 	}
 
-	// Build query for view interactions
+	// Build query for view interactions, scoped to the caller's own identity
+	// (verified JWT when present, otherwise the caller's session).
 	query := db.Model(&models.UserInteraction{}).
 		Where("type = ?", models.InteractionTypeView)
 
-	if userIDStr != "" {
-		if uid, err := uuid.Parse(userIDStr); err == nil {
-			query = query.Where("user_id = ?", uid)
-		}
-	} else {
+	if uid, ok := authedUserID(c); ok {
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID := c.Query("session_id"); sessionID != "" {
 		query = query.Where("session_id = ?", sessionID)
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication or session_id required",
+		})
+		return
 	}
 
 	// Cursor pagination over created_at (view time)
@@ -565,21 +601,15 @@ func GetWatchHistory(c *gin.Context) {
 func DeleteWatchHistory(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
-	sessionID := c.Query("session_id")
-	userIDStr := c.Query("user_id")
-
-	if sessionID == "" && userIDStr == "" {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "session_id or user_id is required"})
-		return
-	}
-
+	// Scope deletion to the caller's own identity (verified JWT or session).
 	query := db.Where("type = ?", models.InteractionTypeView)
-	if userIDStr != "" {
-		if uid, err := uuid.Parse(userIDStr); err == nil {
-			query = query.Where("user_id = ?", uid)
-		}
-	} else {
+	if uid, ok := authedUserID(c); ok {
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID := c.Query("session_id"); sessionID != "" {
 		query = query.Where("session_id = ?", sessionID)
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication or session_id required"})
+		return
 	}
 
 	if err := query.Delete(&models.UserInteraction{}).Error; err != nil {

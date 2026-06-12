@@ -273,3 +273,45 @@ func UserAuthMiddleware() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
+// OptionalUserAuthMiddleware validates a JWT when one is present and, on
+// success, sets user_id in the Gin context. Unlike UserAuthMiddleware it does
+// NOT abort when the Authorization header is missing or invalid — it simply
+// continues without a user_id. This lets routes serve both authenticated users
+// (identity derived from the verified token) and anonymous, session-scoped
+// callers from the same handler, while never trusting a client-supplied
+// user_id for authorization decisions.
+func OptionalUserAuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" || !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			c.Next()
+			return
+		}
+
+		parts := strings.SplitN(authHeader, " ", 2)
+		tokenString := ""
+		if len(parts) == 2 {
+			tokenString = strings.TrimSpace(parts[1])
+		}
+		if tokenString == "" {
+			c.Next()
+			return
+		}
+
+		secret, err := utils.GetJWTSecret()
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		claims, err := utils.ParseJWT(tokenString, secret)
+		if err != nil || claims.UserID == "" {
+			c.Next()
+			return
+		}
+
+		c.Set("user_id", claims.UserID)
+		c.Next()
+	}
+}

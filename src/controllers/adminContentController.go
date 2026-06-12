@@ -48,6 +48,8 @@ type adminContentItemResponse struct {
 	CaptionState           *string                    `json:"caption_state,omitempty"`
 	TranscriptSource       *string                    `json:"transcript_source,omitempty"`
 	HasTranscript          bool                       `json:"has_transcript"`
+	TranscriptApprovedAt   *string                    `json:"transcript_approved_at,omitempty"`
+	TranscriptApprovedBy   *string                    `json:"transcript_approved_by,omitempty"`
 	LatestTranscriptionJob *transcriptionJobResponse  `json:"latest_transcription_job,omitempty"`
 	TranscriptQuality      *transcriptQualityResponse `json:"transcript_quality,omitempty"`
 }
@@ -166,10 +168,10 @@ func ListContentItems(c *gin.Context) {
 
 	data := make([]adminContentItemResponse, 0, len(items))
 	for _, item := range items {
-		row := mapAdminContentItemResponse(item)
-		populateAdminContentTranscription(db, item.PublicID, &row)
-		data = append(data, row)
+		data = append(data, mapAdminContentItemResponse(item))
 	}
+	// Batched (3 queries total) — the per-row variant is 3 queries per item.
+	populateAdminContentTranscriptionBatch(db, items, data)
 
 	c.JSON(http.StatusOK, adminContentListResponse{
 		Data:       data,
@@ -271,6 +273,70 @@ func UpdateContentStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// populateAdminContentTranscriptionBatch fills transcription job / quality /
+// approval fields for a whole page of rows with 3 queries total — the per-row
+// variant below costs 3 queries PER ROW, which at 50 rows × 30s auto-refresh
+// is a real latency problem against a remote Postgres.
+func populateAdminContentTranscriptionBatch(db *gorm.DB, items []models.ContentItem, rows []adminContentItemResponse) {
+	if len(items) == 0 || len(items) != len(rows) {
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.PublicID)
+	}
+
+	// Latest transcription job per item.
+	var jobs []models.TranscriptionJob
+	db.Raw(`SELECT DISTINCT ON (content_item_id) * FROM transcription_jobs
+		WHERE content_item_id IN ?
+		ORDER BY content_item_id, created_at DESC`, ids).Scan(&jobs)
+	jobByContent := make(map[uuid.UUID]models.TranscriptionJob, len(jobs))
+	for _, j := range jobs {
+		jobByContent[j.ContentItemID] = j
+	}
+
+	// Quality is upserted one-row-per-item.
+	var quals []models.TranscriptQuality
+	db.Where("content_item_id IN ?", ids).Find(&quals)
+	qualByContent := make(map[uuid.UUID]models.TranscriptQuality, len(quals))
+	for _, q := range quals {
+		qualByContent[q.ContentItemID] = q
+	}
+
+	// Approval state of each item's ACTIVE transcript.
+	type approvedRow struct {
+		ContentID  uuid.UUID  `gorm:"column:content_id"`
+		ApprovedAt *time.Time `gorm:"column:approved_at"`
+		ApprovedBy *string    `gorm:"column:approved_by"`
+	}
+	var approved []approvedRow
+	db.Raw(`SELECT ci.public_id AS content_id, t.approved_at, t.approved_by
+		FROM content_items ci
+		JOIN transcripts t ON t.public_id = ci.transcript_id
+		WHERE ci.public_id IN ? AND t.approved_at IS NOT NULL`, ids).Scan(&approved)
+	approvedByContent := make(map[uuid.UUID]approvedRow, len(approved))
+	for _, a := range approved {
+		approvedByContent[a.ContentID] = a
+	}
+
+	for i := range rows {
+		cid := items[i].PublicID
+		if j, ok := jobByContent[cid]; ok {
+			mapped := mapTranscriptionJob(j)
+			rows[i].LatestTranscriptionJob = &mapped
+		}
+		if q, ok := qualByContent[cid]; ok {
+			mapped := mapTranscriptQuality(q)
+			rows[i].TranscriptQuality = &mapped
+		}
+		if a, ok := approvedByContent[cid]; ok {
+			rows[i].TranscriptApprovedAt = formatTimePtr(a.ApprovedAt)
+			rows[i].TranscriptApprovedBy = a.ApprovedBy
+		}
+	}
+}
+
 func populateAdminContentTranscription(db *gorm.DB, contentID uuid.UUID, resp *adminContentItemResponse) {
 	if job := latestTranscriptionJob(db, contentID); job != nil {
 		mapped := mapTranscriptionJob(*job)
@@ -279,6 +345,14 @@ func populateAdminContentTranscription(db *gorm.DB, contentID uuid.UUID, resp *a
 	if q := latestTranscriptQuality(db, contentID); q != nil {
 		mapped := mapTranscriptQuality(*q)
 		resp.TranscriptQuality = &mapped
+	}
+	var transcript models.Transcript
+	if err := db.Where(`public_id = (
+		SELECT transcript_id FROM content_items WHERE public_id = ?
+	) AND approved_at IS NOT NULL`, contentID).
+		Order("created_at DESC").First(&transcript).Error; err == nil {
+		resp.TranscriptApprovedAt = formatTimePtr(transcript.ApprovedAt)
+		resp.TranscriptApprovedBy = transcript.ApprovedBy
 	}
 }
 

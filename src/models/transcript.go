@@ -70,6 +70,12 @@ type Transcript struct {
 	Source   *string `gorm:"type:varchar(32)" json:"source,omitempty"`
 	Provider *string `gorm:"type:varchar(64)" json:"provider,omitempty"`
 
+	// Human approval is advisory: Console warns before risky operations, but CMS
+	// does not block edits or replacement.
+	ApprovedAt     *time.Time `gorm:"type:timestamp" json:"approved_at,omitempty"`
+	ApprovedBy     *string    `gorm:"type:varchar(255)" json:"approved_by,omitempty"`
+	ApprovalReason *string    `gorm:"type:text" json:"approval_reason,omitempty"`
+
 	// Timestamps
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 }

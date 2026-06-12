@@ -72,10 +72,15 @@ type studioContentDTO struct {
 }
 
 type studioTranscriptDTO struct {
-	TranscriptID string        `json:"transcript_id"`
-	FullText     string        `json:"full_text"`
-	Language     *string       `json:"language,omitempty"`
-	Segments     []segmentData `json:"segments"`
+	TranscriptID   string        `json:"transcript_id"`
+	FullText       string        `json:"full_text"`
+	Language       *string       `json:"language,omitempty"`
+	Source         *string       `json:"source,omitempty"`
+	Provider       *string       `json:"provider,omitempty"`
+	ApprovedAt     *string       `json:"approved_at,omitempty"`
+	ApprovedBy     *string       `json:"approved_by,omitempty"`
+	ApprovalReason *string       `json:"approval_reason,omitempty"`
+	Segments       []segmentData `json:"segments"`
 }
 
 type studioChapterDTO struct {
@@ -268,10 +273,15 @@ func GetStudio(c *gin.Context) {
 
 	if transcript != nil {
 		resp.Transcript = &studioTranscriptDTO{
-			TranscriptID: transcript.PublicID.String(),
-			FullText:     transcript.FullText,
-			Language:     transcript.Language,
-			Segments:     extractSegments(transcript),
+			TranscriptID:   transcript.PublicID.String(),
+			FullText:       transcript.FullText,
+			Language:       transcript.Language,
+			Source:         transcript.Source,
+			Provider:       transcript.Provider,
+			ApprovedAt:     formatTimePtr(transcript.ApprovedAt),
+			ApprovedBy:     transcript.ApprovedBy,
+			ApprovalReason: transcript.ApprovalReason,
+			Segments:       extractSegments(transcript),
 		}
 		chapters := loadOrSeedChapters(db, principal.TenantID, transcript)
 		resp.Chapters = chaptersToDTO(chapters, durationMs(item))
@@ -692,6 +702,243 @@ func SaveTranscript(c *gin.Context) {
 	})
 }
 
+type approveTranscriptRequest struct {
+	Reason string `json:"reason"`
+}
+
+func ApproveTranscript(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	item, transcript, err := loadStudioItem(db, principal.TenantID, c.Param("id"))
+	if err != nil || transcript == nil {
+		status := http.StatusBadRequest
+		if err == errNotFound || transcript == nil {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, utils.HTTPError{Code: status, Message: "Transcript not found"})
+		return
+	}
+	var req approveTranscriptRequest
+	_ = c.ShouldBindJSON(&req)
+	now := time.Now()
+	reason := strings.TrimSpace(req.Reason)
+	transcript.ApprovedAt = &now
+	transcript.ApprovedBy = &principal.Email
+	if reason != "" {
+		transcript.ApprovalReason = &reason
+	} else {
+		transcript.ApprovalReason = nil
+	}
+	if err := db.Save(transcript).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to approve transcript"})
+		return
+	}
+	createStudioAudit(db, principal, "media_studio.transcript_approve", item.PublicID.String(), "success", "", map[string]interface{}{
+		"transcript_id": transcript.PublicID.String(),
+		"reason":        reason,
+	})
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcript approved", Data: gin.H{"transcript": mapStudioTranscript(transcript)}})
+}
+
+func UnapproveTranscript(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	item, transcript, err := loadStudioItem(db, principal.TenantID, c.Param("id"))
+	if err != nil || transcript == nil {
+		status := http.StatusBadRequest
+		if err == errNotFound || transcript == nil {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, utils.HTTPError{Code: status, Message: "Transcript not found"})
+		return
+	}
+	transcript.ApprovedAt = nil
+	transcript.ApprovedBy = nil
+	transcript.ApprovalReason = nil
+	if err := db.Save(transcript).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to clear transcript approval"})
+		return
+	}
+	createStudioAudit(db, principal, "media_studio.transcript_unapprove", item.PublicID.String(), "success", "", map[string]interface{}{
+		"transcript_id": transcript.PublicID.String(),
+	})
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcript approval cleared", Data: gin.H{"transcript": mapStudioTranscript(transcript)}})
+}
+
+type transcriptCompareCandidate struct {
+	ID              string                     `json:"id"`
+	Kind            string                     `json:"kind"`
+	Source          *string                    `json:"source,omitempty"`
+	Provider        *string                    `json:"provider,omitempty"`
+	Language        *string                    `json:"language,omitempty"`
+	CreatedAt       string                     `json:"created_at"`
+	FullText        string                     `json:"full_text"`
+	Segments        []segmentData              `json:"segments"`
+	WordCount       int                        `json:"word_count"`
+	SegmentCount    int                        `json:"segment_count"`
+	Similarity      float64                    `json:"similarity"`
+	DifferenceCount int                        `json:"difference_count"`
+	Quality         *transcriptQualityResponse `json:"quality,omitempty"`
+	ApprovedAt      *string                    `json:"approved_at,omitempty"`
+	ApprovedBy      *string                    `json:"approved_by,omitempty"`
+	ApprovalReason  *string                    `json:"approval_reason,omitempty"`
+}
+
+func mapStudioTranscript(t *models.Transcript) studioTranscriptDTO {
+	return studioTranscriptDTO{
+		TranscriptID:   t.PublicID.String(),
+		FullText:       t.FullText,
+		Language:       t.Language,
+		Source:         t.Source,
+		Provider:       t.Provider,
+		ApprovedAt:     formatTimePtr(t.ApprovedAt),
+		ApprovedBy:     t.ApprovedBy,
+		ApprovalReason: t.ApprovalReason,
+		Segments:       extractSegments(t),
+	}
+}
+
+func wordSetSimilarity(a, b string) float64 {
+	aw := strings.Fields(strings.ToLower(a))
+	bw := strings.Fields(strings.ToLower(b))
+	if len(aw) == 0 && len(bw) == 0 {
+		return 1
+	}
+	if len(aw) == 0 || len(bw) == 0 {
+		return 0
+	}
+	setA := map[string]bool{}
+	setB := map[string]bool{}
+	for _, w := range aw {
+		setA[w] = true
+	}
+	for _, w := range bw {
+		setB[w] = true
+	}
+	intersection := 0
+	for w := range setA {
+		if setB[w] {
+			intersection++
+		}
+	}
+	union := len(setA)
+	for w := range setB {
+		if !setA[w] {
+			union++
+		}
+	}
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+func compareCandidateQuality(db *gorm.DB, transcriptID uuid.UUID) *transcriptQualityResponse {
+	if db == nil {
+		return nil
+	}
+	var q models.TranscriptQuality
+	if err := db.Where("transcript_id = ?", transcriptID).First(&q).Error; err != nil {
+		return nil
+	}
+	mapped := mapTranscriptQuality(q)
+	return &mapped
+}
+
+func makeTranscriptCandidate(db *gorm.DB, activeText string, kind string, t models.Transcript) transcriptCompareCandidate {
+	segs := extractSegments(&t)
+	sim := wordSetSimilarity(activeText, t.FullText)
+	diff := int(math.Abs(float64(len(strings.Fields(activeText)) - len(strings.Fields(t.FullText)))))
+	return transcriptCompareCandidate{
+		ID:              t.PublicID.String(),
+		Kind:            kind,
+		Source:          t.Source,
+		Provider:        t.Provider,
+		Language:        t.Language,
+		CreatedAt:       t.CreatedAt.UTC().Format(time.RFC3339),
+		FullText:        t.FullText,
+		Segments:        segs,
+		WordCount:       len(strings.Fields(t.FullText)),
+		SegmentCount:    len(segs),
+		Similarity:      sim,
+		DifferenceCount: diff,
+		Quality:         compareCandidateQuality(db, t.PublicID),
+		ApprovedAt:      formatTimePtr(t.ApprovedAt),
+		ApprovedBy:      t.ApprovedBy,
+		ApprovalReason:  t.ApprovalReason,
+	}
+}
+
+func makeVersionCandidate(activeText string, v models.TranscriptVersion) transcriptCompareCandidate {
+	t := models.Transcript{
+		PublicID:       v.PublicID,
+		FullText:       v.FullText,
+		Segments:       v.Segments,
+		WordTimestamps: v.WordTimestamps,
+		Language:       v.Language,
+		Source:         v.Source,
+		Provider:       v.Provider,
+		ApprovedAt:     v.ApprovedAt,
+		ApprovedBy:     v.ApprovedBy,
+		ApprovalReason: v.ApprovalReason,
+		CreatedAt:      v.CreatedAt,
+	}
+	c := makeTranscriptCandidate(nil, activeText, "version", t)
+	c.Quality = nil
+	return c
+}
+
+func CompareTranscripts(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	item, transcript, err := loadStudioItem(db, principal.TenantID, c.Param("id"))
+	if err != nil {
+		status := http.StatusBadRequest
+		if err == errNotFound {
+			status = http.StatusNotFound
+		}
+		c.JSON(status, utils.HTTPError{Code: status, Message: err.Error()})
+		return
+	}
+	if transcript == nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "No active transcript to compare"})
+		return
+	}
+	candidates := []transcriptCompareCandidate{}
+	var transcripts []models.Transcript
+	db.Where("content_item_id = ? AND public_id <> ?", item.PublicID, transcript.PublicID).
+		Order("created_at DESC").Limit(10).Find(&transcripts)
+	for _, t := range transcripts {
+		kind := "transcript"
+		if t.Source != nil && strings.HasPrefix(*t.Source, "youtube_") {
+			kind = "youtube_caption"
+		} else if t.Source != nil && strings.HasPrefix(*t.Source, "stt_") {
+			kind = "stt"
+		}
+		candidates = append(candidates, makeTranscriptCandidate(db, transcript.FullText, kind, t))
+	}
+	var versions []models.TranscriptVersion
+	db.Where("content_item_id = ?", item.PublicID).Order("created_at DESC").Limit(10).Find(&versions)
+	for _, v := range versions {
+		candidates = append(candidates, makeVersionCandidate(transcript.FullText, v))
+	}
+	active := makeTranscriptCandidate(db, transcript.FullText, "active", *transcript)
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Transcript comparison fetched",
+		Data:    gin.H{"active": active, "candidates": candidates},
+	})
+}
+
 func changedSegmentCount(prev, next []segmentData) int {
 	maxLen := len(prev)
 	if len(next) > maxLen {
@@ -731,6 +978,8 @@ func studioAuditSummary(db *gorm.DB, tenantID, contentID string) map[string]inte
 	if err := db.Where("tenant_id = ? AND target_resource = ? AND action IN ?", tenantID, contentID, []string{
 		"media_studio.transcript_edit",
 		"media_studio.chapters_save",
+		"media_studio.transcript_approve",
+		"media_studio.transcript_unapprove",
 	}).Order("created_at DESC").First(&last).Error; err != nil {
 		return nil
 	}
