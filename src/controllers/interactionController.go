@@ -188,16 +188,37 @@ func GetBookmarks(c *gin.Context) {
 		return
 	}
 
+	sortParam := c.DefaultQuery("sort", "saved_desc")
+	sortAsc := sortParam == "saved_asc"
+	if sortParam != "saved_desc" && sortParam != "saved_asc" {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "sort must be saved_desc or saved_asc",
+		})
+		return
+	}
+
+	feedParam := c.DefaultQuery("feed", "all")
+	if feedParam != "all" && feedParam != "foryou" && feedParam != "news" {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "feed must be all, foryou, or news",
+		})
+		return
+	}
+
 	// Query bookmarks, scoped strictly to the caller's own identity. Identity
 	// comes from the verified JWT when present, otherwise the caller's session.
 	query := db.Model(&models.UserInteraction{}).
-		Where("type = ?", models.InteractionTypeBookmark).
-		Order("created_at DESC")
+		Select("user_interactions.*").
+		Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+		Where("user_interactions.type = ?", models.InteractionTypeBookmark).
+		Where("content_items.status = ?", models.ContentStatusReady)
 
 	if uid, ok := authedUserID(c); ok {
-		query = query.Where("user_id = ?", uid)
+		query = query.Where("user_interactions.user_id = ?", uid)
 	} else if sessionID := c.Query("session_id"); sessionID != "" {
-		query = query.Where("session_id = ?", sessionID)
+		query = query.Where("user_interactions.session_id = ?", sessionID)
 	} else {
 		c.JSON(http.StatusUnauthorized, utils.HTTPError{
 			Code:    http.StatusUnauthorized,
@@ -206,13 +227,56 @@ func GetBookmarks(c *gin.Context) {
 		return
 	}
 
-	// Apply cursor
+	switch feedParam {
+	case "foryou":
+		query = query.Where("content_items.type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast})
+	case "news":
+		query = query.Where("content_items.type IN ?", []models.ContentType{
+			models.ContentTypeNews,
+			models.ContentTypeArticle,
+			models.ContentTypeTweet,
+			models.ContentTypeComment,
+		})
+	}
+
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := "%" + q + "%"
+		query = query.Where(
+			"content_items.title ILIKE ? OR content_items.source_name ILIKE ? OR content_items.author ILIKE ?",
+			like,
+			like,
+			like,
+		)
+	}
+
 	if !pagination.Timestamp.IsZero() {
-		query = query.Where("created_at < ?", pagination.Timestamp)
+		if sortAsc {
+			query = query.Where(
+				"user_interactions.created_at > ? OR (user_interactions.created_at = ? AND user_interactions.public_id > ?)",
+				pagination.Timestamp,
+				pagination.Timestamp,
+				pagination.LastID,
+			)
+		} else {
+			query = query.Where(
+				"user_interactions.created_at < ? OR (user_interactions.created_at = ? AND user_interactions.public_id < ?)",
+				pagination.Timestamp,
+				pagination.Timestamp,
+				pagination.LastID,
+			)
+		}
+	}
+
+	orderDirection := "DESC"
+	if sortAsc {
+		orderDirection = "ASC"
 	}
 
 	var interactions []models.UserInteraction
-	if err := query.Limit(pagination.Limit + 1).Find(&interactions).Error; err != nil {
+	if err := query.
+		Order("user_interactions.created_at " + orderDirection + ", user_interactions.public_id " + orderDirection).
+		Limit(pagination.Limit + 1).
+		Find(&interactions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
 			Message: "Failed to fetch bookmarks: " + err.Error(),
@@ -243,10 +307,21 @@ func GetBookmarks(c *gin.Context) {
 		db.Where("public_id IN ?", contentIDs).Find(&contentItems)
 	}
 
-	// Map to response
-	items := make([]ForYouItem, 0, len(contentItems))
+	contentMap := make(map[uuid.UUID]models.ContentItem, len(contentItems))
 	for _, item := range contentItems {
-		items = append(items, mapToForYouItem(item, false, true)) // is_bookmarked = true
+		contentMap[item.PublicID] = item
+	}
+
+	items := make([]ForYouItem, 0, len(interactions))
+	for _, interaction := range interactions {
+		item, ok := contentMap[interaction.ContentItemID]
+		if !ok {
+			continue
+		}
+		mapped := mapToForYouItem(item, false, true)
+		bookmarkedAt := interaction.CreatedAt
+		mapped.BookmarkedAt = &bookmarkedAt
+		items = append(items, mapped)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -488,15 +563,15 @@ func GetContentComments(c *gin.Context) {
 
 // HistoryItem is a single entry in the user's watch history
 type HistoryItem struct {
-	ContentID    uuid.UUID  `json:"content_id"`
-	ViewedAt     time.Time  `json:"viewed_at"`
-	Type         string     `json:"type"`
-	Title        string     `json:"title,omitempty"`
-	ThumbnailURL *string    `json:"thumbnail_url,omitempty"`
-	MediaURL     *string    `json:"media_url,omitempty"`
-	DurationSec  *int       `json:"duration_sec,omitempty"`
-	Author       *string    `json:"author,omitempty"`
-	SourceName   *string    `json:"source_name,omitempty"`
+	ContentID    uuid.UUID `json:"content_id"`
+	ViewedAt     time.Time `json:"viewed_at"`
+	Type         string    `json:"type"`
+	Title        string    `json:"title,omitempty"`
+	ThumbnailURL *string   `json:"thumbnail_url,omitempty"`
+	MediaURL     *string   `json:"media_url,omitempty"`
+	DurationSec  *int      `json:"duration_sec,omitempty"`
+	Author       *string   `json:"author,omitempty"`
+	SourceName   *string   `json:"source_name,omitempty"`
 }
 
 // GetWatchHistory returns a user's watch history (view interactions) with content details.
@@ -510,15 +585,16 @@ func GetWatchHistory(c *gin.Context) {
 		return
 	}
 
-	// Build query for view interactions, scoped to the caller's own identity
-	// (verified JWT when present, otherwise the caller's session).
-	query := db.Model(&models.UserInteraction{}).
+	// Build a latest-view-per-content subquery, scoped to the caller's own
+	// identity (verified JWT when present, otherwise the caller's session).
+	latestViews := db.Model(&models.UserInteraction{}).
+		Select("DISTINCT ON (content_item_id) user_interactions.*").
 		Where("type = ?", models.InteractionTypeView)
 
 	if uid, ok := authedUserID(c); ok {
-		query = query.Where("user_id = ?", uid)
+		latestViews = latestViews.Where("user_id = ?", uid)
 	} else if sessionID := c.Query("session_id"); sessionID != "" {
-		query = query.Where("session_id = ?", sessionID)
+		latestViews = latestViews.Where("session_id = ?", sessionID)
 	} else {
 		c.JSON(http.StatusUnauthorized, utils.HTTPError{
 			Code:    http.StatusUnauthorized,
@@ -527,13 +603,24 @@ func GetWatchHistory(c *gin.Context) {
 		return
 	}
 
-	// Cursor pagination over created_at (view time)
+	latestViews = latestViews.Order("content_item_id, created_at DESC, id DESC")
+
+	// Cursor pagination over the deduped latest views, ordered by view time.
+	query := db.Table("(?) AS latest_views", latestViews)
 	if !pagination.Timestamp.IsZero() {
-		query = query.Where("created_at < ?", pagination.Timestamp)
+		query = query.Where(
+			"created_at < ? OR (created_at = ? AND content_item_id < ?)",
+			pagination.Timestamp,
+			pagination.Timestamp,
+			pagination.LastID,
+		)
 	}
 
 	var interactions []models.UserInteraction
-	if err := query.Order("created_at DESC").Limit(pagination.Limit + 1).Find(&interactions).Error; err != nil {
+	if err := query.
+		Order("created_at DESC, content_item_id DESC").
+		Limit(pagination.Limit + 1).
+		Scan(&interactions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}

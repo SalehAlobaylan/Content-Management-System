@@ -19,28 +19,28 @@ type ForYouResponse struct {
 
 // ForYouItem represents a single item in the For You feed
 type ForYouItem struct {
-	ID           uuid.UUID `json:"id"`
-	Type         string    `json:"type"`
-	Title        string    `json:"title"`
-	MediaURL     string    `json:"media_url"`
-	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
-	DurationSec  int       `json:"duration_sec,omitempty"`
-	Author       string    `json:"author,omitempty"`
-	SourceName   string    `json:"source_name,omitempty"`
-	LikeCount    int       `json:"like_count"`
-	CommentCount int       `json:"comment_count"`
-	ShareCount   int       `json:"share_count"`
-	PublishedAt  time.Time `json:"published_at"`
-	IsLiked      bool      `json:"is_liked"`
-	IsBookmarked bool      `json:"is_bookmarked"`
-	IsArchived   bool      `json:"is_archived"`
-	TranscriptID *string   `json:"transcript_id,omitempty"`
+	ID           uuid.UUID  `json:"id"`
+	Type         string     `json:"type"`
+	Title        string     `json:"title"`
+	MediaURL     string     `json:"media_url"`
+	ThumbnailURL string     `json:"thumbnail_url,omitempty"`
+	DurationSec  int        `json:"duration_sec,omitempty"`
+	Author       string     `json:"author,omitempty"`
+	SourceName   string     `json:"source_name,omitempty"`
+	LikeCount    int        `json:"like_count"`
+	CommentCount int        `json:"comment_count"`
+	ShareCount   int        `json:"share_count"`
+	PublishedAt  time.Time  `json:"published_at"`
+	BookmarkedAt *time.Time `json:"bookmarked_at,omitempty"`
+	IsLiked      bool       `json:"is_liked"`
+	IsBookmarked bool       `json:"is_bookmarked"`
+	IsArchived   bool       `json:"is_archived"`
+	TranscriptID *string    `json:"transcript_id,omitempty"`
 }
 
 func hasCursor(pagination *utils.CursorPagination) bool {
 	return pagination != nil && pagination.Cursor != ""
 }
-
 
 // GetForYouFeed returns the For You feed with cursor-based pagination
 // GET /api/v1/feed/foryou?cursor=xxx&limit=20
@@ -345,7 +345,6 @@ func GetNewsFeed(c *gin.Context) {
 	})
 }
 
-
 // Helper functions
 
 func getInteractionStatus(db *gorm.DB, items []models.ContentItem, sessionID, userIDStr string) (map[uuid.UUID]bool, map[uuid.UUID]bool) {
@@ -437,4 +436,3 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 
 	return result
 }
-
