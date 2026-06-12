@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,28 +23,63 @@ type adminContentListResponse struct {
 	TotalPages int                        `json:"total_pages"`
 }
 
+type mediaSizeAggregateResponse struct {
+	Count int64 `json:"count"`
+	Bytes int64 `json:"bytes"`
+}
+
+type mediaSizeLargestItemResponse struct {
+	ID            string  `json:"id"`
+	Type          string  `json:"type"`
+	Status        string  `json:"status"`
+	Title         string  `json:"title"`
+	SourceName    *string `json:"source_name,omitempty"`
+	FileSizeBytes int64   `json:"file_size_bytes"`
+	StorageTier   *string `json:"storage_tier,omitempty"`
+	MediaURL      *string `json:"media_url,omitempty"`
+	ThumbnailURL  *string `json:"thumbnail_url,omitempty"`
+	PublishedAt   *string `json:"published_at,omitempty"`
+	UpdatedAt     string  `json:"updated_at"`
+}
+
+type mediaSizeStatsResponse struct {
+	TotalCount     int64                                 `json:"total_count"`
+	TrackedCount   int64                                 `json:"tracked_count"`
+	UntrackedCount int64                                 `json:"untracked_count"`
+	TotalBytes     int64                                 `json:"total_bytes"`
+	AvgBytes       int64                                 `json:"avg_bytes"`
+	MaxBytes       int64                                 `json:"max_bytes"`
+	LargestItems   []mediaSizeLargestItemResponse        `json:"largest_items"`
+	ByType         map[string]mediaSizeAggregateResponse `json:"by_type"`
+	BySource       map[string]mediaSizeAggregateResponse `json:"by_source"`
+	ByStatus       map[string]mediaSizeAggregateResponse `json:"by_status"`
+	SizeBuckets    map[string]mediaSizeAggregateResponse `json:"size_buckets"`
+}
+
 type adminContentItemResponse struct {
-	ID           string                 `json:"id"`
-	Type         string                 `json:"type"`
-	Status       string                 `json:"status"`
-	Title        string                 `json:"title"`
-	BodyText     *string                `json:"body_text,omitempty"`
-	Excerpt      *string                `json:"excerpt,omitempty"`
-	Author       *string                `json:"author,omitempty"`
-	SourceID     *string                `json:"source_id,omitempty"`
-	SourceName   *string                `json:"source_name,omitempty"`
-	MediaURL     *string                `json:"media_url,omitempty"`
-	ThumbnailURL *string                `json:"thumbnail_url,omitempty"`
-	OriginalURL  *string                `json:"original_url,omitempty"`
-	DurationSec  *int                   `json:"duration_sec,omitempty"`
-	TopicTags    []string               `json:"topic_tags,omitempty"`
-	PublishedAt  *string                `json:"published_at,omitempty"`
-	CreatedAt    string                 `json:"created_at"`
-	UpdatedAt    string                 `json:"updated_at"`
-	LikeCount    int                    `json:"like_count"`
-	ViewCount    int                    `json:"view_count"`
-	ShareCount   int                    `json:"share_count"`
-	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	ID            string                 `json:"id"`
+	Type          string                 `json:"type"`
+	Status        string                 `json:"status"`
+	Title         string                 `json:"title"`
+	BodyText      *string                `json:"body_text,omitempty"`
+	Excerpt       *string                `json:"excerpt,omitempty"`
+	Author        *string                `json:"author,omitempty"`
+	SourceID      *string                `json:"source_id,omitempty"`
+	SourceName    *string                `json:"source_name,omitempty"`
+	MediaURL      *string                `json:"media_url,omitempty"`
+	ThumbnailURL  *string                `json:"thumbnail_url,omitempty"`
+	OriginalURL   *string                `json:"original_url,omitempty"`
+	DurationSec   *int                   `json:"duration_sec,omitempty"`
+	FileSizeBytes int64                  `json:"file_size_bytes"`
+	StorageTier   *string                `json:"storage_tier,omitempty"`
+	TopicTags     []string               `json:"topic_tags,omitempty"`
+	PublishedAt   *string                `json:"published_at,omitempty"`
+	CreatedAt     string                 `json:"created_at"`
+	UpdatedAt     string                 `json:"updated_at"`
+	LikeCount     int                    `json:"like_count"`
+	ViewCount     int                    `json:"view_count"`
+	ShareCount    int                    `json:"share_count"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
 	// Caption-first state (Media tab badges + STT action gating).
 	CaptionState           *string                    `json:"caption_state,omitempty"`
 	TranscriptSource       *string                    `json:"transcript_source,omitempty"`
@@ -66,14 +102,15 @@ var contentAdminQueryConfig = utils.QueryConfig{
 		Direction: "desc",
 	}},
 	SortableFields: map[string]string{
-		"created_at":   "content_items.created_at",
-		"updated_at":   "content_items.updated_at",
-		"published_at": "content_items.published_at",
-		"title":        "content_items.title",
-		"type":         "content_items.type",
-		"status":       "content_items.status",
-		"duration_sec": "content_items.duration_sec",
-		"source_name":  "content_items.source_name",
+		"created_at":      "content_items.created_at",
+		"updated_at":      "content_items.updated_at",
+		"published_at":    "content_items.published_at",
+		"title":           "content_items.title",
+		"type":            "content_items.type",
+		"status":          "content_items.status",
+		"duration_sec":    "content_items.duration_sec",
+		"file_size_bytes": "content_items.file_size_bytes",
+		"source_name":     "content_items.source_name",
 	},
 	FilterableFields: map[string]string{
 		"status":        "content_items.status",
@@ -117,7 +154,195 @@ func ListContentItems(c *gin.Context) {
 
 	query := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
 	query = utils.ApplyQuery(query, params, contentAdminQueryConfig)
+	query, err = applyAdminContentSpecialFilters(c, query)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "INVALID_QUERY",
+		})
+		return
+	}
 
+	var items []models.ContentItem
+	meta, err := utils.FetchWithPagination(query, params, &items)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to fetch content",
+			Code:    "FETCH_FAILED",
+		})
+		return
+	}
+
+	data := make([]adminContentItemResponse, 0, len(items))
+	for _, item := range items {
+		data = append(data, mapAdminContentItemResponse(item))
+	}
+	// Batched (3 queries total) — the per-row variant is 3 queries per item.
+	populateAdminContentTranscriptionBatch(db, items, data)
+
+	c.JSON(http.StatusOK, adminContentListResponse{
+		Data:       data,
+		Total:      meta.Total,
+		Page:       meta.Page,
+		Limit:      meta.Limit,
+		TotalPages: meta.TotalPages,
+	})
+}
+
+// GetMediaSizeStats handles GET /admin/content/media-size-stats
+func GetMediaSizeStats(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+	params, err := utils.ParseQueryParams(c, contentAdminQueryConfig)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "INVALID_QUERY",
+		})
+		return
+	}
+	params.Sort = nil
+
+	query := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
+	if strings.TrimSpace(c.Query("type")) == "" {
+		query = query.Where("content_items.type IN ?", []models.ContentType{
+			models.ContentTypeVideo,
+			models.ContentTypePodcast,
+		})
+	}
+	query = utils.ApplyQuery(query, params, contentAdminQueryConfig)
+	query, err = applyAdminContentSpecialFilters(c, query)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "INVALID_QUERY",
+		})
+		return
+	}
+
+	var totals struct {
+		TotalCount     int64
+		TrackedCount   int64
+		UntrackedCount int64
+		TotalBytes     int64
+		AvgBytes       int64
+		MaxBytes       int64
+	}
+	if err := query.Session(&gorm.Session{}).
+		Select(`
+			COUNT(*) AS total_count,
+			COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN 1 ELSE 0 END), 0) AS tracked_count,
+			COALESCE(SUM(CASE WHEN file_size_bytes <= 0 THEN 1 ELSE 0 END), 0) AS untracked_count,
+			COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END), 0) AS total_bytes,
+			COALESCE(AVG(NULLIF(file_size_bytes, 0)), 0) AS avg_bytes,
+			COALESCE(MAX(file_size_bytes), 0) AS max_bytes`).
+		Scan(&totals).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate media sizes",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	resp := mediaSizeStatsResponse{
+		TotalCount:     totals.TotalCount,
+		TrackedCount:   totals.TrackedCount,
+		UntrackedCount: totals.UntrackedCount,
+		TotalBytes:     totals.TotalBytes,
+		AvgBytes:       totals.AvgBytes,
+		MaxBytes:       totals.MaxBytes,
+		LargestItems:   []mediaSizeLargestItemResponse{},
+		ByType:         map[string]mediaSizeAggregateResponse{},
+		BySource:       map[string]mediaSizeAggregateResponse{},
+		ByStatus:       map[string]mediaSizeAggregateResponse{},
+		SizeBuckets:    map[string]mediaSizeAggregateResponse{},
+	}
+
+	if err := fillMediaSizeAggregate(query, "type", resp.ByType); err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate media sizes by type",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	if err := fillMediaSizeAggregate(query, "COALESCE(NULLIF(source_name, ''), 'Unknown source')", resp.BySource); err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate media sizes by source",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	if err := fillMediaSizeAggregate(query, "status", resp.ByStatus); err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate media sizes by status",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	if err := fillMediaSizeBuckets(query, resp.SizeBuckets); err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate media size buckets",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	var largest []models.ContentItem
+	if err := query.Session(&gorm.Session{}).
+		Where("file_size_bytes > 0").
+		Order("file_size_bytes DESC").
+		Limit(8).
+		Find(&largest).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to fetch largest media items",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	for _, item := range largest {
+		resp.LargestItems = append(resp.LargestItems, mapMediaSizeLargestItem(item))
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetAdminContentItem handles GET /admin/content/:id
+func GetAdminContentItem(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+	publicID := c.Param("id")
+	id, err := uuid.Parse(publicID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "Invalid content ID",
+			Code:    "INVALID_ID",
+		})
+		return
+	}
+
+	var item models.ContentItem
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{
+			Message: "Content not found",
+			Code:    "NOT_FOUND",
+		})
+		return
+	}
+
+	resp := mapAdminContentItemResponse(item)
+	populateAdminContentTranscription(db, item.PublicID, &resp)
+	c.JSON(http.StatusOK, resp)
+}
+
+func applyAdminContentSpecialFilters(c *gin.Context, query *gorm.DB) (*gorm.DB, error) {
 	// Topic filter — topic_tags is a text[] column not handled by the generic
 	// query builder, so apply array membership directly (same pattern as the
 	// public RSS feed controller).
@@ -155,63 +380,102 @@ func ListContentItems(c *gin.Context) {
 			WHERE tq.content_item_id = content_items.public_id AND tq.status = ?
 		)`, qStatus)
 	}
-
-	var items []models.ContentItem
-	meta, err := utils.FetchWithPagination(query, params, &items)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to fetch content",
-			Code:    "FETCH_FAILED",
-		})
-		return
+	if minSize, ok, err := parseOptionalInt64Query(c, "min_size_bytes"); err != nil {
+		return query, err
+	} else if ok {
+		query = query.Where("file_size_bytes >= ?", minSize)
 	}
-
-	data := make([]adminContentItemResponse, 0, len(items))
-	for _, item := range items {
-		data = append(data, mapAdminContentItemResponse(item))
+	if maxSize, ok, err := parseOptionalInt64Query(c, "max_size_bytes"); err != nil {
+		return query, err
+	} else if ok {
+		query = query.Where("file_size_bytes <= ?", maxSize)
 	}
-	// Batched (3 queries total) — the per-row variant is 3 queries per item.
-	populateAdminContentTranscriptionBatch(db, items, data)
-
-	c.JSON(http.StatusOK, adminContentListResponse{
-		Data:       data,
-		Total:      meta.Total,
-		Page:       meta.Page,
-		Limit:      meta.Limit,
-		TotalPages: meta.TotalPages,
-	})
+	switch strings.ToLower(strings.TrimSpace(c.Query("size_tracked"))) {
+	case "", "all":
+	case "tracked":
+		query = query.Where("file_size_bytes > 0")
+	case "untracked":
+		query = query.Where("file_size_bytes <= 0")
+	default:
+		return query, fmt.Errorf("invalid size_tracked parameter")
+	}
+	return query, nil
 }
 
-// GetAdminContentItem handles GET /admin/content/:id
-func GetAdminContentItem(c *gin.Context) {
-	principal, ok := requireAdminPrincipal(c)
-	if !ok {
-		return
+func parseOptionalInt64Query(c *gin.Context, key string) (int64, bool, error) {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return 0, false, nil
 	}
-
-	db := c.MustGet("db").(*gorm.DB)
-	publicID := c.Param("id")
-	id, err := uuid.Parse(publicID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "Invalid content ID",
-			Code:    "INVALID_ID",
-		})
-		return
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, false, fmt.Errorf("invalid %s parameter", key)
 	}
+	return value, true, nil
+}
 
-	var item models.ContentItem
-	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
-		c.JSON(http.StatusNotFound, authErrorResponse{
-			Message: "Content not found",
-			Code:    "NOT_FOUND",
-		})
-		return
+func fillMediaSizeAggregate(query *gorm.DB, groupExpr string, target map[string]mediaSizeAggregateResponse) error {
+	type row struct {
+		Key   string
+		Count int64
+		Bytes int64
 	}
+	var rows []row
+	if err := query.Session(&gorm.Session{}).
+		Select(fmt.Sprintf("%s AS key, COUNT(*) AS count, COALESCE(SUM(file_size_bytes), 0) AS bytes", groupExpr)).
+		Group(groupExpr).
+		Scan(&rows).Error; err != nil {
+		return err
+	}
+	for _, r := range rows {
+		target[r.Key] = mediaSizeAggregateResponse{Count: r.Count, Bytes: r.Bytes}
+	}
+	return nil
+}
 
-	resp := mapAdminContentItemResponse(item)
-	populateAdminContentTranscription(db, item.PublicID, &resp)
-	c.JSON(http.StatusOK, resp)
+func fillMediaSizeBuckets(query *gorm.DB, target map[string]mediaSizeAggregateResponse) error {
+	buckets := []struct {
+		key   string
+		where string
+	}{
+		{"untracked", "file_size_bytes <= 0"},
+		{"<100MB", "file_size_bytes > 0 AND file_size_bytes < 104857600"},
+		{"100-500MB", "file_size_bytes >= 104857600 AND file_size_bytes < 524288000"},
+		{"500MB-1GB", "file_size_bytes >= 524288000 AND file_size_bytes < 1073741824"},
+		{"1-2GB", "file_size_bytes >= 1073741824 AND file_size_bytes < 2147483648"},
+		{">2GB", "file_size_bytes >= 2147483648"},
+	}
+	for _, bucket := range buckets {
+		var agg mediaSizeAggregateResponse
+		if err := query.Session(&gorm.Session{}).
+			Select("COUNT(*) AS count, COALESCE(SUM(file_size_bytes), 0) AS bytes").
+			Where(bucket.where).
+			Scan(&agg).Error; err != nil {
+			return err
+		}
+		target[bucket.key] = agg
+	}
+	return nil
+}
+
+func mapMediaSizeLargestItem(item models.ContentItem) mediaSizeLargestItemResponse {
+	title := ""
+	if item.Title != nil {
+		title = *item.Title
+	}
+	return mediaSizeLargestItemResponse{
+		ID:            item.PublicID.String(),
+		Type:          string(item.Type),
+		Status:        string(item.Status),
+		Title:         title,
+		SourceName:    item.SourceName,
+		FileSizeBytes: item.FileSizeBytes,
+		StorageTier:   item.StorageTier,
+		MediaURL:      item.MediaURL,
+		ThumbnailURL:  item.ThumbnailURL,
+		PublishedAt:   formatTimePtr(item.PublishedAt),
+		UpdatedAt:     item.UpdatedAt.UTC().Format(time.RFC3339),
+	}
 }
 
 // UpdateContentStatus handles PATCH /admin/content/:id/status
@@ -387,6 +651,8 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 		ThumbnailURL:     item.ThumbnailURL,
 		OriginalURL:      item.OriginalURL,
 		DurationSec:      item.DurationSec,
+		FileSizeBytes:    item.FileSizeBytes,
+		StorageTier:      item.StorageTier,
 		TopicTags:        item.TopicTags,
 		PublishedAt:      publishedAt,
 		CreatedAt:        item.CreatedAt.UTC().Format(time.RFC3339),

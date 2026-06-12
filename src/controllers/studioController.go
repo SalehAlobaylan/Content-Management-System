@@ -58,14 +58,16 @@ type sponsorSegment struct {
 }
 
 type studioContentDTO struct {
-	ID           string  `json:"id"`
-	Type         string  `json:"type"`
-	Title        string  `json:"title"`
-	Status       string  `json:"status"`
-	MediaURL     *string `json:"media_url,omitempty"`
-	ThumbnailURL *string `json:"thumbnail_url,omitempty"`
-	DurationSec  *int    `json:"duration_sec,omitempty"`
-	CaptionState *string `json:"caption_state,omitempty"`
+	ID            string  `json:"id"`
+	Type          string  `json:"type"`
+	Title         string  `json:"title"`
+	Status        string  `json:"status"`
+	MediaURL      *string `json:"media_url,omitempty"`
+	ThumbnailURL  *string `json:"thumbnail_url,omitempty"`
+	DurationSec   *int    `json:"duration_sec,omitempty"`
+	FileSizeBytes int64   `json:"file_size_bytes"`
+	StorageTier   *string `json:"storage_tier,omitempty"`
+	CaptionState  *string `json:"caption_state,omitempty"`
 	// Download-time engagement signals (from content_item.metadata).
 	Heatmap         []heatmapPoint   `json:"heatmap,omitempty"`
 	SponsorSegments []sponsorSegment `json:"sponsor_segments,omitempty"`
@@ -305,13 +307,15 @@ func GetStudio(c *gin.Context) {
 
 func mapStudioContent(item *models.ContentItem) studioContentDTO {
 	dto := studioContentDTO{
-		ID:           item.PublicID.String(),
-		Type:         string(item.Type),
-		Status:       string(item.Status),
-		MediaURL:     item.MediaURL,
-		ThumbnailURL: item.ThumbnailURL,
-		DurationSec:  item.DurationSec,
-		CaptionState: item.CaptionState,
+		ID:            item.PublicID.String(),
+		Type:          string(item.Type),
+		Status:        string(item.Status),
+		MediaURL:      item.MediaURL,
+		ThumbnailURL:  item.ThumbnailURL,
+		DurationSec:   item.DurationSec,
+		FileSizeBytes: item.FileSizeBytes,
+		StorageTier:   item.StorageTier,
+		CaptionState:  item.CaptionState,
 	}
 	if item.Title != nil {
 		dto.Title = *item.Title

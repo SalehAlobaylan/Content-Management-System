@@ -31,6 +31,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/content/import-feed", controllers.ImportFeed)
 	adminGroup.GET("/content/source-names", controllers.ListDistinctSourceNames)
 	adminGroup.GET("/content/status-counts", controllers.GetStatusCounts)
+	adminGroup.GET("/content/media-size-stats", controllers.GetMediaSizeStats)
 	adminGroup.GET("/content/topics", controllers.ListContentTopics)
 	adminGroup.GET("/content/:id", controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", controllers.UpdateContentStatus)

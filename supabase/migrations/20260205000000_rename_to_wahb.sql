@@ -31,7 +31,7 @@
 -- Content-Management-System/.env:
 --   DATABASE_URL=postgres://.../wahb_db?sslmode=...
 --
--- CRM-Service/.env:
+-- Removed CRM module .env:
 --   DATABASE_URL=postgres://.../wahb_platform?sslmode=...
 --
 -- docker-compose.yaml files:
