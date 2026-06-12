@@ -117,9 +117,14 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.EngagementNormalization = req.EngagementNormalization
 	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive
-	// Phase 13 — story + News-feed-mode knobs.
+	// Phase 13 — story + News-feed-mode knobs. Zero values mean "not sent"
+	// (Partial updates from the Console) — disable coverage by sending a tiny
+	// epsilon rather than 0.
 	if req.StoryMatchThreshold > 0 {
 		existing.StoryMatchThreshold = req.StoryMatchThreshold
+	}
+	if req.StoryCoverageWeight > 0 {
+		existing.StoryCoverageWeight = req.StoryCoverageWeight
 	}
 	if req.NewsFeedMode != "" {
 		existing.NewsFeedMode = req.NewsFeedMode // normalized above

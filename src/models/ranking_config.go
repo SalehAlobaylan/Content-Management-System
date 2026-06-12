@@ -64,6 +64,12 @@ type RankingConfig struct {
 	// WRITE time (when the story gains a member) and stored on the topic row —
 	// the read path never waits on the reranker either way.
 	NewsRerankEnabled bool `gorm:"default:false" json:"news_rerank_enabled"`
+	// StoryCoverageWeight makes story RANKING reward aggregation — the core
+	// product signal: a story covered by many recent posts IS the bigger story.
+	// Momentum = maxMemberScore × (1 + w·ln(1 + recentMembers)); at 0.30 a
+	// 24-post story gets ~2× lift over a singleton, so the story of the day
+	// outranks fresher one-off posts. 0 disables (pure per-item momentum).
+	StoryCoverageWeight float64 `gorm:"type:double precision;default:0.30" json:"story_coverage_weight"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
@@ -96,6 +102,7 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		StoryMatchThreshold:            0.70,
 		NewsFeedMode:                   "live",
 		NewsRerankEnabled:              false,
+		StoryCoverageWeight:            0.30,
 	}
 }
 

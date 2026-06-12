@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -34,6 +35,11 @@ const (
 	storyRelatedLimit      = 3    // related stories per slide
 	storyRelatedPoolLimit  = 8    // candidate pool per slide (over-fetched, then filtered + deduped)
 	storyRelatedWindowDays = 30   // related stories must have a member published within this window
+	// storyRelatedMinSimilarity floors related-story candidates. Calibrated on
+	// the Qwen3 space: same-event ≈ ≥0.70, genuinely-related coverage ≈
+	// 0.55–0.70, below 0.55 is just "other news". Better 0 honest related
+	// cards than 3 fabricated ones.
+	storyRelatedMinSimilarity = 0.55
 	storyMaxMembers        = 8    // members rendered under a featured story
 	newsSnapshotSlideCount = 60   // slides precomputed into the cache (≈6 pages before deep scroll goes live)
 )
@@ -238,7 +244,21 @@ func assembleStoryNewsFeed(
 		}
 	}
 
-	// 3. Rank stories by momentum (score desc, then recency).
+	// 3. Rank stories by COVERAGE-AWARE momentum. Aggregation is the product:
+	//    a story many posts are covering IS the bigger story, so the per-item
+	//    momentum (freshness/engagement/velocity) is lifted by ln(1 + recent
+	//    members). At the 0.30 default a 24-post story gets ~2× over a
+	//    singleton — the story of the day outranks fresher one-off posts
+	//    without freezing out breaking singletons.
+	coverageW := config.StoryCoverageWeight
+	if coverageW < 0 {
+		coverageW = 0
+	}
+	if coverageW > 0 {
+		for _, a := range order {
+			a.score *= 1 + coverageW*math.Log1p(float64(len(a.members)))
+		}
+	}
 	sort.SliceStable(order, func(i, j int) bool {
 		if order[i].score != order[j].score {
 			return order[i].score > order[j].score
@@ -273,6 +293,55 @@ func assembleStoryNewsFeed(
 		}
 	}
 
+	// 3c. Inter-slide diversity: sibling stories (stories in each other's
+	//     related sets — i.e. ≥storyRelatedMinSimilarity apart) must not stack
+	//     adjacently. A burst (e.g. five Iran-conflict sub-stories) interleaves
+	//     with other news instead of monopolizing consecutive slides. Greedy
+	//     single-lookahead: pick the highest-ranked candidate that isn't a
+	//     sibling of the previous slide; if everything left is a sibling, give
+	//     up gracefully (don't bury content). Uses the stored related sets —
+	//     no extra queries. topicByID arrives here (fetched concurrently with
+	//     the pool).
+	topicByID := <-topicsCh
+	if len(order) > 2 {
+		siblingSets := make(map[uuid.UUID]map[uuid.UUID]bool, len(order))
+		siblings := func(id uuid.UUID) map[uuid.UUID]bool {
+			if s, ok := siblingSets[id]; ok {
+				return s
+			}
+			s := make(map[uuid.UUID]bool)
+			if t, ok := topicByID[id]; ok {
+				if ids, computed := storedRelatedIDs(t); computed {
+					for _, rid := range ids {
+						s[rid] = true
+					}
+				}
+			}
+			siblingSets[id] = s
+			return s
+		}
+		reordered := make([]*storyAgg, 0, len(order))
+		pool := append([]*storyAgg(nil), order...)
+		var prev *storyAgg
+		for len(pool) > 0 {
+			pick := 0
+			if prev != nil {
+				prevSibs := siblings(prev.storyID)
+				for i, c := range pool {
+					if prevSibs[c.storyID] || siblings(c.storyID)[prev.storyID] {
+						continue
+					}
+					pick = i
+					break
+				}
+			}
+			prev = pool[pick]
+			reordered = append(reordered, prev)
+			pool = append(pool[:pick], pool[pick+1:]...)
+		}
+		order = reordered
+	}
+
 	// 4. Cursor pagination over the ranked story list.
 	startIdx := 0
 	if !lastTimestamp.IsZero() && lastID != uuid.Nil {
@@ -304,10 +373,6 @@ func assembleStoryNewsFeed(
 		return []StorySlide{}, nil
 	}
 	page := order[startIdx:endIdx]
-
-	// 5. Topic metadata (labels, counts, stored related order — not centroids),
-	//    fetched concurrently with the pool above.
-	topicByID := <-topicsCh
 
 	// 6. Build each slide in parallel (per-slide related-story hydration is a
 	//    handful of indexed queries; gorm.DB is goroutine-safe and topicByID is
@@ -569,33 +634,45 @@ func sourceImageForItem(it models.ContentItem, sourceImageByFeedURL map[string]s
 	return ""
 }
 
+// storedRelatedIDs parses the write-time-computed related list. The second
+// return distinguishes "computed" from "never computed": an EMPTY stored array
+// is a real answer ("nothing genuinely related") and must NOT trigger a live
+// kNN fallback on every read.
+func storedRelatedIDs(topic models.Topic) ([]uuid.UUID, bool) {
+	if len(topic.RelatedIDs) == 0 {
+		return nil, false // NULL — never computed
+	}
+	var raw []string
+	if json.Unmarshal(topic.RelatedIDs, &raw) != nil {
+		return nil, false
+	}
+	ids := make([]uuid.UUID, 0, len(raw))
+	for _, s := range raw {
+		if u, err := uuid.Parse(s); err == nil {
+			ids = append(ids, u)
+		}
+	}
+	return ids, true
+}
+
 // relatedCandidateIDs returns the ordered related-story id candidates for a
 // story. Prefers the WRITE-TIME-computed order stored on the topic row
-// (refreshStoryRelated: centroid kNN + optional cross-encoder rerank); falls
-// back to a live centroid kNN when the stored list is absent (story predates
-// the feature or its refresh hasn't landed yet).
+// (refreshStoryRelated: floored centroid kNN + optional cross-encoder rerank);
+// falls back to a live centroid kNN only when the stored list was never
+// computed (story predates the feature or its refresh hasn't landed yet).
 func relatedCandidateIDs(db *gorm.DB, tenantID string, topic models.Topic, storyID uuid.UUID) []uuid.UUID {
-	if len(topic.RelatedIDs) > 0 {
-		var raw []string
-		if json.Unmarshal(topic.RelatedIDs, &raw) == nil && len(raw) > 0 {
-			ids := make([]uuid.UUID, 0, len(raw))
-			for _, s := range raw {
-				if u, err := uuid.Parse(s); err == nil {
-					ids = append(ids, u)
-				}
-			}
-			if len(ids) > 0 {
-				return ids
-			}
-		}
+	if ids, computed := storedRelatedIDs(topic); computed {
+		return ids // may be empty — an honest "no related stories"
 	}
 	return relatedKNNIDs(db, tenantID, storyID, storyRelatedPoolLimit)
 }
 
 // relatedKNNIDs is the raw centroid-cosine neighbor query: active stories with
-// members, nearest first. Self-contained — it fetches the one centroid it
-// needs (the bulk topic load deliberately skips centroids; see
-// topicMetaColumns).
+// members, nearest first — FLOORED at storyRelatedMinSimilarity. Without the
+// floor, kNN dutifully returns the 3 "nearest" stories even when nearest means
+// cosine 0.35 (unrelated news), and the related section lies to the user.
+// Self-contained — fetches the one centroid it needs (the bulk topic load
+// deliberately skips centroids; see topicMetaColumns).
 func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) []uuid.UUID {
 	var lit string
 	db.Model(&models.Topic{}).
@@ -609,6 +686,7 @@ func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) [
 	db.Model(&models.Topic{}).
 		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND article_count > 0", tenantID, storyID).
 		Where("last_member_at IS NULL OR last_member_at > ?", relatedFloor).
+		Where("embedding <=> '"+lit+"' <= ?", 1-storyRelatedMinSimilarity).
 		Order("embedding <=> '"+lit+"'").
 		Limit(limit).
 		Pluck("public_id", &relIDs)
@@ -1007,10 +1085,10 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 	storyRelatedWorkers <- struct{}{}
 	defer func() { <-storyRelatedWorkers }()
 
+	// NOTE: an empty result is STORED (as []) — "computed, nothing genuinely
+	// related" is a real answer that stops the read path from re-running a
+	// live kNN for this story on every request.
 	ids := relatedKNNIDs(db, tenantID, storyID, storyRelatedPoolLimit*2)
-	if len(ids) == 0 {
-		return
-	}
 
 	if loadTenantConfig(db, tenantID).NewsRerankEnabled && len(ids) > 1 {
 		// Hydrate candidate + self summaries in ONE batched query, rerank
