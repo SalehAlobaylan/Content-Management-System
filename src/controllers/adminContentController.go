@@ -56,6 +56,57 @@ type mediaSizeStatsResponse struct {
 	SizeBuckets    map[string]mediaSizeAggregateResponse `json:"size_buckets"`
 }
 
+type contentDailyPoint struct {
+	Day    string `json:"day"`
+	Count  int64  `json:"count"`
+	Failed int64  `json:"failed"`
+}
+
+type contentSourceStat struct {
+	SourceName string `json:"source_name"`
+	Count      int64  `json:"count"`
+	Ready      int64  `json:"ready"`
+	Failed     int64  `json:"failed"`
+}
+
+type contentEngagement struct {
+	Likes  int64 `json:"likes"`
+	Views  int64 `json:"views"`
+	Shares int64 `json:"shares"`
+}
+
+type contentFreshness struct {
+	// OldestUnprocessed is the created_at of the oldest PENDING/PROCESSING item
+	// (ISO string), or nil when the pipeline is empty.
+	OldestUnprocessed   *string `json:"oldest_unprocessed"`
+	StuckCount          int64   `json:"stuck_count"`
+	StuckThresholdHours int     `json:"stuck_threshold_hours"`
+}
+
+type contentFailureReason struct {
+	Reason string `json:"reason"`
+	Count  int64  `json:"count"`
+}
+
+type contentStatsResponse struct {
+	Total          int64                       `json:"total"`
+	ByStatus       map[string]int64            `json:"by_status"`
+	ByType         map[string]int64            `json:"by_type"`
+	ByTypeStatus   map[string]map[string]int64 `json:"by_type_status"`
+	ByCaptionState map[string]int64            `json:"by_caption_state"`
+	Daily          []contentDailyPoint         `json:"daily"`
+	TopSources     []contentSourceStat         `json:"top_sources"`
+	FailureReasons []contentFailureReason      `json:"failure_reasons"`
+	Engagement     contentEngagement           `json:"engagement"`
+	Freshness      contentFreshness            `json:"freshness"`
+	RangeDays      int                         `json:"range_days"`
+}
+
+// stuckThresholdHours flags PENDING/PROCESSING items older than this as stuck.
+// Code default (not env) per Config Discipline — promote to an admin-config row
+// if operators need to tune it.
+const stuckThresholdHours = 24
+
 type adminContentItemResponse struct {
 	ID            string                 `json:"id"`
 	Type          string                 `json:"type"`
@@ -111,6 +162,9 @@ var contentAdminQueryConfig = utils.QueryConfig{
 		"duration_sec":    "content_items.duration_sec",
 		"file_size_bytes": "content_items.file_size_bytes",
 		"source_name":     "content_items.source_name",
+		"like_count":      "content_items.like_count",
+		"view_count":      "content_items.view_count",
+		"share_count":     "content_items.share_count",
 	},
 	FilterableFields: map[string]string{
 		"status":        "content_items.status",
@@ -305,6 +359,195 @@ func GetMediaSizeStats(c *gin.Context) {
 	}
 	for _, item := range largest {
 		resp.LargestItems = append(resp.LargestItems, mapMediaSizeLargestItem(item))
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// GetContentStats handles GET /admin/content/stats
+// Returns filter-scoped analytics aggregates powering the content-monitoring
+// dashboard. Honors the same filters as the content list (type, status,
+// source_name, created_at, published_at) so the console can scope a single
+// endpoint to All / News / Media. The `range_days` query param (default 30,
+// cap 90) only windows the daily ingestion series.
+func GetContentStats(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+	params, err := utils.ParseQueryParams(c, contentAdminQueryConfig)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "INVALID_QUERY",
+		})
+		return
+	}
+	params.Sort = nil
+
+	rangeDays := 30
+	if raw := strings.TrimSpace(c.Query("range_days")); raw != "" {
+		if parsed, convErr := strconv.Atoi(raw); convErr == nil && parsed > 0 {
+			rangeDays = parsed
+		}
+	}
+	if rangeDays > 90 {
+		rangeDays = 90
+	}
+
+	query := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
+	query = utils.ApplyQuery(query, params, contentAdminQueryConfig)
+	query, err = applyAdminContentSpecialFilters(c, query)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: err.Error(),
+			Code:    "INVALID_QUERY",
+		})
+		return
+	}
+
+	resp := contentStatsResponse{
+		ByStatus:       map[string]int64{"PENDING": 0, "PROCESSING": 0, "READY": 0, "FAILED": 0, "ARCHIVED": 0},
+		ByType:         map[string]int64{},
+		ByTypeStatus:   map[string]map[string]int64{},
+		ByCaptionState: map[string]int64{},
+		Daily:          []contentDailyPoint{},
+		TopSources:     []contentSourceStat{},
+		FailureReasons: []contentFailureReason{},
+		Freshness:      contentFreshness{StuckThresholdHours: stuckThresholdHours},
+		RangeDays:      rangeDays,
+	}
+	for _, t := range []models.ContentType{
+		models.ContentTypeNews, models.ContentTypeArticle, models.ContentTypeVideo,
+		models.ContentTypePodcast, models.ContentTypeTweet, models.ContentTypeComment,
+	} {
+		resp.ByType[string(t)] = 0
+	}
+
+	// Type × status matrix — one query feeds Total, ByType, ByStatus, ByTypeStatus.
+	type matrixRow struct {
+		Type   string
+		Status string
+		Count  int64
+	}
+	var matrix []matrixRow
+	if err := query.Session(&gorm.Session{}).
+		Select("type, status, COUNT(*) AS count").
+		Group("type, status").
+		Scan(&matrix).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate content counts",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	for _, row := range matrix {
+		resp.Total += row.Count
+		resp.ByType[row.Type] += row.Count
+		resp.ByStatus[row.Status] += row.Count
+		if resp.ByTypeStatus[row.Type] == nil {
+			resp.ByTypeStatus[row.Type] = map[string]int64{}
+		}
+		resp.ByTypeStatus[row.Type][row.Status] += row.Count
+	}
+
+	// Daily ingestion velocity over the requested window.
+	cutoff := time.Now().AddDate(0, 0, -rangeDays)
+	if err := query.Session(&gorm.Session{}).
+		Select("TO_CHAR(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*) AS count, COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed").
+		Where("created_at >= ?", cutoff).
+		Group("date_trunc('day', created_at)").
+		Order("date_trunc('day', created_at)").
+		Scan(&resp.Daily).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate ingestion velocity",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	// Top sources by item count, with ready/failed split.
+	if err := query.Session(&gorm.Session{}).
+		Select("COALESCE(NULLIF(source_name, ''), 'Unknown source') AS source_name, COUNT(*) AS count, COALESCE(SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END), 0) AS ready, COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed").
+		Group("COALESCE(NULLIF(source_name, ''), 'Unknown source')").
+		Order("count DESC").
+		Limit(10).
+		Scan(&resp.TopSources).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate top sources",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	// Engagement totals.
+	if err := query.Session(&gorm.Session{}).
+		Select("COALESCE(SUM(like_count), 0) AS likes, COALESCE(SUM(view_count), 0) AS views, COALESCE(SUM(share_count), 0) AS shares").
+		Scan(&resp.Engagement).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate engagement",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	// Caption-state coverage (drives the Media transcript-coverage panel).
+	type captionRow struct {
+		Key   string
+		Count int64
+	}
+	var captionRows []captionRow
+	if err := query.Session(&gorm.Session{}).
+		Select("COALESCE(NULLIF(caption_state, ''), 'none') AS key, COUNT(*) AS count").
+		Group("COALESCE(NULLIF(caption_state, ''), 'none')").
+		Scan(&captionRows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate caption coverage",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	for _, row := range captionRows {
+		resp.ByCaptionState[row.Key] = row.Count
+	}
+
+	// Top failure reasons (stored in metadata.failure_reason).
+	if err := query.Session(&gorm.Session{}).
+		Select("COALESCE(NULLIF(metadata->>'failure_reason', ''), 'Unknown') AS reason, COUNT(*) AS count").
+		Where("status = ?", models.ContentStatusFailed).
+		Group("COALESCE(NULLIF(metadata->>'failure_reason', ''), 'Unknown')").
+		Order("count DESC").
+		Limit(6).
+		Scan(&resp.FailureReasons).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate failure reasons",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	// Pipeline freshness — oldest unprocessed item + stuck count.
+	var freshness struct {
+		Oldest *time.Time
+		Stuck  int64
+	}
+	stuckBefore := time.Now().Add(-time.Duration(stuckThresholdHours) * time.Hour)
+	if err := query.Session(&gorm.Session{}).
+		Where("status IN ?", []models.ContentStatus{models.ContentStatusPending, models.ContentStatusProcessing}).
+		Select("MIN(created_at) AS oldest, COALESCE(SUM(CASE WHEN created_at < ? THEN 1 ELSE 0 END), 0) AS stuck", stuckBefore).
+		Scan(&freshness).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to aggregate pipeline freshness",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+	resp.Freshness.StuckCount = freshness.Stuck
+	if freshness.Oldest != nil {
+		iso := freshness.Oldest.UTC().Format(time.RFC3339)
+		resp.Freshness.OldestUnprocessed = &iso
 	}
 
 	c.JSON(http.StatusOK, resp)
