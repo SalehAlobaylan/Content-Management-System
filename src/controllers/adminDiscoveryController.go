@@ -86,6 +86,10 @@ type aggregationDiscoveryProfile struct {
 	Keywords             []string `json:"keywords,omitempty"`
 	Languages            []string `json:"languages,omitempty"`
 	MaxSuggestionsPerRun int      `json:"maxSuggestionsPerRun"`
+	// Config-driven overrides so manual runs honor the same tuning as scheduled
+	// sweeps (recency window + which search provider).
+	RecencyDays    int    `json:"recencyDays,omitempty"`
+	SearchProvider string `json:"searchProvider,omitempty"`
 }
 
 type aggregationDiscoveryRequest struct {
@@ -270,6 +274,11 @@ func RunDiscoveryProfile(c *gin.Context) {
 		return
 	}
 
+	cfg := loadDiscoveryConfig(db, principal.TenantID)
+	maxPerRun := profile.MaxSuggestionsPerRun
+	if cfg.MaxCandidatesPerProfile > 0 && cfg.MaxCandidatesPerProfile < maxPerRun {
+		maxPerRun = cfg.MaxCandidatesPerProfile
+	}
 	triggerRes, err := triggerAggregationDiscoveryRun(aggregationBaseURL, c.GetHeader("Authorization"), aggregationDiscoveryRequest{
 		Profile: aggregationDiscoveryProfile{
 			ID:                   profile.PublicID.String(),
@@ -277,7 +286,9 @@ func RunDiscoveryProfile(c *gin.Context) {
 			Description:          profile.Description,
 			Keywords:             []string(profile.Keywords),
 			Languages:            []string(profile.Languages),
-			MaxSuggestionsPerRun: profile.MaxSuggestionsPerRun,
+			MaxSuggestionsPerRun: maxPerRun,
+			RecencyDays:          cfg.RecencyWindowDays,
+			SearchProvider:       cfg.SearchProvider,
 		},
 	})
 	if err != nil {
@@ -626,6 +637,89 @@ func keywordsFromLabel(label string) []string {
 		}
 	}
 	return out
+}
+
+// ---------- Discovery config (tuning + scheduling) ----------
+
+// GetDiscoveryConfig handles GET /admin/discovery/config
+func GetDiscoveryConfig(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	c.JSON(http.StatusOK, loadDiscoveryConfig(db, principal.TenantID))
+}
+
+// UpdateDiscoveryConfig handles PUT /admin/discovery/config — upserts the
+// single-row config and best-effort re-syncs the Aggregation sweep schedule.
+func UpdateDiscoveryConfig(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req models.DiscoveryConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
+		return
+	}
+	for _, v := range []float64{req.MinConfidence, req.MinRelevance, req.DupThreshold, req.DupPenalty} {
+		if v < 0 || v > 1 {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "thresholds must be in [0,1]", Code: "INVALID_RANGE"})
+			return
+		}
+	}
+	if req.SweepIntervalHours < 1 {
+		req.SweepIntervalHours = 1
+	}
+	if req.MaxCandidatesPerProfile < 1 {
+		req.MaxCandidatesPerProfile = 1
+	}
+	if req.RecencyWindowDays < 1 {
+		req.RecencyWindowDays = 1
+	}
+	switch req.SearchProvider {
+	case "auto", "tavily", "crawl":
+	default:
+		req.SearchProvider = "auto"
+	}
+	req.TenantID = principal.TenantID
+
+	var existing models.DiscoveryConfig
+	if err := db.Where("tenant_id = ?", principal.TenantID).First(&existing).Error; err == nil {
+		req.ID = existing.ID
+		req.CreatedAt = existing.CreatedAt
+		if err := db.Save(&req).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to save config", Code: "SAVE_FAILED"})
+			return
+		}
+	} else if err := db.Create(&req).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create config", Code: "CREATE_FAILED"})
+		return
+	}
+
+	// Best-effort: tell Aggregation to re-sync its repeatable sweep so interval
+	// / automation-toggle changes take effect immediately.
+	triggerAggregationResync(c.GetHeader("Authorization"))
+	c.JSON(http.StatusOK, req)
+}
+
+func loadDiscoveryConfig(db *gorm.DB, tenantID string) models.DiscoveryConfig {
+	var cfg models.DiscoveryConfig
+	if err := db.Where("tenant_id = ?", tenantID).First(&cfg).Error; err != nil {
+		return models.DefaultDiscoveryConfig(tenantID)
+	}
+	return cfg
+}
+
+func triggerAggregationResync(authHeader string) {
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		return
+	}
+	_, _, _ = proxyAggregationRequest(aggregationBaseURL, "/admin/discovery/resync-schedule", authHeader, map[string]interface{}{})
 }
 
 // ---------- helpers ----------

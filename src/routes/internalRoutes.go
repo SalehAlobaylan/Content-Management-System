@@ -13,8 +13,11 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal := router.Group("/internal")
 	internal.Use(utils.InternalAuthMiddleware())
 
-	// Feeds Finding — Aggregation posts discovered source candidates here
+	// Feeds Finding — Aggregation posts discovered source candidates here,
+	// and reads config + enabled profiles for scheduled sweeps
 	internal.POST("/source-suggestions", controllers.InternalCreateSourceSuggestions)
+	internal.GET("/discovery/config", controllers.InternalGetDiscoveryConfig)
+	internal.GET("/discovery/profiles", controllers.InternalListEnabledProfiles)
 
 	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)

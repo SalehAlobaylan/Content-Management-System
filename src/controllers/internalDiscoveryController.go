@@ -14,18 +14,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// minSuggestionConfidence is a low floor that only drops clearly-broken
-// candidates. Semantic relevance_score (not lexical confidence) is the real
-// quality signal — Arabic exact-keyword matching is weak, so a high lexical
-// floor would wrongly drop good topic-specific feeds before they're scored.
-const minSuggestionConfidence = 0.15
-
-// Novelty scoring: a candidate whose sample is near-identical to content we
-// already ingest (a mirror/aggregator) gets its relevance halved.
-const (
-	dupThreshold = 0.92
-	dupPenalty   = 0.5
-)
+// Scoring thresholds (min-confidence floor + novelty dup-threshold/penalty) come
+// from the tenant's discovery_config (admin-tunable via the settings page).
+// loadDiscoveryConfig falls back to models.DefaultDiscoveryConfig when no row
+// exists, so behaviour is unchanged out of the box.
 
 type suggestionCandidate struct {
 	Name          string                   `json:"name"`
@@ -65,6 +57,8 @@ func InternalCreateSourceSuggestions(c *gin.Context) {
 		tenantID = "default"
 	}
 
+	cfg := loadDiscoveryConfig(db, tenantID)
+
 	// Resolve the discovery profile (optional).
 	var profileID *uint
 	if pid, found := resolveProfileInternalID(db, tenantID, req.ProfileID); found {
@@ -86,7 +80,7 @@ func InternalCreateSourceSuggestions(c *gin.Context) {
 	for _, cand := range req.Candidates {
 		canonical := strings.TrimSpace(cand.CanonicalKey)
 		feedURL := strings.TrimSpace(cand.FeedURL)
-		if canonical == "" || feedURL == "" || cand.Confidence < minSuggestionConfidence {
+		if canonical == "" || feedURL == "" || cand.Confidence < cfg.MinConfidence {
 			skipped++
 			continue
 		}
@@ -133,7 +127,7 @@ func InternalCreateSourceSuggestions(c *gin.Context) {
 
 	// Best-effort semantic relevance + novelty scoring (no-op if Enrichment is
 	// down or there's no profile — rows still insert with a null score).
-	scoreSuggestionRows(db, tenantID, profileID, rows)
+	scoreSuggestionRows(db, tenantID, profileID, rows, cfg.DupThreshold, cfg.DupPenalty)
 
 	if len(rows) > 0 {
 		// Upsert on (tenant_id, canonical_key). Refresh candidate data but do NOT
@@ -153,10 +147,41 @@ func InternalCreateSourceSuggestions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"upserted": len(rows), "skipped": skipped})
 }
 
+// InternalGetDiscoveryConfig handles GET /internal/discovery/config — the
+// Aggregation sweeper reads interval/automation/provider/recency/max from here.
+func InternalGetDiscoveryConfig(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := strings.TrimSpace(c.Query("tenant_id"))
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	c.JSON(http.StatusOK, loadDiscoveryConfig(db, tenantID))
+}
+
+// InternalListEnabledProfiles handles GET /internal/discovery/profiles?enabled=true
+// — the sweep's fan-out list.
+func InternalListEnabledProfiles(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := strings.TrimSpace(c.Query("tenant_id"))
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	var profiles []models.DiscoveryProfile
+	if err := db.Where("tenant_id = ? AND enabled = ?", tenantID, true).Find(&profiles).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list profiles"})
+		return
+	}
+	data := make([]discoveryProfileResponse, 0, len(profiles))
+	for _, p := range profiles {
+		data = append(data, mapDiscoveryProfileResponse(p))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": data, "tenant_id": tenantID})
+}
+
 // scoreSuggestionRows fills relevance_score on each row: cosine(profile, sample)
 // adjusted by a novelty penalty for near-duplicate (mirror) content. Best-effort
 // — leaves scores null on any failure so the loop never breaks.
-func scoreSuggestionRows(db *gorm.DB, tenantID string, profileID *uint, rows []models.SourceSuggestion) {
+func scoreSuggestionRows(db *gorm.DB, tenantID string, profileID *uint, rows []models.SourceSuggestion, dupThreshold, dupPenalty float64) {
 	if profileID == nil || len(rows) == 0 {
 		return
 	}
@@ -194,7 +219,7 @@ func scoreSuggestionRows(db *gorm.DB, tenantID string, profileID *uint, rows []m
 			continue
 		}
 		relevance := sum / float64(n)
-		score := relevance * noveltyFactor(db, tenantID, meanVector(vecs))
+		score := relevance * noveltyFactor(db, tenantID, meanVector(vecs), dupThreshold, dupPenalty)
 		s := score
 		rows[i].RelevanceScore = &s
 	}
@@ -250,7 +275,7 @@ func ensureProfileEmbedding(db *gorm.DB, profile *models.DiscoveryProfile) ([]fl
 
 // noveltyFactor returns dupPenalty when the candidate sample is near-identical
 // to existing ingested content (a mirror/aggregator), else 1.0.
-func noveltyFactor(db *gorm.DB, tenantID string, vec []float32) float64 {
+func noveltyFactor(db *gorm.DB, tenantID string, vec []float32, dupThreshold, dupPenalty float64) float64 {
 	lit := utils.PgvectorToLiteral(vec)
 	var row struct{ Sim float64 }
 	err := db.Model(&models.ContentItem{}).
