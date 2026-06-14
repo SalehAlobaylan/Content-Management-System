@@ -1,0 +1,845 @@
+package controllers
+
+import (
+	"content-management-system/src/models"
+	"content-management-system/src/utils"
+	"encoding/json"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/lib/pq"
+	"gorm.io/gorm"
+)
+
+// ---------- Request / response types ----------
+
+type discoveryProfileResponse struct {
+	ID                   string   `json:"id"`
+	Name                 string   `json:"name"`
+	Description          string   `json:"description"`
+	Keywords             []string `json:"keywords"`
+	Languages            []string `json:"languages"`
+	Enabled              bool     `json:"enabled"`
+	MaxSuggestionsPerRun int      `json:"max_suggestions_per_run"`
+	LastRunAt            *string  `json:"last_run_at,omitempty"`
+	CreatedAt            string   `json:"created_at"`
+	UpdatedAt            string   `json:"updated_at"`
+}
+
+type createDiscoveryProfileRequest struct {
+	Name                 string   `json:"name"`
+	Description          string   `json:"description"`
+	Keywords             []string `json:"keywords"`
+	Languages            []string `json:"languages"`
+	Enabled              *bool    `json:"enabled"`
+	MaxSuggestionsPerRun *int     `json:"max_suggestions_per_run"`
+}
+
+type updateDiscoveryProfileRequest struct {
+	Name                 *string   `json:"name"`
+	Description          *string   `json:"description"`
+	Keywords             *[]string `json:"keywords"`
+	Languages            *[]string `json:"languages"`
+	Enabled              *bool     `json:"enabled"`
+	MaxSuggestionsPerRun *int      `json:"max_suggestions_per_run"`
+}
+
+type sourceSuggestionResponse struct {
+	ID             string          `json:"id"`
+	ProfileID      *string         `json:"profile_id,omitempty"`
+	Name           string          `json:"name"`
+	Type           string          `json:"type"`
+	FeedURL        string          `json:"feed_url"`
+	SiteURL        *string         `json:"site_url,omitempty"`
+	ImageURL       *string         `json:"image_url,omitempty"`
+	Language       *string         `json:"language,omitempty"`
+	Confidence     float64         `json:"confidence"`
+	RelevanceScore *float64        `json:"relevance_score,omitempty"`
+	Health         json.RawMessage `json:"health,omitempty"`
+	SampleItems    json.RawMessage `json:"sample_items,omitempty"`
+	DiscoveredVia  string          `json:"discovered_via,omitempty"`
+	Status         string          `json:"status"`
+	RejectReason   *string         `json:"reject_reason,omitempty"`
+	CreatedAt      string          `json:"created_at"`
+	UpdatedAt      string          `json:"updated_at"`
+}
+
+type newsSourceResponse struct {
+	contentSourceResponse
+	DiscoveryProfileID *string `json:"discovery_profile_id,omitempty"`
+	ItemsCount         int64   `json:"items_count"`
+	Ready              int64   `json:"ready"`
+	Failed             int64   `json:"failed"`
+	LastItemAt         *string `json:"last_item_at,omitempty"`
+	Engagement         int64   `json:"engagement"`
+}
+
+type aggregationDiscoveryProfile struct {
+	ID                   string   `json:"id"`
+	Name                 string   `json:"name"`
+	Description          string   `json:"description,omitempty"`
+	Keywords             []string `json:"keywords,omitempty"`
+	Languages            []string `json:"languages,omitempty"`
+	MaxSuggestionsPerRun int      `json:"maxSuggestionsPerRun"`
+}
+
+type aggregationDiscoveryRequest struct {
+	Profile aggregationDiscoveryProfile `json:"profile"`
+}
+
+// ---------- Profiles ----------
+
+// ListDiscoveryProfiles handles GET /admin/discovery/profiles
+func ListDiscoveryProfiles(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var profiles []models.DiscoveryProfile
+	if err := db.Where("tenant_id = ?", principal.TenantID).
+		Order("created_at desc").Find(&profiles).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch profiles", Code: "FETCH_FAILED"})
+		return
+	}
+
+	data := make([]discoveryProfileResponse, 0, len(profiles))
+	for _, p := range profiles {
+		data = append(data, mapDiscoveryProfileResponse(p))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": data})
+}
+
+// CreateDiscoveryProfile handles POST /admin/discovery/profiles
+func CreateDiscoveryProfile(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req createDiscoveryProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request", Code: "INVALID_REQUEST"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Name is required", Code: "NAME_REQUIRED"})
+		return
+	}
+
+	profile := models.DiscoveryProfile{
+		TenantID:             principal.TenantID,
+		Name:                 name,
+		Description:          strings.TrimSpace(req.Description),
+		Keywords:             pq.StringArray(req.Keywords),
+		Languages:            pq.StringArray(req.Languages),
+		Enabled:              true,
+		MaxSuggestionsPerRun: 10,
+	}
+	if req.Enabled != nil {
+		profile.Enabled = *req.Enabled
+	}
+	if req.MaxSuggestionsPerRun != nil && *req.MaxSuggestionsPerRun > 0 {
+		profile.MaxSuggestionsPerRun = *req.MaxSuggestionsPerRun
+	}
+
+	if err := db.Create(&profile).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create profile", Code: "CREATE_FAILED"})
+		return
+	}
+	c.JSON(http.StatusCreated, mapDiscoveryProfileResponse(profile))
+}
+
+// UpdateDiscoveryProfile handles PUT /admin/discovery/profiles/:id
+func UpdateDiscoveryProfile(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid profile ID", Code: "INVALID_ID"})
+		return
+	}
+
+	var profile models.DiscoveryProfile
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&profile).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Profile not found", Code: "NOT_FOUND"})
+		return
+	}
+
+	var req updateDiscoveryProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request", Code: "INVALID_REQUEST"})
+		return
+	}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Name cannot be empty", Code: "NAME_REQUIRED"})
+			return
+		}
+		profile.Name = name
+	}
+	if req.Description != nil {
+		profile.Description = strings.TrimSpace(*req.Description)
+	}
+	if req.Keywords != nil {
+		profile.Keywords = pq.StringArray(*req.Keywords)
+	}
+	if req.Languages != nil {
+		profile.Languages = pq.StringArray(*req.Languages)
+	}
+	if req.Enabled != nil {
+		profile.Enabled = *req.Enabled
+	}
+	if req.MaxSuggestionsPerRun != nil && *req.MaxSuggestionsPerRun > 0 {
+		profile.MaxSuggestionsPerRun = *req.MaxSuggestionsPerRun
+	}
+
+	// Invalidate the cached embedding when its semantic inputs change so it
+	// recomputes on the next scoring pass.
+	if req.Name != nil || req.Description != nil || req.Keywords != nil {
+		profile.Embedding = nil
+	}
+
+	if err := db.Save(&profile).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update profile", Code: "UPDATE_FAILED"})
+		return
+	}
+	c.JSON(http.StatusOK, mapDiscoveryProfileResponse(profile))
+}
+
+// DeleteDiscoveryProfile handles DELETE /admin/discovery/profiles/:id
+func DeleteDiscoveryProfile(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid profile ID", Code: "INVALID_ID"})
+		return
+	}
+
+	res := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).Delete(&models.DiscoveryProfile{})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to delete profile", Code: "DELETE_FAILED"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Profile not found", Code: "NOT_FOUND"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// RunDiscoveryProfile handles POST /admin/discovery/profiles/:id/run — proxies
+// a one-off discovery sweep to Aggregation.
+func RunDiscoveryProfile(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid profile ID", Code: "INVALID_ID"})
+		return
+	}
+
+	var profile models.DiscoveryProfile
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&profile).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Profile not found", Code: "NOT_FOUND"})
+		return
+	}
+
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Aggregation service URL is not configured", Code: "AGGREGATION_NOT_CONFIGURED"})
+		return
+	}
+
+	triggerRes, err := triggerAggregationDiscoveryRun(aggregationBaseURL, c.GetHeader("Authorization"), aggregationDiscoveryRequest{
+		Profile: aggregationDiscoveryProfile{
+			ID:                   profile.PublicID.String(),
+			Name:                 profile.Name,
+			Description:          profile.Description,
+			Keywords:             []string(profile.Keywords),
+			Languages:            []string(profile.Languages),
+			MaxSuggestionsPerRun: profile.MaxSuggestionsPerRun,
+		},
+	})
+	if err != nil {
+		writeDiscoveryAudit(db, principal, "discovery.run", profile.PublicID.String(), "failure", err.Error())
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Failed to trigger discovery: " + err.Error(), Code: "DISCOVERY_TRIGGER_FAILED"})
+		return
+	}
+
+	now := time.Now().UTC()
+	profile.LastRunAt = &now
+	_ = db.Save(&profile).Error
+	writeDiscoveryAudit(db, principal, "discovery.run", profile.PublicID.String(), "success", "")
+
+	c.JSON(http.StatusOK, runSourceResponse{Message: triggerRes.Message, JobID: triggerRes.JobID})
+}
+
+// ---------- Suggestions ----------
+
+// ListSourceSuggestions handles GET /admin/discovery/suggestions
+func ListSourceSuggestions(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	query := db.Model(&models.SourceSuggestion{}).Where("tenant_id = ?", principal.TenantID)
+
+	status := strings.TrimSpace(c.Query("status"))
+	if status == "" {
+		status = models.SuggestionStatusPending
+	}
+	if !strings.EqualFold(status, "all") {
+		query = query.Where("status = ?", strings.ToUpper(status))
+	}
+	if profileParam := strings.TrimSpace(c.Query("profile_id")); profileParam != "" {
+		if internalID, found := resolveProfileInternalID(db, principal.TenantID, profileParam); found {
+			query = query.Where("profile_id = ?", *internalID)
+		}
+	}
+
+	var total int64
+	query.Count(&total)
+
+	limit, page := paginationParams(c, 50, 200)
+	var suggestions []models.SourceSuggestion
+	if err := query.Order("relevance_score DESC NULLS LAST, confidence DESC, created_at DESC").
+		Limit(limit).Offset((page - 1) * limit).Find(&suggestions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch suggestions", Code: "FETCH_FAILED"})
+		return
+	}
+
+	profileIDs := loadProfilePublicIDs(db, principal.TenantID)
+	data := make([]sourceSuggestionResponse, 0, len(suggestions))
+	for _, s := range suggestions {
+		data = append(data, mapSourceSuggestionResponse(s, profileIDs))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": data, "total": total, "page": page, "limit": limit})
+}
+
+// ApproveSuggestion handles POST /admin/discovery/suggestions/:id/approve
+func ApproveSuggestion(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid suggestion ID", Code: "INVALID_ID"})
+		return
+	}
+
+	var suggestion models.SourceSuggestion
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&suggestion).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Suggestion not found", Code: "NOT_FOUND"})
+		return
+	}
+
+	source, err := approveSuggestionTx(db, principal.TenantID, &suggestion)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to approve suggestion", Code: "APPROVE_FAILED"})
+		return
+	}
+	writeDiscoveryAudit(db, principal, "discovery.approve", suggestion.PublicID.String(), "success", "")
+	// Kick off the first ingestion so the new source starts producing items
+	// immediately (best-effort — approval already succeeded regardless).
+	triggerSourceFirstFetch(c.GetHeader("Authorization"), source)
+	c.JSON(http.StatusOK, mapContentSourceResponse(*source))
+}
+
+// RejectSuggestion handles POST /admin/discovery/suggestions/:id/reject
+func RejectSuggestion(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid suggestion ID", Code: "INVALID_ID"})
+		return
+	}
+
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	var suggestion models.SourceSuggestion
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&suggestion).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Suggestion not found", Code: "NOT_FOUND"})
+		return
+	}
+
+	suggestion.Status = models.SuggestionStatusRejected
+	if reason := strings.TrimSpace(body.Reason); reason != "" {
+		suggestion.RejectReason = &reason
+	}
+	if err := db.Save(&suggestion).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to reject suggestion", Code: "REJECT_FAILED"})
+		return
+	}
+	writeDiscoveryAudit(db, principal, "discovery.reject", suggestion.PublicID.String(), "success", "")
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+type bulkSuggestionRequest struct {
+	IDs []string `json:"ids"`
+}
+
+type bulkSuggestionResult struct {
+	ID      string `json:"id"`
+	Message string `json:"message,omitempty"`
+}
+
+type bulkSuggestionResponse struct {
+	Succeeded []string               `json:"succeeded"`
+	Failed    []bulkSuggestionResult `json:"failed"`
+}
+
+// BulkApproveSuggestions handles POST /admin/discovery/suggestions/bulk-approve
+func BulkApproveSuggestions(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var req bulkSuggestionRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "ids are required", Code: "INVALID_REQUEST"})
+		return
+	}
+
+	resp := bulkSuggestionResponse{Succeeded: []string{}, Failed: []bulkSuggestionResult{}}
+	for _, raw := range req.IDs {
+		id, err := uuid.Parse(strings.TrimSpace(raw))
+		if err != nil {
+			resp.Failed = append(resp.Failed, bulkSuggestionResult{ID: raw, Message: "invalid id"})
+			continue
+		}
+		var suggestion models.SourceSuggestion
+		if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&suggestion).Error; err != nil {
+			resp.Failed = append(resp.Failed, bulkSuggestionResult{ID: raw, Message: "not found"})
+			continue
+		}
+		if _, err := approveSuggestionTx(db, principal.TenantID, &suggestion); err != nil {
+			resp.Failed = append(resp.Failed, bulkSuggestionResult{ID: raw, Message: err.Error()})
+			continue
+		}
+		resp.Succeeded = append(resp.Succeeded, raw)
+	}
+	writeDiscoveryAudit(db, principal, "discovery.bulk_approve", "", "success", "")
+	c.JSON(http.StatusOK, resp)
+}
+
+// BulkRejectSuggestions handles POST /admin/discovery/suggestions/bulk-reject
+func BulkRejectSuggestions(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var req bulkSuggestionRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "ids are required", Code: "INVALID_REQUEST"})
+		return
+	}
+
+	res := db.Model(&models.SourceSuggestion{}).
+		Where("tenant_id = ? AND public_id IN ?", principal.TenantID, req.IDs).
+		Update("status", models.SuggestionStatusRejected)
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to reject suggestions", Code: "REJECT_FAILED"})
+		return
+	}
+	writeDiscoveryAudit(db, principal, "discovery.bulk_reject", "", "success", "")
+	c.JSON(http.StatusOK, gin.H{"succeeded": res.RowsAffected})
+}
+
+// ---------- Active news sources (hub list) ----------
+
+type newsSourceStatsRow struct {
+	SourceName string     `gorm:"column:source_name"`
+	Items      int64      `gorm:"column:items"`
+	Ready      int64      `gorm:"column:ready"`
+	Failed     int64      `gorm:"column:failed"`
+	LastItemAt *time.Time `gorm:"column:last_item_at"`
+	Engagement int64      `gorm:"column:engagement"`
+}
+
+// ListNewsSources handles GET /admin/discovery/sources — active news-type
+// sources enriched with per-source ingestion stats, for the News Feeds hub.
+func ListNewsSources(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	// The hub owns news-category sources (a media-category Telegram channel
+	// stays out and is managed on the Sources page instead).
+	query := db.Model(&models.ContentSource{}).
+		Where("tenant_id = ? AND category = ?", principal.TenantID, models.SourceCategoryNews)
+
+	if typeParam := strings.ToUpper(strings.TrimSpace(c.Query("type"))); typeParam != "" {
+		query = query.Where("type = ?", typeParam)
+	}
+	if profileParam := strings.TrimSpace(c.Query("profile_id")); profileParam != "" {
+		if strings.EqualFold(profileParam, "ungrouped") {
+			query = query.Where("discovery_profile_id IS NULL")
+		} else if internalID, found := resolveProfileInternalID(db, principal.TenantID, profileParam); found {
+			query = query.Where("discovery_profile_id = ?", *internalID)
+		}
+	}
+
+	var sources []models.ContentSource
+	if err := query.Order("created_at desc").Find(&sources).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch sources", Code: "FETCH_FAILED"})
+		return
+	}
+
+	// Per-source ingestion stats, grouped by source_name (denormalized on items).
+	var statRows []newsSourceStatsRow
+	db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND source_name IS NOT NULL AND source_name != ''", principal.TenantID).
+		Select("source_name, COUNT(*) AS items, " +
+			"COALESCE(SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END), 0) AS ready, " +
+			"COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, " +
+			"MAX(published_at) AS last_item_at, " +
+			"COALESCE(SUM(like_count + comment_count + share_count), 0) AS engagement").
+		Group("source_name").Scan(&statRows)
+	statByName := make(map[string]newsSourceStatsRow, len(statRows))
+	for _, r := range statRows {
+		statByName[r.SourceName] = r
+	}
+
+	profileIDs := loadProfilePublicIDs(db, principal.TenantID)
+
+	data := make([]newsSourceResponse, 0, len(sources))
+	for _, s := range sources {
+		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(s)}
+		if s.DiscoveryProfileID != nil {
+			if pub, exists := profileIDs[*s.DiscoveryProfileID]; exists {
+				row.DiscoveryProfileID = &pub
+			}
+		}
+		if st, exists := statByName[s.Name]; exists {
+			row.ItemsCount = st.Items
+			row.Ready = st.Ready
+			row.Failed = st.Failed
+			row.Engagement = st.Engagement
+			if st.LastItemAt != nil {
+				formatted := st.LastItemAt.UTC().Format(time.RFC3339)
+				row.LastItemAt = &formatted
+			}
+		}
+		data = append(data, row)
+	}
+	c.JSON(http.StatusOK, gin.H{"data": data, "total": len(data)})
+}
+
+// ---------- Suggest profiles from topics ----------
+
+type suggestedProfileDraft struct {
+	Name         string   `json:"name"`
+	Keywords     []string `json:"keywords"`
+	Description  string   `json:"description"`
+	ArticleCount int      `json:"article_count"`
+}
+
+// SuggestProfilesFromTopics handles POST /admin/discovery/suggest-profiles —
+// proposes interest-profile drafts from the tenant's top trending topics so
+// admins don't hand-create every profile. Read-only.
+func SuggestProfilesFromTopics(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var topics []models.Topic
+	if err := db.Where("tenant_id = ? AND labeled = ?", principal.TenantID, true).
+		Order("article_count DESC, last_member_at DESC NULLS LAST").
+		Limit(12).Find(&topics).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to read topics", Code: "FETCH_FAILED"})
+		return
+	}
+
+	// Skip topics that already have a same-named profile.
+	existing := map[string]bool{}
+	var profiles []models.DiscoveryProfile
+	db.Where("tenant_id = ?", principal.TenantID).Find(&profiles)
+	for _, p := range profiles {
+		existing[strings.ToLower(strings.TrimSpace(p.Name))] = true
+	}
+
+	drafts := make([]suggestedProfileDraft, 0, len(topics))
+	for _, t := range topics {
+		label := strings.TrimSpace(t.Label)
+		if label == "" || existing[strings.ToLower(label)] {
+			continue
+		}
+		drafts = append(drafts, suggestedProfileDraft{
+			Name:         label,
+			Keywords:     keywordsFromLabel(label),
+			Description:  "Auto-suggested from the \"" + label + "\" topic.",
+			ArticleCount: t.ArticleCount,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": drafts})
+}
+
+func keywordsFromLabel(label string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, f := range strings.Fields(label) {
+		w := strings.ToLower(strings.Trim(f, ".,:;!?\"'()[]"))
+		if len([]rune(w)) < 3 || seen[w] {
+			continue
+		}
+		seen[w] = true
+		out = append(out, w)
+		if len(out) >= 6 {
+			break
+		}
+	}
+	return out
+}
+
+// ---------- helpers ----------
+
+func mapDiscoveryProfileResponse(p models.DiscoveryProfile) discoveryProfileResponse {
+	var lastRun *string
+	if p.LastRunAt != nil {
+		formatted := p.LastRunAt.UTC().Format(time.RFC3339)
+		lastRun = &formatted
+	}
+	keywords := []string(p.Keywords)
+	if keywords == nil {
+		keywords = []string{}
+	}
+	languages := []string(p.Languages)
+	if languages == nil {
+		languages = []string{}
+	}
+	return discoveryProfileResponse{
+		ID:                   p.PublicID.String(),
+		Name:                 p.Name,
+		Description:          p.Description,
+		Keywords:             keywords,
+		Languages:            languages,
+		Enabled:              p.Enabled,
+		MaxSuggestionsPerRun: p.MaxSuggestionsPerRun,
+		LastRunAt:            lastRun,
+		CreatedAt:            p.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:            p.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func mapSourceSuggestionResponse(s models.SourceSuggestion, profileIDs map[uint]string) sourceSuggestionResponse {
+	resp := sourceSuggestionResponse{
+		ID:             s.PublicID.String(),
+		Name:           s.Name,
+		Type:           string(s.Type),
+		FeedURL:        s.FeedURL,
+		SiteURL:        s.SiteURL,
+		ImageURL:       s.ImageURL,
+		Language:       s.Language,
+		Confidence:     s.Confidence,
+		RelevanceScore: s.RelevanceScore,
+		Health:         json.RawMessage(s.Health),
+		SampleItems:    json.RawMessage(s.SampleItems),
+		DiscoveredVia:  s.DiscoveredVia,
+		Status:         s.Status,
+		RejectReason:   s.RejectReason,
+		CreatedAt:      s.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:      s.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if s.ProfileID != nil {
+		if pub, ok := profileIDs[*s.ProfileID]; ok {
+			resp.ProfileID = &pub
+		}
+	}
+	return resp
+}
+
+// approveSuggestionTx creates (or links to an existing) ContentSource from a
+// suggestion, idempotently, and marks the suggestion APPROVED.
+func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.SourceSuggestion) (*models.ContentSource, error) {
+	var result models.ContentSource
+	err := db.Transaction(func(tx *gorm.DB) error {
+		// Already approved → return the linked source if it still exists.
+		if suggestion.ApprovedSourceID != nil {
+			var existing models.ContentSource
+			if err := tx.Where("id = ?", *suggestion.ApprovedSourceID).First(&existing).Error; err == nil {
+				result = existing
+				return nil
+			}
+		}
+		// Dedupe against an existing source with the same feed URL.
+		if strings.TrimSpace(suggestion.FeedURL) != "" {
+			var existing models.ContentSource
+			if err := tx.Where("tenant_id = ? AND feed_url = ?", tenantID, suggestion.FeedURL).First(&existing).Error; err == nil {
+				suggestion.Status = models.SuggestionStatusApproved
+				suggestion.ApprovedSourceID = &existing.ID
+				if err := tx.Save(suggestion).Error; err != nil {
+					return err
+				}
+				result = existing
+				return nil
+			}
+		}
+		feedURL := suggestion.FeedURL
+		category := suggestion.Category
+		if category == "" {
+			category = models.DefaultCategoryForType(suggestion.Type)
+		}
+		source := models.ContentSource{
+			TenantID:             tenantID,
+			Name:                 suggestion.Name,
+			Type:                 suggestion.Type,
+			Category:             category,
+			FeedURL:              &feedURL,
+			ImageURL:             suggestion.ImageURL,
+			IsActive:             true,
+			FetchIntervalMinutes: 60,
+			DiscoveryProfileID:   suggestion.ProfileID,
+		}
+		if err := tx.Create(&source).Error; err != nil {
+			return err
+		}
+		suggestion.Status = models.SuggestionStatusApproved
+		suggestion.ApprovedSourceID = &source.ID
+		if err := tx.Save(suggestion).Error; err != nil {
+			return err
+		}
+		result = source
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// triggerSourceFirstFetch best-effort kicks off the first ingestion for a
+// newly-approved source so it starts producing items without a manual run.
+func triggerSourceFirstFetch(authHeader string, source *models.ContentSource) {
+	if source == nil {
+		return
+	}
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		return
+	}
+	sourceURL, err := extractSourceRunURL(*source)
+	if err != nil {
+		return
+	}
+	settings, _ := parseSourceAPIConfig(source.APIConfig)
+	_, _ = triggerAggregationSourceRun(aggregationBaseURL, authHeader, aggregationTriggerRequest{
+		SourceType: string(source.Type),
+		URL:        sourceURL,
+		Name:       source.Name,
+		Settings:   settings,
+	})
+}
+
+func triggerAggregationDiscoveryRun(aggregationBaseURL, authorizationHeader string, payload aggregationDiscoveryRequest) (aggregationTriggerResponse, error) {
+	requestBody, statusCode, err := proxyAggregationRequest(aggregationBaseURL, "/admin/discovery/run", authorizationHeader, payload)
+	if err != nil {
+		return aggregationTriggerResponse{}, err
+	}
+	var body aggregationTriggerResponse
+	if err := json.Unmarshal(requestBody, &body); err != nil {
+		return aggregationTriggerResponse{}, err
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices || !body.Success {
+		if strings.TrimSpace(body.Message) == "" {
+			body.Message = "aggregation rejected discovery request"
+		}
+		return aggregationTriggerResponse{}, &discoveryError{msg: body.Message}
+	}
+	return body, nil
+}
+
+type discoveryError struct{ msg string }
+
+func (e *discoveryError) Error() string { return e.msg }
+
+func loadProfilePublicIDs(db *gorm.DB, tenantID string) map[uint]string {
+	var profiles []models.DiscoveryProfile
+	db.Where("tenant_id = ?", tenantID).Find(&profiles)
+	m := make(map[uint]string, len(profiles))
+	for _, p := range profiles {
+		m[p.ID] = p.PublicID.String()
+	}
+	return m
+}
+
+func resolveProfileInternalID(db *gorm.DB, tenantID, publicID string) (*uint, bool) {
+	id, err := uuid.Parse(strings.TrimSpace(publicID))
+	if err != nil {
+		return nil, false
+	}
+	var profile models.DiscoveryProfile
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, tenantID).First(&profile).Error; err != nil {
+		return nil, false
+	}
+	return &profile.ID, true
+}
+
+func paginationParams(c *gin.Context, defaultLimit, maxLimit int) (limit, page int) {
+	limit = defaultLimit
+	page = 1
+	if v := strings.TrimSpace(c.Query("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	if v := strings.TrimSpace(c.Query("page")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	return limit, page
+}
+
+func writeDiscoveryAudit(db *gorm.DB, principal utils.AdminPrincipal, action, resource, status, errorMessage string) {
+	entry := models.AuditLog{
+		TenantID:       principal.TenantID,
+		UserID:         principal.UserID,
+		UserEmail:      principal.Email,
+		Action:         action,
+		TargetService:  "cms",
+		TargetResource: resource,
+		Status:         status,
+		ErrorMessage:   errorMessage,
+	}
+	_ = db.Create(&entry).Error
+}

@@ -33,6 +33,7 @@ type contentSourceResponse struct {
 	ID                   string          `json:"id"`
 	Name                 string          `json:"name"`
 	Type                 string          `json:"type"`
+	Category             string          `json:"category"`
 	FeedURL              *string         `json:"feed_url,omitempty"`
 	ImageURL             *string         `json:"image_url,omitempty"`
 	APIConfig            json.RawMessage `json:"api_config,omitempty"`
@@ -47,6 +48,7 @@ type contentSourceResponse struct {
 type createContentSourceRequest struct {
 	Name                 string                 `json:"name"`
 	Type                 string                 `json:"type"`
+	Category             *string                `json:"category,omitempty"`
 	FeedURL              *string                `json:"feed_url,omitempty"`
 	ImageURL             *string                `json:"image_url,omitempty"`
 	APIConfig            map[string]interface{} `json:"api_config,omitempty"`
@@ -58,6 +60,7 @@ type createContentSourceRequest struct {
 type updateContentSourceRequest struct {
 	Name                 *string                `json:"name,omitempty"`
 	Type                 *string                `json:"type,omitempty"`
+	Category             *string                `json:"category,omitempty"`
 	FeedURL              *string                `json:"feed_url,omitempty"`
 	ImageURL             *string                `json:"image_url,omitempty"`
 	APIConfig            map[string]interface{} `json:"api_config,omitempty"`
@@ -327,10 +330,17 @@ func CreateContentSource(c *gin.Context) {
 		fetchInterval = *req.FetchIntervalMinutes
 	}
 
+	resolvedType := models.SourceType(strings.ToUpper(sourceType))
+	category := models.DefaultCategoryForType(resolvedType)
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" {
+		category = strings.ToLower(strings.TrimSpace(*req.Category))
+	}
+
 	source := models.ContentSource{
 		TenantID:             principal.TenantID,
 		Name:                 name,
-		Type:                 models.SourceType(strings.ToUpper(sourceType)),
+		Type:                 resolvedType,
+		Category:             category,
 		FeedURL:              req.FeedURL,
 		ImageURL:             sourceImageURL(req.ImageURL, req.FeedURL),
 		APIConfig:            apiConfig,
@@ -429,10 +439,17 @@ func BulkCreateContentSources(c *gin.Context) {
 			fetchInterval = *sourceReq.FetchIntervalMinutes
 		}
 
+		bulkType := models.SourceType(strings.ToUpper(sourceType))
+		bulkCategory := models.DefaultCategoryForType(bulkType)
+		if sourceReq.Category != nil && strings.TrimSpace(*sourceReq.Category) != "" {
+			bulkCategory = strings.ToLower(strings.TrimSpace(*sourceReq.Category))
+		}
+
 		source := models.ContentSource{
 			TenantID:             principal.TenantID,
 			Name:                 name,
-			Type:                 models.SourceType(strings.ToUpper(sourceType)),
+			Type:                 bulkType,
+			Category:             bulkCategory,
 			FeedURL:              sourceReq.FeedURL,
 			ImageURL:             sourceImageURL(sourceReq.ImageURL, sourceReq.FeedURL),
 			APIConfig:            apiConfig,
@@ -519,6 +536,10 @@ func UpdateContentSource(c *gin.Context) {
 			return
 		}
 		source.Type = models.SourceType(strings.ToUpper(sourceType))
+	}
+
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" {
+		source.Category = strings.ToLower(strings.TrimSpace(*req.Category))
 	}
 
 	if req.FeedURL != nil {
@@ -847,6 +868,7 @@ func mapContentSourceResponse(source models.ContentSource) contentSourceResponse
 		ID:                   source.PublicID.String(),
 		Name:                 source.Name,
 		Type:                 string(source.Type),
+		Category:             source.Category,
 		FeedURL:              source.FeedURL,
 		ImageURL:             source.ImageURL,
 		APIConfig:            json.RawMessage(source.APIConfig),

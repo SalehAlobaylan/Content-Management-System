@@ -25,6 +25,20 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.DELETE("/sources/:id", controllers.DeleteContentSource)
 	adminGroup.POST("/sources/:id/run", controllers.RunContentSource)
 
+	// Feeds Finding — auto source discovery
+	adminGroup.GET("/discovery/profiles", controllers.ListDiscoveryProfiles)
+	adminGroup.POST("/discovery/profiles", controllers.CreateDiscoveryProfile)
+	adminGroup.PUT("/discovery/profiles/:id", controllers.UpdateDiscoveryProfile)
+	adminGroup.DELETE("/discovery/profiles/:id", controllers.DeleteDiscoveryProfile)
+	adminGroup.POST("/discovery/profiles/:id/run", controllers.RunDiscoveryProfile)
+	adminGroup.POST("/discovery/suggest-profiles", controllers.SuggestProfilesFromTopics)
+	adminGroup.GET("/discovery/suggestions", controllers.ListSourceSuggestions)
+	adminGroup.POST("/discovery/suggestions/bulk-approve", controllers.BulkApproveSuggestions)
+	adminGroup.POST("/discovery/suggestions/bulk-reject", controllers.BulkRejectSuggestions)
+	adminGroup.POST("/discovery/suggestions/:id/approve", controllers.ApproveSuggestion)
+	adminGroup.POST("/discovery/suggestions/:id/reject", controllers.RejectSuggestion)
+	adminGroup.GET("/discovery/sources", controllers.ListNewsSources)
+
 	adminGroup.GET("/content", controllers.ListContentItems)
 	adminGroup.POST("/content", controllers.CreateAdminContent)
 	adminGroup.POST("/content/extract-url", controllers.ExtractContentURL)

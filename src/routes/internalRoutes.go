@@ -13,6 +13,9 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal := router.Group("/internal")
 	internal.Use(utils.InternalAuthMiddleware())
 
+	// Feeds Finding — Aggregation posts discovered source candidates here
+	internal.POST("/source-suggestions", controllers.InternalCreateSourceSuggestions)
+
 	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)

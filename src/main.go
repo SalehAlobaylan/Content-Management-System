@@ -135,6 +135,9 @@ func main() {
 			&models.Chapter{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
+			// Feeds Finding — auto source discovery (profiles + suggestions)
+			&models.DiscoveryProfile{},
+			&models.SourceSuggestion{},
 			// Phase 13 — precomputed News-feed story-slide snapshot
 			&models.NewsSnapshot{},
 			// Saved syndication feeds (RSS/Atom/JSON)

@@ -17,6 +17,11 @@ type ContentSource struct {
 	Name string     `gorm:"type:varchar(255);not null" json:"name"`
 	Type SourceType `gorm:"type:varchar(20);not null" json:"type"`
 
+	// Category ('news' | 'media') decides which feed/management surface owns the
+	// source. Defaulted by type; editable so dual-type sources (e.g. a Telegram
+	// channel) are unambiguous instead of appearing in both surfaces.
+	Category string `gorm:"type:varchar(16);not null;default:news" json:"category"`
+
 	// Configuration
 	FeedURL   *string        `gorm:"type:text" json:"feed_url,omitempty"`
 	ImageURL  *string        `gorm:"type:text" json:"image_url,omitempty"`
@@ -26,6 +31,11 @@ type ContentSource struct {
 	IsActive             bool       `gorm:"default:true" json:"is_active"`
 	FetchIntervalMinutes int        `gorm:"default:60" json:"fetch_interval_minutes"`
 	LastFetchedAt        *time.Time `gorm:"type:timestamp" json:"last_fetched_at,omitempty"`
+
+	// DiscoveryProfileID links a source to the discovery profile it was
+	// approved from, so the News Feeds hub can group active sources by interest.
+	// NULL = manually-added / ungrouped.
+	DiscoveryProfileID *uint `gorm:"index:idx_content_sources_discovery_profile" json:"discovery_profile_id,omitempty"`
 
 	// Metadata
 	Metadata  datatypes.JSON `gorm:"type:jsonb" json:"metadata,omitempty"`

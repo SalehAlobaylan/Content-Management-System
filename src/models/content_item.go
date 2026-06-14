@@ -43,11 +43,40 @@ const (
 	SourceTypeRSS      SourceType = "RSS"
 	SourceTypeWebsite  SourceType = "WEBSITE"
 	SourceTypeTelegram SourceType = "TELEGRAM"
+	SourceTypeTwitter  SourceType = "TWITTER"
 	SourceTypePodcast  SourceType = "PODCAST"
 	SourceTypeYouTube  SourceType = "YOUTUBE"
 	SourceTypeUpload   SourceType = "UPLOAD"
 	SourceTypeManual   SourceType = "MANUAL"
 )
+
+// Source categories decide which feed/management surface owns a source.
+const (
+	SourceCategoryNews  = "news"
+	SourceCategoryMedia = "media"
+)
+
+// DefaultCategoryForType picks a source's category from its type. YOUTUBE and
+// PODCAST are media (For You); everything else defaults to news. TELEGRAM is
+// genuinely dual — it defaults to news but is meant to be set explicitly.
+func DefaultCategoryForType(t SourceType) string {
+	switch t {
+	case SourceTypeYouTube, SourceTypePodcast:
+		return SourceCategoryMedia
+	default:
+		return SourceCategoryNews
+	}
+}
+
+// NewsSourceTypes are the source types eligible for the News Feeds hub. NOTE:
+// the hub now filters by category='news' (not by this list) so a media-category
+// Telegram source stays out — kept for reference / fallbacks.
+var NewsSourceTypes = []SourceType{
+	SourceTypeRSS,
+	SourceTypeWebsite,
+	SourceTypeTelegram,
+	SourceTypeTwitter,
+}
 
 // ContentStatus enum
 type ContentStatus string
