@@ -62,6 +62,7 @@ type sourceSuggestionResponse struct {
 	RelevanceScore *float64        `json:"relevance_score,omitempty"`
 	Health         json.RawMessage `json:"health,omitempty"`
 	SampleItems    json.RawMessage `json:"sample_items,omitempty"`
+	Evidence       json.RawMessage `json:"evidence,omitempty"`
 	DiscoveredVia  string          `json:"discovered_via,omitempty"`
 	Status         string          `json:"status"`
 	RejectReason   *string         `json:"reject_reason,omitempty"`
@@ -706,6 +707,58 @@ func UpdateDiscoveryConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, req)
 }
 
+// SweepNow handles POST /admin/discovery/sweep-now — proxy a manual sweep.
+func SweepNow(c *gin.Context) {
+	proxyAggregationSimple(c, "/admin/discovery/sweep-now")
+}
+
+// BuildGraph handles POST /admin/discovery/build-graph — proxy a manual graph build.
+func BuildGraph(c *gin.Context) {
+	proxyAggregationSimple(c, "/admin/discovery/build-graph-now")
+}
+
+func proxyAggregationSimple(c *gin.Context, path string) {
+	if _, ok := requireAdminPrincipal(c); !ok {
+		return
+	}
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Aggregation service URL is not configured", Code: "AGGREGATION_NOT_CONFIGURED"})
+		return
+	}
+	body, status, err := proxyAggregationRequest(aggregationBaseURL, path, c.GetHeader("Authorization"), map[string]interface{}{})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation request failed: " + err.Error(), Code: "AGGREGATION_FAILED"})
+		return
+	}
+	c.Data(status, "application/json", body)
+}
+
+// GetAuthorities handles GET /admin/discovery/authorities — the top domains in
+// the tenant's source-intelligence graph (the "your network" insight).
+func GetAuthorities(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var cands []models.SourceCandidate
+	db.Where("tenant_id = ?", principal.TenantID).
+		Order("authority_score desc, citation_count desc").Limit(12).Find(&cands)
+	out := make([]gin.H, 0, len(cands))
+	for _, x := range cands {
+		out = append(out, gin.H{
+			"domain":           x.Domain,
+			"authority":        round2(x.AuthorityScore),
+			"citation_count":   x.CitationCount,
+			"cocitation_count": x.CocitationCount,
+			"feed_valid":       x.FeedValid,
+			"status":           x.Status,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
 func loadDiscoveryConfig(db *gorm.DB, tenantID string) models.DiscoveryConfig {
 	var cfg models.DiscoveryConfig
 	if err := db.Where("tenant_id = ?", tenantID).First(&cfg).Error; err != nil {
@@ -765,6 +818,7 @@ func mapSourceSuggestionResponse(s models.SourceSuggestion, profileIDs map[uint]
 		RelevanceScore: s.RelevanceScore,
 		Health:         json.RawMessage(s.Health),
 		SampleItems:    json.RawMessage(s.SampleItems),
+		Evidence:       json.RawMessage(s.Evidence),
 		DiscoveredVia:  s.DiscoveredVia,
 		Status:         s.Status,
 		RejectReason:   s.RejectReason,

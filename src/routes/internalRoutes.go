@@ -19,6 +19,12 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.GET("/discovery/config", controllers.InternalGetDiscoveryConfig)
 	internal.GET("/discovery/profiles", controllers.InternalListEnabledProfiles)
 
+	// Slice 4 — Source Intelligence Graph
+	internal.GET("/intel/corpus-citations", controllers.InternalGetCorpusCitations)
+	internal.GET("/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
+	internal.POST("/intel/candidates", controllers.InternalUpsertCandidates)
+	internal.GET("/intel/candidates", controllers.InternalListCandidates)
+
 	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)

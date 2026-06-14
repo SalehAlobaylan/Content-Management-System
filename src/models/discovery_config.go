@@ -26,6 +26,19 @@ type DiscoveryConfig struct {
 	MaxCandidatesPerProfile int    `gorm:"type:integer;default:15" json:"max_candidates_per_profile"`
 	SearchProvider          string `gorm:"type:varchar(16);default:auto" json:"search_provider"`
 
+	// Source Intelligence Graph (Slice 4) — self-maintaining candidate graph that
+	// auto-promotes high-scoring on-topic sources into the review queue.
+	IntelligenceEnabled     bool    `gorm:"default:false" json:"intelligence_enabled"`
+	GraphBuildIntervalHours int     `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
+	PromotionThreshold      float64 `gorm:"type:double precision;default:0.30" json:"promotion_threshold"`
+	// Composite-score signal weights (sum ≈ 1.0).
+	WeightCitation   float64 `gorm:"type:double precision;default:0.20" json:"weight_citation"`
+	WeightCocitation float64 `gorm:"type:double precision;default:0.20" json:"weight_cocitation"`
+	WeightAuthority  float64 `gorm:"type:double precision;default:0.20" json:"weight_authority"`
+	WeightRelevance  float64 `gorm:"type:double precision;default:0.25" json:"weight_relevance"`
+	WeightHealth     float64 `gorm:"type:double precision;default:0.10" json:"weight_health"`
+	WeightNovelty    float64 `gorm:"type:double precision;default:0.05" json:"weight_novelty"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -48,5 +61,14 @@ func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 		RecencyWindowDays:       30,
 		MaxCandidatesPerProfile: 15,
 		SearchProvider:          "auto",
+		IntelligenceEnabled:     false,
+		GraphBuildIntervalHours: 24,
+		PromotionThreshold:      0.30,
+		WeightCitation:          0.20,
+		WeightCocitation:        0.20,
+		WeightAuthority:         0.20,
+		WeightRelevance:         0.25,
+		WeightHealth:            0.10,
+		WeightNovelty:           0.05,
 	}
 }

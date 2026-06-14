@@ -45,6 +45,10 @@ type SourceSuggestion struct {
 	Health      datatypes.JSON `gorm:"type:jsonb" json:"health,omitempty"`
 	SampleItems datatypes.JSON `gorm:"type:jsonb" json:"sample_items,omitempty"`
 
+	// Evidence is the source-intelligence signal snapshot for auto-promoted
+	// suggestions (citation_count, cocitation_count, authority, relevance, trend).
+	Evidence datatypes.JSON `gorm:"type:jsonb" json:"evidence,omitempty"`
+
 	DiscoveredVia string `gorm:"type:varchar(20)" json:"discovered_via,omitempty"`
 
 	// Category ('news' | 'media') — defaulted by type at ingest, carried to the

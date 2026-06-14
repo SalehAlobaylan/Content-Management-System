@@ -139,6 +139,9 @@ func main() {
 			&models.DiscoveryProfile{},
 			&models.SourceSuggestion{},
 			&models.DiscoveryConfig{},
+			// Slice 4 — Source Intelligence Graph (ledger + citation edges)
+			&models.SourceCandidate{},
+			&models.SourceEdge{},
 			// Phase 13 — precomputed News-feed story-slide snapshot
 			&models.NewsSnapshot{},
 			// Saved syndication feeds (RSS/Atom/JSON)

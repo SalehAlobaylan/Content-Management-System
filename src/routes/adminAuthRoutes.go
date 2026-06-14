@@ -40,6 +40,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/discovery/sources", controllers.ListNewsSources)
 	adminGroup.GET("/discovery/config", controllers.GetDiscoveryConfig)
 	adminGroup.PUT("/discovery/config", controllers.UpdateDiscoveryConfig)
+	adminGroup.POST("/discovery/sweep-now", controllers.SweepNow)
+	adminGroup.POST("/discovery/build-graph", controllers.BuildGraph)
+	adminGroup.GET("/discovery/authorities", controllers.GetAuthorities)
 
 	adminGroup.GET("/content", controllers.ListContentItems)
 	adminGroup.POST("/content", controllers.CreateAdminContent)
