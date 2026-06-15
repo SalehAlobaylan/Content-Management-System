@@ -22,6 +22,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	// Slice 4 — Source Intelligence Graph
 	internal.GET("/intel/corpus-citations", controllers.InternalGetCorpusCitations)
 	internal.GET("/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
+	internal.GET("/intel/approved-telegram-channels", controllers.InternalGetApprovedTelegramChannels)
 	internal.POST("/intel/candidates", controllers.InternalUpsertCandidates)
 	internal.GET("/intel/candidates", controllers.InternalListCandidates)
 

@@ -117,7 +117,9 @@ func InternalGetApprovedSourcePages(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID := intelTenant(c)
 	var sources []models.ContentSource
-	db.Where("tenant_id = ? AND category = ? AND feed_url IS NOT NULL", tenantID, models.SourceCategoryNews).Find(&sources)
+	// RSS/web sources only — Telegram is crawled via gramjs, not HTTP.
+	db.Where("tenant_id = ? AND category = ? AND type <> ? AND feed_url IS NOT NULL",
+		tenantID, models.SourceCategoryNews, models.SourceTypeTelegram).Find(&sources)
 
 	out := make([]gin.H, 0, len(sources))
 	seen := map[string]bool{}
@@ -135,10 +137,50 @@ func InternalGetApprovedSourcePages(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
+// InternalGetApprovedTelegramChannels handles GET /internal/intel/approved-telegram-channels
+// — the approved Telegram channels that seed the forward-graph.
+func InternalGetApprovedTelegramChannels(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := intelTenant(c)
+	var sources []models.ContentSource
+	db.Where("tenant_id = ? AND type = ? AND feed_url IS NOT NULL", tenantID, models.SourceTypeTelegram).Find(&sources)
+
+	out := make([]gin.H, 0, len(sources))
+	seen := map[string]bool{}
+	for _, s := range sources {
+		if s.FeedURL == nil {
+			continue
+		}
+		u := telegramUsername(*s.FeedURL)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, gin.H{"username": u})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// telegramUsername extracts the bare channel username from a t.me URL or @handle.
+func telegramUsername(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "t.me/")
+	s = strings.TrimPrefix(s, "telegram.me/")
+	s = strings.TrimPrefix(s, "s/")
+	s = strings.TrimPrefix(s, "@")
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // ---------- Ledger upsert + auto-promotion ----------
 
 type intelCandidateIn struct {
 	Domain          string                   `json:"domain"`
+	Kind            string                   `json:"kind"`
 	CanonicalKey    string                   `json:"canonical_key"`
 	ResolvedFeedURL *string                  `json:"resolved_feed_url"`
 	FeedValid       bool                     `json:"feed_valid"`
@@ -186,9 +228,14 @@ func InternalUpsertCandidates(c *gin.Context) {
 		if domain == "" {
 			continue
 		}
+		kind := strings.ToLower(strings.TrimSpace(cand.Kind))
+		if kind != models.CandidateKindTelegram {
+			kind = models.CandidateKindRSS
+		}
 		row := models.SourceCandidate{
 			TenantID:        tenantID,
 			Domain:          domain,
+			Kind:            kind,
 			CanonicalKey:    cand.CanonicalKey,
 			ResolvedFeedURL: cand.ResolvedFeedURL,
 			FeedValid:       cand.FeedValid,
@@ -214,7 +261,7 @@ func InternalUpsertCandidates(c *gin.Context) {
 		_ = db.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "tenant_id"}, {Name: "domain"}},
 			DoUpdates: clause.AssignmentColumns([]string{
-				"canonical_key", "resolved_feed_url", "feed_valid", "last_resolved_at",
+				"kind", "canonical_key", "resolved_feed_url", "feed_valid", "last_resolved_at",
 				"citation_count", "cocitation_count", "authority_score", "trend",
 				"discovered_via", "sample_titles", "feed_health", "last_seen_at",
 			}),
@@ -282,6 +329,19 @@ func compositeScore(cfg models.DiscoveryConfig, citation, cocitation, authority,
 	relN := math.Min(1, relevance/0.25) // Arabic cosine peaks ~0.25
 	return cfg.WeightCitation*citN + cfg.WeightCocitation*cocN + cfg.WeightAuthority*authority +
 		cfg.WeightRelevance*relN + cfg.WeightHealth*health + cfg.WeightNovelty*novelty
+}
+
+func subscribersFromHealth(raw datatypes.JSON) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var h struct {
+		Subscribers int `json:"subscribers"`
+	}
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return 0
+	}
+	return h.Subscribers
 }
 
 func healthScore(raw datatypes.JSON) float64 {
@@ -373,7 +433,19 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 			continue
 		}
 
-		evidence, _ := json.Marshal(gin.H{
+		// Kind-aware: RSS candidate → RSS feed suggestion; Telegram candidate →
+		// TELEGRAM channel suggestion (the existing fetcher ingests t.me/<x>).
+		sugType := models.SourceTypeRSS
+		via := "graph"
+		if cand.Kind == models.CandidateKindTelegram {
+			sugType = models.SourceTypeTelegram
+			via = "telegram-graph"
+		}
+		if len(cand.DiscoveredVia) > 0 {
+			via = cand.DiscoveredVia[0]
+		}
+
+		ev := gin.H{
 			"citation_count":   cand.CitationCount,
 			"cocitation_count": cand.CocitationCount,
 			"authority":        round2(cand.AuthorityScore),
@@ -381,24 +453,28 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 			"composite":        round2(composite),
 			"trend":            cand.Trend,
 			"via":              []string(cand.DiscoveredVia),
-		})
+		}
+		if subs := subscribersFromHealth(cand.FeedHealth); subs > 0 {
+			ev["subscribers"] = subs
+		}
+		evidence, _ := json.Marshal(ev)
 
 		rel := relevance
 		sug := models.SourceSuggestion{
-			TenantID:      tenantID,
-			ProfileID:     &profile.ID,
-			Name:          cand.Domain,
-			Type:          models.SourceTypeRSS,
-			FeedURL:       *cand.ResolvedFeedURL,
-			CanonicalKey:  defaultStr(cand.CanonicalKey, *cand.ResolvedFeedURL),
-			Confidence:    composite,
+			TenantID:       tenantID,
+			ProfileID:      &profile.ID,
+			Name:           cand.Domain,
+			Type:           sugType,
+			FeedURL:        *cand.ResolvedFeedURL,
+			CanonicalKey:   defaultStr(cand.CanonicalKey, *cand.ResolvedFeedURL),
+			Confidence:     composite,
 			RelevanceScore: &rel,
-			SampleItems:   cand.SampleTitles,
-			Health:        cand.FeedHealth,
-			Evidence:      datatypes.JSON(evidence),
-			DiscoveredVia: "graph",
-			Category:      models.SourceCategoryNews,
-			Status:        models.SuggestionStatusPending,
+			SampleItems:    cand.SampleTitles,
+			Health:         cand.FeedHealth,
+			Evidence:       datatypes.JSON(evidence),
+			DiscoveredVia:  via,
+			Category:       models.SourceCategoryNews,
+			Status:         models.SuggestionStatusPending,
 		}
 		err := db.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "tenant_id"}, {Name: "profile_id"}, {Name: "canonical_key"}},

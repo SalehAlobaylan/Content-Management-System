@@ -16,6 +16,12 @@ const (
 	CandidateStatusRejected  = "rejected"
 )
 
+// SourceCandidate kinds.
+const (
+	CandidateKindRSS      = "rss"
+	CandidateKindTelegram = "telegram"
+)
+
 // SourceCandidate is the persistent ledger of candidate news domains discovered
 // from your trusted graph (corpus citations + link-graph). It accumulates
 // signals across graph-build runs; high-scoring on-topic candidates auto-promote
@@ -27,6 +33,10 @@ type SourceCandidate struct {
 
 	Domain       string `gorm:"type:varchar(255);not null;uniqueIndex:idx_source_candidates_tenant_domain,priority:2" json:"domain"`
 	CanonicalKey string `gorm:"type:text" json:"canonical_key"`
+
+	// Kind ('rss' | 'telegram') — an RSS candidate resolves to a feed; a telegram
+	// candidate is a channel (domain = username, feed_url = https://t.me/<username>).
+	Kind string `gorm:"type:varchar(16);not null;default:rss" json:"kind"`
 
 	// Resolution (a candidate becomes promotable once its feed is found + valid).
 	ResolvedFeedURL *string    `gorm:"type:text" json:"resolved_feed_url,omitempty"`

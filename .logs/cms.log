@@ -1,0 +1,154 @@
+2026/06/14 23:54:29 Starting Content Management System...
+2026/06/14 23:54:29 Environment: production
+2026/06/14 23:54:29 [CMS] Connection targets
+2026/06/14 23:54:29 [CMS] - Server bind: :8080
+2026/06/14 23:54:29 [CMS] - Database: ep-calm-leaf-an11otsx-pooler.c-6.us-east-1.aws.neon.tech/neondb
+2026/06/14 23:54:29 [CMS] - Whisper API: http://localhost:9002
+2026/06/14 23:54:29 [CMS] - Aggregation API: http://localhost:5002
+2026/06/14 23:54:29 [CMS] - Enrichment API: http://localhost:5050
+2026/06/14 23:54:29 [CMS] - Storage endpoint: http://localhost:9000
+2026/06/14 23:54:29 [CMS] - Storage public URL: http://localhost:9000
+2026/06/14 23:54:29 [CMS] - CORS mode: AllowAllOrigins=true
+
+2026/06/14 23:54:30 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/utils/database.go:37 [33mSLOW SQL >= 200ms
+[0m[31;1m[329.965ms] [33m[rows:0][35m CREATE EXTENSION IF NOT EXISTS pgcrypto[0m
+2026/06/14 23:54:30 Successfully connected to database
+2026/06/14 23:54:33 Tenant scope schema patch verified
+2026/06/14 23:54:33 [CMS] Auth verifier config
+2026/06/14 23:54:33 [CMS] - JWT_ISSUER=cms-service
+2026/06/14 23:54:33 [CMS] - JWT_ALLOWED_ISSUERS=cms-service,iam-authorization-service
+2026/06/14 23:54:33 [CMS] - JWT_REQUIRE_TENANT_ID=false
+2026/06/14 23:54:33 [CMS] - DEFAULT_TENANT_ID=default
+2026/06/14 23:54:33 [CMS] - Verifier mode=compatibility (accepts CMS + IAM issuers)
+2026/06/14 23:54:33 [CMS] - Auth mode: IAM-issued JWT verification only (no local login)
+2026/06/14 23:54:33 Starting server on :8080...
+[GIN] 2026/06/14 - 23:54:33 | 401 |   11.881625ms |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:33 | 401 |   11.594917ms |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:34 | 200 |    2.037625ms |             ::1 | GET      "/health"
+
+2026/06/14 23:54:34 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/topicClassifier.go:338 [33mSLOW SQL >= 200ms
+[0m[31;1m[1246.708ms] [33m[rows:0][35m SELECT public_id, tenant_id FROM "topics" WHERE related_ids IS NULL AND embedding IS NOT NULL AND article_count > 0[0m
+[GIN] 2026/06/14 - 23:54:36 | 401 |         134µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:36 | 401 |     634.084µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:39 | 401 |     203.083µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:39 | 401 |      204.25µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:42 | 401 |     133.292µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:42 | 401 |     132.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:44 | 200 |      1.1555ms |             ::1 | GET      "/admin/me"
+
+2026/06/14 23:54:44 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/adminDiscoveryController.go:764 [33mSLOW SQL >= 200ms
+[0m[31;1m[357.561ms] [33m[rows:1][35m SELECT * FROM "discovery_configs" WHERE tenant_id = 'default' ORDER BY "discovery_configs"."id" LIMIT 1[0m
+[GIN] 2026/06/14 - 23:54:44 | 200 |     359.059ms |             ::1 | GET      "/admin/discovery/config"
+[GIN] 2026/06/14 - 23:54:44 | 200 |  175.641416ms |             ::1 | GET      "/admin/discovery/config"
+
+2026/06/14 23:54:45 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/adminDiscoveryController.go:695 [33mSLOW SQL >= 200ms
+[0m[31;1m[518.359ms] [33m[rows:1][35m UPDATE "discovery_configs" SET "tenant_id"='default',"automation_enabled"=false,"sweep_interval_hours"=24,"min_confidence"=0.15,"min_relevance"=0.1,"dup_threshold"=0.92,"dup_penalty"=0.5,"recency_window_days"=30,"max_candidates_per_profile"=15,"search_provider"='auto',"intelligence_enabled"=true,"telegram_discovery_enabled"=true,"graph_build_interval_hours"=24,"promotion_threshold"=0.3,"weight_citation"=0.2,"weight_cocitation"=0.2,"weight_authority"=0.2,"weight_relevance"=0.25,"weight_health"=0.1,"weight_novelty"=0.05,"created_at"='2026-06-14 06:04:14.232',"updated_at"='2026-06-14 23:54:45.245' WHERE "id" = 1[0m
+[GIN] 2026/06/14 - 23:54:45 | 200 |  709.573334ms |             ::1 | PUT      "/admin/discovery/config"
+[GIN] 2026/06/14 - 23:54:45 | 401 |     188.625µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:45 | 401 |     188.583µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:48 | 401 |     225.916µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:48 | 401 |      66.292µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:51 | 401 |     125.709µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:51 | 401 |     126.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:54 | 401 |     137.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:54 | 401 |     127.167µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:57 | 401 |     133.333µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:54:57 | 401 |     133.375µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:00 | 401 |      89.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:00 | 401 |      89.833µs |             ::1 | GET      "/admin/me"
+
+2026/06/14 23:55:03 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/intelController.go:146 [33mSLOW SQL >= 200ms
+[0m[31;1m[744.290ms] [33m[rows:2][35m SELECT * FROM "content_sources" WHERE tenant_id = 'default' AND type = 'TELEGRAM' AND feed_url IS NOT NULL[0m
+[GIN] 2026/06/14 - 23:55:03 | 200 |     746.291ms |             ::1 | GET      "/internal/intel/approved-telegram-channels"
+[GIN] 2026/06/14 - 23:55:03 | 200 |  175.751208ms |             ::1 | GET      "/internal/intel/approved-source-pages"
+[GIN] 2026/06/14 - 23:55:03 | 200 |  173.295083ms |             ::1 | GET      "/internal/discovery/config"
+[GIN] 2026/06/14 - 23:55:03 | 401 |     303.917µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:03 | 401 |     303.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:06 | 401 |     260.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:06 | 401 |      80.333µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:09 | 401 |     193.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:09 | 401 |     193.458µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:13 | 401 |     142.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:13 | 401 |     142.625µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:16 | 401 |     151.041µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:16 | 401 |       148.5µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:19 | 401 |     114.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:19 | 401 |      614.75µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:22 | 401 |     141.916µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:22 | 401 |     141.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:25 | 401 |     144.208µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:25 | 401 |     144.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:28 | 401 |     123.084µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:28 | 401 |     144.333µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:31 | 401 |         107µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:31 | 401 |       107.5µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:34 | 401 |     125.916µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:34 | 401 |     125.917µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:37 | 401 |     246.166µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:37 | 401 |          77µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:40 | 401 |     141.125µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:40 | 401 |     140.291µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:43 | 401 |     103.334µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:43 | 401 |     101.792µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:46 | 401 |     133.041µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:46 | 401 |     136.833µs |             ::1 | GET      "/admin/me"
+
+2026/06/14 23:55:48 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/adminDiscoveryController.go:764 [33mSLOW SQL >= 200ms
+[0m[31;1m[345.315ms] [33m[rows:1][35m SELECT * FROM "discovery_configs" WHERE tenant_id = 'default' ORDER BY "discovery_configs"."id" LIMIT 1[0m
+[GIN] 2026/06/14 - 23:55:48 | 200 |  345.688875ms |             ::1 | GET      "/admin/discovery/config"
+[GIN] 2026/06/14 - 23:55:49 | 401 |       188.5µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:49 | 401 |     188.583µs |             ::1 | GET      "/admin/me"
+
+2026/06/14 23:55:49 [32m/Users/salehalobaylan/Desktop/Wahb-Project/Content-Management-System/src/controllers/adminDiscoveryController.go:695 [33mSLOW SQL >= 200ms
+[0m[31;1m[512.333ms] [33m[rows:1][35m UPDATE "discovery_configs" SET "tenant_id"='default',"automation_enabled"=false,"sweep_interval_hours"=24,"min_confidence"=0.15,"min_relevance"=0.1,"dup_threshold"=0.92,"dup_penalty"=0.5,"recency_window_days"=30,"max_candidates_per_profile"=15,"search_provider"='auto',"intelligence_enabled"=false,"telegram_discovery_enabled"=false,"graph_build_interval_hours"=24,"promotion_threshold"=0.3,"weight_citation"=0.2,"weight_cocitation"=0.2,"weight_authority"=0.2,"weight_relevance"=0.25,"weight_health"=0.1,"weight_novelty"=0.05,"created_at"='2026-06-14 06:04:14.232',"updated_at"='2026-06-14 23:55:49.337' WHERE "id" = 1[0m
+[GIN] 2026/06/14 - 23:55:49 | 200 |    686.2055ms |             ::1 | PUT      "/admin/discovery/config"
+[GIN] 2026/06/14 - 23:55:52 | 401 |     221.375µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:52 | 401 |      212.25µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:55 | 401 |     118.667µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:55 | 401 |      144.25µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:58 | 401 |     126.375µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:55:58 | 401 |       124.5µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:01 | 401 |      177.25µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:01 | 401 |     176.458µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:04 | 401 |     124.084µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:04 | 401 |     124.041µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:07 | 401 |     141.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:07 | 401 |       90.75µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:10 | 401 |     203.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:10 | 401 |         192µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:13 | 401 |     103.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:13 | 401 |     103.959µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:16 | 401 |     123.042µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:16 | 401 |         123µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:19 | 401 |     128.167µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:19 | 401 |     128.208µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:22 | 401 |     120.416µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:22 | 401 |     122.291µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:25 | 401 |     117.958µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:25 | 401 |      62.875µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:28 | 401 |    2.042417ms |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:28 | 401 |    2.292041ms |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:31 | 401 |      153.75µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:31 | 401 |      74.083µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:34 | 401 |     196.916µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:34 | 401 |     196.291µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:37 | 401 |     135.708µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:37 | 401 |     134.583µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:40 | 401 |     196.167µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:40 | 401 |     196.208µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:43 | 401 |     196.834µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:43 | 401 |     196.834µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:46 | 401 |     189.667µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:46 | 401 |      68.208µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:49 | 401 |     150.625µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:49 | 401 |     150.583µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:52 | 401 |     113.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:52 | 401 |     113.542µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:55 | 401 |     165.459µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:55 | 401 |     154.292µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:58 | 401 |     121.792µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:56:58 | 401 |     141.291µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:57:01 | 401 |      91.166µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:57:01 | 401 |      89.333µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:57:04 | 401 |      90.125µs |             ::1 | GET      "/admin/me"
+[GIN] 2026/06/14 - 23:57:04 | 401 |     101.292µs |             ::1 | GET      "/admin/me"

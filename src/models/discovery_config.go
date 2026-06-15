@@ -28,8 +28,9 @@ type DiscoveryConfig struct {
 
 	// Source Intelligence Graph (Slice 4) — self-maintaining candidate graph that
 	// auto-promotes high-scoring on-topic sources into the review queue.
-	IntelligenceEnabled     bool    `gorm:"default:false" json:"intelligence_enabled"`
-	GraphBuildIntervalHours int     `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
+	IntelligenceEnabled       bool `gorm:"default:false" json:"intelligence_enabled"`
+	TelegramDiscoveryEnabled  bool `gorm:"default:false" json:"telegram_discovery_enabled"`
+	GraphBuildIntervalHours   int  `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
 	PromotionThreshold      float64 `gorm:"type:double precision;default:0.30" json:"promotion_threshold"`
 	// Composite-score signal weights (sum ≈ 1.0).
 	WeightCitation   float64 `gorm:"type:double precision;default:0.20" json:"weight_citation"`
@@ -61,9 +62,10 @@ func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 		RecencyWindowDays:       30,
 		MaxCandidatesPerProfile: 15,
 		SearchProvider:          "auto",
-		IntelligenceEnabled:     false,
-		GraphBuildIntervalHours: 24,
-		PromotionThreshold:      0.30,
+		IntelligenceEnabled:      false,
+		TelegramDiscoveryEnabled: false,
+		GraphBuildIntervalHours:  24,
+		PromotionThreshold:       0.30,
 		WeightCitation:          0.20,
 		WeightCocitation:        0.20,
 		WeightAuthority:         0.20,
