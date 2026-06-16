@@ -20,6 +20,7 @@ const (
 const (
 	CandidateKindRSS      = "rss"
 	CandidateKindTelegram = "telegram"
+	CandidateKindTwitter  = "twitter"
 )
 
 // SourceCandidate is the persistent ledger of candidate news domains discovered

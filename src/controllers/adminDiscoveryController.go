@@ -542,9 +542,13 @@ func ListNewsSources(c *gin.Context) {
 			"MAX(published_at) AS last_item_at, " +
 			"COALESCE(SUM(like_count + comment_count + share_count), 0) AS engagement").
 		Group("source_name").Scan(&statRows)
+	// Key stats by the @-stripped, lowercased source name: content items
+	// denormalize source_name to the bare handle (e.g. "spagov"), while a
+	// manually-added X source may be named "@spagov" or differ in case.
+	normName := func(s string) string { return strings.ToLower(strings.TrimPrefix(s, "@")) }
 	statByName := make(map[string]newsSourceStatsRow, len(statRows))
 	for _, r := range statRows {
-		statByName[r.SourceName] = r
+		statByName[normName(r.SourceName)] = r
 	}
 
 	profileIDs := loadProfilePublicIDs(db, principal.TenantID)
@@ -557,7 +561,7 @@ func ListNewsSources(c *gin.Context) {
 				row.DiscoveryProfileID = &pub
 			}
 		}
-		if st, exists := statByName[s.Name]; exists {
+		if st, exists := statByName[normName(s.Name)]; exists {
 			row.ItemsCount = st.Items
 			row.Ready = st.Ready
 			row.Failed = st.Failed
@@ -743,12 +747,18 @@ func GetAuthorities(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var cands []models.SourceCandidate
-	db.Where("tenant_id = ?", principal.TenantID).
-		Order("authority_score desc, citation_count desc").Limit(12).Find(&cands)
+	q := db.Where("tenant_id = ?", principal.TenantID)
+	// Optional per-platform filter (?kind=twitter|telegram|rss) for the
+	// "Top voices in your X network" panel.
+	if kind := strings.ToLower(strings.TrimSpace(c.Query("kind"))); kind != "" {
+		q = q.Where("kind = ?", kind)
+	}
+	q.Order("authority_score desc, cocitation_count desc, citation_count desc").Limit(12).Find(&cands)
 	out := make([]gin.H, 0, len(cands))
 	for _, x := range cands {
 		out = append(out, gin.H{
 			"domain":           x.Domain,
+			"kind":             x.Kind,
 			"authority":        round2(x.AuthorityScore),
 			"citation_count":   x.CitationCount,
 			"cocitation_count": x.CocitationCount,

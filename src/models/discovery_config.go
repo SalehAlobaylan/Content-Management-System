@@ -30,6 +30,7 @@ type DiscoveryConfig struct {
 	// auto-promotes high-scoring on-topic sources into the review queue.
 	IntelligenceEnabled       bool `gorm:"default:false" json:"intelligence_enabled"`
 	TelegramDiscoveryEnabled  bool `gorm:"default:false" json:"telegram_discovery_enabled"`
+	TwitterDiscoveryEnabled   bool `gorm:"default:false" json:"twitter_discovery_enabled"`
 	GraphBuildIntervalHours   int  `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
 	PromotionThreshold      float64 `gorm:"type:double precision;default:0.30" json:"promotion_threshold"`
 	// Composite-score signal weights (sum ≈ 1.0).
@@ -64,6 +65,7 @@ func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 		SearchProvider:          "auto",
 		IntelligenceEnabled:      false,
 		TelegramDiscoveryEnabled: false,
+		TwitterDiscoveryEnabled:  false,
 		GraphBuildIntervalHours:  24,
 		PromotionThreshold:       0.30,
 		WeightCitation:          0.20,

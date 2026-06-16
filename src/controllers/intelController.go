@@ -117,9 +117,10 @@ func InternalGetApprovedSourcePages(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID := intelTenant(c)
 	var sources []models.ContentSource
-	// RSS/web sources only — Telegram is crawled via gramjs, not HTTP.
-	db.Where("tenant_id = ? AND category = ? AND type <> ? AND feed_url IS NOT NULL",
-		tenantID, models.SourceCategoryNews, models.SourceTypeTelegram).Find(&sources)
+	// RSS/web sources only — Telegram (gramjs) + Twitter (syndication) are crawled
+	// via their own graph contributors, not HTTP link extraction.
+	db.Where("tenant_id = ? AND category = ? AND type NOT IN (?) AND feed_url IS NOT NULL",
+		tenantID, models.SourceCategoryNews, []models.SourceType{models.SourceTypeTelegram, models.SourceTypeTwitter}).Find(&sources)
 
 	out := make([]gin.H, 0, len(sources))
 	seen := map[string]bool{}
@@ -169,6 +170,46 @@ func telegramUsername(raw string) string {
 	s = strings.TrimPrefix(s, "t.me/")
 	s = strings.TrimPrefix(s, "telegram.me/")
 	s = strings.TrimPrefix(s, "s/")
+	s = strings.TrimPrefix(s, "@")
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// InternalGetApprovedTwitterHandles handles GET /internal/intel/approved-twitter-handles
+// — the approved X accounts that seed the interaction-graph.
+func InternalGetApprovedTwitterHandles(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := intelTenant(c)
+	var sources []models.ContentSource
+	db.Where("tenant_id = ? AND type = ? AND feed_url IS NOT NULL", tenantID, models.SourceTypeTwitter).Find(&sources)
+
+	out := make([]gin.H, 0, len(sources))
+	seen := map[string]bool{}
+	for _, s := range sources {
+		if s.FeedURL == nil {
+			continue
+		}
+		u := twitterHandle(*s.FeedURL)
+		if u == "" || seen[u] {
+			continue
+		}
+		seen[u] = true
+		out = append(out, gin.H{"username": u})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// twitterHandle extracts the bare handle from an x.com/twitter.com URL or @handle.
+func twitterHandle(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "www.")
+	s = strings.TrimPrefix(s, "x.com/")
+	s = strings.TrimPrefix(s, "twitter.com/")
+	s = strings.TrimPrefix(s, "mobile.twitter.com/")
 	s = strings.TrimPrefix(s, "@")
 	if i := strings.IndexAny(s, "/?#"); i >= 0 {
 		s = s[:i]
@@ -229,7 +270,7 @@ func InternalUpsertCandidates(c *gin.Context) {
 			continue
 		}
 		kind := strings.ToLower(strings.TrimSpace(cand.Kind))
-		if kind != models.CandidateKindTelegram {
+		if kind != models.CandidateKindTelegram && kind != models.CandidateKindTwitter {
 			kind = models.CandidateKindRSS
 		}
 		row := models.SourceCandidate{
@@ -433,13 +474,17 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 			continue
 		}
 
-		// Kind-aware: RSS candidate → RSS feed suggestion; Telegram candidate →
-		// TELEGRAM channel suggestion (the existing fetcher ingests t.me/<x>).
+		// Kind-aware: RSS → RSS feed suggestion; Telegram → TELEGRAM channel; Twitter
+		// → TWITTER account. The matching fetcher ingests the resolved_feed_url on approve.
 		sugType := models.SourceTypeRSS
 		via := "graph"
-		if cand.Kind == models.CandidateKindTelegram {
+		switch cand.Kind {
+		case models.CandidateKindTelegram:
 			sugType = models.SourceTypeTelegram
 			via = "telegram-graph"
+		case models.CandidateKindTwitter:
+			sugType = models.SourceTypeTwitter
+			via = "x-graph"
 		}
 		if len(cand.DiscoveredVia) > 0 {
 			via = cand.DiscoveredVia[0]
