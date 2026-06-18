@@ -106,7 +106,7 @@ func main() {
 	// every model (hundreds of information_schema round-trips); against a
 	// remote DB like Neon (~0.3-0.6s RTT each) that turns boot into multiple
 	// minutes and start.sh times out. Schema changes are tracked as SQL files
-	// in supabase/migrations and applied directly, so day-to-day boots can
+	// in migrations/ and applied directly, so day-to-day boots can
 	// skip the sweep (set AUTO_MIGRATE=false in .env.local). Unset = migrate,
 	// the safe default for fresh setups.
 	// Note: In production, use manual migrations or migration tools to avoid conflicts

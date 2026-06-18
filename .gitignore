@@ -12,3 +12,12 @@
 example.compose.yaml
 Dockerfile.example
 README.Docker.md
+.logs/
+
+# OS junk
+.DS_Store
+
+# Compiled Go binaries
+/main
+/src/cms
+/cms

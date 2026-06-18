@@ -130,12 +130,13 @@ type ContentItem struct {
 	// (Enrichment LLM label + embedding centroid). NULL until classified.
 	// Distinct from the legacy free-form TopicTags above.
 	TopicID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_topic_id" json:"topic_id,omitempty"`
-	// Embedding is the BAAI/bge-m3 dense text vector (1024-dim), populated by
-	// Enrichment-Service. Multilingual — performs well on Arabic + English.
+	// Embedding is the Qwen/Qwen3-Embedding-0.6B dense text vector (1024-dim),
+	// populated by Enrichment-Service. Multilingual — strong on Arabic + English.
+	// (Replaced BGE-M3; semantic similarity is dense cosine only.)
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
-	// EmbeddingSparse is BGE-M3's learned sparse output (250002-dim sparsevec),
-	// added for forward compatibility with hybrid retrieval (Slice A). Stays
-	// NULL until Slice A wires FlagEmbedding into the embedder.
+	// EmbeddingSparse is a dead BGE-M3-era column (250002-dim sparsevec). It was
+	// for hybrid retrieval (Slice A) but is unused post-Qwen — always NULL for
+	// new content. Retained only so the legacy knn-sparse path still type-checks.
 	EmbeddingSparse *pgvector.SparseVector `gorm:"type:sparsevec(250002)" json:"-"`
 	// EmbeddingModel records WHICH model produced the current Embedding
 	// (e.g. "Qwen/Qwen3-Embedding-0.6B"). Set by the write-back; NULL means the

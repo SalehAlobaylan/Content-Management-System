@@ -103,8 +103,8 @@ type internalUpdateEmbeddingRequest struct {
 // output. Must match the sparsevec(N) column type in the schema.
 const bgeM3SparseDim int32 = 250002
 
-// textEmbeddingDim is the dense embedding length BGE-M3 produces. Mirrors
-// the strict-dimension check on image embeddings (CLIP at 512).
+// textEmbeddingDim is the dense embedding length Qwen3-Embedding-0.6B produces.
+// Mirrors the strict-dimension check on image embeddings (CLIP at 512).
 const textEmbeddingDim = 1024
 
 type internalUpdateImageEmbeddingRequest struct {
@@ -497,7 +497,7 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 
 // InternalUpdateContentImageEmbedding handles PATCH /internal/content-items/:id/image-embedding.
 // Stores a CLIP-ViT-B-32 image embedding (512-dim) on the content item.
-// Independent from the text Embedding (1024-dim BGE-M3) — both can coexist.
+// Independent from the text Embedding (1024-dim Qwen3) — both can coexist.
 func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
