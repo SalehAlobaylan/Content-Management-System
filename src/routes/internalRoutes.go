@@ -19,6 +19,11 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.GET("/discovery/config", controllers.InternalGetDiscoveryConfig)
 	internal.GET("/discovery/profiles", controllers.InternalListEnabledProfiles)
 
+	// News Circulation — Aggregation claims due news sources and reports run outcomes.
+	internal.GET("/circulation/policy", controllers.InternalGetCirculationPolicy)
+	internal.POST("/circulation/claim-sources", controllers.InternalClaimCirculationSources)
+	internal.POST("/circulation/source-runs", controllers.InternalReportSourceRun)
+
 	// Slice 4 — Source Intelligence Graph
 	internal.GET("/intel/corpus-citations", controllers.InternalGetCorpusCitations)
 	internal.GET("/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)

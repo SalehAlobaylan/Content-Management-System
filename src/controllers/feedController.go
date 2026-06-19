@@ -283,7 +283,7 @@ func GetForYouFeed(c *gin.Context) {
 }
 
 // GetNewsFeed returns the News feed with cursor-based pagination
-// GET /api/v1/feed/news?cursor=xxx&limit=10
+// GET /api/v1/feed/news?window=today|week|month&cursor=xxx&limit=10
 func GetNewsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
@@ -326,6 +326,7 @@ func GetNewsFeed(c *gin.Context) {
 	// Load ranking config (in-process cached; also carries the Phase-13 story
 	// + feed-mode knobs).
 	config := loadTenantConfig(db, "default")
+	circ := circulationContextFor(db, "default", c.Query("window"), time.Now())
 
 	// News feed = story-slides, assembled LIVE by default ("write-time
 	// intelligence, read-time freshness") behind a freshness-bounded
@@ -336,7 +337,7 @@ func GetNewsFeed(c *gin.Context) {
 		return seenIDs
 	}
 	slides, nextCursor := serveStoryNewsFeed(
-		db, "default", config, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen,
+		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen,
 	)
 
 	c.JSON(http.StatusOK, StoryNewsResponse{

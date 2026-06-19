@@ -62,6 +62,10 @@ func setup() {
 		&models.ContentFlag{},
 		&models.Topic{},
 		&models.NewsSnapshot{},
+		&models.NewsCirculationPolicy{},
+		&models.NewsStoryOverride{},
+		&models.SourceRunTelemetry{},
+		&models.SourceCirculationRecommendation{},
 	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
@@ -92,6 +96,14 @@ func cleanup() {
 	}
 	m := testDB.Migrator()
 	// Wahb Platform tables
+	_ = m.DropTable(&models.SourceCirculationRecommendation{})
+	_ = m.DropTable(&models.SourceRunTelemetry{})
+	_ = m.DropTable(&models.NewsStoryOverride{})
+	_ = m.DropTable(&models.NewsCirculationPolicy{})
+	_ = m.DropTable(&models.NewsSnapshot{})
+	_ = m.DropTable(&models.Topic{})
+	_ = m.DropTable(&models.ContentFlag{})
+	_ = m.DropTable(&models.RankingConfig{})
 	_ = m.DropTable(&models.UserInteraction{})
 	_ = m.DropTable(&models.Transcript{})
 	_ = m.DropTable(&models.ContentItem{})

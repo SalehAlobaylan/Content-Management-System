@@ -285,10 +285,12 @@ func StartClassificationBackfill(db *gorm.DB) {
 			// Refresh the precompute snapshot so the healed stories are served.
 			config := loadTenantConfig(db, "default")
 			if config.NewsFeedMode != "on_demand" {
-				if n, err := buildNewsSnapshot(db, "default"); err != nil {
-					log.Printf("[classification-backfill] snapshot rebuild failed: %v", err)
-				} else {
-					log.Printf("[classification-backfill] snapshot rebuilt (%d slides)", n)
+				for _, window := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
+					if n, err := buildNewsSnapshot(db, "default", window); err != nil {
+						log.Printf("[classification-backfill] snapshot rebuild failed (%s): %v", window, err)
+					} else {
+						log.Printf("[classification-backfill] snapshot rebuilt (%s, %d slides)", window, n)
+					}
 				}
 			}
 		}

@@ -144,6 +144,11 @@ func main() {
 			&models.SourceEdge{},
 			// Phase 13 — precomputed News-feed story-slide snapshot
 			&models.NewsSnapshot{},
+			// News Circulation Engine — story windows, overrides, source cadence
+			&models.NewsCirculationPolicy{},
+			&models.NewsStoryOverride{},
+			&models.SourceRunTelemetry{},
+			&models.SourceCirculationRecommendation{},
 			// Saved syndication feeds (RSS/Atom/JSON)
 			&models.RSSFeed{},
 			// Storage management

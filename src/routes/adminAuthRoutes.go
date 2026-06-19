@@ -86,6 +86,19 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Intelligence — News-feed story snapshot (precompute mode) rebuild
 	adminGroup.POST("/intelligence/news-snapshot/refresh", controllers.RefreshNewsSnapshot)
 
+	// Intelligence — News Circulation Engine
+	adminGroup.GET("/intelligence/circulation/policy", controllers.GetCirculationPolicy)
+	adminGroup.PUT("/intelligence/circulation/policy", controllers.UpdateCirculationPolicy)
+	adminGroup.POST("/intelligence/circulation/presets/:preset", controllers.ApplyCirculationPreset)
+	adminGroup.GET("/intelligence/circulation/preview", controllers.PreviewCirculation)
+	adminGroup.GET("/intelligence/circulation/metrics", controllers.GetCirculationMetrics)
+	adminGroup.GET("/intelligence/circulation/overrides", controllers.ListStoryOverrides)
+	adminGroup.PUT("/intelligence/circulation/overrides/:story_id", controllers.UpsertStoryOverride)
+	adminGroup.DELETE("/intelligence/circulation/overrides/:story_id", controllers.DeleteStoryOverride)
+	adminGroup.GET("/intelligence/circulation/source-recommendations", controllers.ListSourceRecommendations)
+	adminGroup.POST("/intelligence/circulation/source-recommendations/generate", controllers.GenerateSourceRecommendations)
+	adminGroup.POST("/intelligence/circulation/source-recommendations/:id/apply", controllers.ApplySourceRecommendation)
+
 	// Media — Transcription/STT config (auto-STT toggle + budget cap)
 	adminGroup.GET("/transcription-config", controllers.GetTranscriptionConfig)
 	adminGroup.PATCH("/transcription-config", controllers.UpdateTranscriptionConfig)

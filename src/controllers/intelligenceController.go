@@ -157,7 +157,8 @@ func RefreshNewsSnapshot(c *gin.Context) {
 	// single Refresh click converges even after bulk re-embeds.
 	StartClassificationBackfill(db)
 
-	count, err := buildNewsSnapshot(db, principal.TenantID)
+	window := normalizeNewsWindow(c.DefaultQuery("window", models.NewsWindowToday))
+	count, err := buildNewsSnapshot(db, principal.TenantID, window)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to build snapshot: " + err.Error(),
@@ -165,7 +166,7 @@ func RefreshNewsSnapshot(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"slide_count": count, "built_at": time.Now()})
+	c.JSON(http.StatusOK, gin.H{"slide_count": count, "window": window, "built_at": time.Now()})
 }
 
 // ================================================================

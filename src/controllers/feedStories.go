@@ -40,8 +40,8 @@ const (
 	// 0.55–0.70, below 0.55 is just "other news". Better 0 honest related
 	// cards than 3 fabricated ones.
 	storyRelatedMinSimilarity = 0.55
-	storyMaxMembers        = 8    // members rendered under a featured story
-	newsSnapshotSlideCount = 60   // slides precomputed into the cache (≈6 pages before deep scroll goes live)
+	storyMaxMembers           = 8  // members rendered under a featured story
+	newsSnapshotSlideCount    = 60 // slides precomputed into the cache (≈6 pages before deep scroll goes live)
 )
 
 // storyFeedColumns omits the heavy content_items columns a feed read never
@@ -98,9 +98,12 @@ type StoryMember struct {
 // that member's content id — clients open / like / bookmark against it (NOT the
 // StoryID, which is a topic id with no content row).
 type StorySummary struct {
-	StoryID        uuid.UUID `json:"story_id"`
-	LeadID         uuid.UUID `json:"lead_id"`
-	Label          string    `json:"label"`
+	StoryID      uuid.UUID `json:"story_id"`
+	LeadID       uuid.UUID `json:"lead_id"`
+	Label        string    `json:"label"`
+	LastMemberAt time.Time `json:"last_member_at"`
+	Lifecycle    string    `json:"lifecycle"`
+	IsCarryover  bool      `json:"is_carryover,omitempty"`
 	// Summary + Bullets are the source-grounded AI digest of the WHOLE story
 	// (Slice 8). Populated on the FEATURED story only; empty when not yet
 	// digested — the slide then falls back to the lead member's excerpt.
@@ -111,17 +114,17 @@ type StorySummary struct {
 	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
 	SourceName     string    `json:"source_name,omitempty"`
 	SourceImageURL string    `json:"source_image_url,omitempty"`
-	PublishedAt time.Time `json:"published_at"`
-	MemberCount int       `json:"member_count"`
+	PublishedAt    time.Time `json:"published_at"`
+	MemberCount    int       `json:"member_count"`
 	// SourceCount is the number of DISTINCT sources among the story's hydrated
 	// members — the Radar-style "covered by N sources" signal. Computed for
 	// the featured story only (related cards show member_count); 0 = not
 	// computed.
 	SourceCount  int `json:"source_count,omitempty"`
 	LikeCount    int `json:"like_count"`
-	CommentCount   int       `json:"comment_count"`
-	ShareCount     int       `json:"share_count"`
-	ViewCount      int       `json:"view_count"`
+	CommentCount int `json:"comment_count"`
+	ShareCount   int `json:"share_count"`
+	ViewCount    int `json:"view_count"`
 }
 
 // StoryFeatured is the featured story of a slide: its summary plus its members.
@@ -165,11 +168,13 @@ func engagementScore(it models.ContentItem) int {
 
 // storyAgg accumulates a story's scored members during assembly.
 type storyAgg struct {
-	storyID  uuid.UUID
-	score    float64
-	newest   time.Time
-	newestID uuid.UUID // id of the newest member — what the client reports as "seen"
-	members  []models.ContentItem
+	storyID   uuid.UUID
+	score     float64
+	newest    time.Time
+	newestID  uuid.UUID // id of the newest member — what the client reports as "seen"
+	lifecycle string
+	carryover bool
+	members   []models.ContentItem
 }
 
 // assembleStoryNewsFeed builds the News feed as story-slides. Self-contained in
@@ -181,17 +186,16 @@ func assembleStoryNewsFeed(
 	db *gorm.DB,
 	tenantID string,
 	config models.RankingConfig,
+	circ circulationContext,
 	lastTimestamp time.Time,
 	lastID uuid.UUID,
 	slideLimit int,
 	seenIDs []uuid.UUID,
 ) ([]StorySlide, *string) {
+	config = applyLatestPlusPolicy(config, circ.Policy)
+	now := circ.Window.Now
 	// 1. Pull a recent pool of classified NEWS members and score them with the
 	//    existing ranking engine (freshness/engagement/velocity/trending).
-	windowDays := config.FreshnessDecayHours / 24
-	if windowDays < 30 {
-		windowDays = 30
-	}
 	// Topic metadata is independent of the member pool — overlap the two WAN
 	// round-trips (each is the better part of a second against a remote DB).
 	topicsCh := make(chan map[uuid.UUID]models.Topic, 1)
@@ -205,7 +209,7 @@ func assembleStoryNewsFeed(
 		topicsCh <- byID
 	}()
 
-	windowStart := time.Now().AddDate(0, 0, -windowDays)
+	windowStart := circ.Window.QueryStart
 	var members []models.ContentItem
 	db.Select(storyScoreColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND topic_id IS NOT NULL",
@@ -221,8 +225,8 @@ func assembleStoryNewsFeed(
 
 	contentIDs := extractPublicIDs(members)
 	flagMap := LoadContentFlags(db, tenantID, contentIDs)
-	velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
-	scored := ScoreItems(members, config, flagMap, velocityData, time.Now())
+	velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, now)
+	scored := ScoreItems(members, config, flagMap, velocityData, now)
 
 	// 2. Aggregate scored members into stories. Story momentum = max member
 	//    score; we also track the newest-member time for the cursor.
@@ -264,12 +268,74 @@ func assembleStoryNewsFeed(
 			a.score *= 1 + coverageW*math.Log1p(float64(len(a.members)))
 		}
 	}
+
+	storyIDsForOverrides := make([]uuid.UUID, 0, len(order))
+	for _, a := range order {
+		storyIDsForOverrides = append(storyIDsForOverrides, a.storyID)
+	}
+	overrides := activeStoryOverrides(db, tenantID, storyIDsForOverrides, now)
+	filteredByOverride := order[:0]
+	for _, a := range order {
+		if ov, ok := overrides[a.storyID]; ok {
+			if ov.ExcludeFromFeed {
+				continue
+			}
+			if ov.PinToTop {
+				a.score = math.MaxFloat64
+			} else {
+				if ov.ImportanceBoost > 0 && ov.ImportanceBoost != 1 {
+					a.score *= ov.ImportanceBoost
+				}
+				if ov.Suppress {
+					a.score *= 0.1
+				}
+			}
+		}
+		filteredByOverride = append(filteredByOverride, a)
+	}
+	order = filteredByOverride
+
 	sort.SliceStable(order, func(i, j int) bool {
 		if order[i].score != order[j].score {
 			return order[i].score > order[j].score
 		}
 		return order[i].newest.After(order[j].newest)
 	})
+
+	if circ.Window.Name == models.NewsWindowToday {
+		primary := make([]*storyAgg, 0, len(order))
+		carryovers := make([]*storyAgg, 0)
+		for _, a := range order {
+			if !a.newest.Before(circ.Window.PrimaryStart) {
+				primary = append(primary, a)
+				continue
+			}
+			if a.score >= circ.Policy.CarryoverMinScore {
+				a.carryover = true
+				carryovers = append(carryovers, a)
+			}
+		}
+		order = primary
+		if len(order) < circ.Policy.MinTodayStories {
+			need := circ.Policy.MinTodayStories - len(order)
+			if need > len(carryovers) {
+				need = len(carryovers)
+			}
+			order = append(order, carryovers[:need]...)
+		}
+	} else {
+		filtered := order[:0]
+		for _, a := range order {
+			if !a.newest.Before(circ.Window.PrimaryStart) {
+				filtered = append(filtered, a)
+			}
+		}
+		order = filtered
+	}
+
+	for _, a := range order {
+		a.lifecycle = storyLifecycle(circ.Policy, circ.Window, a.newest, len(a.members), a.carryover)
+	}
 
 	// 3b. Drop already-seen slides (the client reports views against the slide's
 	//     lead member id = the story's newest member). When the session has
@@ -429,9 +495,9 @@ func assembleStoryNewsFeed(
 				// at worst render text-light rather than dropping the slide.
 				storyMembers = ag.members
 			}
-			featured := buildStoryFeatured(topic, ag.storyID, storyMembers, sourceImageByFeedURL)
+			featured := buildStoryFeatured(topic, ag, storyMembers, sourceImageByFeedURL)
 			slides[idx] = StorySlide{SlideID: uuid.New(), Featured: featured}
-			relCandidates[idx] = buildRelatedStories(db, tenantID, topic, ag.storyID, topicByID, pageIDs)
+			relCandidates[idx] = buildRelatedStories(db, tenantID, topic, ag.storyID, topicByID, pageIDs, circ)
 		}(i, a)
 	}
 	wg.Wait()
@@ -479,7 +545,7 @@ func topMember(members []models.ContentItem) models.ContentItem {
 	return best
 }
 
-func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.ContentItem, sourceImageByFeedURL map[string]string) StoryFeatured {
+func buildStoryFeatured(topic models.Topic, ag *storyAgg, members []models.ContentItem, sourceImageByFeedURL map[string]string) StoryFeatured {
 	// Newest-first members for display.
 	sort.SliceStable(members, func(i, j int) bool {
 		return itemTime(members[i]).After(itemTime(members[j]))
@@ -502,9 +568,12 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 		}
 	}
 	summary := StorySummary{
-		StoryID:        storyID,
+		StoryID:        ag.storyID,
 		LeadID:         top.PublicID,
 		Label:          topic.Label,
+		LastMemberAt:   ag.newest,
+		Lifecycle:      ag.lifecycle,
+		IsCarryover:    ag.carryover,
 		Summary:        derefStr(topic.Summary),
 		Bullets:        parseStoryBullets(topic.Bullets),
 		Title:          derefStr(top.Title),
@@ -723,6 +792,7 @@ func leadSummariesByStory(
 	tenantID string,
 	storyIDs []uuid.UUID,
 	topicByID map[uuid.UUID]models.Topic,
+	circ circulationContext,
 ) map[uuid.UUID]StorySummary {
 	out := make(map[uuid.UUID]StorySummary, len(storyIDs))
 	if len(storyIDs) == 0 {
@@ -743,10 +813,16 @@ func leadSummariesByStory(
 		sid := *top.TopicID
 		t := topicByID[sid]
 		memberCount := t.ArticleCount
+		lastMemberAt := itemTime(top)
+		if t.LastMemberAt != nil {
+			lastMemberAt = *t.LastMemberAt
+		}
 		out[sid] = StorySummary{
 			StoryID:        sid,
 			LeadID:         top.PublicID,
 			Label:          t.Label,
+			LastMemberAt:   lastMemberAt,
+			Lifecycle:      storyLifecycle(circ.Policy, circ.Window, lastMemberAt, memberCount, false),
 			Title:          derefStr(top.Title),
 			Excerpt:        derefStr(top.Excerpt),
 			ThumbnailURL:   derefStr(top.ThumbnailURL),
@@ -775,6 +851,7 @@ func buildRelatedStories(
 	storyID uuid.UUID,
 	topicByID map[uuid.UUID]models.Topic,
 	excludeIDs map[uuid.UUID]bool,
+	circ circulationContext,
 ) []StorySummary {
 	relIDs := relatedCandidateIDs(db, tenantID, topic, storyID)
 
@@ -784,7 +861,7 @@ func buildRelatedStories(
 			cands = append(cands, rid)
 		}
 	}
-	leads := leadSummariesByStory(db, tenantID, cands, topicByID)
+	leads := leadSummariesByStory(db, tenantID, cands, topicByID, circ)
 
 	out := make([]StorySummary, 0, len(cands))
 	for _, rid := range cands {
@@ -801,9 +878,10 @@ func buildRelatedStories(
 // the per-tenant news_snapshots cache row (clearing Dirty). Called by the SWR
 // background refresh, the admin Refresh endpoint, the classification backfill,
 // and lazily when the cache is empty.
-func buildNewsSnapshot(db *gorm.DB, tenantID string) (int, error) {
+func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error) {
 	config := loadTenantConfig(db, tenantID)
-	slides, _ := assembleStoryNewsFeed(db, tenantID, config, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil)
+	circ := circulationContextFor(db, tenantID, window, time.Now())
+	slides, _ := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil)
 	if slides == nil {
 		slides = []StorySlide{}
 	}
@@ -817,13 +895,14 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string) (int, error) {
 	// in-memory copy's built_at compares Equal to what reads see from the DB.
 	snap := models.NewsSnapshot{
 		TenantID:   tenantID,
+		Window:     circ.Window.Name,
 		Slides:     datatypes.JSON(data),
 		SlideCount: len(slides),
 		Dirty:      false,
 		BuiltAt:    time.Now().Truncate(time.Microsecond),
 	}
 	err = db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "tenant_id"}},
+		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "window"}},
 		DoUpdates: clause.AssignmentColumns([]string{"slides", "slide_count", "dirty", "built_at"}),
 	}).Create(&snap).Error
 	if err != nil {
@@ -831,7 +910,7 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string) (int, error) {
 	}
 	// Seed process memory directly — the next read serves without re-pulling
 	// the JSON it just wrote.
-	newsSnapshotMem.Store(&memCachedSnapshot{tenantID: tenantID, slides: slides, builtAt: snap.BuiltAt})
+	newsSnapshotMem.Store(snapshotMemKey(tenantID, circ.Window.Name), &memCachedSnapshot{tenantID: tenantID, window: circ.Window.Name, slides: slides, builtAt: snap.BuiltAt})
 	return len(slides), nil
 }
 
@@ -856,38 +935,46 @@ const newsSnapshotMaxStale = 15 * time.Minute
 // header query and serves from memory when built_at matches.
 type memCachedSnapshot struct {
 	tenantID string
+	window   string
 	slides   []StorySlide
 	builtAt  time.Time
 }
 
-var newsSnapshotMem atomic.Pointer[memCachedSnapshot]
+var newsSnapshotMem sync.Map
+
+func snapshotMemKey(tenantID, window string) string {
+	return tenantID + ":" + normalizeNewsWindow(window)
+}
 
 // loadCachedSnapshot returns the cached slides plus their freshness header,
 // preferring process memory (one tiny header query on the hot path). ok=false
 // → no usable cache row at all.
-func loadCachedSnapshot(db *gorm.DB, tenantID string) (slides []StorySlide, builtAt time.Time, dirty bool, ok bool) {
+func loadCachedSnapshot(db *gorm.DB, tenantID string, window string) (slides []StorySlide, builtAt time.Time, dirty bool, ok bool) {
+	window = normalizeNewsWindow(window)
 	var head struct {
 		Dirty   bool
 		BuiltAt time.Time
 	}
 	if err := db.Model(&models.NewsSnapshot{}).
 		Select("dirty, built_at").
-		Where("tenant_id = ?", tenantID).
+		Where("tenant_id = ? AND window = ?", tenantID, window).
 		Scan(&head).Error; err != nil || head.BuiltAt.IsZero() {
 		return nil, time.Time{}, false, false
 	}
-	if mem := newsSnapshotMem.Load(); mem != nil && mem.tenantID == tenantID && mem.builtAt.Equal(head.BuiltAt) {
-		return mem.slides, head.BuiltAt, head.Dirty, true
+	if raw, exists := newsSnapshotMem.Load(snapshotMemKey(tenantID, window)); exists {
+		if mem, ok := raw.(*memCachedSnapshot); ok && mem.tenantID == tenantID && mem.window == window && mem.builtAt.Equal(head.BuiltAt) {
+			return mem.slides, head.BuiltAt, head.Dirty, true
+		}
 	}
 	var snap models.NewsSnapshot
-	if err := db.Where("tenant_id = ?", tenantID).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
+	if err := db.Where("tenant_id = ? AND window = ?", tenantID, window).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
 		return nil, time.Time{}, false, false
 	}
 	var all []StorySlide
 	if json.Unmarshal(snap.Slides, &all) != nil || len(all) == 0 {
 		return nil, time.Time{}, false, false
 	}
-	newsSnapshotMem.Store(&memCachedSnapshot{tenantID: tenantID, slides: all, builtAt: snap.BuiltAt})
+	newsSnapshotMem.Store(snapshotMemKey(tenantID, window), &memCachedSnapshot{tenantID: tenantID, window: window, slides: all, builtAt: snap.BuiltAt})
 	return all, snap.BuiltAt, snap.Dirty, true
 }
 
@@ -905,13 +992,13 @@ var snapshotRebuildRunning atomic.Bool
 
 // startSnapshotRebuild rebuilds the precompute snapshot in the background.
 // No-ops when a rebuild is already in flight.
-func startSnapshotRebuild(db *gorm.DB, tenantID string) {
+func startSnapshotRebuild(db *gorm.DB, tenantID string, window string) {
 	if !snapshotRebuildRunning.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer snapshotRebuildRunning.Store(false)
-		if _, err := buildNewsSnapshot(db, tenantID); err != nil {
+		if _, err := buildNewsSnapshot(db, tenantID, window); err != nil {
 			log.Printf("[news-snapshot] background rebuild failed: %v", err)
 		}
 	}()
@@ -986,16 +1073,16 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 // serveNewsSnapshot serves strictly from the cache (cached_only emergency mode).
 // Lazily builds the cache on first read if it's missing/empty, and kicks a
 // background rebuild when stale — even the escape hatch never fossilizes.
-func serveNewsSnapshot(db *gorm.DB, tenantID string, lastTimestamp time.Time, lastID uuid.UUID, slideLimit int, seenIDs []uuid.UUID) ([]StorySlide, *string) {
+func serveNewsSnapshot(db *gorm.DB, tenantID string, circ circulationContext, lastTimestamp time.Time, lastID uuid.UUID, slideLimit int, seenIDs []uuid.UUID) ([]StorySlide, *string) {
 	var snap models.NewsSnapshot
-	err := db.Where("tenant_id = ?", tenantID).First(&snap).Error
+	err := db.Where("tenant_id = ? AND window = ?", tenantID, circ.Window.Name).First(&snap).Error
 	if err != nil || len(snap.Slides) == 0 {
-		_, _ = buildNewsSnapshot(db, tenantID)
-		if err := db.Where("tenant_id = ?", tenantID).First(&snap).Error; err != nil {
+		_, _ = buildNewsSnapshot(db, tenantID, circ.Window.Name)
+		if err := db.Where("tenant_id = ? AND window = ?", tenantID, circ.Window.Name).First(&snap).Error; err != nil {
 			return []StorySlide{}, nil
 		}
 	} else if snap.Dirty || time.Since(snap.BuiltAt) > newsSnapshotTTL {
-		startSnapshotRebuild(db, tenantID)
+		startSnapshotRebuild(db, tenantID, circ.Window.Name)
 	}
 
 	var all []StorySlide
@@ -1020,13 +1107,14 @@ func serveStoryNewsFeed(
 	db *gorm.DB,
 	tenantID string,
 	config models.RankingConfig,
+	circ circulationContext,
 	lastTimestamp time.Time,
 	lastID uuid.UUID,
 	slideLimit int,
 	waitSeen func() []uuid.UUID,
 ) ([]StorySlide, *string) {
 	if config.NewsFeedMode == "cached_only" {
-		return serveNewsSnapshot(db, tenantID, lastTimestamp, lastID, slideLimit, waitSeen())
+		return serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
 	}
 
 	// Live mode (default; legacy "precompute"/"on_demand" values fold in here).
@@ -1042,11 +1130,11 @@ func serveStoryNewsFeed(
 	// Deep scrolls past the cached slides — or a session that has already
 	// seen all of them — fall through to live assembly over the full corpus
 	// instead of dead-ending the feed with an empty page.
-	if all, builtAt, dirty, ok := loadCachedSnapshot(db, tenantID); ok {
+	if all, builtAt, dirty, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name); ok {
 		age := time.Since(builtAt)
 		if age <= newsSnapshotMaxStale {
 			if dirty || age > newsSnapshotTTL {
-				startSnapshotRebuild(db, tenantID)
+				startSnapshotRebuild(db, tenantID, circ.Window.Name)
 			}
 			cursorCovered := lastID == uuid.Nil
 			if !cursorCovered {
@@ -1069,9 +1157,9 @@ func serveStoryNewsFeed(
 	// Cache can't serve this request (cold, idle past the stale ceiling, deep
 	// cursor, or seen-exhausted page) — assemble inline from the full corpus.
 	slides, nextCursor := assembleStoryNewsFeed(
-		db, tenantID, config, lastTimestamp, lastID, slideLimit, waitSeen(),
+		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(),
 	)
-	startSnapshotRebuild(db, tenantID)
+	startSnapshotRebuild(db, tenantID, circ.Window.Name)
 	return slides, nextCursor
 }
 
@@ -1228,7 +1316,8 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		for _, t := range metas {
 			metaByID[t.PublicID] = t
 		}
-		leads := leadSummariesByStory(db, tenantID, all, metaByID)
+		circ := circulationContextFor(db, tenantID, models.NewsWindowMonth, time.Now())
+		leads := leadSummariesByStory(db, tenantID, all, metaByID, circ)
 
 		self := leads[storyID]
 		query := strings.TrimSpace(self.Title + " " + self.Excerpt)
