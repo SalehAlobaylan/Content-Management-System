@@ -41,6 +41,16 @@ type Topic struct {
 	// are labeled at creation, so they are true.
 	Labeled bool `gorm:"default:true" json:"labeled"`
 
+	// Story digest (Slice 8) — a source-grounded LLM digest of the story's
+	// members: Summary is a one-line Arabic lede, Bullets a JSON array of short
+	// factual points. Generated at WRITE time (refreshStorySummary) when the
+	// story gains members, best-effort. NULL = not yet digested; the feed falls
+	// back to the headline + lead-member excerpt. SummaryBuiltAt rate-caps
+	// regeneration on hot stories.
+	Summary        *string        `gorm:"type:text" json:"summary,omitempty"`
+	Bullets        datatypes.JSON `gorm:"type:jsonb" json:"bullets,omitempty"`
+	SummaryBuiltAt *time.Time     `gorm:"index:idx_topics_summary_built_at" json:"summary_built_at,omitempty"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }

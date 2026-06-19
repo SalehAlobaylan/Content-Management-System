@@ -71,6 +71,14 @@ type RankingConfig struct {
 	// outranks fresher one-off posts. 0 disables (pure per-item momentum).
 	StoryCoverageWeight float64 `gorm:"type:double precision;default:0.30" json:"story_coverage_weight"`
 
+	// Story digest (Slice 8) — a source-grounded LLM headline+bullets digest per
+	// story, generated at WRITE time. StorySummaryMinMembers skips singletons
+	// (their lead excerpt already suffices); StorySummaryMinIntervalMinutes
+	// rate-caps regeneration on hot stories (cost control). All best-effort.
+	StorySummaryEnabled            bool `gorm:"default:true" json:"story_summary_enabled"`
+	StorySummaryMinMembers         int  `gorm:"type:integer;default:3" json:"story_summary_min_members"`
+	StorySummaryMinIntervalMinutes int  `gorm:"type:integer;default:30" json:"story_summary_min_interval_minutes"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -103,6 +111,9 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		NewsFeedMode:                   "live",
 		NewsRerankEnabled:              false,
 		StoryCoverageWeight:            0.30,
+		StorySummaryEnabled:            true,
+		StorySummaryMinMembers:         3,
+		StorySummaryMinIntervalMinutes: 30,
 	}
 }
 

@@ -67,6 +67,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/topics/reclassify", controllers.ReclassifyTopics)
 	adminGroup.POST("/topics/recluster", controllers.ReclusterTopics)
 	adminGroup.POST("/topics/label-batch", controllers.LabelTopicsBatch)
+	adminGroup.POST("/topics/summary-batch", controllers.DigestTopicsBatch)
 
 	// Saved syndication feeds (RSS/Atom/JSON output)
 	adminGroup.GET("/feeds", controllers.ListRSSFeeds)

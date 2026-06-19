@@ -63,7 +63,7 @@ const storyFeedColumns = "id, public_id, tenant_id, type, format, source, status
 // row) — feed reads need labels/counts/related_ids only; the kNN fallback
 // fetches the one centroid it needs on demand.
 const topicMetaColumns = "id, public_id, tenant_id, label, article_count, " +
-	"labeled, last_member_at, related_ids, created_at, updated_at"
+	"labeled, last_member_at, related_ids, summary, bullets, summary_built_at, created_at, updated_at"
 
 // storyScoreColumns is the SCORING projection: the 1000-row candidate pool
 // only feeds ScoreItems + story aggregation, so it carries no display text at
@@ -101,6 +101,11 @@ type StorySummary struct {
 	StoryID        uuid.UUID `json:"story_id"`
 	LeadID         uuid.UUID `json:"lead_id"`
 	Label          string    `json:"label"`
+	// Summary + Bullets are the source-grounded AI digest of the WHOLE story
+	// (Slice 8). Populated on the FEATURED story only; empty when not yet
+	// digested — the slide then falls back to the lead member's excerpt.
+	Summary        string    `json:"summary,omitempty"`
+	Bullets        []string  `json:"bullets,omitempty"`
 	Title          string    `json:"title,omitempty"`
 	Excerpt        string    `json:"excerpt,omitempty"`
 	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
@@ -500,6 +505,8 @@ func buildStoryFeatured(topic models.Topic, storyID uuid.UUID, members []models.
 		StoryID:        storyID,
 		LeadID:         top.PublicID,
 		Label:          topic.Label,
+		Summary:        derefStr(topic.Summary),
+		Bullets:        parseStoryBullets(topic.Bullets),
 		Title:          derefStr(top.Title),
 		Excerpt:        derefStr(top.Excerpt),
 		ThumbnailURL:   derefStr(top.ThumbnailURL),
@@ -632,6 +639,19 @@ func sourceImageForItem(it models.ContentItem, sourceImageByFeedURL map[string]s
 		}
 	}
 	return ""
+}
+
+// parseStoryBullets decodes the topic's jsonb bullets array (Slice 8). Returns
+// nil for a null/invalid column so the slide cleanly falls back to the excerpt.
+func parseStoryBullets(raw datatypes.JSON) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var bullets []string
+	if json.Unmarshal(raw, &bullets) != nil {
+		return nil
+	}
+	return bullets
 }
 
 // storedRelatedIDs parses the write-time-computed related list. The second
@@ -1071,6 +1091,110 @@ var storyRelatedRefreshInFlight sync.Map
 // story; unbounded, hundreds of goroutines each holding DB queries + a rerank
 // HTTP call would starve the read path.
 var storyRelatedWorkers = make(chan struct{}, 2)
+
+// storySummaryRefreshInFlight + storySummaryWorkers mirror the related-refresh
+// debounce/bound for the LLM digest. A separate channel so digest generation
+// (a slower LLM call) never starves related-story refresh.
+var storySummaryRefreshInFlight sync.Map
+var storySummaryWorkers = make(chan struct{}, 2)
+
+// storyDigestMemberLimit caps how many member posts seed a digest — the LLM
+// signal saturates well before the full story; the lead dozen carry it.
+const storyDigestMemberLimit = 12
+
+// storyDigestMemberTexts pulls the recent READY member posts of a story as the
+// LLM digest input (title+excerpt, body fallback). READY-only so the digest is
+// grounded in exactly what the feed shows — used by both the write-time refresh
+// and the admin backfill so they stay consistent.
+func storyDigestMemberTexts(db *gorm.DB, tenantID string, storyID uuid.UUID) []string {
+	windowStart := time.Now().AddDate(0, 0, -storyRelatedWindowDays)
+	var members []models.ContentItem
+	db.Select("title, excerpt, LEFT(body_text, 600) AS body_text, published_at, created_at").
+		Where("tenant_id = ? AND type = ? AND status = ? AND topic_id = ?",
+			tenantID, models.ContentTypeNews, models.ContentStatusReady, storyID).
+		Where("COALESCE(published_at, created_at) > ?", windowStart).
+		Order("COALESCE(published_at, created_at) DESC").
+		Limit(storyDigestMemberLimit).
+		Find(&members)
+
+	texts := make([]string, 0, len(members))
+	for _, m := range members {
+		t := strings.TrimSpace(derefStr(m.Title) + " " + derefStr(m.Excerpt))
+		if t == "" {
+			t = strings.TrimSpace(derefStr(m.BodyText))
+		}
+		if t != "" {
+			texts = append(texts, t)
+		}
+	}
+	return texts
+}
+
+// refreshStorySummary recomputes one story's source-grounded LLM digest
+// (headline lede + bullets) at WRITE time. Harnessed: debounced per story,
+// worker-bounded, and GATED — skipped when disabled, when the story is too
+// small to be worth a digest (singletons keep their lead excerpt), or when it
+// was digested within the min-interval (cost cap on hot stories). Best-effort:
+// any failure leaves the previous digest in place; the feed falls back to the
+// headline + lead excerpt when there is none.
+func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
+	cfg := loadTenantConfig(db, tenantID)
+	if !cfg.StorySummaryEnabled {
+		return
+	}
+	if _, busy := storySummaryRefreshInFlight.LoadOrStore(storyID, true); busy {
+		return
+	}
+	defer storySummaryRefreshInFlight.Delete(storyID)
+
+	storySummaryWorkers <- struct{}{}
+	defer func() { <-storySummaryWorkers }()
+
+	var topic models.Topic
+	if err := db.Select(topicMetaColumns).
+		Where("tenant_id = ? AND public_id = ?", tenantID, storyID).
+		First(&topic).Error; err != nil {
+		return
+	}
+	minMembers := cfg.StorySummaryMinMembers
+	if minMembers < 1 {
+		minMembers = 1
+	}
+	if topic.ArticleCount < minMembers {
+		return // singleton / tiny story — the lead excerpt already suffices
+	}
+	// Rate-cap regeneration: a hot story re-digests at most once per interval,
+	// unless it has no digest yet (first time always runs).
+	if topic.SummaryBuiltAt != nil && len(topic.Bullets) > 0 {
+		interval := time.Duration(cfg.StorySummaryMinIntervalMinutes) * time.Minute
+		if interval > 0 && time.Since(*topic.SummaryBuiltAt) < interval {
+			return
+		}
+	}
+
+	texts := storyDigestMemberTexts(db, tenantID, storyID)
+	if len(texts) < minMembers {
+		return
+	}
+
+	summary, bullets, err := generateStorySummaryViaEnrichment(texts)
+	if err != nil || len(bullets) == 0 {
+		return // best-effort — keep the previous digest (or none)
+	}
+
+	bulletsJSON, err := json.Marshal(bullets)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	db.Model(&models.Topic{}).
+		Where("public_id = ?", storyID).
+		Updates(map[string]interface{}{
+			"summary":          summary,
+			"bullets":          datatypes.JSON(bulletsJSON),
+			"summary_built_at": now,
+		})
+}
 
 // refreshStoryRelated recomputes one story's ordered related-story list:
 // centroid kNN candidates, cross-encoder reranked when NewsRerankEnabled

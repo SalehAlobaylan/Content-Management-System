@@ -3,6 +3,7 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -758,6 +760,95 @@ func LabelTopicsBatch(c *gin.Context) {
 	db.Model(&models.Topic{}).
 		Where("tenant_id = ? AND labeled = ?", principal.TenantID, false).
 		Count(&remaining)
+
+	c.JSON(http.StatusOK, labelBatchResponse{Processed: processed, Remaining: remaining})
+}
+
+// DigestTopicsBatch handles POST /admin/topics/summary-batch — backfills the
+// source-grounded AI digest (Slice 8) for multi-member stories that lack one,
+// biggest first. The UI loops until remaining == 0. Capped per call (each story
+// = one LLM call). Future stories self-digest at write time; this fills the
+// pre-existing corpus. Best-effort per story, but surfaces an Enrichment outage
+// so the loop can retry instead of silently no-op'ing.
+func DigestTopicsBatch(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	cfg := loadTenantConfig(db, principal.TenantID)
+	if !cfg.StorySummaryEnabled {
+		c.JSON(http.StatusOK, labelBatchResponse{Processed: 0, Remaining: 0})
+		return
+	}
+	minMembers := cfg.StorySummaryMinMembers
+	if minMembers < 1 {
+		minMembers = 1
+	}
+
+	var req labelBatchRequest
+	_ = c.ShouldBindJSON(&req)
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 12 {
+		limit = 12
+	}
+
+	// "Un-digested" = multi-member stories with no bullets yet AND not already
+	// attempted (summary_built_at marks an attempt). Without the
+	// summary_built_at clause a story that yields no usable text / no bullets
+	// would stay bullets-NULL forever, so `remaining` never drains and the UI
+	// loop hammers Enrichment indefinitely.
+	selectUndigested := func(q *gorm.DB) *gorm.DB {
+		return q.Where("tenant_id = ? AND article_count >= ? AND bullets IS NULL AND summary_built_at IS NULL",
+			principal.TenantID, minMembers)
+	}
+
+	var topics []models.Topic
+	selectUndigested(db.Model(&models.Topic{})).
+		Order("article_count DESC").
+		Limit(limit).
+		Find(&topics)
+
+	processed := 0
+	for _, t := range topics {
+		texts := storyDigestMemberTexts(db, principal.TenantID, t.PublicID)
+		now := time.Now()
+		if len(texts) < minMembers {
+			// Nothing groundable — mark attempted so the loop drains; write-time
+			// will retry it (its gate regenerates while bullets is NULL).
+			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("summary_built_at", now)
+			continue
+		}
+		summary, bullets, derr := generateStorySummaryViaEnrichment(texts)
+		if derr != nil {
+			// Surface an Enrichment outage (don't mark attempted) so the caller
+			// can retry — matches LabelTopicsBatch's behaviour.
+			c.JSON(http.StatusBadGateway, authErrorResponse{
+				Message: "Story digest failed (Enrichment): " + derr.Error(),
+				Code:    "DIGEST_FAILED",
+			})
+			return
+		}
+		if len(bullets) == 0 {
+			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("summary_built_at", now)
+			continue
+		}
+		bulletsJSON, _ := json.Marshal(bullets)
+		db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+			Updates(map[string]interface{}{
+				"summary":          summary,
+				"bullets":          datatypes.JSON(bulletsJSON),
+				"summary_built_at": now,
+			})
+		processed++
+	}
+
+	var remaining int64
+	selectUndigested(db.Model(&models.Topic{})).Count(&remaining)
 
 	c.JSON(http.StatusOK, labelBatchResponse{Processed: processed, Remaining: remaining})
 }

@@ -177,6 +177,8 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 		// cross-encoder reranked when NewsRerankEnabled).
 		markNewsSnapshotDirty(db, item.TenantID)
 		go refreshStoryRelated(db, item.TenantID, topicID)
+		// Source-grounded story digest (debounced/gated/best-effort; Slice 8).
+		go refreshStorySummary(db, item.TenantID, topicID)
 	}
 }
 
