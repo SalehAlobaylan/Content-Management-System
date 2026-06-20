@@ -797,13 +797,14 @@ func DigestTopicsBatch(c *gin.Context) {
 		limit = 12
 	}
 
-	// "Un-digested" = multi-member stories with no bullets yet AND not already
-	// attempted (summary_built_at marks an attempt). Without the
-	// summary_built_at clause a story that yields no usable text / no bullets
-	// would stay bullets-NULL forever, so `remaining` never drains and the UI
-	// loop hammers Enrichment indefinitely.
+	// "Needs work" = multi-member stories that either have no digest yet (no
+	// bullets AND not already attempted — summary_built_at marks an attempt) OR
+	// have no category yet (a story digested before the classifier existed).
+	// Every attempt path below writes BOTH summary_built_at and category, so a
+	// groundless story can't stay NULL on either axis — `remaining` always
+	// drains and the UI loop never hammers Enrichment indefinitely.
 	selectUndigested := func(q *gorm.DB) *gorm.DB {
-		return q.Where("tenant_id = ? AND article_count >= ? AND bullets IS NULL AND summary_built_at IS NULL",
+		return q.Where("tenant_id = ? AND article_count >= ? AND ((bullets IS NULL AND summary_built_at IS NULL) OR category IS NULL)",
 			principal.TenantID, minMembers)
 	}
 
@@ -818,12 +819,13 @@ func DigestTopicsBatch(c *gin.Context) {
 		texts := storyDigestMemberTexts(db, principal.TenantID, t.PublicID)
 		now := time.Now()
 		if len(texts) < minMembers {
-			// Nothing groundable — mark attempted so the loop drains; write-time
-			// will retry it (its gate regenerates while bullets is NULL).
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("summary_built_at", now)
+			// Nothing groundable — mark attempted (both axes) so the loop drains;
+			// write-time will retry it (its gate regenerates while bullets is NULL).
+			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+				Updates(map[string]interface{}{"summary_built_at": now, "category": "general"})
 			continue
 		}
-		summary, bullets, derr := generateStorySummaryViaEnrichment(texts)
+		summary, bullets, category, derr := generateStorySummaryViaEnrichment(texts)
 		if derr != nil {
 			// Surface an Enrichment outage (don't mark attempted) so the caller
 			// can retry — matches LabelTopicsBatch's behaviour.
@@ -834,7 +836,8 @@ func DigestTopicsBatch(c *gin.Context) {
 			return
 		}
 		if len(bullets) == 0 {
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("summary_built_at", now)
+			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+				Updates(map[string]interface{}{"summary_built_at": now, "category": normalizeStoryCategory(category)})
 			continue
 		}
 		bulletsJSON, _ := json.Marshal(bullets)
@@ -843,6 +846,7 @@ func DigestTopicsBatch(c *gin.Context) {
 				"summary":          summary,
 				"bullets":          datatypes.JSON(bulletsJSON),
 				"summary_built_at": now,
+				"category":         normalizeStoryCategory(category),
 			})
 		processed++
 	}

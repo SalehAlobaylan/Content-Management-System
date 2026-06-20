@@ -62,7 +62,7 @@ const storyFeedColumns = "id, public_id, tenant_id, type, format, source, status
 // row) — feed reads need labels/counts/related_ids only; the kNN fallback
 // fetches the one centroid it needs on demand.
 const topicMetaColumns = "id, public_id, tenant_id, label, article_count, " +
-	"labeled, last_member_at, related_ids, summary, bullets, summary_built_at, created_at, updated_at"
+	"labeled, last_member_at, related_ids, summary, bullets, summary_built_at, category, created_at, updated_at"
 
 // storyScoreColumns is the SCORING projection: the 1000-row candidate pool
 // only feeds ScoreItems + story aggregation, so it carries no display text at
@@ -78,6 +78,9 @@ type StoryMember struct {
 	ID             uuid.UUID `json:"id"`
 	Type           string    `json:"type"`
 	Format         string    `json:"format,omitempty"`
+	// Source (RSS/TELEGRAM/...) lets the UI distinguish a Telegram channel post
+	// (which ingests as format=ARTICLE) from an RSS article for honest badging.
+	Source         string    `json:"source,omitempty"`
 	Title          string    `json:"title,omitempty"`
 	Excerpt        string    `json:"excerpt,omitempty"`
 	BodyText       string    `json:"body_text,omitempty"`
@@ -109,11 +112,18 @@ type StorySummary struct {
 	// digested — the slide then falls back to the lead member's excerpt.
 	Summary        string    `json:"summary,omitempty"`
 	Bullets        []string  `json:"bullets,omitempty"`
+	// Category is the story's news-taxonomy slug (politics/economy/...), shown as
+	// the topic chip. Present on featured + related; empty/general → no chip.
+	Category       string    `json:"category,omitempty"`
 	Title          string    `json:"title,omitempty"`
 	Excerpt        string    `json:"excerpt,omitempty"`
 	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
 	SourceName     string    `json:"source_name,omitempty"`
 	SourceImageURL string    `json:"source_image_url,omitempty"`
+	// Format + Source of the LEAD member, so a related-story card badges by its
+	// lead post's real type (article/tweet/comment) and detects Telegram leads.
+	Format         string    `json:"format,omitempty"`
+	Source         string    `json:"source,omitempty"`
 	PublishedAt    time.Time `json:"published_at"`
 	MemberCount    int       `json:"member_count"`
 	// SourceCount is the number of DISTINCT sources among the story's hydrated
@@ -584,6 +594,20 @@ func buildStoryFeatured(topic models.Topic, ag *storyAgg, members []models.Conte
 			distinctSources[s] = true
 		}
 	}
+	// Story image: prefer the lead member's own post image; if the lead has none,
+	// borrow a real image from ANY member that carries one (stories with an image
+	// are preferable, and the headline often differs from the member that shipped
+	// the photo). Empty when no member has an image — the UI then shows just a
+	// small source logo.
+	storyImage := derefStr(top.ThumbnailURL)
+	if storyImage == "" {
+		for _, m := range members {
+			if mt := derefStr(m.ThumbnailURL); mt != "" {
+				storyImage = mt
+				break
+			}
+		}
+	}
 	summary := StorySummary{
 		StoryID:        ag.storyID,
 		LeadID:         top.PublicID,
@@ -594,11 +618,14 @@ func buildStoryFeatured(topic models.Topic, ag *storyAgg, members []models.Conte
 		Reason:         ag.reason,
 		Summary:        derefStr(topic.Summary),
 		Bullets:        parseStoryBullets(topic.Bullets),
+		Category:       derefStr(topic.Category),
 		Title:          derefStr(top.Title),
 		Excerpt:        derefStr(top.Excerpt),
-		ThumbnailURL:   derefStr(top.ThumbnailURL),
+		ThumbnailURL:   storyImage,
 		SourceName:     derefStr(top.SourceName),
 		SourceImageURL: sourceImageForItem(top, sourceImageByFeedURL),
+		Format:         derefStr(top.Format),
+		Source:         string(top.Source),
 		PublishedAt:    itemTime(top),
 		MemberCount:    memberCount,
 		SourceCount:    len(distinctSources),
@@ -624,6 +651,7 @@ func mapStoryMember(m models.ContentItem, sourceImageByFeedURL map[string]string
 		ID:             m.PublicID,
 		Type:           string(m.Type),
 		Format:         derefStr(m.Format),
+		Source:         string(m.Source),
 		Title:          derefStr(m.Title),
 		Excerpt:        derefStr(m.Excerpt),
 		BodyText:       derefStr(m.BodyText),
@@ -841,11 +869,14 @@ func leadSummariesByStory(
 			Label:          t.Label,
 			LastMemberAt:   lastMemberAt,
 			Lifecycle:      storyLifecycle(circ.Policy, circ.Window, lastMemberAt, memberCount, false),
+			Category:       derefStr(t.Category),
 			Title:          derefStr(top.Title),
 			Excerpt:        derefStr(top.Excerpt),
 			ThumbnailURL:   derefStr(top.ThumbnailURL),
 			SourceName:     derefStr(top.SourceName),
 			SourceImageURL: sourceImageForItem(top, sourceImageByFeedURL),
+			Format:         derefStr(top.Format),
+			Source:         string(top.Source),
 			PublishedAt:    itemTime(top),
 			MemberCount:    memberCount,
 			LikeCount:      top.LikeCount,
@@ -1286,7 +1317,7 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		return
 	}
 
-	summary, bullets, err := generateStorySummaryViaEnrichment(texts)
+	summary, bullets, category, err := generateStorySummaryViaEnrichment(texts)
 	if err != nil || len(bullets) == 0 {
 		return // best-effort — keep the previous digest (or none)
 	}
@@ -1302,7 +1333,19 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 			"summary":          summary,
 			"bullets":          datatypes.JSON(bulletsJSON),
 			"summary_built_at": now,
+			"category":         normalizeStoryCategory(category),
 		})
+}
+
+// normalizeStoryCategory keeps the stored slug non-empty so the backfill's
+// "category IS NULL" selection drains (an attempted-but-uncategorized story
+// lands on "general", which the UI renders as no chip).
+func normalizeStoryCategory(category string) string {
+	cat := strings.ToLower(strings.TrimSpace(category))
+	if cat == "" {
+		return "general"
+	}
+	return cat
 }
 
 // refreshStoryRelated recomputes one story's ordered related-story list:

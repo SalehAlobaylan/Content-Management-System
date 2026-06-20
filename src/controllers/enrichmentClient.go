@@ -396,32 +396,34 @@ type topicLabelResult struct {
 }
 
 type storyDigestResult struct {
-	Summary string   `json:"summary"`
-	Bullets []string `json:"bullets"`
+	Summary  string   `json:"summary"`
+	Bullets  []string `json:"bullets"`
+	Category string   `json:"category"`
 }
 
 // generateStorySummaryViaEnrichment digests a story's member texts into a
-// source-grounded lede + bullets via Enrichment's /v1/topics/digest. Mirrors
-// generateTopicLabelViaEnrichment. Caller treats failure as best-effort.
-func generateStorySummaryViaEnrichment(texts []string) (string, []string, error) {
+// source-grounded lede + bullets + one category slug via Enrichment's
+// /v1/topics/digest. Mirrors generateTopicLabelViaEnrichment. Caller treats
+// failure as best-effort.
+func generateStorySummaryViaEnrichment(texts []string) (string, []string, string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
-		return "", nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+		return "", nil, "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
 	}
 	token := enrichmentServiceToken()
 	if token == "" {
-		return "", nil, fmt.Errorf("enrichment service token is not configured")
+		return "", nil, "", fmt.Errorf("enrichment service token is not configured")
 	}
 
 	payload := map[string]interface{}{"texts": texts, "max_bullets": 3}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", nil, fmt.Errorf("marshal story-digest request: %w", err)
+		return "", nil, "", fmt.Errorf("marshal story-digest request: %w", err)
 	}
 
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/topics/digest", bytes.NewReader(body))
 	if err != nil {
-		return "", nil, fmt.Errorf("build story-digest request: %w", err)
+		return "", nil, "", fmt.Errorf("build story-digest request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -429,20 +431,20 @@ func generateStorySummaryViaEnrichment(texts []string) (string, []string, error)
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", nil, fmt.Errorf("enrichment story-digest request failed: %w", err)
+		return "", nil, "", fmt.Errorf("enrichment story-digest request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("enrichment story-digest returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", nil, "", fmt.Errorf("enrichment story-digest returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var decoded storyDigestResult
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return "", nil, fmt.Errorf("decode story-digest response: %w", err)
+		return "", nil, "", fmt.Errorf("decode story-digest response: %w", err)
 	}
-	return decoded.Summary, decoded.Bullets, nil
+	return decoded.Summary, decoded.Bullets, decoded.Category, nil
 }
 
 func generateTopicLabelViaEnrichment(texts []string) (string, error) {

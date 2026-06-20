@@ -50,6 +50,9 @@ type Topic struct {
 	Summary        *string        `gorm:"type:text" json:"summary,omitempty"`
 	Bullets        datatypes.JSON `gorm:"type:jsonb" json:"bullets,omitempty"`
 	SummaryBuiltAt *time.Time     `gorm:"index:idx_topics_summary_built_at" json:"summary_built_at,omitempty"`
+	// Category is one slug from the finite news taxonomy (politics/economy/...),
+	// classified by the same LLM digest call. "general"/unknown render no chip.
+	Category       *string        `gorm:"type:text" json:"category,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
