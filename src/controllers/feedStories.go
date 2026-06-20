@@ -745,15 +745,46 @@ func hostKey(value string) string {
 }
 
 func sourceImageForItem(it models.ContentItem, sourceImageByFeedURL map[string]string) string {
-	if len(sourceImageByFeedURL) == 0 {
-		return ""
-	}
 	for _, key := range sourceLookupKeys(derefStr(it.SourceFeedURL), derefStr(it.SourceName)) {
 		if value := sourceImageByFeedURL[key]; value != "" {
 			return value
 		}
 	}
+	// Telegram channels carry no stored image_url, but their public avatar is
+	// derivable from the t.me handle — give them a source image like RSS sources.
+	if it.Source == models.SourceTypeTelegram {
+		if avatar := telegramAvatarURL(derefStr(it.SourceFeedURL)); avatar != "" {
+			return avatar
+		}
+	}
 	return ""
+}
+
+// telegramAvatarURL turns a Telegram channel's t.me handle (t.me/<user> or
+// t.me/s/<user>, with or without scheme) into its public avatar URL. Telegram's
+// userpic endpoint 302-redirects to the channel photo on its CDN, so browsers
+// load it directly. Empty when no username can be parsed.
+func telegramAvatarURL(feedURL string) string {
+	u := strings.TrimSpace(feedURL)
+	if u == "" {
+		return ""
+	}
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	u = strings.TrimPrefix(u, "www.")
+	u = strings.TrimPrefix(u, "t.me/")
+	u = strings.TrimPrefix(u, "telegram.me/")
+	u = strings.TrimPrefix(u, "s/") // t.me/s/<user>
+	u = strings.TrimPrefix(u, "@")
+	// Keep only the first path segment (channel username), drop message ids etc.
+	if i := strings.IndexAny(u, "/?#"); i >= 0 {
+		u = u[:i]
+	}
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return ""
+	}
+	return "https://t.me/i/userpic/320/" + u + ".jpg"
 }
 
 // parseStoryBullets decodes the topic's jsonb bullets array (Slice 8). Returns
@@ -924,7 +955,7 @@ func buildRelatedStories(
 // ─── Read-through cache (freshness-bounded, never authoritative) ───────────
 
 // buildNewsSnapshot assembles the top story-slides live and upserts them into
-// the per-tenant news_snapshots cache row (clearing Dirty). Called by the SWR
+// the per-tenant/window news_snapshots cache row (clearing Dirty). Called by the SWR
 // background refresh, the admin Refresh endpoint, the classification backfill,
 // and lazily when the cache is empty.
 func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error) {
@@ -938,7 +969,7 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	// Atomic upsert on the unique tenant_id — avoids the SELECT-then-INSERT race
+	// Atomic upsert on tenant + window avoids the SELECT-then-INSERT race
 	// (lazy build on read vs admin Refresh) that a FirstOrCreate would hit.
 	// built_at truncated to microseconds (Postgres timestamp precision) so the
 	// in-memory copy's built_at compares Equal to what reads see from the DB.
