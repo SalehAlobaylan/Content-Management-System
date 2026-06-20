@@ -209,6 +209,10 @@ func main() {
 	// Precompute missing topics.related_ids (stories predating the write-time
 	// related feature) so feed reads never fall back to per-slide centroid kNN.
 	controllers.StartRelatedBackfill(db)
+	// News Circulation automation heartbeat — periodically recompute source
+	// cadence recommendations (and auto-apply inside guardrails) for tenants that
+	// opted in, so the news pipeline self-tunes without manual admin triggers.
+	controllers.StartCirculationAutomation(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

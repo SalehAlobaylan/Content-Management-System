@@ -51,9 +51,21 @@ type NewsCirculationPolicy struct {
 
 	SourceCadenceMode        string `gorm:"type:varchar(20);not null;default:'suggest'" json:"source_cadence_mode"`
 	SourceClaimIntervalMins  int    `gorm:"type:integer;not null;default:15" json:"source_claim_interval_minutes"`
+	SourceClaimBatchSize     int    `gorm:"type:integer;not null;default:20" json:"source_claim_batch_size"`
 	SourceMinIntervalMinutes int    `gorm:"type:integer;not null;default:10" json:"source_min_interval_minutes"`
 	SourceMaxIntervalMinutes int    `gorm:"type:integer;not null;default:360" json:"source_max_interval_minutes"`
 	SourceMaxChangePercent   int    `gorm:"type:integer;not null;default:50" json:"source_max_change_percent"`
+
+	// Automation heartbeat — the self-running recommendation loop. Off by default
+	// so turning the system "automatic" is always a deliberate, reversible choice.
+	// The cadence mode (suggest/auto_apply/manual) decides what the heartbeat DOES;
+	// these knobs decide whether it runs and how aggressively it may act.
+	AutomationEnabled         bool       `gorm:"not null;default:false" json:"automation_enabled"`
+	AutomationIntervalMinutes int        `gorm:"type:integer;not null;default:60" json:"automation_interval_minutes"`
+	AutoApplySpeedups         bool       `gorm:"not null;default:false" json:"auto_apply_speedups"`
+	MaxAutoAppliesPerRun      int        `gorm:"type:integer;not null;default:5" json:"max_auto_applies_per_run"`
+	MinRunsForAuto            int        `gorm:"type:integer;not null;default:4" json:"min_runs_for_auto"`
+	LastAutomationRunAt       *time.Time `gorm:"type:timestamp" json:"last_automation_run_at,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
@@ -65,26 +77,32 @@ func (NewsCirculationPolicy) TableName() string {
 
 func DefaultNewsCirculationPolicy(tenantID string) NewsCirculationPolicy {
 	return NewsCirculationPolicy{
-		TenantID:                 tenantID,
-		Preset:                   NewsCirculationPresetLatestPlus,
-		Timezone:                 "Asia/Riyadh",
-		MinTodayStories:          8,
-		CarryoverHours:           72,
-		CarryoverMinScore:        0.25,
-		BreakingMaxAgeMinutes:    180,
-		BreakingMinMembers:       3,
-		RecencyWeight:            0.55,
-		ImportanceWeight:         0.15,
-		MomentumWeight:           0.10,
-		CoverageWeight:           0.30,
-		SourceQualityWeight:      0.10,
-		DiversityWeight:          0.05,
-		TrendingWeight:           0.05,
-		SourceCadenceMode:        SourceCadenceModeSuggest,
-		SourceClaimIntervalMins:  15,
-		SourceMinIntervalMinutes: 10,
-		SourceMaxIntervalMinutes: 360,
-		SourceMaxChangePercent:   50,
+		TenantID:                  tenantID,
+		Preset:                    NewsCirculationPresetLatestPlus,
+		Timezone:                  "Asia/Riyadh",
+		MinTodayStories:           8,
+		CarryoverHours:            72,
+		CarryoverMinScore:         0.25,
+		BreakingMaxAgeMinutes:     180,
+		BreakingMinMembers:        3,
+		RecencyWeight:             0.55,
+		ImportanceWeight:          0.15,
+		MomentumWeight:            0.10,
+		CoverageWeight:            0.30,
+		SourceQualityWeight:       0.10,
+		DiversityWeight:           0.05,
+		TrendingWeight:            0.05,
+		SourceCadenceMode:         SourceCadenceModeSuggest,
+		SourceClaimIntervalMins:   15,
+		SourceClaimBatchSize:      20,
+		SourceMinIntervalMinutes:  10,
+		SourceMaxIntervalMinutes:  360,
+		SourceMaxChangePercent:    50,
+		AutomationEnabled:         false,
+		AutomationIntervalMinutes: 60,
+		AutoApplySpeedups:         false,
+		MaxAutoAppliesPerRun:      5,
+		MinRunsForAuto:            4,
 	}
 }
 

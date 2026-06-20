@@ -2,9 +2,66 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/utils"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+func cachedSlide(storyID uuid.UUID, leadPublishedAt, lastMemberAt time.Time) StorySlide {
+	return StorySlide{
+		Featured: StoryFeatured{
+			StorySummary: StorySummary{
+				StoryID:      storyID,
+				PublishedAt:  leadPublishedAt,
+				LastMemberAt: lastMemberAt,
+			},
+		},
+	}
+}
+
+func TestPaginateStorySlidesUsesLastMemberAtForCursor(t *testing.T) {
+	storyID := uuid.New()
+	leadPublishedAt := time.Date(2026, 6, 19, 8, 0, 0, 0, time.UTC)
+	lastMemberAt := time.Date(2026, 6, 19, 11, 30, 0, 0, time.UTC)
+
+	_, cursor := paginateStorySlides([]StorySlide{
+		cachedSlide(storyID, leadPublishedAt, lastMemberAt),
+	}, time.Time{}, uuid.Nil, 1, nil)
+	if cursor == nil || *cursor == "" {
+		t.Fatal("expected cursor")
+	}
+	gotTime, gotID, err := utils.DecodeCursor(*cursor)
+	if err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	if gotID != storyID {
+		t.Fatalf("cursor story = %s, want %s", gotID, storyID)
+	}
+	if !gotTime.Equal(lastMemberAt) {
+		t.Fatalf("cursor time = %s, want last_member_at %s", gotTime, lastMemberAt)
+	}
+}
+
+func TestPaginateStorySlidesFallbackUsesLastMemberAt(t *testing.T) {
+	cursorStory := uuid.New()
+	first := uuid.New()
+	second := uuid.New()
+	cursorTime := time.Date(2026, 6, 19, 11, 0, 0, 0, time.UTC)
+	slides := []StorySlide{
+		cachedSlide(first, time.Date(2026, 6, 19, 7, 0, 0, 0, time.UTC), time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)),
+		cachedSlide(second, time.Date(2026, 6, 19, 10, 45, 0, 0, time.UTC), time.Date(2026, 6, 19, 10, 30, 0, 0, time.UTC)),
+	}
+
+	page, _ := paginateStorySlides(slides, cursorTime, cursorStory, 1, nil)
+	if len(page) != 1 {
+		t.Fatalf("page len = %d, want 1", len(page))
+	}
+	if page[0].Featured.StoryID != second {
+		t.Fatalf("resumed story = %s, want %s", page[0].Featured.StoryID, second)
+	}
+}
 
 func TestCirculationWindowForUsesRiyadhCalendarBoundaries(t *testing.T) {
 	policy := models.DefaultNewsCirculationPolicy("default")
@@ -36,6 +93,69 @@ func TestCirculationWindowForUsesRiyadhCalendarBoundaries(t *testing.T) {
 	wantMonth := time.Date(2026, 6, 1, 0, 0, 0, 0, loc).UTC()
 	if !month.PrimaryStart.Equal(wantMonth) {
 		t.Fatalf("month primary start = %s, want %s", month.PrimaryStart, wantMonth)
+	}
+}
+
+func TestCirculationContextFromPolicyUsesProvidedPolicy(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.CarryoverHours = 24
+	now := time.Date(2026, 6, 19, 9, 15, 0, 0, time.UTC)
+
+	ctx := circulationContextFromPolicy(policy, models.NewsWindowToday, now)
+	if ctx.Policy.CarryoverHours != 24 {
+		t.Fatalf("policy carryover = %d, want override", ctx.Policy.CarryoverHours)
+	}
+	if got, want := ctx.Window.QueryStart, ctx.Window.PrimaryStart.Add(-24*time.Hour); !got.Equal(want) {
+		t.Fatalf("query start = %s, want %s", got, want)
+	}
+}
+
+func TestSanitizeCirculationPolicyEnforcesCadenceGuardrails(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.CarryoverMinScore = 4
+	policy.RecencyWeight = -1
+	policy.ImportanceWeight = 2
+	policy.SourceMinIntervalMinutes = 5
+	policy.SourceMaxIntervalMinutes = 900
+	policy.SourceMaxChangePercent = 90
+
+	got := sanitizeCirculationPolicy(policy)
+	if got.CarryoverMinScore != 1 {
+		t.Fatalf("carryover min score = %f, want 1", got.CarryoverMinScore)
+	}
+	if got.RecencyWeight != 0 || got.ImportanceWeight != 1 {
+		t.Fatalf("weights = recency %f importance %f, want 0 and 1", got.RecencyWeight, got.ImportanceWeight)
+	}
+	if got.SourceMinIntervalMinutes != 10 {
+		t.Fatalf("source min interval = %d, want 10", got.SourceMinIntervalMinutes)
+	}
+	if got.SourceMaxIntervalMinutes != 360 {
+		t.Fatalf("source max interval = %d, want 360", got.SourceMaxIntervalMinutes)
+	}
+	if got.SourceMaxChangePercent != 50 {
+		t.Fatalf("source max change = %d, want 50", got.SourceMaxChangePercent)
+	}
+}
+
+func TestSanitizeOverrideBoostBoundsManualExceptions(t *testing.T) {
+	tests := []struct {
+		name  string
+		input float64
+		want  float64
+	}{
+		{name: "zero resets to neutral", input: 0, want: 1},
+		{name: "negative resets to neutral", input: -4, want: 1},
+		{name: "tiny clamps to floor", input: 0.01, want: 0.1},
+		{name: "normal passes through", input: 1.4, want: 1.4},
+		{name: "huge clamps to ceiling", input: 50, want: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeOverrideBoost(tt.input); got != tt.want {
+				t.Fatalf("boost = %f, want %f", got, tt.want)
+			}
+		})
 	}
 }
 

@@ -86,18 +86,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Intelligence — News-feed story snapshot (precompute mode) rebuild
 	adminGroup.POST("/intelligence/news-snapshot/refresh", controllers.RefreshNewsSnapshot)
 
-	// Intelligence — News Circulation Engine
-	adminGroup.GET("/intelligence/circulation/policy", controllers.GetCirculationPolicy)
-	adminGroup.PUT("/intelligence/circulation/policy", controllers.UpdateCirculationPolicy)
-	adminGroup.POST("/intelligence/circulation/presets/:preset", controllers.ApplyCirculationPreset)
-	adminGroup.GET("/intelligence/circulation/preview", controllers.PreviewCirculation)
-	adminGroup.GET("/intelligence/circulation/metrics", controllers.GetCirculationMetrics)
-	adminGroup.GET("/intelligence/circulation/overrides", controllers.ListStoryOverrides)
-	adminGroup.PUT("/intelligence/circulation/overrides/:story_id", controllers.UpsertStoryOverride)
-	adminGroup.DELETE("/intelligence/circulation/overrides/:story_id", controllers.DeleteStoryOverride)
-	adminGroup.GET("/intelligence/circulation/source-recommendations", controllers.ListSourceRecommendations)
-	adminGroup.POST("/intelligence/circulation/source-recommendations/generate", controllers.GenerateSourceRecommendations)
-	adminGroup.POST("/intelligence/circulation/source-recommendations/:id/apply", controllers.ApplySourceRecommendation)
+	// News — Circulation Engine. Intelligence aliases remain for older Console builds.
+	registerCirculationRoutes(adminGroup, "/news/circulation")
+	registerCirculationRoutes(adminGroup, "/intelligence/circulation")
 
 	// Media — Transcription/STT config (auto-STT toggle + budget cap)
 	adminGroup.GET("/transcription-config", controllers.GetTranscriptionConfig)
@@ -184,4 +175,20 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	// Self-restart — exits the process so the supervisor restarts the service.
 	adminGroup.POST("/restart", controllers.RestartService)
+}
+
+func registerCirculationRoutes(adminGroup *gin.RouterGroup, prefix string) {
+	adminGroup.GET(prefix+"/policy", controllers.GetCirculationPolicy)
+	adminGroup.PUT(prefix+"/policy", controllers.UpdateCirculationPolicy)
+	adminGroup.POST(prefix+"/presets/:preset", controllers.ApplyCirculationPreset)
+	adminGroup.GET(prefix+"/preview", controllers.PreviewCirculation)
+	adminGroup.POST(prefix+"/preview", controllers.PreviewCirculation)
+	adminGroup.GET(prefix+"/metrics", controllers.GetCirculationMetrics)
+	adminGroup.GET(prefix+"/overrides", controllers.ListStoryOverrides)
+	adminGroup.PUT(prefix+"/overrides/:story_id", controllers.UpsertStoryOverride)
+	adminGroup.DELETE(prefix+"/overrides/:story_id", controllers.DeleteStoryOverride)
+	adminGroup.GET(prefix+"/source-recommendations", controllers.ListSourceRecommendations)
+	adminGroup.POST(prefix+"/source-recommendations/generate", controllers.GenerateSourceRecommendations)
+	adminGroup.POST(prefix+"/source-recommendations/:id/apply", controllers.ApplySourceRecommendation)
+	adminGroup.POST(prefix+"/sweep-now", controllers.RunCirculationSweepNow)
 }

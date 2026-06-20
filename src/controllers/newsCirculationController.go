@@ -69,17 +69,40 @@ func sanitizeCirculationPolicy(policy models.NewsCirculationPolicy) models.NewsC
 	if policy.CarryoverHours < 1 {
 		policy.CarryoverHours = 72
 	}
+	policy.CarryoverMinScore = clampFloat(policy.CarryoverMinScore, 0, 1)
 	if policy.BreakingMaxAgeMinutes < 1 {
 		policy.BreakingMaxAgeMinutes = 180
 	}
 	if policy.BreakingMinMembers < 1 {
 		policy.BreakingMinMembers = 3
 	}
+	policy.RecencyWeight = clampFloat(policy.RecencyWeight, 0, 1)
+	policy.ImportanceWeight = clampFloat(policy.ImportanceWeight, 0, 1)
+	policy.MomentumWeight = clampFloat(policy.MomentumWeight, 0, 1)
+	policy.CoverageWeight = clampFloat(policy.CoverageWeight, 0, 1)
+	policy.SourceQualityWeight = clampFloat(policy.SourceQualityWeight, 0, 1)
+	policy.DiversityWeight = clampFloat(policy.DiversityWeight, 0, 1)
+	policy.TrendingWeight = clampFloat(policy.TrendingWeight, 0, 1)
 	if policy.SourceClaimIntervalMins < 1 {
 		policy.SourceClaimIntervalMins = 15
 	}
-	if policy.SourceMinIntervalMinutes < 1 {
+	if policy.SourceClaimBatchSize < 1 {
+		policy.SourceClaimBatchSize = 20
+	}
+	if policy.SourceClaimBatchSize > 200 {
+		policy.SourceClaimBatchSize = 200
+	}
+	if policy.SourceMinIntervalMinutes < 10 {
 		policy.SourceMinIntervalMinutes = 10
+	}
+	if policy.SourceMinIntervalMinutes > 360 {
+		policy.SourceMinIntervalMinutes = 360
+	}
+	if policy.SourceMaxIntervalMinutes < 10 {
+		policy.SourceMaxIntervalMinutes = 360
+	}
+	if policy.SourceMaxIntervalMinutes > 360 {
+		policy.SourceMaxIntervalMinutes = 360
 	}
 	if policy.SourceMaxIntervalMinutes < policy.SourceMinIntervalMinutes {
 		policy.SourceMaxIntervalMinutes = policy.SourceMinIntervalMinutes
@@ -87,12 +110,50 @@ func sanitizeCirculationPolicy(policy models.NewsCirculationPolicy) models.NewsC
 	if policy.SourceMaxChangePercent < 1 {
 		policy.SourceMaxChangePercent = 50
 	}
+	if policy.SourceMaxChangePercent > 50 {
+		policy.SourceMaxChangePercent = 50
+	}
 	switch policy.SourceCadenceMode {
 	case models.SourceCadenceModeSuggest, models.SourceCadenceModeAutoApply, models.SourceCadenceModeManual:
 	default:
 		policy.SourceCadenceMode = models.SourceCadenceModeSuggest
 	}
+	if policy.AutomationIntervalMinutes < 5 {
+		policy.AutomationIntervalMinutes = 5
+	}
+	if policy.AutomationIntervalMinutes > 1440 {
+		policy.AutomationIntervalMinutes = 1440
+	}
+	if policy.MaxAutoAppliesPerRun < 1 {
+		policy.MaxAutoAppliesPerRun = 1
+	}
+	if policy.MaxAutoAppliesPerRun > 100 {
+		policy.MaxAutoAppliesPerRun = 100
+	}
+	if policy.MinRunsForAuto < 2 {
+		policy.MinRunsForAuto = 2
+	}
+	if policy.MinRunsForAuto > 100 {
+		policy.MinRunsForAuto = 100
+	}
 	return policy
+}
+
+func clampFloat(value, lower, upper float64) float64 {
+	if value < lower {
+		return lower
+	}
+	if value > upper {
+		return upper
+	}
+	return value
+}
+
+func sanitizeOverrideBoost(value float64) float64 {
+	if value <= 0 {
+		return 1
+	}
+	return clampFloat(value, 0.1, 3)
 }
 
 func applyLatestPlusPolicy(config models.RankingConfig, policy models.NewsCirculationPolicy) models.RankingConfig {
@@ -148,6 +209,11 @@ func circulationWindowFor(policy models.NewsCirculationPolicy, window string, no
 
 func circulationContextFor(db *gorm.DB, tenantID, rawWindow string, now time.Time) circulationContext {
 	policy := loadCirculationPolicy(db, tenantID)
+	window := normalizeNewsWindow(rawWindow)
+	return circulationContextFromPolicy(policy, window, now)
+}
+
+func circulationContextFromPolicy(policy models.NewsCirculationPolicy, rawWindow string, now time.Time) circulationContext {
 	window := normalizeNewsWindow(rawWindow)
 	return circulationContext{
 		Policy: policy,
@@ -256,8 +322,9 @@ func UpdateCirculationPolicy(c *gin.Context) {
 			"breaking_max_age_minutes", "breaking_min_members", "recency_weight", "importance_weight",
 			"momentum_weight", "coverage_weight", "source_quality_weight", "diversity_weight",
 			"trending_weight", "source_cadence_mode", "source_claim_interval_minutes",
-			"source_min_interval_minutes", "source_max_interval_minutes", "source_max_change_percent",
-			"updated_at",
+			"source_claim_batch_size", "source_min_interval_minutes", "source_max_interval_minutes",
+			"source_max_change_percent", "automation_enabled", "automation_interval_minutes",
+			"auto_apply_speedups", "max_auto_applies_per_run", "min_runs_for_auto", "updated_at",
 		}),
 	}).Create(&req).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to save policy", Code: "SAVE_FAILED"})
@@ -295,8 +362,9 @@ func ApplyCirculationPreset(c *gin.Context) {
 			"breaking_max_age_minutes", "breaking_min_members", "recency_weight", "importance_weight",
 			"momentum_weight", "coverage_weight", "source_quality_weight", "diversity_weight",
 			"trending_weight", "source_cadence_mode", "source_claim_interval_minutes",
-			"source_min_interval_minutes", "source_max_interval_minutes", "source_max_change_percent",
-			"updated_at",
+			"source_claim_batch_size", "source_min_interval_minutes", "source_max_interval_minutes",
+			"source_max_change_percent", "automation_enabled", "automation_interval_minutes",
+			"auto_apply_speedups", "max_auto_applies_per_run", "min_runs_for_auto", "updated_at",
 		}),
 	}).Create(&policy).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to apply preset", Code: "SAVE_FAILED"})
@@ -316,12 +384,38 @@ func PreviewCirculation(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+
+	type previewRequest struct {
+		Window string                        `json:"window"`
+		Limit  int                           `json:"limit"`
+		Policy *models.NewsCirculationPolicy `json:"policy"`
+	}
+	var req previewRequest
+	if c.Request.Method == http.MethodPost {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
+			return
+		}
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit, _ = strconv.Atoi(c.DefaultQuery("limit", "20"))
+	}
 	if limit < 1 || limit > 60 {
 		limit = 20
 	}
+	window := req.Window
+	if window == "" {
+		window = c.Query("window")
+	}
 	config := loadTenantConfig(db, principal.TenantID)
-	ctx := circulationContextFor(db, principal.TenantID, c.Query("window"), time.Now())
+	ctx := circulationContextFor(db, principal.TenantID, window, time.Now())
+	if req.Policy != nil {
+		req.Policy.TenantID = principal.TenantID
+		policy := sanitizeCirculationPolicy(*req.Policy)
+		ctx = circulationContextFromPolicy(policy, window, time.Now())
+	}
 	slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, limit, nil)
 	c.JSON(http.StatusOK, StoryNewsResponse{Cursor: nil, Slides: slides})
 }
@@ -334,6 +428,7 @@ func GetCirculationMetrics(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	policy := loadCirculationPolicy(db, principal.TenantID)
 	now := time.Now()
+	config := loadTenantConfig(db, principal.TenantID)
 
 	type windowMetric struct {
 		Window      string `json:"window"`
@@ -348,23 +443,16 @@ func GetCirculationMetrics(c *gin.Context) {
 
 	metrics := make([]windowMetric, 0, 3)
 	for _, w := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
-		win := circulationWindowFor(policy, w, now)
-		var topics []models.Topic
-		db.Select(topicMetaColumns).
-			Where("tenant_id = ? AND article_count > 0 AND last_member_at IS NOT NULL AND last_member_at >= ?", principal.TenantID, win.QueryStart).
-			Find(&topics)
-		m := windowMetric{Window: w, PrimaryFrom: win.PrimaryStart.Format(time.RFC3339)}
-		for _, t := range topics {
-			if t.LastMemberAt == nil {
-				continue
-			}
-			carry := w == models.NewsWindowToday && t.LastMemberAt.Before(win.PrimaryStart)
-			lifecycle := storyLifecycle(policy, win, *t.LastMemberAt, t.ArticleCount, carry)
+		ctx := circulationContextFromPolicy(policy, w, now)
+		slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, 60, nil)
+		m := windowMetric{Window: w, PrimaryFrom: ctx.Window.PrimaryStart.Format(time.RFC3339)}
+		for _, slide := range slides {
+			story := slide.Featured.StorySummary
 			m.Stories++
-			if carry {
+			if story.IsCarryover {
 				m.Carryover++
 			}
-			switch lifecycle {
+			switch story.Lifecycle {
 			case models.NewsLifecycleBreaking:
 				m.Breaking++
 			case models.NewsLifecycleActive:
@@ -455,9 +543,7 @@ func UpsertStoryOverride(c *gin.Context) {
 	if req.ImportanceBoost != nil {
 		row.ImportanceBoost = *req.ImportanceBoost
 	}
-	if row.ImportanceBoost <= 0 {
-		row.ImportanceBoost = 1.0
-	}
+	row.ImportanceBoost = sanitizeOverrideBoost(row.ImportanceBoost)
 	row.Notes = req.Notes
 	row.SetBy = principal.Email
 	if req.ExpiresAt != nil && strings.TrimSpace(*req.ExpiresAt) != "" {
@@ -562,6 +648,23 @@ func ApplySourceRecommendation(c *gin.Context) {
 	c.JSON(http.StatusOK, rec)
 }
 
+func RunCirculationSweepNow(c *gin.Context) {
+	if _, ok := requireAdminPrincipal(c); !ok {
+		return
+	}
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Aggregation service URL is not configured", Code: "AGGREGATION_NOT_CONFIGURED"})
+		return
+	}
+	body, status, err := proxyAggregationRequest(aggregationBaseURL, "/admin/circulation/sweep-now", c.GetHeader("Authorization"), map[string]interface{}{})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation request failed: " + err.Error(), Code: "AGGREGATION_FAILED"})
+		return
+	}
+	c.Data(status, "application/json", body)
+}
+
 // ─── Internal API used by Aggregation ──────────────────────────────────────
 
 func InternalGetCirculationPolicy(c *gin.Context) {
@@ -579,18 +682,16 @@ func InternalClaimCirculationSources(c *gin.Context) {
 	if tenantID == "" {
 		tenantID = defaultCirculationTenant
 	}
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	if limit < 1 || limit > 100 {
+	policy := loadCirculationPolicy(db, tenantID)
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
+	if limit < 1 {
+		limit = policy.SourceClaimBatchSize
+	}
+	if limit < 1 || limit > 200 {
 		limit = 20
 	}
-	policy := loadCirculationPolicy(db, tenantID)
+	force := strings.EqualFold(c.Query("force"), "true")
 	now := time.Now().UTC()
-
-	var sources []models.ContentSource
-	db.Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, models.SourceCategoryNews, true).
-		Order("last_fetched_at ASC NULLS FIRST").
-		Limit(200).
-		Find(&sources)
 
 	type sourceClaim struct {
 		ID                   string                 `json:"id"`
@@ -601,42 +702,61 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		Settings             map[string]interface{} `json:"settings"`
 	}
 	claims := make([]sourceClaim, 0, limit)
-	for _, source := range sources {
-		if len(claims) >= limit {
-			break
+
+	// Atomic claim. The due-filter runs in SQL and the rows are taken with
+	// FOR UPDATE SKIP LOCKED inside a transaction, so two concurrent claims (a
+	// manual sweep racing the scheduled tick, or >1 worker) can never pull the
+	// same source twice — each locks only the rows it takes and the other skips
+	// them. A manual `force` run can pull sources early, but still respects the
+	// min-interval floor, so repeated clicks cannot hammer a provider or run up
+	// fetch bills.
+	err := db.Transaction(func(tx *gorm.DB) error {
+		q := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, models.SourceCategoryNews, true).
+			Where("feed_url IS NOT NULL AND feed_url <> ''")
+		if force {
+			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ?",
+				now.Add(-time.Duration(policy.SourceMinIntervalMinutes)*time.Minute))
+		} else {
+			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ? - make_interval(mins => GREATEST(fetch_interval_minutes, ?))",
+				now, policy.SourceMinIntervalMinutes)
 		}
-		if source.FeedURL == nil || strings.TrimSpace(*source.FeedURL) == "" {
-			continue
+
+		var sources []models.ContentSource
+		if err := q.Order("last_fetched_at ASC NULLS FIRST").Limit(limit).Find(&sources).Error; err != nil {
+			return err
 		}
-		interval := source.FetchIntervalMinutes
-		if interval < policy.SourceMinIntervalMinutes {
-			interval = policy.SourceMinIntervalMinutes
+
+		ids := make([]uuid.UUID, 0, len(sources))
+		for _, source := range sources {
+			interval := source.FetchIntervalMinutes
+			if interval < policy.SourceMinIntervalMinutes {
+				interval = policy.SourceMinIntervalMinutes
+			}
+			settings := map[string]interface{}{}
+			_ = json.Unmarshal(source.APIConfig, &settings)
+			claims = append(claims, sourceClaim{
+				ID:                   source.PublicID.String(),
+				Name:                 source.Name,
+				Type:                 string(source.Type),
+				URL:                  *source.FeedURL,
+				FetchIntervalMinutes: interval,
+				Settings:             settings,
+			})
+			ids = append(ids, source.PublicID)
 		}
-		due := source.LastFetchedAt == nil || source.LastFetchedAt.Before(now.Add(-time.Duration(interval)*time.Minute))
-		if !due {
-			continue
-		}
-		settings := map[string]interface{}{}
-		_ = json.Unmarshal(source.APIConfig, &settings)
-		claims = append(claims, sourceClaim{
-			ID:                   source.PublicID.String(),
-			Name:                 source.Name,
-			Type:                 string(source.Type),
-			URL:                  *source.FeedURL,
-			FetchIntervalMinutes: source.FetchIntervalMinutes,
-			Settings:             settings,
-		})
-	}
-	if len(claims) > 0 {
-		ids := make([]uuid.UUID, 0, len(claims))
-		for _, claim := range claims {
-			if id, err := uuid.Parse(claim.ID); err == nil {
-				ids = append(ids, id)
+		if len(ids) > 0 {
+			if err := tx.Model(&models.ContentSource{}).
+				Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
+				UpdateColumn("last_fetched_at", now).Error; err != nil {
+				return err
 			}
 		}
-		db.Model(&models.ContentSource{}).
-			Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
-			UpdateColumn("last_fetched_at", now)
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to claim sources"})
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": claims, "policy": policy})
 }
@@ -720,7 +840,95 @@ func InternalReportSourceRun(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to record run"})
 		return
 	}
+
+	// Failure backoff. The claim optimistically stamped last_fetched_at=now, which
+	// would otherwise hold a source out for its full interval. When a run produced
+	// nothing usable and only failures (unreachable/broken source, exhausted by the
+	// BullMQ retries upstream), pull its next-due forward to the min-interval floor
+	// so it gets another chance on the next tick instead of silently going dark for
+	// a whole cycle — but never below the floor, so a persistently broken source
+	// still can't be hammered. The `last_fetched_at > retryDue` guard only ever
+	// moves the source earlier, so repeated reports are idempotent.
+	if req.Fetched == 0 && req.Accepted == 0 && req.Failed > 0 {
+		policy := loadCirculationPolicy(db, tenantID)
+		var source models.ContentSource
+		if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, sourceID).First(&source).Error; err == nil {
+			interval := source.FetchIntervalMinutes
+			if interval < policy.SourceMinIntervalMinutes {
+				interval = policy.SourceMinIntervalMinutes
+			}
+			if interval > policy.SourceMinIntervalMinutes {
+				retryDue := time.Now().UTC().Add(-time.Duration(interval-policy.SourceMinIntervalMinutes) * time.Minute)
+				db.Model(&models.ContentSource{}).
+					Where("tenant_id = ? AND public_id = ? AND last_fetched_at > ?", tenantID, sourceID, retryDue).
+					UpdateColumn("last_fetched_at", retryDue)
+			}
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ─── Automation heartbeat ──────────────────────────────────────────────────
+
+// StartCirculationAutomation launches the self-running recommendation loop. A
+// single lightweight ticker fires once a minute and, for every tenant that has
+// opted in (automation_enabled), runs recommendation generation when that
+// tenant's own cadence (automation_interval_minutes) is due. Generation files
+// suggestions and — only inside the auto-apply guardrails — adjusts source
+// intervals, so the news pipeline keeps tuning itself without an admin clicking
+// "Recompute". Automation is OFF by default; enabling it is a deliberate,
+// reversible switch (flip automation_enabled back off to pause instantly).
+func StartCirculationAutomation(db *gorm.DB) {
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			runCirculationAutomationDue(db)
+		}
+	}()
+}
+
+func runCirculationAutomationDue(db *gorm.DB) {
+	var policies []models.NewsCirculationPolicy
+	if err := db.Where("automation_enabled = ?", true).Find(&policies).Error; err != nil {
+		return
+	}
+	now := time.Now()
+	for _, raw := range policies {
+		policy := sanitizeCirculationPolicy(raw)
+		due := policy.AutomationIntervalMinutes
+		if raw.LastAutomationRunAt != nil &&
+			now.Sub(*raw.LastAutomationRunAt) < time.Duration(due)*time.Minute {
+			continue
+		}
+		rows, applied := generateSourceRecommendations(db, policy)
+		db.Model(&models.NewsCirculationPolicy{}).
+			Where("id = ?", raw.ID).
+			UpdateColumn("last_automation_run_at", now)
+		writeCirculationAuditSystem(db, policy.TenantID, "circulation.automation.run", policy.TenantID, map[string]interface{}{
+			"recommendations": len(rows),
+			"auto_applied":    applied,
+			"mode":            policy.SourceCadenceMode,
+		})
+	}
+}
+
+func writeCirculationAuditSystem(db *gorm.DB, tenantID, action, resource string, payload map[string]interface{}) {
+	entry := models.AuditLog{
+		TenantID:       tenantID,
+		UserID:         "system",
+		UserEmail:      "automation",
+		Action:         action,
+		TargetService:  "news_circulation",
+		TargetResource: resource,
+		Status:         "success",
+	}
+	if payload != nil {
+		if raw, err := json.Marshal(payload); err == nil {
+			entry.Payload = datatypes.JSON(raw)
+		}
+	}
+	_ = db.Create(&entry).Error
 }
 
 // ─── Recommendation helpers ────────────────────────────────────────────────
@@ -733,14 +941,19 @@ func generateSourceRecommendations(db *gorm.DB, policy models.NewsCirculationPol
 	rows := make([]models.SourceCirculationRecommendation, 0)
 	autoApplied := 0
 	for _, source := range sources {
-		rec, ok := recommendationForSource(db, policy, source)
+		rec, runCount, ok := recommendationForSource(db, policy, source)
 		if !ok {
 			continue
 		}
 		if err := saveSourceRecommendation(db, &rec); err != nil {
 			continue
 		}
-		if policy.SourceCadenceMode == models.SourceCadenceModeAutoApply {
+		// Auto-apply is gated by three guardrails so the automatic loop can never
+		// run away: a per-run velocity cap, a confidence floor (enough telemetry
+		// behind the change), and the cost asymmetry — speed-ups (the only change
+		// that raises fetch volume/bills) stay human-gated unless explicitly opted
+		// in, while slow-downs (always cheaper/safer) can apply on their own.
+		if autoApplied < policy.MaxAutoAppliesPerRun && shouldAutoApply(policy, rec, runCount) {
 			if err := applySourceRecommendation(db, &rec); err == nil {
 				autoApplied++
 			}
@@ -748,6 +961,21 @@ func generateSourceRecommendations(db *gorm.DB, policy models.NewsCirculationPol
 		rows = append(rows, rec)
 	}
 	return rows, autoApplied
+}
+
+// shouldAutoApply decides whether a recommendation may apply without a human.
+func shouldAutoApply(policy models.NewsCirculationPolicy, rec models.SourceCirculationRecommendation, runCount int) bool {
+	if policy.SourceCadenceMode != models.SourceCadenceModeAutoApply {
+		return false
+	}
+	if runCount < policy.MinRunsForAuto {
+		return false
+	}
+	isSpeedup := rec.RecommendedIntervalMinutes < rec.CurrentIntervalMinutes
+	if isSpeedup && !policy.AutoApplySpeedups {
+		return false
+	}
+	return true
 }
 
 func saveSourceRecommendation(db *gorm.DB, rec *models.SourceCirculationRecommendation) error {
@@ -771,13 +999,13 @@ func saveSourceRecommendation(db *gorm.DB, rec *models.SourceCirculationRecommen
 	return nil
 }
 
-func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, source models.ContentSource) (models.SourceCirculationRecommendation, bool) {
+func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, source models.ContentSource) (models.SourceCirculationRecommendation, int, bool) {
 	cutoff := time.Now().AddDate(0, 0, -7)
 	var runs []models.SourceRunTelemetry
 	db.Where("tenant_id = ? AND source_id = ? AND finished_at > ?", policy.TenantID, source.PublicID, cutoff).
 		Find(&runs)
 	if len(runs) < 2 {
-		return models.SourceCirculationRecommendation{}, false
+		return models.SourceCirculationRecommendation{}, 0, false
 	}
 	var fetched, accepted, failed, duplicates, filtered int
 	for _, r := range runs {
@@ -788,7 +1016,7 @@ func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, s
 		filtered += r.Filtered
 	}
 	if fetched == 0 && accepted == 0 && failed == 0 {
-		return models.SourceCirculationRecommendation{}, false
+		return models.SourceCirculationRecommendation{}, len(runs), false
 	}
 	yield := 0.0
 	if fetched > 0 {
@@ -806,17 +1034,20 @@ func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, s
 	reason := ""
 	score := yield - failureRate
 	switch {
-	case failureRate > 0.35 || yield < 0.05:
+	case failureRate > 0.35:
 		recommended = guardedInterval(current, current*2, policy)
-		reason = "Low yield or high failure rate; slow this source down."
+		reason = "High failure rate; back this source off until it recovers."
+	case yield < 0.05:
+		recommended = guardedInterval(current, current*2, policy)
+		reason = "Very little new content (mostly duplicates/filtered); slow this source down."
 	case yield > 0.45 && failureRate < 0.15:
 		recommended = guardedInterval(current, int(math.Ceil(float64(current)/2)), policy)
-		reason = "High yield with low failures; pull this source more often."
+		reason = "High new-content yield with low failures; pull this source more often."
 	default:
-		return models.SourceCirculationRecommendation{}, false
+		return models.SourceCirculationRecommendation{}, len(runs), false
 	}
 	if recommended == current {
-		return models.SourceCirculationRecommendation{}, false
+		return models.SourceCirculationRecommendation{}, len(runs), false
 	}
 	metrics, _ := json.Marshal(gin.H{
 		"runs":         len(runs),
@@ -839,7 +1070,7 @@ func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, s
 		Reason:                     reason,
 		Mode:                       policy.SourceCadenceMode,
 		Metrics:                    datatypes.JSON(metrics),
-	}, true
+	}, len(runs), true
 }
 
 func guardedInterval(current, target int, policy models.NewsCirculationPolicy) int {
@@ -867,11 +1098,23 @@ func guardedInterval(current, target int, policy models.NewsCirculationPolicy) i
 
 func applySourceRecommendation(db *gorm.DB, rec *models.SourceCirculationRecommendation) error {
 	now := time.Now()
-	if err := db.Model(&models.ContentSource{}).
-		Where("tenant_id = ? AND public_id = ?", rec.TenantID, rec.SourceID).
-		Update("fetch_interval_minutes", rec.RecommendedIntervalMinutes).Error; err != nil {
+	var source models.ContentSource
+	if err := db.Where("tenant_id = ? AND public_id = ?", rec.TenantID, rec.SourceID).First(&source).Error; err != nil {
 		return err
 	}
+	policy := loadCirculationPolicy(db, rec.TenantID)
+	current := source.FetchIntervalMinutes
+	if current <= 0 {
+		current = policy.SourceMinIntervalMinutes
+	}
+	target := guardedInterval(current, rec.RecommendedIntervalMinutes, policy)
+	if err := db.Model(&models.ContentSource{}).
+		Where("tenant_id = ? AND public_id = ?", rec.TenantID, rec.SourceID).
+		Update("fetch_interval_minutes", target).Error; err != nil {
+		return err
+	}
+	rec.CurrentIntervalMinutes = current
+	rec.RecommendedIntervalMinutes = target
 	rec.Applied = true
 	rec.AppliedAt = &now
 	return db.Save(rec).Error

@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"content-management-system/src/models"
@@ -104,6 +103,7 @@ type StorySummary struct {
 	LastMemberAt time.Time `json:"last_member_at"`
 	Lifecycle    string    `json:"lifecycle"`
 	IsCarryover  bool      `json:"is_carryover,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
 	// Summary + Bullets are the source-grounded AI digest of the WHOLE story
 	// (Slice 8). Populated on the FEATURED story only; empty when not yet
 	// digested — the slide then falls back to the lead member's excerpt.
@@ -174,6 +174,7 @@ type storyAgg struct {
 	newestID  uuid.UUID // id of the newest member — what the client reports as "seen"
 	lifecycle string
 	carryover bool
+	reason    string
 	members   []models.ContentItem
 }
 
@@ -282,12 +283,19 @@ func assembleStoryNewsFeed(
 			}
 			if ov.PinToTop {
 				a.score = math.MaxFloat64
+				a.reason = "Editor priority"
 			} else {
 				if ov.ImportanceBoost > 0 && ov.ImportanceBoost != 1 {
 					a.score *= ov.ImportanceBoost
+					if ov.ImportanceBoost > 1 {
+						a.reason = "Editor priority"
+					}
 				}
 				if ov.Suppress {
 					a.score *= 0.1
+					if a.reason == "" {
+						a.reason = "Suppressed"
+					}
 				}
 			}
 		}
@@ -307,11 +315,17 @@ func assembleStoryNewsFeed(
 		carryovers := make([]*storyAgg, 0)
 		for _, a := range order {
 			if !a.newest.Before(circ.Window.PrimaryStart) {
+				if a.reason == "" {
+					a.reason = "Updated today"
+				}
 				primary = append(primary, a)
 				continue
 			}
 			if a.score >= circ.Policy.CarryoverMinScore {
 				a.carryover = true
+				if a.reason == "" {
+					a.reason = "Carryover fill"
+				}
 				carryovers = append(carryovers, a)
 			}
 		}
@@ -327,6 +341,9 @@ func assembleStoryNewsFeed(
 		filtered := order[:0]
 		for _, a := range order {
 			if !a.newest.Before(circ.Window.PrimaryStart) {
+				if a.reason == "" {
+					a.reason = "Inside selected window"
+				}
 				filtered = append(filtered, a)
 			}
 		}
@@ -574,6 +591,7 @@ func buildStoryFeatured(topic models.Topic, ag *storyAgg, members []models.Conte
 		LastMemberAt:   ag.newest,
 		Lifecycle:      ag.lifecycle,
 		IsCarryover:    ag.carryover,
+		Reason:         ag.reason,
 		Summary:        derefStr(topic.Summary),
 		Bullets:        parseStoryBullets(topic.Bullets),
 		Title:          derefStr(top.Title),
@@ -987,17 +1005,20 @@ func markNewsSnapshotDirty(db *gorm.DB, tenantID string) {
 		UpdateColumn("dirty", true)
 }
 
-// snapshotRebuildRunning guards the SWR background rebuild against stampedes.
-var snapshotRebuildRunning atomic.Bool
+// snapshotRebuildRunning guards SWR background rebuilds against stampedes per
+// tenant+window. Today, week, and month snapshots should not block each other.
+var snapshotRebuildRunning sync.Map
 
 // startSnapshotRebuild rebuilds the precompute snapshot in the background.
 // No-ops when a rebuild is already in flight.
 func startSnapshotRebuild(db *gorm.DB, tenantID string, window string) {
-	if !snapshotRebuildRunning.CompareAndSwap(false, true) {
+	window = normalizeNewsWindow(window)
+	key := snapshotMemKey(tenantID, window)
+	if _, loaded := snapshotRebuildRunning.LoadOrStore(key, true); loaded {
 		return
 	}
 	go func() {
-		defer snapshotRebuildRunning.Store(false)
+		defer snapshotRebuildRunning.Delete(key)
 		if _, err := buildNewsSnapshot(db, tenantID, window); err != nil {
 			log.Printf("[news-snapshot] background rebuild failed: %v", err)
 		}
@@ -1039,7 +1060,7 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 			// Cache was rebuilt between pages and the cursor story moved or
 			// dropped — resume by timestamp instead of restarting page 1.
 			for i, s := range all {
-				if !s.Featured.PublishedAt.After(lastTimestamp) {
+				if !s.Featured.LastMemberAt.After(lastTimestamp) {
 					start = i
 					break
 				}
@@ -1064,7 +1085,7 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 	var nextCursor *string
 	if len(page) == slideLimit {
 		last := page[len(page)-1]
-		cursor := utils.EncodeCursor(last.Featured.PublishedAt, last.Featured.StoryID)
+		cursor := utils.EncodeCursor(last.Featured.LastMemberAt, last.Featured.StoryID)
 		nextCursor = &cursor
 	}
 	return page, nextCursor
