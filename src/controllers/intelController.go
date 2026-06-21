@@ -385,6 +385,22 @@ func subscribersFromHealth(raw datatypes.JSON) int {
 	return h.Subscribers
 }
 
+// imageFromHealth pulls the profile avatar the discovery contributor stashed in
+// feed_health (e.g. X account photo) so promotion can surface it on the
+// suggestion without a dedicated candidate column.
+func imageFromHealth(raw datatypes.JSON) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var h struct {
+		Image string `json:"image"`
+	}
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(h.Image)
+}
+
 func healthScore(raw datatypes.JSON) float64 {
 	if len(raw) == 0 {
 		return 0.3
@@ -521,11 +537,14 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 			Category:       models.SourceCategoryNews,
 			Status:         models.SuggestionStatusPending,
 		}
+		if img := imageFromHealth(cand.FeedHealth); img != "" {
+			sug.ImageURL = &img
+		}
 		err := db.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "tenant_id"}, {Name: "profile_id"}, {Name: "canonical_key"}},
 			DoUpdates: clause.AssignmentColumns([]string{
 				"name", "type", "feed_url", "confidence", "relevance_score",
-				"sample_items", "health", "evidence", "discovered_via", "category", "updated_at",
+				"sample_items", "health", "evidence", "discovered_via", "category", "image_url", "updated_at",
 			}),
 		}).Create(&sug).Error
 		if err == nil {
