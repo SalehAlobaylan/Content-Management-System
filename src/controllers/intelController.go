@@ -3,9 +3,11 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"encoding/json"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -401,6 +403,149 @@ func imageFromHealth(raw datatypes.JSON) string {
 	return strings.TrimSpace(h.Image)
 }
 
+// ---------- source classification (deterministic, multi-signal) ----------
+//
+// Tags a discovered source OFFICIAL / NEWS / PERSON / OTHER so reviewers can scan
+// and filter by type. No LLM — combines bio-URL TLD, an outlet allowlist (fixes
+// keyword-less outlets like AlArabiya), and multilingual (AR/EN) keyword scoring
+// with a tie-break of OFFICIAL > NEWS > PERSON. RSS feeds default to NEWS.
+
+const (
+	SourceClassOfficial = "official"
+	SourceClassNews     = "news"
+	SourceClassPerson   = "person"
+	SourceClassOther    = "other"
+)
+
+// Major Arabic outlets whose bios lack obvious news keywords. Handle (lowercased).
+var newsOutletAllowlist = map[string]bool{
+	"alarabiya": true, "alarabiya_brk": true, "alarabiya_egy": true, "alhadath": true,
+	"skynewsarabia": true, "skynewsarabia_b": true, "ajarabic": true, "ajabreaking": true,
+	"ajmubasher": true, "bbcarabic": true, "rtarabic": true, "rtarabic_bn": true,
+	"france24_ar": true, "almayadeennews": true, "akhbaar24": true, "okaznews": true,
+	"aawsat": true, "cnbcarabia": true, "alhurranews": true, "aa_arabic": true,
+	"youm7": true, "almasryalyoum": true, "alahram": true, "alqabas": true,
+	"arabi21news": true, "rassdnewsn": true, "elwatannews": true, "trtarabi": true,
+}
+
+// Keyword-less official accounts — rulers/royals + state entities/regulators whose
+// bios carry no gov keyword (so the LLM fallback / keyword pass would miss them).
+var officialAllowlist = map[string]bool{
+	"kingsalman": true, "mohamedbinzayed": true, "hhshkmohd": true, "hamdanmohammed": true,
+	"abzayed": true, "saudivision2030": true, "tadawul": true, "pif_en": true, "pifsaudi": true,
+	"sama_gov": true, "saudicma": true, "spagov": true, "absher": true,
+}
+
+var officialStrongKW = []string{
+	"حكوم", "وزار", "أمانة", "امانة", "إمارة", "امارة", "ديوان", "رئاسة", "سفار",
+	"government", "ministry", "minister", "municipal", "embassy", "governorate", "royal court",
+}
+var officialWeakKW = []string{"هيئة", "authority", "official account"}
+var newsKW = []string{
+	"أخبار", "اخبار", "خبر", "عاجل", "قناة", "صحيف", "جريدة", "وكالة", "أنباء", "انباء",
+	"إعلام", "اعلام", "نيوز", "شبكة", "تلفز", "إذاع", "اذاع", "صحاف",
+	"news", "media", "press", "newspaper", "agency", "broadcast", "journal",
+}
+var personKW = []string{
+	"صحفي", "صحافي", "إعلامي", "اعلامي", "كاتب", "محلل", "مذيع", "رئيس تحرير", "مؤلف", "ناشط",
+	"journalist", "writer", "columnist", "anchor", "analyst", "author", "presenter", "reporter", "editor",
+}
+var newsHandleTokens = []string{"news", "tv", "press", "akhbar", "sabq", "media"}
+
+func countMatches(text string, kws []string) int {
+	n := 0
+	for _, k := range kws {
+		if strings.Contains(text, k) {
+			n++
+		}
+	}
+	return n
+}
+
+func feedHealthStr(raw datatypes.JSON, key string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	if s, ok := m[key].(string); ok {
+		return s
+	}
+	return ""
+}
+
+// classifySource returns the source class for a discovered candidate.
+func classifySource(cand *models.SourceCandidate) string {
+	handle := strings.ToLower(strings.TrimSpace(cand.Domain))
+	bio := feedHealthStr(cand.FeedHealth, "bio")
+	url := strings.ToLower(feedHealthStr(cand.FeedHealth, "url"))
+	titles := strings.Join(sampleTitleListFromCandidate(cand.SampleTitles), " ")
+	text := strings.ToLower(handle + " " + bio + " " + titles)
+	isRSS := cand.Kind != models.CandidateKindTwitter && cand.Kind != models.CandidateKindTelegram
+
+	// 1. Authoritative: a government/military bio website (or RSS host).
+	govProbe := url
+	if isRSS {
+		govProbe = handle
+	}
+	if strings.Contains(govProbe, ".gov") || strings.Contains(govProbe, "gov.") || strings.Contains(govProbe, ".mil") {
+		return SourceClassOfficial
+	}
+	// 2. Allowlists for keyword-less accounts (official rulers/entities, major outlets).
+	if officialAllowlist[handle] {
+		return SourceClassOfficial
+	}
+	if newsOutletAllowlist[handle] {
+		return SourceClassNews
+	}
+
+	// 3. Weighted keyword scoring.
+	official := countMatches(text, officialStrongKW)*5 + countMatches(text, officialWeakKW)*2
+	news := countMatches(text, newsKW) * 2
+	person := countMatches(text, personKW) * 3
+	for _, tok := range newsHandleTokens {
+		if strings.Contains(handle, tok) {
+			news += 2
+			break
+		}
+	}
+
+	switch {
+	case official > 0 && official >= news && official >= person:
+		return SourceClassOfficial
+	case news > 0 && news >= person:
+		return SourceClassNews
+	case person > 0:
+		return SourceClassPerson
+	case isRSS:
+		// RSS feeds in this pipeline are news sources by construction.
+		return SourceClassNews
+	default:
+		return SourceClassOther
+	}
+}
+
+// ClassifySuggestion runs the deterministic classifier over an existing
+// suggestion's stored signals (handle/name, sample_items, health). Used to
+// backfill source_class onto suggestions promoted before classification existed.
+func ClassifySuggestion(s *models.SourceSuggestion) string {
+	kind := ""
+	switch s.Type {
+	case models.SourceTypeTwitter:
+		kind = models.CandidateKindTwitter
+	case models.SourceTypeTelegram:
+		kind = models.CandidateKindTelegram
+	}
+	return classifySource(&models.SourceCandidate{
+		Domain:       strings.ToLower(strings.TrimSpace(s.Name)),
+		Kind:         kind,
+		SampleTitles: s.SampleItems,
+		FeedHealth:   s.Health,
+	})
+}
+
 func healthScore(raw datatypes.JSON) float64 {
 	if len(raw) == 0 {
 		return 0.3
@@ -442,14 +587,77 @@ func promoteCandidatesForAllProfiles(db *gorm.DB, tenantID string) int {
 	db.Where("tenant_id = ? AND feed_valid = ? AND status NOT IN ?", tenantID, true, []string{models.CandidateStatusApproved, models.CandidateStatusRejected}).
 		Order("authority_score desc").Limit(80).Find(&candidates)
 
+	// Classify each candidate ONCE (class is per-account, not per-profile).
+	classMap, methodMap := classifyCandidates(candidates)
+
 	total := 0
 	for i := range profiles {
-		total += promoteForProfile(db, tenantID, &profiles[i], cfg, candidates)
+		total += promoteForProfile(db, tenantID, &profiles[i], cfg, candidates, classMap, methodMap)
 	}
 	return total
 }
 
-func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryProfile, cfg models.DiscoveryConfig, candidates []models.SourceCandidate) int {
+// classifyCandidates tags every candidate OFFICIAL/NEWS/PERSON/OTHER. The cheap
+// deterministic pass runs for all; ambiguous ("other") X/Telegram accounts that
+// carry a bio escalate, in one batch, to Enrichment's cached LLM classifier
+// (on by default; set LLM_SOURCE_CLASSIFY_ENABLED=false to disable). Returns
+// candID -> class and candID -> method ("rule" | "llm").
+func classifyCandidates(candidates []models.SourceCandidate) (map[uint]string, map[uint]string) {
+	classMap := make(map[uint]string, len(candidates))
+	methodMap := make(map[uint]string, len(candidates))
+	for i := range candidates {
+		classMap[candidates[i].ID] = classifySource(&candidates[i])
+		methodMap[candidates[i].ID] = "rule"
+	}
+
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("LLM_SOURCE_CLASSIFY_ENABLED")), "false") {
+		return classMap, methodMap
+	}
+
+	const maxLLM = 40
+	var batch []accountToClassify
+	var ids []uint
+	for i := range candidates {
+		if len(batch) >= maxLLM {
+			break
+		}
+		c := &candidates[i]
+		if classMap[c.ID] != SourceClassOther {
+			continue
+		}
+		if c.Kind != models.CandidateKindTwitter && c.Kind != models.CandidateKindTelegram {
+			continue // RSS has no bio; stays news-default.
+		}
+		bio := feedHealthStr(c.FeedHealth, "bio")
+		name := ""
+		if titles := sampleTitleListFromCandidate(c.SampleTitles); len(titles) > 0 {
+			name = titles[0]
+		}
+		if strings.TrimSpace(bio) == "" && strings.TrimSpace(name) == "" {
+			continue // nothing to reason over.
+		}
+		batch = append(batch, accountToClassify{Handle: c.Domain, Name: name, Bio: bio})
+		ids = append(ids, c.ID)
+	}
+	if len(batch) == 0 {
+		return classMap, methodMap
+	}
+
+	results, err := classifyAccountsViaEnrichment(batch)
+	if err != nil {
+		log.Printf("source classify: LLM fallback failed (keeping deterministic): %v", err)
+		return classMap, methodMap
+	}
+	for j, acc := range batch {
+		if cls, ok := results[strings.ToLower(strings.TrimSpace(acc.Handle))]; ok && cls != "" && cls != SourceClassOther {
+			classMap[ids[j]] = cls
+			methodMap[ids[j]] = "llm"
+		}
+	}
+	return classMap, methodMap
+}
+
+func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryProfile, cfg models.DiscoveryConfig, candidates []models.SourceCandidate, classMap map[uint]string, methodMap map[uint]string) int {
 	profileVec, ok := ensureProfileEmbedding(db, profile)
 	if !ok {
 		return 0
@@ -517,6 +725,12 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 		}
 		if subs := subscribersFromHealth(cand.FeedHealth); subs > 0 {
 			ev["subscribers"] = subs
+		}
+		if cls, ok := classMap[cand.ID]; ok {
+			ev["source_class"] = cls
+			ev["source_class_method"] = methodMap[cand.ID]
+		} else {
+			ev["source_class"] = classifySource(cand)
 		}
 		evidence, _ := json.Marshal(ev)
 

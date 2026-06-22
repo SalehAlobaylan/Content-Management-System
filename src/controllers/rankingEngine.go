@@ -227,7 +227,7 @@ func LoadContentFlags(db *gorm.DB, tenantID string, contentIDs []uuid.UUID) map[
 // Core scoring pipeline
 // ----------------------------------------------------------------
 
-// ScoreItems scores a batch of content items using the 7-signal ranking engine.
+// ScoreItems scores a batch of content items using the ranking engine.
 func ScoreItems(items []models.ContentItem, config models.RankingConfig, flagMap map[uuid.UUID]models.ContentFlag, velocityData VelocityData, now time.Time) []ScoredItem {
 	if len(items) == 0 {
 		return nil
