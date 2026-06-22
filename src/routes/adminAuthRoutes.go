@@ -200,4 +200,11 @@ func registerCirculationRoutes(adminGroup *gin.RouterGroup, prefix string) {
 	adminGroup.POST(prefix+"/source-recommendations/generate", perm("feed", "manage"), controllers.GenerateSourceRecommendations)
 	adminGroup.POST(prefix+"/source-recommendations/:id/apply", perm("feed", "manage"), controllers.ApplySourceRecommendation)
 	adminGroup.POST(prefix+"/sweep-now", perm("feed", "manage"), controllers.RunCirculationSweepNow)
+	adminGroup.GET(prefix+"/autopilot/status", perm("feed", "read"), controllers.GetCirculationAutopilotStatus)
+	adminGroup.PATCH(prefix+"/autopilot/settings", perm("feed", "manage"), controllers.UpdateCirculationAutopilotSettings)
+	adminGroup.POST(prefix+"/autopilot/run", perm("feed", "manage"), controllers.RunCirculationAutopilotNow)
+	adminGroup.POST(prefix+"/autopilot/boost", perm("feed", "manage"), controllers.BoostCirculationAutopilot)
+	adminGroup.POST(prefix+"/autopilot/pause", perm("feed", "manage"), controllers.PauseCirculationAutopilot)
+	adminGroup.GET(prefix+"/autopilot/runs", perm("feed", "read"), controllers.ListCirculationAutopilotRuns)
+	adminGroup.GET(prefix+"/autopilot/runs/:id", perm("feed", "read"), controllers.GetCirculationAutopilotRun)
 }

@@ -22,6 +22,19 @@ const (
 	SourceCadenceModeSuggest   = "suggest"
 	SourceCadenceModeAutoApply = "auto_apply"
 	SourceCadenceModeManual    = "manual"
+
+	NewsAutopilotModeAssist   = "assist"
+	NewsAutopilotModeSafeAuto = "safe_auto"
+
+	NewsAutopilotToolScopeCore    = "core"
+	NewsAutopilotToolScopeBoosted = "boosted"
+
+	NewsAutopilotStateHealthy  = "healthy"
+	NewsAutopilotStateWatching = "watching"
+	NewsAutopilotStateBoosting = "boosting"
+	NewsAutopilotStateSafety   = "safety"
+	NewsAutopilotStatePaused   = "paused"
+	NewsAutopilotStateDegraded = "degraded"
 )
 
 // NewsCirculationPolicy stores the tenant-level story circulation knobs. It is
@@ -67,6 +80,18 @@ type NewsCirculationPolicy struct {
 	MinRunsForAuto            int        `gorm:"type:integer;not null;default:4" json:"min_runs_for_auto"`
 	LastAutomationRunAt       *time.Time `gorm:"type:timestamp" json:"last_automation_run_at,omitempty"`
 
+	// News Autopilot — deterministic circulation orchestration. It supervises
+	// the existing source tuning heartbeat, snapshot refresh, queue checks, and
+	// boosted freshness tools without making structural editorial changes.
+	AutopilotEnabled          bool       `gorm:"not null;default:false" json:"autopilot_enabled"`
+	AutopilotMode             string     `gorm:"type:varchar(24);not null;default:'safe_auto'" json:"autopilot_mode"`
+	AutopilotIntervalMinutes  int        `gorm:"type:integer;not null;default:60" json:"autopilot_interval_minutes"`
+	AutopilotBoostUntil       *time.Time `gorm:"type:timestamp" json:"autopilot_boost_until,omitempty"`
+	AutopilotPausedUntil      *time.Time `gorm:"type:timestamp" json:"autopilot_paused_until,omitempty"`
+	AutopilotLastRunAt        *time.Time `gorm:"type:timestamp" json:"autopilot_last_run_at,omitempty"`
+	AutopilotMaxQueueDepth    int        `gorm:"type:integer;not null;default:100" json:"autopilot_max_queue_depth"`
+	AutopilotMaxActionsPerRun int        `gorm:"type:integer;not null;default:8" json:"autopilot_max_actions_per_run"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -103,7 +128,66 @@ func DefaultNewsCirculationPolicy(tenantID string) NewsCirculationPolicy {
 		AutoApplySpeedups:         false,
 		MaxAutoAppliesPerRun:      5,
 		MinRunsForAuto:            4,
+		AutopilotEnabled:          false,
+		AutopilotMode:             NewsAutopilotModeSafeAuto,
+		AutopilotIntervalMinutes:  60,
+		AutopilotMaxQueueDepth:    100,
+		AutopilotMaxActionsPerRun: 8,
 	}
+}
+
+// NewsAutopilotRun records one deterministic Autopilot pass. A pass may be
+// scheduled, manual, or boosted; actions below provide the detailed ledger.
+type NewsAutopilotRun struct {
+	ID       uint      `gorm:"primaryKey" json:"-"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_news_autopilot_runs_public_id" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;index:idx_news_autopilot_runs_tenant" json:"tenant_id"`
+
+	Trigger   string `gorm:"type:varchar(24);not null" json:"trigger"`
+	Mode      string `gorm:"type:varchar(24);not null" json:"mode"`
+	ToolScope string `gorm:"type:varchar(24);not null" json:"tool_scope"`
+	Status    string `gorm:"type:varchar(24);not null;index:idx_news_autopilot_runs_status" json:"status"`
+
+	StartedAt    time.Time      `gorm:"type:timestamp;not null;index:idx_news_autopilot_runs_started_at" json:"started_at"`
+	FinishedAt   *time.Time     `gorm:"type:timestamp" json:"finished_at,omitempty"`
+	Summary      string         `gorm:"type:text" json:"summary,omitempty"`
+	HealthBefore datatypes.JSON `gorm:"type:jsonb" json:"health_before,omitempty"`
+	HealthAfter  datatypes.JSON `gorm:"type:jsonb" json:"health_after,omitempty"`
+	CreatedBy    string         `gorm:"type:varchar(255)" json:"created_by,omitempty"`
+	Error        string         `gorm:"type:text" json:"error,omitempty"`
+
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+func (NewsAutopilotRun) TableName() string {
+	return "news_autopilot_runs"
+}
+
+// NewsAutopilotAction is the audit-grade ledger for every tool Autopilot
+// attempted, skipped, completed, or failed during a run.
+type NewsAutopilotAction struct {
+	ID       uint      `gorm:"primaryKey" json:"-"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_news_autopilot_actions_public_id" json:"id"`
+	RunID    uint      `gorm:"not null;index:idx_news_autopilot_actions_run_id" json:"-"`
+	TenantID string    `gorm:"type:varchar(64);not null;index:idx_news_autopilot_actions_tenant" json:"tenant_id"`
+
+	ToolName string `gorm:"type:varchar(80);not null;index:idx_news_autopilot_actions_tool" json:"tool_name"`
+	Status   string `gorm:"type:varchar(24);not null;index:idx_news_autopilot_actions_status" json:"status"`
+	Reason   string `gorm:"type:text" json:"reason,omitempty"`
+
+	Input      datatypes.JSON `gorm:"type:jsonb" json:"input,omitempty"`
+	Output     datatypes.JSON `gorm:"type:jsonb" json:"output,omitempty"`
+	Error      string         `gorm:"type:text" json:"error,omitempty"`
+	StartedAt  time.Time      `gorm:"type:timestamp;not null" json:"started_at"`
+	FinishedAt *time.Time     `gorm:"type:timestamp" json:"finished_at,omitempty"`
+
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+func (NewsAutopilotAction) TableName() string {
+	return "news_autopilot_actions"
 }
 
 // NewsStoryOverride is the story-level exception layer. It targets topics,

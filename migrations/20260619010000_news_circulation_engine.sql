@@ -5,11 +5,11 @@
 -- reviewable source-cadence recommendations.
 
 ALTER TABLE news_snapshots
-    ADD COLUMN IF NOT EXISTS window VARCHAR(16) NOT NULL DEFAULT 'today';
+    ADD COLUMN IF NOT EXISTS "window" VARCHAR(16) NOT NULL DEFAULT 'today';
 
 DROP INDEX IF EXISTS idx_news_snapshot_tenant;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_news_snapshot_tenant_window
-    ON news_snapshots (tenant_id, window);
+    ON news_snapshots (tenant_id, "window");
 
 CREATE TABLE IF NOT EXISTS news_circulation_policies (
     id BIGSERIAL PRIMARY KEY,

@@ -75,9 +75,9 @@ const storyScoreColumns = "public_id, tenant_id, type, source, status, topic_id,
 
 // StoryMember is one post (NEWS item) inside a story.
 type StoryMember struct {
-	ID             uuid.UUID `json:"id"`
-	Type           string    `json:"type"`
-	Format         string    `json:"format,omitempty"`
+	ID     uuid.UUID `json:"id"`
+	Type   string    `json:"type"`
+	Format string    `json:"format,omitempty"`
 	// Source (RSS/TELEGRAM/...) lets the UI distinguish a Telegram channel post
 	// (which ingests as format=ARTICLE) from an RSS article for honest badging.
 	Source         string    `json:"source,omitempty"`
@@ -110,22 +110,22 @@ type StorySummary struct {
 	// Summary + Bullets are the source-grounded AI digest of the WHOLE story
 	// (Slice 8). Populated on the FEATURED story only; empty when not yet
 	// digested — the slide then falls back to the lead member's excerpt.
-	Summary        string    `json:"summary,omitempty"`
-	Bullets        []string  `json:"bullets,omitempty"`
+	Summary string   `json:"summary,omitempty"`
+	Bullets []string `json:"bullets,omitempty"`
 	// Category is the story's news-taxonomy slug (politics/economy/...), shown as
 	// the topic chip. Present on featured + related; empty/general → no chip.
-	Category       string    `json:"category,omitempty"`
-	Title          string    `json:"title,omitempty"`
-	Excerpt        string    `json:"excerpt,omitempty"`
-	ThumbnailURL   string    `json:"thumbnail_url,omitempty"`
-	SourceName     string    `json:"source_name,omitempty"`
-	SourceImageURL string    `json:"source_image_url,omitempty"`
+	Category       string `json:"category,omitempty"`
+	Title          string `json:"title,omitempty"`
+	Excerpt        string `json:"excerpt,omitempty"`
+	ThumbnailURL   string `json:"thumbnail_url,omitempty"`
+	SourceName     string `json:"source_name,omitempty"`
+	SourceImageURL string `json:"source_image_url,omitempty"`
 	// Format + Source of the LEAD member, so a related-story card badges by its
 	// lead post's real type (article/tweet/comment) and detects Telegram leads.
-	Format         string    `json:"format,omitempty"`
-	Source         string    `json:"source,omitempty"`
-	PublishedAt    time.Time `json:"published_at"`
-	MemberCount    int       `json:"member_count"`
+	Format      string    `json:"format,omitempty"`
+	Source      string    `json:"source,omitempty"`
+	PublishedAt time.Time `json:"published_at"`
+	MemberCount int       `json:"member_count"`
 	// SourceCount is the number of DISTINCT sources among the story's hydrated
 	// members — the Radar-style "covered by N sources" signal. Computed for
 	// the featured story only (related cards show member_count); 0 = not
@@ -1037,7 +1037,7 @@ func loadCachedSnapshot(db *gorm.DB, tenantID string, window string) (slides []S
 	}
 	if err := db.Model(&models.NewsSnapshot{}).
 		Select("dirty, built_at").
-		Where("tenant_id = ? AND window = ?", tenantID, window).
+		Where("tenant_id = ? AND \"window\" = ?", tenantID, window).
 		Scan(&head).Error; err != nil || head.BuiltAt.IsZero() {
 		return nil, time.Time{}, false, false
 	}
@@ -1047,7 +1047,7 @@ func loadCachedSnapshot(db *gorm.DB, tenantID string, window string) (slides []S
 		}
 	}
 	var snap models.NewsSnapshot
-	if err := db.Where("tenant_id = ? AND window = ?", tenantID, window).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
+	if err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, window).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
 		return nil, time.Time{}, false, false
 	}
 	var all []StorySlide
@@ -1158,10 +1158,10 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 // background rebuild when stale — even the escape hatch never fossilizes.
 func serveNewsSnapshot(db *gorm.DB, tenantID string, circ circulationContext, lastTimestamp time.Time, lastID uuid.UUID, slideLimit int, seenIDs []uuid.UUID) ([]StorySlide, *string) {
 	var snap models.NewsSnapshot
-	err := db.Where("tenant_id = ? AND window = ?", tenantID, circ.Window.Name).First(&snap).Error
+	err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, circ.Window.Name).First(&snap).Error
 	if err != nil || len(snap.Slides) == 0 {
 		_, _ = buildNewsSnapshot(db, tenantID, circ.Window.Name)
-		if err := db.Where("tenant_id = ? AND window = ?", tenantID, circ.Window.Name).First(&snap).Error; err != nil {
+		if err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, circ.Window.Name).First(&snap).Error; err != nil {
 			return []StorySlide{}, nil
 		}
 	} else if snap.Dirty || time.Since(snap.BuiltAt) > newsSnapshotTTL {

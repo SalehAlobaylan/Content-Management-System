@@ -149,6 +149,8 @@ func main() {
 			&models.NewsStoryOverride{},
 			&models.SourceRunTelemetry{},
 			&models.SourceCirculationRecommendation{},
+			&models.NewsAutopilotRun{},
+			&models.NewsAutopilotAction{},
 			// Saved syndication feeds (RSS/Atom/JSON)
 			&models.RSSFeed{},
 			// Storage management

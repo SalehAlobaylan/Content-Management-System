@@ -136,6 +136,29 @@ func sanitizeCirculationPolicy(policy models.NewsCirculationPolicy) models.NewsC
 	if policy.MinRunsForAuto > 100 {
 		policy.MinRunsForAuto = 100
 	}
+	switch policy.AutopilotMode {
+	case models.NewsAutopilotModeAssist, models.NewsAutopilotModeSafeAuto:
+	default:
+		policy.AutopilotMode = models.NewsAutopilotModeSafeAuto
+	}
+	if policy.AutopilotIntervalMinutes < 5 {
+		policy.AutopilotIntervalMinutes = 5
+	}
+	if policy.AutopilotIntervalMinutes > 1440 {
+		policy.AutopilotIntervalMinutes = 1440
+	}
+	if policy.AutopilotMaxQueueDepth < 1 {
+		policy.AutopilotMaxQueueDepth = 100
+	}
+	if policy.AutopilotMaxQueueDepth > 10000 {
+		policy.AutopilotMaxQueueDepth = 10000
+	}
+	if policy.AutopilotMaxActionsPerRun < 1 {
+		policy.AutopilotMaxActionsPerRun = 8
+	}
+	if policy.AutopilotMaxActionsPerRun > 50 {
+		policy.AutopilotMaxActionsPerRun = 50
+	}
 	return policy
 }
 
@@ -325,6 +348,9 @@ func UpdateCirculationPolicy(c *gin.Context) {
 			"source_claim_batch_size", "source_min_interval_minutes", "source_max_interval_minutes",
 			"source_max_change_percent", "automation_enabled", "automation_interval_minutes",
 			"auto_apply_speedups", "max_auto_applies_per_run", "min_runs_for_auto", "updated_at",
+			"autopilot_enabled", "autopilot_mode", "autopilot_interval_minutes",
+			"autopilot_boost_until", "autopilot_paused_until", "autopilot_max_queue_depth",
+			"autopilot_max_actions_per_run",
 		}),
 	}).Create(&req).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to save policy", Code: "SAVE_FAILED"})
@@ -718,7 +744,7 @@ func InternalClaimCirculationSources(c *gin.Context) {
 			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ?",
 				now.Add(-time.Duration(policy.SourceMinIntervalMinutes)*time.Minute))
 		} else {
-			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ? - make_interval(mins => GREATEST(fetch_interval_minutes, ?))",
+			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < (?::timestamp - (GREATEST(fetch_interval_minutes, ?)::integer * interval '1 minute'))",
 				now, policy.SourceMinIntervalMinutes)
 		}
 
@@ -870,14 +896,10 @@ func InternalReportSourceRun(c *gin.Context) {
 
 // ─── Automation heartbeat ──────────────────────────────────────────────────
 
-// StartCirculationAutomation launches the self-running recommendation loop. A
-// single lightweight ticker fires once a minute and, for every tenant that has
-// opted in (automation_enabled), runs recommendation generation when that
-// tenant's own cadence (automation_interval_minutes) is due. Generation files
-// suggestions and — only inside the auto-apply guardrails — adjusts source
-// intervals, so the news pipeline keeps tuning itself without an admin clicking
-// "Recompute". Automation is OFF by default; enabling it is a deliberate,
-// reversible switch (flip automation_enabled back off to pause instantly).
+// StartCirculationAutomation launches the self-running circulation loop. A
+// single lightweight ticker fires once a minute. Tenants with Autopilot enabled
+// run the full deterministic orchestration pass when due; tenants without
+// Autopilot keep the legacy source-recommendation heartbeat unchanged.
 func StartCirculationAutomation(db *gorm.DB) {
 	go func() {
 		ticker := time.NewTicker(1 * time.Minute)
@@ -890,12 +912,32 @@ func StartCirculationAutomation(db *gorm.DB) {
 
 func runCirculationAutomationDue(db *gorm.DB) {
 	var policies []models.NewsCirculationPolicy
-	if err := db.Where("automation_enabled = ?", true).Find(&policies).Error; err != nil {
+	if err := db.Where("automation_enabled = ? OR autopilot_enabled = ?", true, true).Find(&policies).Error; err != nil {
 		return
 	}
 	now := time.Now()
 	for _, raw := range policies {
 		policy := sanitizeCirculationPolicy(raw)
+		if policy.AutopilotEnabled {
+			if raw.AutopilotLastRunAt != nil &&
+				now.Sub(*raw.AutopilotLastRunAt) < time.Duration(policy.AutopilotIntervalMinutes)*time.Minute {
+				continue
+			}
+			run, _, err := runCirculationAutopilot(db, policy.TenantID, autopilotRunOptions{
+				Trigger:   "scheduled",
+				ToolScope: models.NewsAutopilotToolScopeCore,
+				CreatedBy: "automation",
+			})
+			payload := map[string]interface{}{
+				"status": run.Status,
+				"scope":  run.ToolScope,
+			}
+			if err != nil {
+				payload["error"] = err.Error()
+			}
+			writeCirculationAuditSystem(db, policy.TenantID, "circulation.autopilot.scheduled", policy.TenantID, payload)
+			continue
+		}
 		due := policy.AutomationIntervalMinutes
 		if raw.LastAutomationRunAt != nil &&
 			now.Sub(*raw.LastAutomationRunAt) < time.Duration(due)*time.Minute {

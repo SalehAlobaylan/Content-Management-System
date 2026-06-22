@@ -137,6 +137,28 @@ func TestSanitizeCirculationPolicyEnforcesCadenceGuardrails(t *testing.T) {
 	}
 }
 
+func TestSanitizeCirculationPolicyEnforcesAutopilotGuardrails(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.AutopilotMode = "wild"
+	policy.AutopilotIntervalMinutes = 1
+	policy.AutopilotMaxQueueDepth = -10
+	policy.AutopilotMaxActionsPerRun = 500
+
+	got := sanitizeCirculationPolicy(policy)
+	if got.AutopilotMode != models.NewsAutopilotModeSafeAuto {
+		t.Fatalf("autopilot mode = %s, want safe_auto", got.AutopilotMode)
+	}
+	if got.AutopilotIntervalMinutes != 5 {
+		t.Fatalf("autopilot interval = %d, want 5", got.AutopilotIntervalMinutes)
+	}
+	if got.AutopilotMaxQueueDepth != 100 {
+		t.Fatalf("autopilot max queue = %d, want default 100", got.AutopilotMaxQueueDepth)
+	}
+	if got.AutopilotMaxActionsPerRun != 50 {
+		t.Fatalf("autopilot max actions = %d, want ceiling 50", got.AutopilotMaxActionsPerRun)
+	}
+}
+
 func TestSanitizeOverrideBoostBoundsManualExceptions(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -156,6 +178,49 @@ func TestSanitizeOverrideBoostBoundsManualExceptions(t *testing.T) {
 				t.Fatalf("boost = %f, want %f", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAutopilotStateAndToolAccessRespectSafety(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.AutopilotEnabled = true
+	policy.AutopilotMaxQueueDepth = 10
+	boostUntil := time.Now().Add(time.Hour)
+	policy.AutopilotBoostUntil = &boostUntil
+	health := autopilotHealthSignal{
+		AggregationReachable: true,
+		QueueDepth:           25,
+		MaxQueueDepth:        10,
+	}
+
+	if got := autopilotStateForPolicy(policy, health, time.Now()); got != models.NewsAutopilotStateSafety {
+		t.Fatalf("state = %s, want safety to take precedence over active boost window", got)
+	}
+	allowed, blocked := autopilotToolAccess(policy, health, time.Now())
+	for _, tool := range allowed {
+		if tool == "circulation.sweep" {
+			t.Fatalf("circulation sweep should be blocked while queue depth is unsafe")
+		}
+	}
+	found := false
+	for _, tool := range blocked {
+		if tool.Name == "circulation.sweep" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected circulation.sweep in blocked tools")
+	}
+}
+
+func TestRelevantQueueDepthOnlyCountsNewsToolbeltQueues(t *testing.T) {
+	stats := []autopilotQueueStat{
+		{Queue: "fetch-queue", Waiting: 2, Active: 1, Delayed: 3},
+		{Queue: "news-circulation-queue", Waiting: 4},
+		{Queue: "media-queue", Waiting: 100},
+	}
+	if got := relevantQueueDepth(stats); got != 10 {
+		t.Fatalf("queue depth = %d, want 10", got)
 	}
 }
 
