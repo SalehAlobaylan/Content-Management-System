@@ -13,8 +13,8 @@ func SetupPostRoutes(router gin.IRouter, db *gorm.DB) {
 	// letting anyone create/overwrite/delete posts.
 	admin := utils.AdminAuthMiddleware(db)
 	router.GET("/posts", controllers.GetPosts)
-	router.POST("/posts", admin, controllers.CreatePost)
+	router.POST("/posts", admin, utils.RequireAdminPermission("content", "write"), controllers.CreatePost)
 	router.GET("/posts/:id", controllers.GetPost)
-	router.PUT("/posts/:id", admin, controllers.UpdatePost)
-	router.DELETE("/posts/:id", admin, controllers.DeletePost)
+	router.PUT("/posts/:id", admin, utils.RequireAdminPermission("content", "write"), controllers.UpdatePost)
+	router.DELETE("/posts/:id", admin, utils.RequireAdminPermission("content", "delete"), controllers.DeletePost)
 }

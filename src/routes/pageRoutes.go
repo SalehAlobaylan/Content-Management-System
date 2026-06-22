@@ -12,9 +12,9 @@ func SetupPageRoutes(router gin.IRouter, db *gorm.DB) {
 	// Mutations require an admin JWT — previously these were unauthenticated,
 	// letting anyone create/overwrite/delete pages.
 	admin := utils.AdminAuthMiddleware(db)
-	router.POST("/pages", admin, controllers.CreatePage)
+	router.POST("/pages", admin, utils.RequireAdminPermission("content", "write"), controllers.CreatePage)
 	router.GET("/pages", controllers.GetPages)
 	router.GET("/pages/:id", controllers.GetPage)
-	router.PUT("/pages/:id", admin, controllers.UpdatePage)
-	router.DELETE("/pages/:id", admin, controllers.DeletePage)
+	router.PUT("/pages/:id", admin, utils.RequireAdminPermission("content", "write"), controllers.UpdatePage)
+	router.DELETE("/pages/:id", admin, utils.RequireAdminPermission("content", "delete"), controllers.DeletePage)
 }

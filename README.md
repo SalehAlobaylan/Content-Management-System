@@ -60,7 +60,8 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `JWT_EXPIRATION_HOURS` | no | 24 | Token lifetime (dev admin seed) |
 | `JWT_ISSUER` | no | cms-service | Issuer claim |
 | `JWT_AUDIENCE` | no | platform-console | Audience claim |
-| `JWT_ALLOWED_ISSUERS` | no | `cms-service,iam-authorization-service` | Accepted token issuers |
+| `JWT_ALLOWED_ISSUERS` | no | `cms-service,iam-authorization-service` | Accepted token issuers. Empty-issuer tokens are rejected (`iss` must be listed) |
+| `JWT_ALLOWED_AUDIENCES` | no | — (disabled) | Optional `aud` allowlist (comma-separated); when unset, audience checks are skipped |
 | `JWT_REQUIRE_TENANT_ID` | no | false | Enforce tenant claim |
 | `DEFAULT_TENANT_ID` | no | default | Fallback tenant |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_ROLE` | no | — | Seed a dev admin user |
@@ -72,10 +73,10 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 
 ## Authentication
 
-CMS **does not log anyone in** — IAM issues JWTs (HS256). Platform-Console and Wahb-Platform attach `Authorization: Bearer <token>`; CMS validates the signature and issuer (`JWT_ALLOWED_ISSUERS`). There is no `/admin/login` route on CMS.
+CMS **does not log anyone in** — IAM issues JWTs (HS256). Platform-Console and Wahb-Platform attach `Authorization: Bearer <token>`; CMS validates the signature and issuer (`JWT_ALLOWED_ISSUERS`; empty issuers rejected) and optionally the audience (`JWT_ALLOWED_AUDIENCES`). There is no `/admin/login` route on CMS.
 
-- **Admin routes** (`/admin/*`) — require a valid IAM JWT (`AdminAuthMiddleware`).
-- **User routes** (`/api/v1/content/mine`, `/content/submit`, interactions) — require a user JWT (`UserAuthMiddleware`); some accept an optional session via `OptionalUserAuthMiddleware`.
+- **Admin routes** (`/admin/*`) — authenticate with a valid IAM JWT (`AdminAuthMiddleware`), then **authorize per route via per-permission RBAC** (`RequireAdminPermission(resource, action)` in `src/utils/admin_authz_middleware.go`). Authorization reads the token's flattened `permissions` claim — the `admin` role bypasses, `resource:*`/`*:*` wildcards are honored, and a plain `user` token gets **403**. `manager`/`editor`/`agent` get exactly their seeded scope. `POST /admin/restart` is `admin`-role-only (`RequireAdminRole`). Mapping: sources/discovery→`source:*`, content/topics/enrichment/quality/transcription/studio/flags/analytics→`content:*`, feeds/intelligence-modes/ranking/circulation→`feed:*`, storage→`aggregation:*`, audit→`iam:*`.
+- **User routes** (`/api/v1/content/mine`, `/content/submit`, `/content/:id/request-restore`, transcribe, interactions) — require a user JWT (`UserAuthMiddleware`); some accept an optional session via `OptionalUserAuthMiddleware`.
 - **Internal routes** (`/internal/*`) — static service token (`CMS_SERVICE_TOKEN`), not user JWTs.
 
 ## API Surface

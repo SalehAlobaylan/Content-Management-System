@@ -108,6 +108,9 @@ func ParseJWT(tokenString string, secret []byte) (*JWTClaims, error) {
 	if !isAllowedIssuer(claims.Issuer) {
 		return nil, ErrTokenInvalid
 	}
+	if !hasAllowedAudience(claims) {
+		return nil, ErrTokenInvalid
+	}
 
 	normalizeClaims(claims)
 
@@ -258,7 +261,47 @@ func normalizePermissions(permissions []string) []string {
 func isAllowedIssuer(issuer string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(issuer))
 	if normalized == "" {
-		return true
+		// A token with no issuer is not trusted: every token CMS should accept is
+		// minted by IAM (or CMS) with an explicit issuer in the allowlist.
+		return false
 	}
 	return slices.Contains(GetJWTAllowedIssuers(), normalized)
+}
+
+// GetJWTAllowedAudiences returns the audience allowlist from JWT_ALLOWED_AUDIENCES
+// (comma-separated). When unset, audience validation is skipped — this avoids
+// breaking tokens that legitimately omit `aud`. When set, a token must carry at
+// least one matching audience.
+func GetJWTAllowedAudiences() []string {
+	allowed := strings.TrimSpace(os.Getenv("JWT_ALLOWED_AUDIENCES"))
+	if allowed == "" {
+		return nil
+	}
+
+	parts := strings.Split(allowed, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := strings.TrimSpace(strings.ToLower(part))
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+// hasAllowedAudience reports whether the claims carry an audience in the
+// allowlist. Returns true when no allowlist is configured (validation disabled).
+func hasAllowedAudience(claims *JWTClaims) bool {
+	allowed := GetJWTAllowedAudiences()
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, aud := range claims.Audience {
+		normalized := strings.ToLower(strings.TrimSpace(aud))
+		if slices.Contains(allowed, normalized) {
+			return true
+		}
+	}
+	return false
 }

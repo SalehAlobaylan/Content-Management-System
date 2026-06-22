@@ -12,8 +12,8 @@ func SetupMediaRoutes(router gin.IRouter, db *gorm.DB) {
 	// Mutations require an admin JWT — previously these were unauthenticated,
 	// letting anyone create/delete media records.
 	admin := utils.AdminAuthMiddleware(db)
-	router.POST("/media", admin, controllers.CreateMedia)
+	router.POST("/media", admin, utils.RequireAdminPermission("content", "write"), controllers.CreateMedia)
 	router.GET("/media", controllers.GetMedia)
 	router.GET("/media/:id", controllers.GetMedia)
-	router.DELETE("/media/:id", admin, controllers.DeleteMedia)
+	router.DELETE("/media/:id", admin, utils.RequireAdminPermission("content", "delete"), controllers.DeleteMedia)
 }
