@@ -144,6 +144,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	// Enrichment — On-demand enrichment management
 	adminGroup.GET("/enrichment/stats", perm("content", "read"), controllers.GetEnrichmentStats)
+	adminGroup.GET("/enrichment/missing-counts", perm("content", "read"), controllers.GetMissingEnrichmentCounts)
 	adminGroup.GET("/enrichment/missing", perm("content", "read"), controllers.GetMissingEnrichments)
 	adminGroup.POST("/enrichment/trigger/:id", perm("content", "write"), controllers.TriggerEnrichment)
 	adminGroup.POST("/enrichment/trigger-batch", perm("content", "write"), controllers.TriggerBatchEnrichment)

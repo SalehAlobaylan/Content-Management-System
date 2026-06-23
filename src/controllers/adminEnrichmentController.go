@@ -44,6 +44,15 @@ type enrichmentStatsResponse struct {
 	TotalReady            int64 `json:"total_ready"`
 }
 
+type missingEnrichmentCountsResponse struct {
+	Transcript      int64 `json:"transcript"`
+	Embedding       int64 `json:"embedding"`
+	Sparse          int64 `json:"sparse"`
+	Image           int64 `json:"image"`
+	TranscriptImage int64 `json:"transcript_image"`
+	EmbeddingSparse int64 `json:"embedding_sparse"`
+}
+
 type missingEnrichmentItem struct {
 	ID                string `json:"id"`
 	Title             string `json:"title"`
@@ -124,6 +133,53 @@ func GetEnrichmentStats(c *gin.Context) {
 		Code:    http.StatusOK,
 		Message: "Enrichment stats fetched successfully",
 		Data:    stats,
+	})
+}
+
+// ── GET /admin/enrichment/missing-counts ───────────────────
+
+func GetMissingEnrichmentCounts(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	contentType := c.Query("type")
+	status := c.DefaultQuery("status", "READY")
+
+	countFor := func(missingParam string) (int64, error) {
+		var total int64
+		err := buildMissingQuery(db, missingParam, contentType, status).Count(&total).Error
+		return total, err
+	}
+
+	var counts missingEnrichmentCountsResponse
+	var err error
+	if counts.Transcript, err = countFor("transcript"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count transcript gaps: " + err.Error()})
+		return
+	}
+	if counts.Embedding, err = countFor("embedding"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count embedding gaps: " + err.Error()})
+		return
+	}
+	if counts.Sparse, err = countFor("sparse"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count sparse gaps: " + err.Error()})
+		return
+	}
+	if counts.Image, err = countFor("image"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count image gaps: " + err.Error()})
+		return
+	}
+	if counts.TranscriptImage, err = countFor("transcript,image"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count media enrichment gaps: " + err.Error()})
+		return
+	}
+	if counts.EmbeddingSparse, err = countFor("embedding,sparse"); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count news enrichment gaps: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Missing enrichment counts fetched successfully",
+		Data:    counts,
 	})
 }
 
