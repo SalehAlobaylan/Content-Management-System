@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -165,6 +166,7 @@ var contentSourceQueryConfig = utils.QueryConfig{
 	FilterableFields: map[string]string{
 		"name":       "content_sources.name",
 		"type":       "content_sources.type",
+		"category":   "content_sources.category",
 		"is_active":  "content_sources.is_active",
 		"created_at": "content_sources.created_at",
 		"updated_at": "content_sources.updated_at",
@@ -228,6 +230,260 @@ func ListContentSources(c *gin.Context) {
 		Limit:      meta.Limit,
 		TotalPages: meta.TotalPages,
 	})
+}
+
+// --- Source monitoring stats -------------------------------------------------
+
+type sourceFreshness struct {
+	OverdueCount  int64   `json:"overdue_count"`
+	DueSoonCount  int64   `json:"due_soon_count"`
+	FreshCount    int64   `json:"fresh_count"`
+	NeverRunCount int64   `json:"never_run_count"`
+	OldestFetched *string `json:"oldest_fetched_at"`
+}
+
+type sourceOutputStat struct {
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`
+	Category   string  `json:"category"`
+	Items      int64   `json:"items"`
+	Ready      int64   `json:"ready"`
+	Failed     int64   `json:"failed"`
+	LastItemAt *string `json:"last_item_at,omitempty"`
+}
+
+type sourceAttention struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	Type          string  `json:"type"`
+	Category      string  `json:"category"`
+	Health        string  `json:"health"`
+	LastFetchedAt *string `json:"last_fetched_at,omitempty"`
+}
+
+type sourceStatsResponse struct {
+	Total          int64                       `json:"total"`
+	ByCategory     map[string]int64            `json:"by_category"`
+	ByType         map[string]int64            `json:"by_type"`
+	ByStatus       map[string]int64            `json:"by_status"`
+	ByHealth       map[string]int64            `json:"by_health"`
+	ByTypeHealth   map[string]map[string]int64 `json:"by_type_health"`
+	Freshness      sourceFreshness             `json:"freshness"`
+	TopSources     []sourceOutputStat          `json:"top_sources"`
+	RecentFailures []sourceAttention           `json:"recent_failures"`
+}
+
+// computeSourceHealth mirrors the frontend sourceHealth helper
+// (Platform-Console/src/lib/sources/health.ts) so the dashboard and the source
+// list agree on what "stale" means.
+func computeSourceHealth(s models.ContentSource, now time.Time) string {
+	if !s.IsActive {
+		return "disabled"
+	}
+	if s.LastFetchedAt == nil {
+		return "never_run"
+	}
+	interval := time.Duration(s.FetchIntervalMinutes) * time.Minute
+	if now.Sub(*s.LastFetchedAt) > interval {
+		return "stale"
+	}
+	return "healthy"
+}
+
+// GetSourceStats handles GET /admin/sources/stats. It returns source-centric
+// aggregates powering the Sources monitoring dashboard. Honors an optional
+// `category` filter (news|media) so the dashboard can scope All / News / Media.
+// Health is derived (not stored) so it tracks the same rules as the list UI.
+func GetSourceStats(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+
+	db := c.MustGet("db").(*gorm.DB)
+	now := time.Now()
+
+	categoryFilter := strings.ToLower(strings.TrimSpace(c.Query("category")))
+
+	query := db.Model(&models.ContentSource{}).Where("tenant_id = ?", principal.TenantID)
+	if categoryFilter != "" {
+		query = query.Where("category = ?", categoryFilter)
+	}
+
+	var sources []models.ContentSource
+	if err := query.Find(&sources).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to fetch sources",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	resp := sourceStatsResponse{
+		Total:          int64(len(sources)),
+		ByCategory:     map[string]int64{models.SourceCategoryNews: 0, models.SourceCategoryMedia: 0},
+		ByType:         map[string]int64{},
+		ByStatus:       map[string]int64{"active": 0, "disabled": 0},
+		ByHealth:       map[string]int64{"healthy": 0, "stale": 0, "never_run": 0, "disabled": 0},
+		ByTypeHealth:   map[string]map[string]int64{},
+		TopSources:     []sourceOutputStat{},
+		RecentFailures: []sourceAttention{},
+	}
+
+	// names maps a source name to its meta (type/category) for enriching the
+	// per-source output query, which joins content_items by source_name.
+	type sourceMeta struct {
+		Type     string
+		Category string
+	}
+	nameMeta := make(map[string]sourceMeta, len(sources))
+	names := make([]string, 0, len(sources))
+	var oldestFetched *time.Time
+	// Sources needing attention (active but stale / never run), oldest first.
+	type attentionRow struct {
+		src    models.ContentSource
+		health string
+		ageKey int64 // larger = needs attention sooner; sentinel for never_run
+	}
+	var attention []attentionRow
+
+	for _, s := range sources {
+		typeStr := string(s.Type)
+		resp.ByType[typeStr]++
+
+		cat := s.Category
+		if cat == "" {
+			cat = models.SourceCategoryNews
+		}
+		resp.ByCategory[cat]++
+
+		if s.IsActive {
+			resp.ByStatus["active"]++
+		} else {
+			resp.ByStatus["disabled"]++
+		}
+
+		health := computeSourceHealth(s, now)
+		resp.ByHealth[health]++
+		if resp.ByTypeHealth[typeStr] == nil {
+			resp.ByTypeHealth[typeStr] = map[string]int64{}
+		}
+		resp.ByTypeHealth[typeStr][health]++
+
+		// Freshness buckets (active sources only).
+		switch health {
+		case "never_run":
+			resp.Freshness.NeverRunCount++
+		case "stale":
+			resp.Freshness.OverdueCount++
+		case "healthy":
+			// Due soon = within the last quarter of the fetch interval.
+			interval := time.Duration(s.FetchIntervalMinutes) * time.Minute
+			if s.LastFetchedAt != nil && now.Sub(*s.LastFetchedAt) > interval*3/4 {
+				resp.Freshness.DueSoonCount++
+			} else {
+				resp.Freshness.FreshCount++
+			}
+		}
+
+		if s.LastFetchedAt != nil && (oldestFetched == nil || s.LastFetchedAt.Before(*oldestFetched)) {
+			oldestFetched = s.LastFetchedAt
+		}
+
+		if s.Name != "" {
+			if _, seen := nameMeta[s.Name]; !seen {
+				names = append(names, s.Name)
+			}
+			nameMeta[s.Name] = sourceMeta{Type: typeStr, Category: cat}
+		}
+
+		if s.IsActive && (health == "stale" || health == "never_run") {
+			ageKey := int64(1) << 62 // never_run sorts to the top
+			if s.LastFetchedAt != nil {
+				ageKey = now.Sub(*s.LastFetchedAt).Milliseconds()
+			}
+			attention = append(attention, attentionRow{src: s, health: health, ageKey: ageKey})
+		}
+	}
+
+	if oldestFetched != nil {
+		iso := oldestFetched.UTC().Format(time.RFC3339)
+		resp.Freshness.OldestFetched = &iso
+	}
+
+	// Top sources by output — join content_items on source_name (the established
+	// convention; content_items carry no source FK). When a category filter is
+	// active we restrict to that category's source names so the join stays scoped.
+	type outputRow struct {
+		SourceName string
+		Count      int64
+		Ready      int64
+		Failed     int64
+		LastItemAt *time.Time
+	}
+	itemQuery := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
+	skipTop := false
+	if categoryFilter != "" {
+		if len(names) == 0 {
+			skipTop = true
+		} else {
+			itemQuery = itemQuery.Where("source_name IN ?", names)
+		}
+	}
+	if !skipTop {
+		var rows []outputRow
+		if err := itemQuery.
+			Select("COALESCE(NULLIF(source_name, ''), 'Unknown source') AS source_name, COUNT(*) AS count, COALESCE(SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END), 0) AS ready, COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, MAX(created_at) AS last_item_at").
+			Group("COALESCE(NULLIF(source_name, ''), 'Unknown source')").
+			Order("count DESC").
+			Limit(10).
+			Scan(&rows).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{
+				Message: "Failed to aggregate source output",
+				Code:    "STATS_FAILED",
+			})
+			return
+		}
+		for _, r := range rows {
+			stat := sourceOutputStat{
+				Name:   r.SourceName,
+				Items:  r.Count,
+				Ready:  r.Ready,
+				Failed: r.Failed,
+			}
+			if meta, ok := nameMeta[r.SourceName]; ok {
+				stat.Type = meta.Type
+				stat.Category = meta.Category
+			}
+			if r.LastItemAt != nil {
+				iso := r.LastItemAt.UTC().Format(time.RFC3339)
+				stat.LastItemAt = &iso
+			}
+			resp.TopSources = append(resp.TopSources, stat)
+		}
+	}
+
+	// Recent failures / needs attention — oldest unfetched first, capped small.
+	sort.Slice(attention, func(i, j int) bool { return attention[i].ageKey > attention[j].ageKey })
+	for i, a := range attention {
+		if i >= 6 {
+			break
+		}
+		row := sourceAttention{
+			ID:       a.src.PublicID.String(),
+			Name:     a.src.Name,
+			Type:     string(a.src.Type),
+			Category: a.src.Category,
+			Health:   a.health,
+		}
+		if a.src.LastFetchedAt != nil {
+			iso := a.src.LastFetchedAt.UTC().Format(time.RFC3339)
+			row.LastFetchedAt = &iso
+		}
+		resp.RecentFailures = append(resp.RecentFailures, row)
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // GetContentSource handles GET /admin/sources/:id
