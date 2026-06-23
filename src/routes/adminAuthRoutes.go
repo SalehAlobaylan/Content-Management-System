@@ -104,9 +104,11 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/transcription/jobs", perm("content", "write"), controllers.CreateTranscriptionJob)
 	adminGroup.POST("/transcription/jobs/bulk", perm("content", "write"), controllers.BulkCreateTranscriptionJobs)
 	adminGroup.POST("/transcription/batches", perm("content", "write"), controllers.CreateTranscriptionBatch)
+	adminGroup.GET("/transcription/batches", perm("content", "read"), controllers.ListTranscriptionBatches)
 	adminGroup.GET("/transcription/batches/:id", perm("content", "read"), controllers.GetTranscriptionBatch)
 	adminGroup.POST("/transcription/batches/:id/cancel", perm("content", "write"), controllers.CancelTranscriptionBatch)
 	adminGroup.GET("/transcription/quality", perm("content", "read"), controllers.ListTranscriptQuality)
+	adminGroup.POST("/transcription/quality/repair-sweep", perm("content", "write"), controllers.RepairTranscriptionQualitySweep)
 
 	// Media Studio — per-item transcript + chapter editor
 	adminGroup.GET("/content/:id/studio", perm("content", "read"), controllers.GetStudio)

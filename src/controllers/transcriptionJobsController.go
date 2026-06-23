@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -17,11 +19,19 @@ import (
 	"github.com/lib/pq"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+var errTranscriptionBudgetCapReached = errors.New("monthly STT budget cap reached")
 
 type transcriptionJobResponse struct {
 	ID                string                 `json:"id"`
 	ContentItemID     string                 `json:"content_item_id"`
+	ContentTitle      string                 `json:"content_title,omitempty"`
+	ContentType       string                 `json:"content_type,omitempty"`
+	ContentSourceName string                 `json:"content_source_name,omitempty"`
+	FileSizeBytes     int64                  `json:"file_size_bytes,omitempty"`
+	StorageTier       string                 `json:"storage_tier,omitempty"`
 	TranscriptID      *string                `json:"transcript_id,omitempty"`
 	BatchID           *string                `json:"batch_id,omitempty"`
 	BatchItemID       *string                `json:"batch_item_id,omitempty"`
@@ -130,6 +140,25 @@ func mapTranscriptionJob(job models.TranscriptionJob) transcriptionJobResponse {
 	}
 }
 
+func mapTranscriptionJobWithContent(job models.TranscriptionJob, item *models.ContentItem) transcriptionJobResponse {
+	out := mapTranscriptionJob(job)
+	if item == nil {
+		return out
+	}
+	if item.Title != nil {
+		out.ContentTitle = *item.Title
+	}
+	out.ContentType = string(item.Type)
+	if item.SourceName != nil {
+		out.ContentSourceName = *item.SourceName
+	}
+	out.FileSizeBytes = item.FileSizeBytes
+	if item.StorageTier != nil {
+		out.StorageTier = *item.StorageTier
+	}
+	return out
+}
+
 func mapTranscriptQuality(q models.TranscriptQuality) transcriptQualityResponse {
 	var details map[string]interface{}
 	if len(q.Details) > 0 {
@@ -152,15 +181,6 @@ func estimateSTTCostForDuration(durationSec float64) float64 {
 		return 0
 	}
 	return (durationSec / 3600.0) * sttEstimatedCostPerHourUsd
-}
-
-func reserveTranscriptionBudget(db *gorm.DB, tenantID string, est float64) {
-	if est <= 0 {
-		return
-	}
-	db.Model(&models.TranscriptionConfig{}).
-		Where("tenant_id = ?", tenantID).
-		UpdateColumn("monthly_reserved_usd", gorm.Expr("monthly_reserved_usd + ?", est))
 }
 
 func settleTranscriptionBudget(db *gorm.DB, tenantID string, reserved, actual float64) {
@@ -195,19 +215,39 @@ func createSkippedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigge
 
 func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, triggerSource string) (models.TranscriptionJob, error) {
 	est := estimateSTTCostUSD(item.DurationSec)
-	job := models.TranscriptionJob{
-		TenantID:         item.TenantID,
-		ContentItemID:    item.PublicID,
-		TranscriptID:     item.TranscriptID,
-		TriggerSource:    triggerSource,
-		Status:           models.TranscriptionJobStatusQueued,
-		EstimatedCostUsd: est,
-		ReservedCostUsd:  est,
-	}
-	if err := db.Create(&job).Error; err != nil {
+	var job models.TranscriptionJob
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var cfg models.TranscriptionConfig
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ?", item.TenantID).
+			First(&cfg).Error; err != nil {
+			return err
+		}
+		if cfg.MonthlyBudgetCapUsd > 0 && cfg.MonthlySpendUsd+cfg.MonthlyReservedUsd+est > cfg.MonthlyBudgetCapUsd {
+			return errTranscriptionBudgetCapReached
+		}
+		job = models.TranscriptionJob{
+			TenantID:         item.TenantID,
+			ContentItemID:    item.PublicID,
+			TranscriptID:     item.TranscriptID,
+			TriggerSource:    triggerSource,
+			Status:           models.TranscriptionJobStatusQueued,
+			EstimatedCostUsd: est,
+			ReservedCostUsd:  est,
+		}
+		if err := tx.Create(&job).Error; err != nil {
+			return err
+		}
+		if est > 0 {
+			if err := tx.Model(&cfg).UpdateColumn("monthly_reserved_usd", gorm.Expr("monthly_reserved_usd + ?", est)).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return job, err
 	}
-	reserveTranscriptionBudget(db, item.TenantID, est)
 	return job, nil
 }
 
@@ -253,21 +293,19 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 			return job, false, job.SkipReason, nil
 		}
 		if state == "" || state == models.CaptionStateNone {
-			if !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual {
+			if !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual && triggerSource != models.TranscriptionTriggerAutoQuality {
 				job := createSkippedTranscriptionJob(db, item, triggerSource, "auto-STT disabled (manual trigger required)")
 				return job, false, job.SkipReason, nil
 			}
 		}
 	}
 
-	est := estimateSTTCostUSD(item.DurationSec)
-	if cfg.MonthlyBudgetCapUsd > 0 && cfg.MonthlySpendUsd+cfg.MonthlyReservedUsd+est > cfg.MonthlyBudgetCapUsd {
-		job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
-		return job, false, job.SkipReason, nil
-	}
-
 	job, err := createAcceptedTranscriptionJob(db, item, triggerSource)
 	if err != nil {
+		if errors.Is(err, errTranscriptionBudgetCapReached) {
+			job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
+			return job, false, job.SkipReason, nil
+		}
 		return job, false, "", err
 	}
 	return job, true, "", nil
@@ -646,14 +684,15 @@ type bulkTranscriptionJobRequest struct {
 }
 
 type transcriptionBatchItemResponse struct {
-	ID            string  `json:"id"`
-	ContentItemID string  `json:"content_item_id"`
-	JobID         *string `json:"job_id,omitempty"`
-	Status        string  `json:"status"`
-	Reason        string  `json:"reason,omitempty"`
-	Error         string  `json:"error,omitempty"`
-	CreatedAt     string  `json:"created_at"`
-	UpdatedAt     string  `json:"updated_at"`
+	ID            string                    `json:"id"`
+	ContentItemID string                    `json:"content_item_id"`
+	JobID         *string                   `json:"job_id,omitempty"`
+	Job           *transcriptionJobResponse `json:"job,omitempty"`
+	Status        string                    `json:"status"`
+	Reason        string                    `json:"reason,omitempty"`
+	Error         string                    `json:"error,omitempty"`
+	CreatedAt     string                    `json:"created_at"`
+	UpdatedAt     string                    `json:"updated_at"`
 }
 
 type transcriptionBatchResponse struct {
@@ -675,12 +714,24 @@ type transcriptionBatchResponse struct {
 	Items          []transcriptionBatchItemResponse `json:"items,omitempty"`
 }
 
+type transcriptionBatchListResponse struct {
+	Data       []transcriptionBatchResponse `json:"data"`
+	Total      int64                        `json:"total"`
+	Page       int                          `json:"page"`
+	Limit      int                          `json:"limit"`
+	TotalPages int                          `json:"total_pages"`
+}
+
 type createTranscriptionBatchRequest struct {
 	ContentIDs []string `json:"content_ids"`
 	Force      *bool    `json:"force"`
 }
 
 func mapTranscriptionBatch(batch models.TranscriptionBatch, items []models.TranscriptionBatchItem) transcriptionBatchResponse {
+	return mapTranscriptionBatchWithJobs(batch, items, nil)
+}
+
+func mapTranscriptionBatchWithJobs(batch models.TranscriptionBatch, items []models.TranscriptionBatchItem, jobs map[uuid.UUID]transcriptionJobResponse) transcriptionBatchResponse {
 	out := transcriptionBatchResponse{
 		ID:             batch.PublicID.String(),
 		Status:         batch.Status,
@@ -706,16 +757,59 @@ func mapTranscriptionBatch(batch models.TranscriptionBatch, items []models.Trans
 				s := item.JobID.String()
 				jobID = &s
 			}
+			var job *transcriptionJobResponse
+			if item.JobID != nil && jobs != nil {
+				if mapped, ok := jobs[*item.JobID]; ok {
+					mappedCopy := mapped
+					job = &mappedCopy
+				}
+			}
 			out.Items = append(out.Items, transcriptionBatchItemResponse{
 				ID:            item.PublicID.String(),
 				ContentItemID: item.ContentItemID.String(),
 				JobID:         jobID,
+				Job:           job,
 				Status:        item.Status,
 				Reason:        item.Reason,
 				Error:         item.Error,
 				CreatedAt:     item.CreatedAt.UTC().Format(time.RFC3339),
 				UpdatedAt:     item.UpdatedAt.UTC().Format(time.RFC3339),
 			})
+		}
+	}
+	return out
+}
+
+func loadTranscriptionJobSummariesForBatchItems(db *gorm.DB, tenantID string, items []models.TranscriptionBatchItem) map[uuid.UUID]transcriptionJobResponse {
+	jobIDs := make([]uuid.UUID, 0, len(items))
+	for _, item := range items {
+		if item.JobID != nil {
+			jobIDs = append(jobIDs, *item.JobID)
+		}
+	}
+	if len(jobIDs) == 0 {
+		return nil
+	}
+	var jobs []models.TranscriptionJob
+	db.Where("tenant_id = ? AND public_id IN ?", tenantID, jobIDs).Find(&jobs)
+	contentIDs := make([]uuid.UUID, 0, len(jobs))
+	for _, job := range jobs {
+		contentIDs = append(contentIDs, job.ContentItemID)
+	}
+	var contentItems []models.ContentItem
+	if len(contentIDs) > 0 {
+		db.Where("tenant_id = ? AND public_id IN ?", tenantID, contentIDs).Find(&contentItems)
+	}
+	contentByID := map[uuid.UUID]models.ContentItem{}
+	for _, item := range contentItems {
+		contentByID[item.PublicID] = item
+	}
+	out := map[uuid.UUID]transcriptionJobResponse{}
+	for _, job := range jobs {
+		if item, ok := contentByID[job.ContentItemID]; ok {
+			out[job.PublicID] = mapTranscriptionJobWithContent(job, &item)
+		} else {
+			out[job.PublicID] = mapTranscriptionJob(job)
 		}
 	}
 	return out
@@ -829,60 +923,122 @@ func dispatchTranscriptionBatch(db *gorm.DB, batchID uuid.UUID) {
 	}).
 		Order("created_at ASC").Find(&items)
 	for _, batchItem := range items {
-		if err := db.Where("public_id = ?", batchID).First(&batch).Error; err != nil {
-			return
-		}
-		if batch.CanceledAt != nil {
-			db.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusCanceled, "reason": "batch canceled"})
-			continue
-		}
-		if batchItem.Status == models.TranscriptionBatchItemStatusAccepted && batchItem.JobID != nil {
-			var existingJob models.TranscriptionJob
-			if err := db.Where("public_id = ?", *batchItem.JobID).First(&existingJob).Error; err == nil {
-				if terminalTranscriptionStatus(existingJob.Status) {
-					updateBatchItemForJob(db, &existingJob)
-					continue
+		var submitItem *models.ContentItem
+		var submitJobID string
+		err := db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("public_id = ?", batchID).
+				First(&batch).Error; err != nil {
+				return err
+			}
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+				Where("public_id = ? AND status IN ?", batchItem.PublicID, []string{
+					models.TranscriptionBatchItemStatusPending,
+					models.TranscriptionBatchItemStatusAccepted,
+				}).
+				First(&batchItem).Error; err != nil {
+				return err
+			}
+			if batch.CanceledAt != nil {
+				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusCanceled, "reason": "batch canceled"}).Error
+			}
+			if batchItem.Status == models.TranscriptionBatchItemStatusAccepted && batchItem.JobID != nil {
+				var existingJob models.TranscriptionJob
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ?", *batchItem.JobID).First(&existingJob).Error; err != nil {
+					return err
 				}
-				if existingJob.MediaJobID != "" || existingJob.Status == models.TranscriptionJobStatusRunning {
-					continue
+				if terminalTranscriptionStatus(existingJob.Status) {
+					status := models.TranscriptionBatchItemStatusFailed
+					reason := ""
+					errMsg := existingJob.ErrorMessage
+					switch existingJob.Status {
+					case models.TranscriptionJobStatusSucceeded:
+						status = models.TranscriptionBatchItemStatusDone
+					case models.TranscriptionJobStatusSkipped:
+						status = models.TranscriptionBatchItemStatusSkipped
+						reason = existingJob.SkipReason
+					case models.TranscriptionJobStatusCanceled:
+						status = models.TranscriptionBatchItemStatusCanceled
+						reason = existingJob.SkipReason
+					case models.TranscriptionJobStatusWritebackFailed:
+						if errMsg == "" {
+							errMsg = existingJob.WritebackError
+						}
+					}
+					return tx.Model(&batchItem).Updates(map[string]interface{}{"status": status, "reason": reason, "error": errMsg}).Error
+				}
+				if existingJob.MediaJobID != "" {
+					return nil
+				}
+				if existingJob.Status == models.TranscriptionJobStatusRunning &&
+					existingJob.StartedAt != nil &&
+					time.Since(*existingJob.StartedAt) < 2*time.Minute {
+					return nil
 				}
 				var item models.ContentItem
-				if err := db.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
-					_ = updateTranscriptionJobTerminal(db, existingJob.PublicID.String(), models.TranscriptionJobStatusFailed, "content item not found")
-					continue
+				if err := tx.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
+					existingJob.Status = models.TranscriptionJobStatusFailed
+					existingJob.ErrorMessage = "content item not found"
+					now := time.Now()
+					existingJob.CompletedAt = &now
+					if saveErr := tx.Save(&existingJob).Error; saveErr != nil {
+						return saveErr
+					}
+					settleTranscriptionBudget(tx, existingJob.TenantID, existingJob.ReservedCostUsd, 0)
+					return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": "content item not found"}).Error
 				}
-				if err := submitTranscriptionJobToMedia(db, &item, existingJob.PublicID.String()); err != nil {
-					_ = updateTranscriptionJobTerminal(db, existingJob.PublicID.String(), models.TranscriptionJobStatusFailed, err.Error())
+				existingJob.Status = models.TranscriptionJobStatusRunning
+				if existingJob.StartedAt == nil {
+					now := time.Now()
+					existingJob.StartedAt = &now
 				}
-				continue
+				if err := tx.Save(&existingJob).Error; err != nil {
+					return err
+				}
+				itemCopy := item
+				submitItem = &itemCopy
+				submitJobID = existingJob.PublicID.String()
+				return nil
 			}
-		}
-		var item models.ContentItem
-		if err := db.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
-			db.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": "content item not found"})
-			continue
-		}
-		job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerBulkManual, batch.Force)
-		if err != nil {
+			var item models.ContentItem
+			if err := tx.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
+				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": "content item not found"}).Error
+			}
+			job, triggered, reason, err := createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerBulkManual, batch.Force)
+			if err != nil {
+				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": err.Error()}).Error
+			}
+			job.BatchID = &batch.PublicID
+			job.BatchItemID = &batchItem.PublicID
+			if !triggered {
+				job.Status = models.TranscriptionJobStatusSkipped
+				job.SkipReason = reason
+				if err := tx.Save(&job).Error; err != nil {
+					return err
+				}
+				return tx.Model(&batchItem).Updates(map[string]interface{}{"job_id": job.PublicID, "status": models.TranscriptionBatchItemStatusSkipped, "reason": reason}).Error
+			}
+			job.Status = models.TranscriptionJobStatusRunning
+			now := time.Now()
+			job.StartedAt = &now
+			if err := tx.Save(&job).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&batchItem).Updates(map[string]interface{}{"job_id": job.PublicID, "status": models.TranscriptionBatchItemStatusAccepted}).Error; err != nil {
+				return err
+			}
+			itemCopy := item
+			submitItem = &itemCopy
+			submitJobID = job.PublicID.String()
+			return nil
+		})
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			db.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": err.Error()})
-			continue
 		}
-		job.BatchID = &batch.PublicID
-		job.BatchItemID = &batchItem.PublicID
-		_ = db.Save(&job).Error
-		db.Model(&batchItem).Updates(map[string]interface{}{"job_id": job.PublicID, "status": models.TranscriptionBatchItemStatusAccepted})
-		if !triggered {
-			job.Status = models.TranscriptionJobStatusSkipped
-			job.SkipReason = reason
-			_ = db.Save(&job).Error
-			db.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusSkipped, "reason": reason})
-			recomputeTranscriptionBatch(db, batchID)
-			continue
-		}
-		itemCopy := item
-		jobID := job.PublicID.String()
-		if err := submitTranscriptionJobToMedia(db, &itemCopy, jobID); err != nil {
-			_ = updateTranscriptionJobTerminal(db, jobID, models.TranscriptionJobStatusFailed, err.Error())
+		if submitItem != nil && submitJobID != "" {
+			if err := submitTranscriptionJobToMedia(db, submitItem, submitJobID); err != nil {
+				_ = updateTranscriptionJobTerminal(db, submitJobID, models.TranscriptionJobStatusFailed, err.Error())
+			}
 		}
 		recomputeTranscriptionBatch(db, batchID)
 	}
@@ -967,7 +1123,70 @@ func GetTranscriptionBatch(c *gin.Context) {
 	var items []models.TranscriptionBatchItem
 	db.Where("batch_id = ? AND tenant_id = ?", batch.PublicID, principal.TenantID).
 		Order("created_at ASC").Find(&items)
-	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcription batch fetched", Data: mapTranscriptionBatch(batch, items)})
+	jobs := loadTranscriptionJobSummariesForBatchItems(db, principal.TenantID, items)
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcription batch fetched", Data: mapTranscriptionBatchWithJobs(batch, items, jobs)})
+}
+
+func ListTranscriptionBatches(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	page := 1
+	limit := 20
+	if raw := strings.TrimSpace(c.Query("page")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	query := db.Model(&models.TranscriptionBatch{}).Where("tenant_id = ?", principal.TenantID)
+	switch strings.ToLower(strings.TrimSpace(c.Query("status"))) {
+	case "", "all":
+	case "active":
+		query = query.Where("status IN ?", []string{models.TranscriptionBatchStatusQueued, models.TranscriptionBatchStatusRunning})
+	case "terminal":
+		query = query.Where("status IN ?", []string{models.TranscriptionBatchStatusCompleted, models.TranscriptionBatchStatusCanceled, models.TranscriptionBatchStatusFailed})
+	default:
+		query = query.Where("status = ?", strings.TrimSpace(c.Query("status")))
+	}
+	var total int64
+	query.Count(&total)
+	var batches []models.TranscriptionBatch
+	query.Order("created_at DESC").Offset((page - 1) * limit).Limit(limit).Find(&batches)
+	out := make([]transcriptionBatchResponse, 0, len(batches))
+	for _, batch := range batches {
+		var items []models.TranscriptionBatchItem
+		db.Where("batch_id = ? AND tenant_id = ?", batch.PublicID, principal.TenantID).
+			Order("updated_at DESC").
+			Limit(10).
+			Find(&items)
+		jobs := loadTranscriptionJobSummariesForBatchItems(db, principal.TenantID, items)
+		out = append(out, mapTranscriptionBatchWithJobs(batch, items, jobs))
+	}
+	totalPages := 0
+	if total > 0 {
+		totalPages = int(math.Ceil(float64(total) / float64(limit)))
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Transcription batches fetched",
+		Data: transcriptionBatchListResponse{
+			Data:       out,
+			Total:      total,
+			Page:       page,
+			Limit:      limit,
+			TotalPages: totalPages,
+		},
+	})
 }
 
 func CancelTranscriptionBatch(c *gin.Context) {
@@ -1099,6 +1318,14 @@ func ListTranscriptionJobs(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	limit := 50
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
 	var jobs []models.TranscriptionJob
 	query := db.Where("tenant_id = ?", principal.TenantID)
 	if status := strings.TrimSpace(c.Query("status")); status != "" {
@@ -1110,9 +1337,26 @@ func ListTranscriptionJobs(c *gin.Context) {
 		}
 	}
 	query.Order("created_at DESC").Limit(limit).Find(&jobs)
+	contentIDs := make([]uuid.UUID, 0, len(jobs))
+	for _, job := range jobs {
+		contentIDs = append(contentIDs, job.ContentItemID)
+	}
+	var contentItems []models.ContentItem
+	if len(contentIDs) > 0 {
+		db.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, contentIDs).Find(&contentItems)
+	}
+	contentByID := map[uuid.UUID]models.ContentItem{}
+	for _, item := range contentItems {
+		contentByID[item.PublicID] = item
+	}
 	out := make([]transcriptionJobResponse, 0, len(jobs))
 	for _, job := range jobs {
-		out = append(out, mapTranscriptionJob(job))
+		item, ok := contentByID[job.ContentItemID]
+		if ok {
+			out = append(out, mapTranscriptionJobWithContent(job, &item))
+		} else {
+			out = append(out, mapTranscriptionJob(job))
+		}
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcription jobs fetched", Data: out})
 }
@@ -1134,6 +1378,135 @@ func ListTranscriptQuality(c *gin.Context) {
 		out = append(out, mapTranscriptQuality(row))
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcript quality fetched", Data: out})
+}
+
+type transcriptionRepairSweepResponse struct {
+	Accepted int              `json:"accepted"`
+	Skipped  int              `json:"skipped"`
+	Failed   int              `json:"failed"`
+	Reasons  map[string]int   `json:"reasons"`
+	Results  []map[string]any `json:"results"`
+	JobIDs   []string         `json:"job_ids"`
+}
+
+func activeTranscriptIsProtected(db *gorm.DB, item models.ContentItem) (bool, string) {
+	if item.TranscriptID == nil {
+		return false, ""
+	}
+	var transcript models.Transcript
+	if err := db.Where("public_id = ?", *item.TranscriptID).First(&transcript).Error; err != nil {
+		return false, ""
+	}
+	if transcript.ApprovedAt != nil {
+		return true, "approved transcript"
+	}
+	if transcript.Source != nil && *transcript.Source == models.TranscriptSourceYouTubeHuman {
+		return true, "human transcript"
+	}
+	return false, ""
+}
+
+func hasActiveTranscriptionJob(db *gorm.DB, contentID uuid.UUID) bool {
+	var count int64
+	db.Model(&models.TranscriptionJob{}).
+		Where("content_item_id = ? AND status IN ?", contentID, []string{models.TranscriptionJobStatusQueued, models.TranscriptionJobStatusRunning}).
+		Count(&count)
+	return count > 0
+}
+
+func RepairTranscriptionQualitySweep(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	limit := 100
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 250 {
+		limit = 250
+	}
+	cfg := getOrCreateTranscriptionConfig(db, principal.TenantID)
+	resp := transcriptionRepairSweepResponse{
+		Reasons: map[string]int{},
+		Results: []map[string]any{},
+		JobIDs:  []string{},
+	}
+	if !cfg.AutoRepairEnabled {
+		resp.Reasons["auto repair disabled"] = 1
+		c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Repair sweep skipped", Data: resp})
+		return
+	}
+	var items []models.ContentItem
+	db.Where("tenant_id = ? AND type IN ? AND media_url IS NOT NULL AND media_url <> ''", principal.TenantID, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+		Where(`(
+			transcript_id IS NULL
+			OR COALESCE(caption_state, '') IN ?
+			OR EXISTS (
+				SELECT 1 FROM transcript_quality tq
+				WHERE tq.content_item_id = content_items.public_id AND tq.status = ?
+			)
+		)`, []string{"", models.CaptionStateNone, models.CaptionStateYouTubeAuto}, models.TranscriptQualityAutoRepair).
+		Order("updated_at DESC").
+		Limit(limit).
+		Find(&items)
+
+	type pendingSubmit struct {
+		item  models.ContentItem
+		jobID string
+	}
+	var submits []pendingSubmit
+	for _, item := range items {
+		contentID := item.PublicID.String()
+		if protected, reason := activeTranscriptIsProtected(db, item); protected {
+			resp.Skipped++
+			resp.Reasons[reason]++
+			resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "skipped", "reason": reason})
+			continue
+		}
+		if hasActiveTranscriptionJob(db, item.PublicID) {
+			reason := "transcription already queued or running"
+			resp.Skipped++
+			resp.Reasons[reason]++
+			resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "skipped", "reason": reason})
+			continue
+		}
+		job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false)
+		if err != nil {
+			resp.Failed++
+			resp.Reasons[err.Error()]++
+			resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "failed", "error": err.Error()})
+			continue
+		}
+		if !triggered {
+			resp.Skipped++
+			resp.Reasons[reason]++
+			resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "skipped", "reason": reason, "job_id": job.PublicID.String()})
+			continue
+		}
+		resp.Accepted++
+		resp.JobIDs = append(resp.JobIDs, job.PublicID.String())
+		resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "accepted", "job_id": job.PublicID.String()})
+		submits = append(submits, pendingSubmit{item: item, jobID: job.PublicID.String()})
+	}
+	// Submit accepted jobs to Media from a single background goroutine, one at a
+	// time. Spawning a goroutine per item would fire up to `limit` concurrent
+	// submits, risking connection-pool exhaustion and overwhelming Media; the
+	// batch dispatcher submits sequentially for the same reason.
+	if len(submits) > 0 {
+		go func() {
+			for _, s := range submits {
+				itemCopy := s.item
+				if err := submitTranscriptionJobToMedia(db, &itemCopy, s.jobID); err != nil {
+					_ = updateTranscriptionJobTerminal(db, s.jobID, models.TranscriptionJobStatusFailed, err.Error())
+				}
+			}
+		}()
+	}
+	c.JSON(http.StatusAccepted, utils.ResponseMessage{Code: http.StatusAccepted, Message: "Repair sweep processed", Data: resp})
 }
 
 func updateTranscriptionJobTerminal(db *gorm.DB, jobID, status, message string) error {

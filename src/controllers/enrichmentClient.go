@@ -156,6 +156,9 @@ func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID str
 	writer.WriteField("url", *item.MediaURL)
 	writer.WriteField("content_id", item.PublicID.String())
 	writer.WriteField("transcription_job_id", transcriptionJobID)
+	if item.FileSizeBytes > 0 {
+		writer.WriteField("media_size_bytes", fmt.Sprintf("%d", item.FileSizeBytes))
+	}
 	writer.WriteField("word_timestamps", "true")
 	writer.Close()
 

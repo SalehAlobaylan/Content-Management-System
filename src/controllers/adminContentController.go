@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/utils"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -283,17 +284,17 @@ func GetMediaSizeStats(c *gin.Context) {
 		TrackedCount   int64
 		UntrackedCount int64
 		TotalBytes     int64
-		AvgBytes       int64
+		AvgBytes       float64
 		MaxBytes       int64
 	}
 	if err := query.Session(&gorm.Session{}).
 		Select(`
 			COUNT(*) AS total_count,
-			COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN 1 ELSE 0 END), 0) AS tracked_count,
-			COALESCE(SUM(CASE WHEN file_size_bytes <= 0 THEN 1 ELSE 0 END), 0) AS untracked_count,
+			COALESCE(SUM(CASE WHEN COALESCE(file_size_bytes, 0) > 0 THEN 1 ELSE 0 END), 0) AS tracked_count,
+			COALESCE(SUM(CASE WHEN COALESCE(file_size_bytes, 0) <= 0 THEN 1 ELSE 0 END), 0) AS untracked_count,
 			COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END), 0) AS total_bytes,
-			COALESCE(AVG(NULLIF(file_size_bytes, 0)), 0) AS avg_bytes,
-			COALESCE(MAX(file_size_bytes), 0) AS max_bytes`).
+			COALESCE(AVG(NULLIF(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END, 0)), 0) AS avg_bytes,
+			COALESCE(MAX(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END), 0) AS max_bytes`).
 		Scan(&totals).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to aggregate media sizes",
@@ -307,7 +308,7 @@ func GetMediaSizeStats(c *gin.Context) {
 		TrackedCount:   totals.TrackedCount,
 		UntrackedCount: totals.UntrackedCount,
 		TotalBytes:     totals.TotalBytes,
-		AvgBytes:       totals.AvgBytes,
+		AvgBytes:       int64(math.Round(totals.AvgBytes)),
 		MaxBytes:       totals.MaxBytes,
 		LargestItems:   []mediaSizeLargestItemResponse{},
 		ByType:         map[string]mediaSizeAggregateResponse{},
@@ -636,9 +637,9 @@ func applyAdminContentSpecialFilters(c *gin.Context, query *gorm.DB) (*gorm.DB, 
 	switch strings.ToLower(strings.TrimSpace(c.Query("size_tracked"))) {
 	case "", "all":
 	case "tracked":
-		query = query.Where("file_size_bytes > 0")
+		query = query.Where("COALESCE(file_size_bytes, 0) > 0")
 	case "untracked":
-		query = query.Where("file_size_bytes <= 0")
+		query = query.Where("COALESCE(file_size_bytes, 0) <= 0")
 	default:
 		return query, fmt.Errorf("invalid size_tracked parameter")
 	}
@@ -665,7 +666,7 @@ func fillMediaSizeAggregate(query *gorm.DB, groupExpr string, target map[string]
 	}
 	var rows []row
 	if err := query.Session(&gorm.Session{}).
-		Select(fmt.Sprintf("%s AS key, COUNT(*) AS count, COALESCE(SUM(file_size_bytes), 0) AS bytes", groupExpr)).
+		Select(fmt.Sprintf("%s AS key, COUNT(*) AS count, COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END), 0) AS bytes", groupExpr)).
 		Group(groupExpr).
 		Scan(&rows).Error; err != nil {
 		return err
@@ -681,7 +682,7 @@ func fillMediaSizeBuckets(query *gorm.DB, target map[string]mediaSizeAggregateRe
 		key   string
 		where string
 	}{
-		{"untracked", "file_size_bytes <= 0"},
+		{"untracked", "COALESCE(file_size_bytes, 0) <= 0"},
 		{"<100MB", "file_size_bytes > 0 AND file_size_bytes < 104857600"},
 		{"100-500MB", "file_size_bytes >= 104857600 AND file_size_bytes < 524288000"},
 		{"500MB-1GB", "file_size_bytes >= 524288000 AND file_size_bytes < 1073741824"},
@@ -691,7 +692,7 @@ func fillMediaSizeBuckets(query *gorm.DB, target map[string]mediaSizeAggregateRe
 	for _, bucket := range buckets {
 		var agg mediaSizeAggregateResponse
 		if err := query.Session(&gorm.Session{}).
-			Select("COUNT(*) AS count, COALESCE(SUM(file_size_bytes), 0) AS bytes").
+			Select("COUNT(*) AS count, COALESCE(SUM(CASE WHEN file_size_bytes > 0 THEN file_size_bytes ELSE 0 END), 0) AS bytes").
 			Where(bucket.where).
 			Scan(&agg).Error; err != nil {
 			return err
