@@ -976,14 +976,32 @@ func writeCirculationAuditSystem(db *gorm.DB, tenantID, action, resource string,
 // ─── Recommendation helpers ────────────────────────────────────────────────
 
 func generateSourceRecommendations(db *gorm.DB, policy models.NewsCirculationPolicy) ([]models.SourceCirculationRecommendation, int) {
+	rows, autoApplied, _ := generateSourceRecommendationsLimited(db, policy, 0)
+	return rows, autoApplied
+}
+
+func generateSourceRecommendationsLimited(db *gorm.DB, policy models.NewsCirculationPolicy, limit int) ([]models.SourceCirculationRecommendation, int, int) {
 	var sources []models.ContentSource
-	db.Where("tenant_id = ? AND category = ? AND is_active = ?", policy.TenantID, models.SourceCategoryNews, true).
-		Find(&sources)
+	q := db.Where("tenant_id = ? AND category = ? AND is_active = ?", policy.TenantID, models.SourceCategoryNews, true).
+		Order("last_fetched_at ASC NULLS FIRST, updated_at ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	q.Find(&sources)
+	if len(sources) == 0 {
+		return []models.SourceCirculationRecommendation{}, 0, 0
+	}
+
+	sourceIDs := make([]uuid.UUID, 0, len(sources))
+	for _, source := range sources {
+		sourceIDs = append(sourceIDs, source.PublicID)
+	}
+	statsBySource := sourceRecommendationStatsBySource(db, policy, sourceIDs)
 
 	rows := make([]models.SourceCirculationRecommendation, 0)
 	autoApplied := 0
 	for _, source := range sources {
-		rec, runCount, ok := recommendationForSource(db, policy, source)
+		rec, runCount, ok := recommendationForSourceStats(policy, source, statsBySource[source.PublicID])
 		if !ok {
 			continue
 		}
@@ -1002,7 +1020,33 @@ func generateSourceRecommendations(db *gorm.DB, policy models.NewsCirculationPol
 		}
 		rows = append(rows, rec)
 	}
-	return rows, autoApplied
+	return rows, autoApplied, len(sources)
+}
+
+type sourceRecommendationStats struct {
+	SourceID   uuid.UUID
+	RunCount   int64
+	Fetched    int
+	Accepted   int
+	Failed     int
+	Duplicates int
+	Filtered   int
+}
+
+func sourceRecommendationStatsBySource(db *gorm.DB, policy models.NewsCirculationPolicy, sourceIDs []uuid.UUID) map[uuid.UUID]sourceRecommendationStats {
+	cutoff := time.Now().AddDate(0, 0, -7)
+	var rows []sourceRecommendationStats
+	db.Model(&models.SourceRunTelemetry{}).
+		Select("source_id, COUNT(*) AS run_count, COALESCE(SUM(fetched), 0) AS fetched, COALESCE(SUM(accepted), 0) AS accepted, COALESCE(SUM(failed), 0) AS failed, COALESCE(SUM(duplicates), 0) AS duplicates, COALESCE(SUM(filtered), 0) AS filtered").
+		Where("tenant_id = ? AND source_id IN ? AND finished_at > ?", policy.TenantID, sourceIDs, cutoff).
+		Group("source_id").
+		Scan(&rows)
+
+	statsBySource := make(map[uuid.UUID]sourceRecommendationStats, len(rows))
+	for _, row := range rows {
+		statsBySource[row.SourceID] = row
+	}
+	return statsBySource
 }
 
 // shouldAutoApply decides whether a recommendation may apply without a human.
@@ -1042,23 +1086,22 @@ func saveSourceRecommendation(db *gorm.DB, rec *models.SourceCirculationRecommen
 }
 
 func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, source models.ContentSource) (models.SourceCirculationRecommendation, int, bool) {
-	cutoff := time.Now().AddDate(0, 0, -7)
-	var runs []models.SourceRunTelemetry
-	db.Where("tenant_id = ? AND source_id = ? AND finished_at > ?", policy.TenantID, source.PublicID, cutoff).
-		Find(&runs)
-	if len(runs) < 2 {
+	stats := sourceRecommendationStatsBySource(db, policy, []uuid.UUID{source.PublicID})[source.PublicID]
+	return recommendationForSourceStats(policy, source, stats)
+}
+
+func recommendationForSourceStats(policy models.NewsCirculationPolicy, source models.ContentSource, stats sourceRecommendationStats) (models.SourceCirculationRecommendation, int, bool) {
+	if stats.RunCount < 2 {
 		return models.SourceCirculationRecommendation{}, 0, false
 	}
-	var fetched, accepted, failed, duplicates, filtered int
-	for _, r := range runs {
-		fetched += r.Fetched
-		accepted += r.Accepted
-		failed += r.Failed
-		duplicates += r.Duplicates
-		filtered += r.Filtered
-	}
+	fetched := stats.Fetched
+	accepted := stats.Accepted
+	failed := stats.Failed
+	duplicates := stats.Duplicates
+	filtered := stats.Filtered
+	runCount := int(stats.RunCount)
 	if fetched == 0 && accepted == 0 && failed == 0 {
-		return models.SourceCirculationRecommendation{}, len(runs), false
+		return models.SourceCirculationRecommendation{}, runCount, false
 	}
 	yield := 0.0
 	if fetched > 0 {
@@ -1086,13 +1129,13 @@ func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, s
 		recommended = guardedInterval(current, int(math.Ceil(float64(current)/2)), policy)
 		reason = "High new-content yield with low failures; pull this source more often."
 	default:
-		return models.SourceCirculationRecommendation{}, len(runs), false
+		return models.SourceCirculationRecommendation{}, runCount, false
 	}
 	if recommended == current {
-		return models.SourceCirculationRecommendation{}, len(runs), false
+		return models.SourceCirculationRecommendation{}, runCount, false
 	}
 	metrics, _ := json.Marshal(gin.H{
-		"runs":         len(runs),
+		"runs":         runCount,
 		"fetched":      fetched,
 		"accepted":     accepted,
 		"duplicates":   duplicates,
@@ -1112,7 +1155,7 @@ func recommendationForSource(db *gorm.DB, policy models.NewsCirculationPolicy, s
 		Reason:                     reason,
 		Mode:                       policy.SourceCadenceMode,
 		Metrics:                    datatypes.JSON(metrics),
-	}, len(runs), true
+	}, runCount, true
 }
 
 func guardedInterval(current, target int, policy models.NewsCirculationPolicy) int {

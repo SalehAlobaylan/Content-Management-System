@@ -29,6 +29,8 @@ const (
 	autopilotActionStatusSuccess = "success"
 	autopilotActionStatusSkipped = "skipped"
 	autopilotActionStatusError   = "error"
+
+	autopilotSourceRecommendationLimit = 8
 )
 
 type autopilotQueueStat struct {
@@ -63,6 +65,20 @@ type autopilotHealthSignal struct {
 	Snapshots              []autopilotSnapshotSignal `json:"snapshots"`
 	Queues                 []autopilotQueueStat      `json:"queues"`
 	GeneratedAt            string                    `json:"generated_at"`
+}
+
+type autopilotFreshnessReason struct {
+	Tone   string `json:"tone"`
+	Label  string `json:"label"`
+	Detail string `json:"detail"`
+}
+
+type autopilotFreshnessVerdict struct {
+	Score             int                        `json:"score"`
+	Verdict           string                     `json:"verdict"`
+	Summary           string                     `json:"summary"`
+	Reasons           []autopilotFreshnessReason `json:"reasons"`
+	RecommendedAction string                     `json:"recommended_action"`
 }
 
 type autopilotBlockedTool struct {
@@ -127,6 +143,7 @@ func GetCirculationAutopilotStatus(c *gin.Context) {
 	policy := loadCirculationPolicy(db, principal.TenantID)
 	health := collectAutopilotHealth(db, principal.TenantID, policy)
 	health.State = autopilotStateForPolicy(policy, health, time.Now())
+	freshness := computeAutopilotFreshness(policy, health)
 
 	latest, latestActions := latestAutopilotRunSummary(db, principal.TenantID)
 	if latestActions == nil {
@@ -142,6 +159,7 @@ func GetCirculationAutopilotStatus(c *gin.Context) {
 		"state":          health.State,
 		"policy":         policy,
 		"health":         health,
+		"freshness":      freshness,
 		"next_run_at":    autopilotNextRunAt(policy, time.Now()),
 		"boost_until":    policy.AutopilotBoostUntil,
 		"paused_until":   policy.AutopilotPausedUntil,
@@ -423,9 +441,21 @@ func runCirculationAutopilot(db *gorm.DB, tenantID string, opts autopilotRunOpti
 		}
 	}
 
-	runner.execute("source_recommendations.generate", "Generate source cadence recommendations and apply only changes allowed by existing guardrails.", nil, func() (interface{}, error) {
-		rows, applied := generateSourceRecommendations(db, policy)
-		return gin.H{"recommendations": len(rows), "auto_applied": applied}, nil
+	runner.execute("source_recommendations.generate", "Generate a bounded source-cadence batch and apply only changes allowed by existing guardrails.", gin.H{
+		"limit": autopilotSourceRecommendationLimit,
+	}, func() (interface{}, error) {
+		if healthBefore.PendingRecommendations >= int64(autopilotSourceRecommendationLimit) {
+			return gin.H{
+				"recommendations":         0,
+				"auto_applied":            0,
+				"sources_scanned":         0,
+				"limited":                 true,
+				"skipped_generation":      true,
+				"pending_recommendations": healthBefore.PendingRecommendations,
+			}, nil
+		}
+		rows, applied, scanned := generateSourceRecommendationsLimited(db, policy, autopilotSourceRecommendationLimit)
+		return gin.H{"recommendations": len(rows), "auto_applied": applied, "sources_scanned": scanned, "limited": true}, nil
 	})
 
 	runner.execute("snapshots.refresh", "Refresh stale or dirty News snapshots for all circulation windows.", gin.H{
@@ -434,9 +464,10 @@ func runCirculationAutopilot(db *gorm.DB, tenantID string, opts autopilotRunOpti
 		return refreshAutopilotSnapshots(db, tenantID, scope == models.NewsAutopilotToolScopeBoosted)
 	})
 
-	healthAfter := collectAutopilotHealth(db, tenantID, policy)
-	healthAfter.State = autopilotStateForPolicy(policy, healthAfter, time.Now())
 	finishedAt := time.Now()
+	healthAfter := healthBefore
+	healthAfter.GeneratedAt = finishedAt.Format(time.RFC3339)
+	healthAfter.State = autopilotStateForPolicy(policy, healthAfter, finishedAt)
 	status := autopilotRunStatusCompleted
 	if runner.errors > 0 && runner.success == 0 {
 		status = autopilotRunStatusFailed
@@ -639,10 +670,18 @@ func cheapTodayStoryMetrics(db *gorm.DB, tenantID string, circ circulationContex
 func refreshAutopilotSnapshots(db *gorm.DB, tenantID string, force bool) (gin.H, error) {
 	queued := []string{}
 	skipped := []string{}
-	for _, window := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
+	windows := []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth}
+	var snaps []models.NewsSnapshot
+	db.Select("window", "built_at", "dirty").
+		Where("tenant_id = ? AND \"window\" IN ?", tenantID, windows).
+		Find(&snaps)
+	snapshotByWindow := make(map[string]models.NewsSnapshot, len(snaps))
+	for _, snap := range snaps {
+		snapshotByWindow[snap.Window] = snap
+	}
+	for _, window := range windows {
 		needsRefresh := force
-		var snap models.NewsSnapshot
-		if err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, window).First(&snap).Error; err != nil {
+		if snap, ok := snapshotByWindow[window]; !ok {
 			needsRefresh = true
 		} else if snap.Dirty || time.Since(snap.BuiltAt) > newsSnapshotTTL {
 			needsRefresh = true
@@ -655,6 +694,156 @@ func refreshAutopilotSnapshots(db *gorm.DB, tenantID string, force bool) (gin.H,
 		queued = append(queued, window)
 	}
 	return gin.H{"queued": queued, "skipped": skipped}, nil
+}
+
+func computeAutopilotFreshness(policy models.NewsCirculationPolicy, health autopilotHealthSignal) autopilotFreshnessVerdict {
+	reasons := []autopilotFreshnessReason{}
+	addReason := func(tone, label, detail string) {
+		reasons = append(reasons, autopilotFreshnessReason{Tone: tone, Label: label, Detail: detail})
+	}
+
+	if !health.AggregationReachable {
+		addReason("danger", "Aggregation unavailable", "Autopilot cannot safely pull sources or inspect queue-backed freshness tools.")
+		return autopilotFreshnessVerdict{
+			Score:             0,
+			Verdict:           "degraded",
+			Summary:           "Aggregation is unreachable, so freshness automation is degraded.",
+			Reasons:           reasons,
+			RecommendedAction: "pause",
+		}
+	}
+	if policy.AutopilotMaxQueueDepth > 0 && health.QueueDepth > policy.AutopilotMaxQueueDepth {
+		addReason("danger", "Queue safety active", fmt.Sprintf("News tool queues are at %d/%d, above the configured safety limit.", health.QueueDepth, policy.AutopilotMaxQueueDepth))
+		return autopilotFreshnessVerdict{
+			Score:             20,
+			Verdict:           "blocked",
+			Summary:           "Queue pressure is blocking pull-heavy Autopilot actions.",
+			Reasons:           reasons,
+			RecommendedAction: "pause",
+		}
+	}
+
+	score := 100.0
+	minToday := policy.MinTodayStories
+	if minToday < 1 {
+		minToday = 8
+	}
+	todayRatio := float64(health.TodayStoryCount) / float64(minToday)
+	todayThin := health.TodayStoryCount < int64(minToday)
+	if todayThin {
+		penalty := 10 + (1-todayRatio)*40
+		if penalty > 35 {
+			penalty = 35
+		}
+		score -= penalty
+		addReason("warning", "Today feed is thin", fmt.Sprintf("%d/%d target stories are available for Today.", health.TodayStoryCount, minToday))
+	} else {
+		addReason("good", "Today has enough stories", fmt.Sprintf("%d stories meet the Today freshness target.", health.TodayStoryCount))
+	}
+
+	if health.TodayCarryoverRatio > 0.65 {
+		score -= 25
+		addReason("danger", "Carryover is high", fmt.Sprintf("%d carried stories make up %d%% of Today.", health.TodayCarryoverCount, int(health.TodayCarryoverRatio*100)))
+	} else if health.TodayCarryoverRatio > 0.4 {
+		score -= 12
+		addReason("warning", "Carryover is noticeable", fmt.Sprintf("%d%% of Today is filled by carried stories.", int(health.TodayCarryoverRatio*100)))
+	}
+
+	staleSnapshots := 0
+	catchingUpSnapshots := 0
+	dirtyGraceSeconds := int64((2 * newsSnapshotTTL).Seconds())
+	for _, snapshot := range health.Snapshots {
+		if snapshot.AgeSeconds > int64(newsSnapshotTTL.Seconds()) || (snapshot.Dirty && snapshot.AgeSeconds > dirtyGraceSeconds) {
+			staleSnapshots++
+		} else if snapshot.Dirty {
+			catchingUpSnapshots++
+		}
+	}
+	staleDominates := staleSnapshots >= 2
+	if staleDominates {
+		score -= 28
+		addReason("warning", "Snapshots need refresh", fmt.Sprintf("%d News windows are dirty or older than the cache SLO.", staleSnapshots))
+	} else if staleSnapshots == 1 {
+		score -= 10
+		addReason("warning", "One snapshot needs refresh", "One News window is dirty or older than the cache SLO.")
+	}
+	if catchingUpSnapshots > 0 {
+		penalty := catchingUpSnapshots * 6
+		if penalty > 16 {
+			penalty = 16
+		}
+		score -= float64(penalty)
+		addReason("warning", "Snapshots are catching up", fmt.Sprintf("%d News windows received newer story activity after their last build.", catchingUpSnapshots))
+	}
+
+	dueRatio := 0.0
+	if health.ActiveSources > 0 {
+		dueRatio = float64(health.DueSources) / float64(health.ActiveSources)
+	}
+	if dueRatio > 0.75 {
+		score -= 15
+		addReason("warning", "Many sources are due", fmt.Sprintf("%d/%d active sources are ready to pull.", health.DueSources, health.ActiveSources))
+	} else if dueRatio > 0.4 {
+		score -= 8
+		addReason("warning", "Sources are accumulating", fmt.Sprintf("%d/%d active sources are due.", health.DueSources, health.ActiveSources))
+	}
+
+	if health.SourceErrorRate >= 0.25 {
+		score -= 20
+		addReason("danger", "Source errors are high", fmt.Sprintf("%d%% of recent source runs failed without accepted items.", int(health.SourceErrorRate*100)))
+	} else if health.SourceErrorRate >= 0.1 {
+		score -= 10
+		addReason("warning", "Source errors need watching", fmt.Sprintf("%d%% of recent source runs failed without accepted items.", int(health.SourceErrorRate*100)))
+	}
+
+	queueRatio := 0.0
+	if policy.AutopilotMaxQueueDepth > 0 {
+		queueRatio = float64(health.QueueDepth) / float64(policy.AutopilotMaxQueueDepth)
+	}
+	if queueRatio > 0.8 {
+		score -= 15
+		addReason("warning", "Queue pressure is elevated", fmt.Sprintf("News tool queues are at %d/%d.", health.QueueDepth, policy.AutopilotMaxQueueDepth))
+	} else if queueRatio > 0.5 {
+		score -= 8
+		addReason("warning", "Queue pressure is building", fmt.Sprintf("News tool queues are at %d/%d.", health.QueueDepth, policy.AutopilotMaxQueueDepth))
+	}
+
+	if score < 0 {
+		score = 0
+	}
+	rounded := int(score + 0.5)
+	verdict := "watching"
+	summary := "Freshness is acceptable, but Autopilot should keep watching."
+	action := "none"
+
+	switch {
+	case staleDominates || rounded < 50:
+		verdict = "stale"
+		summary = "News freshness needs a refresh pass before operators can trust the cache state."
+		action = "run_once"
+	case todayThin || rounded < 70:
+		verdict = "thin"
+		summary = "Today is thinner than the circulation policy wants, so freshness should be boosted."
+		action = "boost_freshness"
+	case rounded >= 85:
+		verdict = "fresh"
+		summary = "News freshness is healthy and Autopilot does not need intervention."
+		action = "none"
+		addReason("good", "Freshness is healthy", "The main freshness signals are inside their guardrails.")
+	default:
+		if health.SourceErrorRate >= 0.25 {
+			action = "review_sources"
+			summary = "Freshness is usable, but source reliability needs review."
+		}
+	}
+
+	return autopilotFreshnessVerdict{
+		Score:             rounded,
+		Verdict:           verdict,
+		Summary:           summary,
+		Reasons:           reasons,
+		RecommendedAction: action,
+	}
 }
 
 func autopilotStateForPolicy(policy models.NewsCirculationPolicy, health autopilotHealthSignal, now time.Time) string {

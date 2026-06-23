@@ -224,6 +224,145 @@ func TestRelevantQueueDepthOnlyCountsNewsToolbeltQueues(t *testing.T) {
 	}
 }
 
+func baseFreshnessHealth(policy models.NewsCirculationPolicy) autopilotHealthSignal {
+	return autopilotHealthSignal{
+		AggregationReachable: true,
+		QueueDepth:           4,
+		MaxQueueDepth:        policy.AutopilotMaxQueueDepth,
+		TodayStoryCount:      int64(policy.MinTodayStories + 6),
+		ActiveSources:        20,
+		DueSources:           2,
+		Snapshots: []autopilotSnapshotSignal{
+			{Window: models.NewsWindowToday, Dirty: false, AgeSeconds: 10},
+			{Window: models.NewsWindowWeek, Dirty: false, AgeSeconds: 10},
+			{Window: models.NewsWindowMonth, Dirty: false, AgeSeconds: 10},
+		},
+	}
+}
+
+func TestAutopilotFreshnessVerdictHealthyFeed(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.AutopilotMaxQueueDepth = 100
+
+	got := computeAutopilotFreshness(policy, baseFreshnessHealth(policy))
+	if got.Verdict != "fresh" {
+		t.Fatalf("verdict = %s, want fresh", got.Verdict)
+	}
+	if got.Score < 85 {
+		t.Fatalf("score = %d, want >= 85", got.Score)
+	}
+	if got.RecommendedAction != "none" {
+		t.Fatalf("recommended action = %s, want none", got.RecommendedAction)
+	}
+}
+
+func TestAutopilotFreshnessVerdictThinToday(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.MinTodayStories = 10
+	health := baseFreshnessHealth(policy)
+	health.TodayStoryCount = 5
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Verdict != "thin" {
+		t.Fatalf("verdict = %s, want thin", got.Verdict)
+	}
+	if got.RecommendedAction != "boost_freshness" {
+		t.Fatalf("recommended action = %s, want boost_freshness", got.RecommendedAction)
+	}
+}
+
+func TestAutopilotFreshnessVerdictHighCarryoverLowersScore(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	health := baseFreshnessHealth(policy)
+	health.TodayStoryCount = 10
+	health.TodayCarryoverCount = 7
+	health.TodayCarryoverRatio = 0.7
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Score >= 85 {
+		t.Fatalf("score = %d, want below fresh threshold", got.Score)
+	}
+	if got.Verdict == "fresh" {
+		t.Fatalf("verdict = fresh, want carryover to prevent fresh verdict")
+	}
+}
+
+func TestAutopilotFreshnessVerdictStaleSnapshots(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	health := baseFreshnessHealth(policy)
+	health.Snapshots = []autopilotSnapshotSignal{
+		{Window: models.NewsWindowToday, Dirty: true, AgeSeconds: 180},
+		{Window: models.NewsWindowWeek, Dirty: false, AgeSeconds: 120},
+		{Window: models.NewsWindowMonth, Dirty: false, AgeSeconds: 10},
+	}
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Verdict != "stale" {
+		t.Fatalf("verdict = %s, want stale", got.Verdict)
+	}
+	if got.RecommendedAction != "run_once" {
+		t.Fatalf("recommended action = %s, want run_once", got.RecommendedAction)
+	}
+}
+
+func TestAutopilotFreshnessVerdictRecentDirtySnapshotsAreWatching(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	health := baseFreshnessHealth(policy)
+	health.Snapshots = []autopilotSnapshotSignal{
+		{Window: models.NewsWindowToday, Dirty: true, AgeSeconds: 15},
+		{Window: models.NewsWindowWeek, Dirty: true, AgeSeconds: 15},
+		{Window: models.NewsWindowMonth, Dirty: true, AgeSeconds: 15},
+	}
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Verdict != "watching" {
+		t.Fatalf("verdict = %s, want watching", got.Verdict)
+	}
+	if got.RecommendedAction != "none" {
+		t.Fatalf("recommended action = %s, want none", got.RecommendedAction)
+	}
+}
+
+func TestAutopilotFreshnessVerdictSafetyBlocks(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	policy.AutopilotMaxQueueDepth = 10
+	health := baseFreshnessHealth(policy)
+	health.QueueDepth = 11
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Verdict != "blocked" {
+		t.Fatalf("verdict = %s, want blocked", got.Verdict)
+	}
+	if got.RecommendedAction != "pause" {
+		t.Fatalf("recommended action = %s, want pause", got.RecommendedAction)
+	}
+}
+
+func TestAutopilotFreshnessVerdictDegraded(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	health := baseFreshnessHealth(policy)
+	health.AggregationReachable = false
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.Verdict != "degraded" {
+		t.Fatalf("verdict = %s, want degraded", got.Verdict)
+	}
+	if got.Score != 0 {
+		t.Fatalf("score = %d, want 0", got.Score)
+	}
+}
+
+func TestAutopilotFreshnessVerdictSourceReviewRecommendation(t *testing.T) {
+	policy := models.DefaultNewsCirculationPolicy("default")
+	health := baseFreshnessHealth(policy)
+	health.SourceErrorRate = 0.3
+
+	got := computeAutopilotFreshness(policy, health)
+	if got.RecommendedAction != "review_sources" {
+		t.Fatalf("recommended action = %s, want review_sources", got.RecommendedAction)
+	}
+}
+
 func TestStoryLifecycle(t *testing.T) {
 	policy := models.DefaultNewsCirculationPolicy("default")
 	window := circulationWindow{
