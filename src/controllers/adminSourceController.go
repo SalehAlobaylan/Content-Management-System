@@ -124,6 +124,46 @@ type previewSourceItem struct {
 	Author         *string `json:"author,omitempty"`
 	OriginalURL    string  `json:"originalUrl"`
 	PublishedAt    *string `json:"publishedAt,omitempty"`
+	// Rich media metadata (carried through from the aggregation preview) so the
+	// "Add media source" wizard can show thumbnails + durations.
+	ThumbnailURL *string `json:"thumbnailUrl,omitempty"`
+	DurationSec  *int    `json:"durationSec,omitempty"`
+}
+
+// --- Media-add discovery proxies (podcast search, youtube resolve) -----------
+
+type podcastSearchResult struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	FeedURL  string `json:"feed_url"`
+	ImageURL string `json:"image_url,omitempty"`
+}
+
+type podcastSearchResponse struct {
+	Results []podcastSearchResult `json:"results"`
+}
+
+type itunesAggResponse struct {
+	Results []struct {
+		CollectionID   int64  `json:"collectionId"`
+		CollectionName string `json:"collectionName"`
+		FeedURL        string `json:"feedUrl"`
+		ArtworkURL600  string `json:"artworkUrl600"`
+	} `json:"results"`
+}
+
+type youtubeResolveResponse struct {
+	ChannelID       string `json:"channel_id"`
+	Title           string `json:"title"`
+	Thumbnail       string `json:"thumbnail,omitempty"`
+	SubscriberCount int64  `json:"subscriber_count,omitempty"`
+}
+
+type youtubeAggResponse struct {
+	ChannelID       string `json:"channelId"`
+	Title           string `json:"title"`
+	Thumbnail       string `json:"thumbnail"`
+	SubscriberCount int64  `json:"subscriberCount"`
 }
 
 type previewSourceResponse struct {
@@ -1111,6 +1151,106 @@ func PreviewSource(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// SearchPodcasts handles GET /admin/sources/podcast-search?term=&limit=&country=
+// Proxies to the aggregation iTunes search so the "Add media source" wizard can
+// let admins pick a podcast by name (returns feed URL + artwork).
+func SearchPodcasts(c *gin.Context) {
+	if _, ok := requireAdminPrincipal(c); !ok {
+		return
+	}
+
+	term := strings.TrimSpace(c.Query("term"))
+	if term == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "term is required", Code: "TERM_REQUIRED"})
+		return
+	}
+
+	q := url.Values{}
+	q.Set("term", term)
+	if l := strings.TrimSpace(c.Query("limit")); l != "" {
+		q.Set("limit", l)
+	}
+	if co := strings.TrimSpace(c.Query("country")); co != "" {
+		q.Set("country", co)
+	}
+
+	body, statusCode, err := proxyAggregationGet(c.GetHeader("Authorization"), "/admin/itunes/search?"+q.Encode())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Failed to search podcasts: " + err.Error(), Code: "ITUNES_SEARCH_FAILED"})
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		c.JSON(statusCode, authErrorResponse{Message: "Aggregation rejected podcast search", Code: "ITUNES_SEARCH_REJECTED"})
+		return
+	}
+
+	var agg itunesAggResponse
+	if err := json.Unmarshal(body, &agg); err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Invalid response from aggregation service", Code: "INVALID_AGGREGATION_RESPONSE"})
+		return
+	}
+
+	resp := podcastSearchResponse{Results: []podcastSearchResult{}}
+	for _, r := range agg.Results {
+		if strings.TrimSpace(r.FeedURL) == "" {
+			continue
+		}
+		resp.Results = append(resp.Results, podcastSearchResult{
+			ID:       r.CollectionID,
+			Name:     r.CollectionName,
+			FeedURL:  r.FeedURL,
+			ImageURL: r.ArtworkURL600,
+		})
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// ResolveYoutube handles GET /admin/sources/youtube-resolve?url=
+// Proxies to the aggregation YouTube resolver so the wizard can confirm the
+// channel (name + avatar) before saving.
+func ResolveYoutube(c *gin.Context) {
+	if _, ok := requireAdminPrincipal(c); !ok {
+		return
+	}
+
+	target := strings.TrimSpace(c.Query("url"))
+	if target == "" {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "url is required", Code: "URL_REQUIRED"})
+		return
+	}
+
+	q := url.Values{}
+	q.Set("url", target)
+
+	body, statusCode, err := proxyAggregationGet(c.GetHeader("Authorization"), "/admin/youtube/resolve?"+q.Encode())
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Failed to resolve channel: " + err.Error(), Code: "YOUTUBE_RESOLVE_FAILED"})
+		return
+	}
+	if statusCode == http.StatusNotFound {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Could not resolve a YouTube channel from that URL", Code: "YOUTUBE_NOT_RESOLVED"})
+		return
+	}
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		c.JSON(statusCode, authErrorResponse{Message: "Aggregation rejected channel resolve", Code: "YOUTUBE_RESOLVE_REJECTED"})
+		return
+	}
+
+	var agg youtubeAggResponse
+	if err := json.Unmarshal(body, &agg); err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Invalid response from aggregation service", Code: "INVALID_AGGREGATION_RESPONSE"})
+		return
+	}
+
+	c.JSON(http.StatusOK, youtubeResolveResponse{
+		ChannelID:       agg.ChannelID,
+		Title:           agg.Title,
+		Thumbnail:       agg.Thumbnail,
+		SubscriberCount: agg.SubscriberCount,
+	})
 }
 
 func mapContentSourceResponse(source models.ContentSource) contentSourceResponse {
