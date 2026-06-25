@@ -23,6 +23,12 @@ func SetupInteractionRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// Get user's bookmarked content
 	group.GET("/interactions/bookmarks", auth, controllers.GetBookmarks)
 
+	// Get user's liked content
+	group.GET("/interactions/likes", auth, controllers.GetLikes)
+
+	// Aggregate profile counts (saved/likes/listened/created)
+	group.GET("/interactions/stats", auth, controllers.GetUserStats)
+
 	// Watch history — list and clear
 	group.GET("/interactions/history", auth, controllers.GetWatchHistory)
 	group.DELETE("/interactions/history", auth, controllers.DeleteWatchHistory)

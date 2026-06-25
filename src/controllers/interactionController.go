@@ -330,6 +330,170 @@ func GetBookmarks(c *gin.Context) {
 	})
 }
 
+// GetLikes returns the content the user has liked, newest-like first.
+// GET /api/v1/interactions/likes?session_id=xxx&cursor=xxx&limit=20
+//
+// Mirrors GetBookmarks but scopes to like interactions. Items carry is_liked
+// (always true here) and the real is_bookmarked flag so the row can render
+// engagement state consistently with the Saved tab.
+func GetLikes(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Invalid cursor: " + err.Error(),
+		})
+		return
+	}
+
+	// Scope strictly to the caller's own identity (verified JWT, else session).
+	query := db.Model(&models.UserInteraction{}).
+		Select("user_interactions.*").
+		Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+		Where("user_interactions.type = ?", models.InteractionTypeLike).
+		Where("content_items.status = ?", models.ContentStatusReady)
+
+	if uid, ok := authedUserID(c); ok {
+		query = query.Where("user_interactions.user_id = ?", uid)
+	} else if sessionID := c.Query("session_id"); sessionID != "" {
+		query = query.Where("user_interactions.session_id = ?", sessionID)
+	} else {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication or session_id required",
+		})
+		return
+	}
+
+	if !pagination.Timestamp.IsZero() {
+		query = query.Where(
+			"user_interactions.created_at < ? OR (user_interactions.created_at = ? AND user_interactions.public_id < ?)",
+			pagination.Timestamp,
+			pagination.Timestamp,
+			pagination.LastID,
+		)
+	}
+
+	var interactions []models.UserInteraction
+	if err := query.
+		Order("user_interactions.created_at DESC, user_interactions.public_id DESC").
+		Limit(pagination.Limit + 1).
+		Find(&interactions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code:    http.StatusInternalServerError,
+			Message: "Failed to fetch likes: " + err.Error(),
+		})
+		return
+	}
+
+	var nextCursor *string
+	hasMore := len(interactions) > pagination.Limit
+	if hasMore {
+		interactions = interactions[:pagination.Limit]
+	}
+	if len(interactions) > 0 && hasMore {
+		lastItem := interactions[len(interactions)-1]
+		cursor := utils.EncodeCursor(lastItem.CreatedAt, lastItem.PublicID)
+		nextCursor = &cursor
+	}
+
+	contentIDs := make([]uuid.UUID, len(interactions))
+	for i, interaction := range interactions {
+		contentIDs[i] = interaction.ContentItemID
+	}
+
+	var contentItems []models.ContentItem
+	if len(contentIDs) > 0 {
+		db.Where("public_id IN ?", contentIDs).Find(&contentItems)
+	}
+
+	contentMap := make(map[uuid.UUID]models.ContentItem, len(contentItems))
+	for _, item := range contentItems {
+		contentMap[item.PublicID] = item
+	}
+
+	// Resolve the bookmark flag for each liked item, scoped to the caller.
+	userIDStr, sessionID := readIdentity(c)
+	_, bookmarkedMap := getInteractionStatus(db, contentItems, sessionID, userIDStr)
+
+	items := make([]ForYouItem, 0, len(interactions))
+	for _, interaction := range interactions {
+		item, ok := contentMap[interaction.ContentItemID]
+		if !ok {
+			continue
+		}
+		items = append(items, mapToForYouItem(item, true, bookmarkedMap[item.PublicID]))
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"cursor": nextCursor,
+		"items":  items,
+	})
+}
+
+// UserStats is the aggregate engagement summary shown on the profile hub.
+type UserStats struct {
+	Saved    int64 `json:"saved"`
+	Likes    int64 `json:"likes"`
+	Listened int64 `json:"listened"`
+	Created  int64 `json:"created"`
+}
+
+// GetUserStats returns the authenticated user's profile counts. Each count is
+// aligned with the list it heads: saved/likes are joined to READY content (so
+// they match the Saved/Likes tabs), listened is distinct viewed content (matches
+// the de-duped history), created mirrors GetMyContent's author scoping.
+// GET /api/v1/interactions/stats
+func GetUserStats(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+
+	uid, ok := authedUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{
+			Code:    http.StatusUnauthorized,
+			Message: "Authentication required",
+		})
+		return
+	}
+
+	var stats UserStats
+
+	db.Model(&models.UserInteraction{}).
+		Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+		Where("user_interactions.user_id = ?", uid).
+		Where("user_interactions.type = ?", models.InteractionTypeBookmark).
+		Where("content_items.status = ?", models.ContentStatusReady).
+		Count(&stats.Saved)
+
+	db.Model(&models.UserInteraction{}).
+		Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+		Where("user_interactions.user_id = ?", uid).
+		Where("user_interactions.type = ?", models.InteractionTypeLike).
+		Where("content_items.status = ?", models.ContentStatusReady).
+		Count(&stats.Likes)
+
+	db.Model(&models.UserInteraction{}).
+		Where("user_id = ?", uid).
+		Where("type = ?", models.InteractionTypeView).
+		Distinct("content_item_id").
+		Count(&stats.Listened)
+
+	db.Model(&models.ContentItem{}).
+		Where("author_id = ?", uid).
+		Where("status IN ?", []models.ContentStatus{
+			models.ContentStatusReady,
+			models.ContentStatusPending,
+			models.ContentStatusProcessing,
+			models.ContentStatusFailed,
+			models.ContentStatusArchived,
+		}).
+		Count(&stats.Created)
+
+	c.JSON(http.StatusOK, stats)
+}
+
 // DeleteInteraction removes an interaction (unlike, unbookmark)
 // DELETE /api/v1/interactions/:id
 func DeleteInteraction(c *gin.Context) {
