@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -24,6 +25,7 @@ type discoveryProfileResponse struct {
 	Description          string   `json:"description"`
 	Keywords             []string `json:"keywords"`
 	Languages            []string `json:"languages"`
+	Category             string   `json:"category"`
 	Enabled              bool     `json:"enabled"`
 	MaxSuggestionsPerRun int      `json:"max_suggestions_per_run"`
 	LastRunAt            *string  `json:"last_run_at,omitempty"`
@@ -36,6 +38,7 @@ type createDiscoveryProfileRequest struct {
 	Description          string   `json:"description"`
 	Keywords             []string `json:"keywords"`
 	Languages            []string `json:"languages"`
+	Category             string   `json:"category"`
 	Enabled              *bool    `json:"enabled"`
 	MaxSuggestionsPerRun *int     `json:"max_suggestions_per_run"`
 }
@@ -45,6 +48,7 @@ type updateDiscoveryProfileRequest struct {
 	Description          *string   `json:"description"`
 	Keywords             *[]string `json:"keywords"`
 	Languages            *[]string `json:"languages"`
+	Category             *string   `json:"category"`
 	Enabled              *bool     `json:"enabled"`
 	MaxSuggestionsPerRun *int      `json:"max_suggestions_per_run"`
 }
@@ -64,6 +68,7 @@ type sourceSuggestionResponse struct {
 	SampleItems    json.RawMessage `json:"sample_items,omitempty"`
 	Evidence       json.RawMessage `json:"evidence,omitempty"`
 	DiscoveredVia  string          `json:"discovered_via,omitempty"`
+	Category       string          `json:"category"`
 	Status         string          `json:"status"`
 	RejectReason   *string         `json:"reject_reason,omitempty"`
 	CreatedAt      string          `json:"created_at"`
@@ -87,6 +92,9 @@ type aggregationDiscoveryProfile struct {
 	Keywords             []string `json:"keywords,omitempty"`
 	Languages            []string `json:"languages,omitempty"`
 	MaxSuggestionsPerRun int      `json:"maxSuggestionsPerRun"`
+	// Category ('news' | 'media') routes the sweep to the right keyword provider —
+	// media profiles discover podcasts via iTunes instead of the news web search.
+	Category string `json:"category,omitempty"`
 	// Config-driven overrides so manual runs honor the same tuning as scheduled
 	// sweeps (recency window + which search provider).
 	RecencyDays    int    `json:"recencyDays,omitempty"`
@@ -146,6 +154,7 @@ func CreateDiscoveryProfile(c *gin.Context) {
 		Description:          strings.TrimSpace(req.Description),
 		Keywords:             pq.StringArray(req.Keywords),
 		Languages:            pq.StringArray(req.Languages),
+		Category:             normalizeDiscoveryCategory(req.Category),
 		Enabled:              true,
 		MaxSuggestionsPerRun: 10,
 	}
@@ -203,6 +212,9 @@ func UpdateDiscoveryProfile(c *gin.Context) {
 	}
 	if req.Languages != nil {
 		profile.Languages = pq.StringArray(*req.Languages)
+	}
+	if req.Category != nil {
+		profile.Category = normalizeDiscoveryCategory(*req.Category)
 	}
 	if req.Enabled != nil {
 		profile.Enabled = *req.Enabled
@@ -288,6 +300,7 @@ func RunDiscoveryProfile(c *gin.Context) {
 			Keywords:             []string(profile.Keywords),
 			Languages:            []string(profile.Languages),
 			MaxSuggestionsPerRun: maxPerRun,
+			Category:             profile.Category,
 			RecencyDays:          cfg.RecencyWindowDays,
 			SearchProvider:       cfg.SearchProvider,
 		},
@@ -329,6 +342,11 @@ func ListSourceSuggestions(c *gin.Context) {
 		if internalID, found := resolveProfileInternalID(db, principal.TenantID, profileParam); found {
 			query = query.Where("profile_id = ?", *internalID)
 		}
+	}
+	// Category filter ('news' | 'media') so the For You hub fetches only media
+	// suggestions instead of pulling a mixed page and dropping media client-side.
+	if cat := strings.TrimSpace(c.Query("category")); cat != "" && !strings.EqualFold(cat, "all") {
+		query = query.Where("category = ?", strings.ToLower(cat))
 	}
 
 	var total int64
@@ -510,10 +528,14 @@ func ListNewsSources(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 
-	// The hub owns news-category sources (a media-category Telegram channel
-	// stays out and is managed on the Sources page instead).
+	// Category-scoped: the News hub passes 'news' (default), the For You hub
+	// passes 'media'. A source belongs to exactly one hub by its category.
+	cat := strings.ToLower(strings.TrimSpace(c.Query("category")))
+	if cat != models.SourceCategoryMedia {
+		cat = models.SourceCategoryNews
+	}
 	query := db.Model(&models.ContentSource{}).
-		Where("tenant_id = ? AND category = ?", principal.TenantID, models.SourceCategoryNews)
+		Where("tenant_id = ? AND category = ?", principal.TenantID, cat)
 
 	if typeParam := strings.ToUpper(strings.TrimSpace(c.Query("type"))); typeParam != "" {
 		query = query.Where("type = ?", typeParam)
@@ -807,12 +829,22 @@ func mapDiscoveryProfileResponse(p models.DiscoveryProfile) discoveryProfileResp
 		Description:          p.Description,
 		Keywords:             keywords,
 		Languages:            languages,
+		Category:             normalizeDiscoveryCategory(p.Category),
 		Enabled:              p.Enabled,
 		MaxSuggestionsPerRun: p.MaxSuggestionsPerRun,
 		LastRunAt:            lastRun,
 		CreatedAt:            p.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:            p.UpdatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+// normalizeDiscoveryCategory clamps a free-text category to the two supported
+// hubs, defaulting to news.
+func normalizeDiscoveryCategory(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), models.SourceCategoryMedia) {
+		return models.SourceCategoryMedia
+	}
+	return models.SourceCategoryNews
 }
 
 func mapSourceSuggestionResponse(s models.SourceSuggestion, profileIDs map[uint]string) sourceSuggestionResponse {
@@ -830,6 +862,7 @@ func mapSourceSuggestionResponse(s models.SourceSuggestion, profileIDs map[uint]
 		SampleItems:    json.RawMessage(s.SampleItems),
 		Evidence:       json.RawMessage(s.Evidence),
 		DiscoveredVia:  s.DiscoveredVia,
+		Category:       defaultStr(s.Category, models.DefaultCategoryForType(s.Type)),
 		Status:         s.Status,
 		RejectReason:   s.RejectReason,
 		CreatedAt:      s.CreatedAt.UTC().Format(time.RFC3339),
@@ -874,6 +907,17 @@ func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.Source
 		if category == "" {
 			category = models.DefaultCategoryForType(suggestion.Type)
 		}
+		// Storage guard: cap a newly-approved MEDIA source to the N most-recent
+		// episodes/videos so a deep podcast back-catalog doesn't flood ingestion
+		// + S3 on first fetch. Ongoing interval fetches still pick up new items.
+		var apiConfig datatypes.JSON
+		if category == models.SourceCategoryMedia {
+			if cfg := loadDiscoveryConfig(db, tenantID); cfg.MediaInitialMaxEpisodes > 0 {
+				if raw, err := json.Marshal(map[string]interface{}{"max_results": cfg.MediaInitialMaxEpisodes}); err == nil {
+					apiConfig = datatypes.JSON(raw)
+				}
+			}
+		}
 		source := models.ContentSource{
 			TenantID:             tenantID,
 			Name:                 suggestion.Name,
@@ -881,6 +925,7 @@ func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.Source
 			Category:             category,
 			FeedURL:              &feedURL,
 			ImageURL:             suggestion.ImageURL,
+			APIConfig:            apiConfig,
 			IsActive:             true,
 			FetchIntervalMinutes: 60,
 			DiscoveryProfileID:   suggestion.ProfileID,

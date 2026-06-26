@@ -29,6 +29,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.GET("/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
 	internal.GET("/intel/approved-telegram-channels", controllers.InternalGetApprovedTelegramChannels)
 	internal.GET("/intel/approved-twitter-handles", controllers.InternalGetApprovedTwitterHandles)
+	internal.GET("/intel/approved-youtube-channels", controllers.InternalGetApprovedYouTubeChannels)
+	internal.GET("/intel/approved-podcast-feeds", controllers.InternalGetApprovedPodcastFeeds)
 	internal.POST("/intel/candidates", controllers.InternalUpsertCandidates)
 	internal.GET("/intel/candidates", controllers.InternalListCandidates)
 

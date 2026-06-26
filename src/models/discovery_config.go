@@ -33,6 +33,19 @@ type DiscoveryConfig struct {
 	TwitterDiscoveryEnabled   bool `gorm:"default:false" json:"twitter_discovery_enabled"`
 	// X "who to follow" / قد يعجبك relatedness discovery (guest-accessible REST).
 	TwitterRecommendEnabled   bool `gorm:"default:false" json:"twitter_recommend_enabled"`
+	// Media (For You) discovery contributors — YouTube via InnerTube, podcasts via
+	// RSS/iTunes. The *_related flags gate the scraped owner-curated relation
+	// shelves (YT featured / Apple "Listeners Also Subscribed"), enabled only
+	// after a live probe confirms the endpoint shape.
+	YouTubeDiscoveryEnabled   bool `gorm:"default:false" json:"youtube_discovery_enabled"`
+	PodcastDiscoveryEnabled   bool `gorm:"default:false" json:"podcast_discovery_enabled"`
+	YouTubeRelatedEnabled     bool `gorm:"default:false" json:"youtube_related_enabled"`
+	AppleRelatedEnabled       bool `gorm:"default:false" json:"apple_related_enabled"`
+	// Storage guard: how many of the most-recent episodes/videos to pull when a
+	// media source is approved. Caps `max_results` on the new source so a podcast
+	// with a deep back-catalog doesn't flood ingestion/S3 on first fetch; ongoing
+	// fetches still pick up new items. 0 = no cap (pull everything — discouraged).
+	MediaInitialMaxEpisodes   int  `gorm:"type:integer;default:5" json:"media_initial_max_episodes"`
 	GraphBuildIntervalHours   int  `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
 	PromotionThreshold      float64 `gorm:"type:double precision;default:0.30" json:"promotion_threshold"`
 	// Composite-score signal weights (sum ≈ 1.0).
@@ -69,6 +82,11 @@ func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 		TelegramDiscoveryEnabled: false,
 		TwitterDiscoveryEnabled:  false,
 		TwitterRecommendEnabled:  false,
+		YouTubeDiscoveryEnabled:  false,
+		PodcastDiscoveryEnabled:  false,
+		YouTubeRelatedEnabled:    false,
+		AppleRelatedEnabled:      false,
+		MediaInitialMaxEpisodes:  5,
 		GraphBuildIntervalHours:  24,
 		PromotionThreshold:       0.30,
 		WeightCitation:          0.20,

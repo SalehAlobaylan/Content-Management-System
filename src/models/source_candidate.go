@@ -21,7 +21,22 @@ const (
 	CandidateKindRSS      = "rss"
 	CandidateKindTelegram = "telegram"
 	CandidateKindTwitter  = "twitter"
+	CandidateKindYouTube  = "youtube"
+	CandidateKindPodcast  = "podcast"
 )
+
+// CategoryForCandidateKind maps a candidate kind to the discovery category that
+// owns it. YouTube/podcast candidates are media (For You); everything else is
+// news. Used to keep media and news promotion graphs isolated — a candidate
+// only promotes against profiles in its own category.
+func CategoryForCandidateKind(kind string) string {
+	switch kind {
+	case CandidateKindYouTube, CandidateKindPodcast:
+		return SourceCategoryMedia
+	default:
+		return SourceCategoryNews
+	}
+}
 
 // SourceCandidate is the persistent ledger of candidate news domains discovered
 // from your trusted graph (corpus citations + link-graph). It accumulates
@@ -35,8 +50,10 @@ type SourceCandidate struct {
 	Domain       string `gorm:"type:varchar(255);not null;uniqueIndex:idx_source_candidates_tenant_domain,priority:2" json:"domain"`
 	CanonicalKey string `gorm:"type:text" json:"canonical_key"`
 
-	// Kind ('rss' | 'telegram') — an RSS candidate resolves to a feed; a telegram
-	// candidate is a channel (domain = username, feed_url = https://t.me/<username>).
+	// Kind ('rss' | 'telegram' | 'twitter' | 'youtube' | 'podcast') — an RSS/podcast
+	// candidate resolves to a feed; a telegram/twitter candidate is a channel/handle
+	// (domain = username); a youtube candidate is a channel (domain = channelId,
+	// feed_url = https://www.youtube.com/channel/<id>).
 	Kind string `gorm:"type:varchar(16);not null;default:rss" json:"kind"`
 
 	// Resolution (a candidate becomes promotable once its feed is found + valid).

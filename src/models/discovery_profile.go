@@ -22,6 +22,12 @@ type DiscoveryProfile struct {
 	Keywords    pq.StringArray `gorm:"type:text[]" json:"keywords"`
 	Languages   pq.StringArray `gorm:"type:text[]" json:"languages"`
 
+	// Category ('news' | 'media') scopes the profile to a discovery hub. News
+	// profiles only ever match news candidates (RSS/Telegram/X); media profiles
+	// only match media candidates (YouTube/podcast) — promotion is category-
+	// isolated so authority never bleeds across the two For-You/News graphs.
+	Category string `gorm:"type:varchar(16);not null;default:news" json:"category"`
+
 	Enabled              bool       `gorm:"default:true" json:"enabled"`
 	MaxSuggestionsPerRun int        `gorm:"default:10" json:"max_suggestions_per_run"`
 	LastRunAt            *time.Time `gorm:"type:timestamp" json:"last_run_at,omitempty"`

@@ -203,6 +203,86 @@ func InternalGetApprovedTwitterHandles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
+// InternalGetApprovedYouTubeChannels handles GET /internal/intel/approved-youtube-channels
+// — the approved YouTube channels that seed the media interaction graph (watch-next
+// + featured). Returns a channel reference (handle / channelId / custom URL) that
+// Enrichment's InnerTube extractor resolves.
+func InternalGetApprovedYouTubeChannels(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := intelTenant(c)
+	var sources []models.ContentSource
+	db.Where("tenant_id = ? AND type = ? AND feed_url IS NOT NULL", tenantID, models.SourceTypeYouTube).Find(&sources)
+
+	out := make([]gin.H, 0, len(sources))
+	seen := map[string]bool{}
+	for _, s := range sources {
+		if s.FeedURL == nil {
+			continue
+		}
+		ref := youtubeChannelRef(*s.FeedURL)
+		if ref == "" || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		out = append(out, gin.H{"channel": ref})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// youtubeChannelRef extracts a stable channel reference from a YouTube URL,
+// @handle, or raw channelId. Enrichment resolves any of these to a channel.
+func youtubeChannelRef(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		p := strings.Trim(u.Path, "/")
+		switch {
+		case strings.HasPrefix(p, "channel/"):
+			return strings.TrimPrefix(p, "channel/")
+		case strings.HasPrefix(p, "c/"):
+			return strings.TrimPrefix(p, "c/")
+		case strings.HasPrefix(p, "user/"):
+			return strings.TrimPrefix(p, "user/")
+		case strings.HasPrefix(p, "@"):
+			return p // @handle
+		case p != "":
+			return p
+		}
+	}
+	// Bare @handle or channelId.
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
+// InternalGetApprovedPodcastFeeds handles GET /internal/intel/approved-podcast-feeds
+// — the approved podcast RSS feeds that seed the media link-graph (show-notes
+// outbound links + topical similarity).
+func InternalGetApprovedPodcastFeeds(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	tenantID := intelTenant(c)
+	var sources []models.ContentSource
+	db.Where("tenant_id = ? AND type = ? AND feed_url IS NOT NULL", tenantID, models.SourceTypePodcast).Find(&sources)
+
+	out := make([]gin.H, 0, len(sources))
+	seen := map[string]bool{}
+	for _, s := range sources {
+		if s.FeedURL == nil {
+			continue
+		}
+		feed := strings.TrimSpace(*s.FeedURL)
+		if feed == "" || seen[feed] {
+			continue
+		}
+		seen[feed] = true
+		out = append(out, gin.H{"feed_url": feed})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
 // twitterHandle extracts the bare handle from an x.com/twitter.com URL or @handle.
 func twitterHandle(raw string) string {
 	s := strings.TrimSpace(raw)
@@ -272,7 +352,11 @@ func InternalUpsertCandidates(c *gin.Context) {
 			continue
 		}
 		kind := strings.ToLower(strings.TrimSpace(cand.Kind))
-		if kind != models.CandidateKindTelegram && kind != models.CandidateKindTwitter {
+		switch kind {
+		case models.CandidateKindTelegram, models.CandidateKindTwitter,
+			models.CandidateKindYouTube, models.CandidateKindPodcast:
+			// recognized kind — keep as-is
+		default:
 			kind = models.CandidateKindRSS
 		}
 		row := models.SourceCandidate{
@@ -583,9 +667,34 @@ func promoteCandidatesForAllProfiles(db *gorm.DB, tenantID string) int {
 	var profiles []models.DiscoveryProfile
 	db.Where("tenant_id = ? AND enabled = ?", tenantID, true).Find(&profiles)
 
+	// Fetch the candidate pool PER category (news vs media) so a large, mature
+	// news ledger can't starve media graph candidates out of the top-N by
+	// authority (the two graphs have independent authority scales). Only pull a
+	// category that actually has an enabled profile to score against.
+	wantCat := map[string]bool{}
+	for i := range profiles {
+		c := strings.TrimSpace(profiles[i].Category)
+		if c == "" {
+			c = models.SourceCategoryNews
+		}
+		wantCat[c] = true
+	}
+	kindsByCat := map[string][]string{
+		models.SourceCategoryNews:  {models.CandidateKindRSS, models.CandidateKindTelegram, models.CandidateKindTwitter},
+		models.SourceCategoryMedia: {models.CandidateKindYouTube, models.CandidateKindPodcast},
+	}
 	var candidates []models.SourceCandidate
-	db.Where("tenant_id = ? AND feed_valid = ? AND status NOT IN ?", tenantID, true, []string{models.CandidateStatusApproved, models.CandidateStatusRejected}).
-		Order("authority_score desc").Limit(80).Find(&candidates)
+	for cat := range wantCat {
+		kinds := kindsByCat[cat]
+		if len(kinds) == 0 {
+			continue
+		}
+		var part []models.SourceCandidate
+		db.Where("tenant_id = ? AND feed_valid = ? AND status NOT IN ? AND kind IN ?",
+			tenantID, true, []string{models.CandidateStatusApproved, models.CandidateStatusRejected}, kinds).
+			Order("authority_score desc").Limit(80).Find(&part)
+		candidates = append(candidates, part...)
+	}
 
 	// Classify each candidate ONCE (class is per-account, not per-profile).
 	classMap, methodMap := classifyCandidates(candidates)
@@ -662,9 +771,19 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 	if !ok {
 		return 0
 	}
+	profileCategory := strings.TrimSpace(profile.Category)
+	if profileCategory == "" {
+		profileCategory = models.SourceCategoryNews
+	}
 	promoted := 0
 	for ci := range candidates {
 		cand := &candidates[ci]
+		// Category-isolation: a profile only ever promotes candidates from its own
+		// hub — news profiles match RSS/Telegram/X, media profiles match
+		// YouTube/podcast. Keeps the two authority graphs from bleeding together.
+		if models.CategoryForCandidateKind(cand.Kind) != profileCategory {
+			continue
+		}
 		if cand.ResolvedFeedURL == nil {
 			continue
 		}
@@ -709,6 +828,12 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 		case models.CandidateKindTwitter:
 			sugType = models.SourceTypeTwitter
 			via = "x-graph"
+		case models.CandidateKindYouTube:
+			sugType = models.SourceTypeYouTube
+			via = "youtube-graph"
+		case models.CandidateKindPodcast:
+			sugType = models.SourceTypePodcast
+			via = "podcast-graph"
 		}
 		if len(cand.DiscoveredVia) > 0 {
 			via = cand.DiscoveredVia[0]
@@ -748,7 +873,7 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 			Health:         cand.FeedHealth,
 			Evidence:       datatypes.JSON(evidence),
 			DiscoveredVia:  via,
-			Category:       models.SourceCategoryNews,
+			Category:       profileCategory,
 			Status:         models.SuggestionStatusPending,
 		}
 		if img := imageFromHealth(cand.FeedHealth); img != "" {
