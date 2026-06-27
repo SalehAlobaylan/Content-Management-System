@@ -114,6 +114,10 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/transcription/quality/repair-sweep", perm("content", "write"), controllers.RepairTranscriptionQualitySweep)
 
 	// Media Atomization — operations dashboard and chapter review queue
+	adminGroup.GET("/media-atomization/policy", perm("content", "read"), controllers.AdminGetMediaAtomizationPolicy)
+	adminGroup.PATCH("/media-atomization/policy", perm("content", "write"), controllers.AdminUpdateMediaAtomizationPolicy)
+	adminGroup.GET("/media-atomization/sources", perm("content", "read"), controllers.AdminListMediaAtomizationSources)
+	adminGroup.PATCH("/media-atomization/sources/:id/policy", perm("content", "write"), controllers.AdminUpdateMediaAtomizationSourcePolicy)
 	adminGroup.GET("/media-atomization/overview", perm("content", "read"), controllers.AdminGetMediaAtomizationOverview)
 	adminGroup.GET("/media-atomization/pipeline", perm("content", "read"), controllers.AdminGetMediaAtomizationPipeline)
 	adminGroup.GET("/media-atomization/parents", perm("content", "read"), controllers.AdminListMediaAtomizationParents)
@@ -122,6 +126,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/media-atomization/review", perm("content", "read"), controllers.AdminListAtomizationReview)
 	adminGroup.POST("/media-atomization/repair-leaks", perm("content", "write"), controllers.AdminRepairMediaAtomizationLeaks)
 	adminGroup.POST("/media-atomization/sweep-now", perm("content", "write"), controllers.AdminRunAtomizationSweepNow)
+	adminGroup.PATCH("/media-atomization/parents/:id/override", perm("content", "write"), controllers.AdminUpdateMediaAtomizationParentOverride)
+	adminGroup.POST("/media-atomization/parents/:id/atomize", perm("content", "write"), controllers.AdminAtomizeMediaParent)
+	adminGroup.POST("/media-atomization/parents/:id/reatomize", perm("content", "write"), controllers.AdminReatomizeMediaParent)
 	adminGroup.POST("/media-atomization/chapters/:chapter_id/approve", perm("content", "publish"), controllers.AdminApproveAtomizedChapter)
 	adminGroup.POST("/media-atomization/chapters/:chapter_id/reject", perm("content", "publish"), controllers.AdminRejectAtomizedChapter)
 

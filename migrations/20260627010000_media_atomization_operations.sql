@@ -14,11 +14,11 @@ CREATE TABLE IF NOT EXISTS media_atomization_runs (
     completed_at timestamp,
     created_at timestamp NOT NULL DEFAULT now(),
     updated_at timestamp NOT NULL DEFAULT now(),
-    CONSTRAINT idx_media_atomization_runs_public_id UNIQUE (public_id),
     CONSTRAINT media_atomization_runs_parent_content_item_id_fkey
         FOREIGN KEY (parent_content_item_id) REFERENCES content_items (public_id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_media_atomization_runs_public_id ON media_atomization_runs (public_id);
 CREATE INDEX IF NOT EXISTS idx_media_atomization_runs_tenant ON media_atomization_runs (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_media_atomization_runs_parent ON media_atomization_runs (parent_content_item_id);
 CREATE INDEX IF NOT EXISTS idx_media_atomization_runs_status ON media_atomization_runs (status);

@@ -13,12 +13,14 @@ type MediaAtomizationRun struct {
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_media_atomization_runs_public_id" json:"id"`
 	TenantID string    `gorm:"type:varchar(64);not null;index:idx_media_atomization_runs_tenant" json:"tenant_id"`
 
-	ParentContentItemID uuid.UUID `gorm:"type:uuid;not null;index:idx_media_atomization_runs_parent" json:"parent_content_item_id"`
-	Status              string    `gorm:"type:varchar(24);not null;index:idx_media_atomization_runs_status" json:"status"`
-	Phase               string    `gorm:"type:varchar(32);not null;index:idx_media_atomization_runs_phase" json:"phase"`
-	ChildCount          int       `gorm:"not null;default:0" json:"child_count"`
-	ReviewCount         int       `gorm:"not null;default:0" json:"review_count"`
-	ErrorMessage        *string   `gorm:"type:text" json:"error_message,omitempty"`
+	ParentContentItemID uuid.UUID  `gorm:"type:uuid;not null;index:idx_media_atomization_runs_parent" json:"parent_content_item_id"`
+	Status              string     `gorm:"type:varchar(24);not null;index:idx_media_atomization_runs_status" json:"status"`
+	Phase               string     `gorm:"type:varchar(32);not null;index:idx_media_atomization_runs_phase" json:"phase"`
+	ChildCount          int        `gorm:"not null;default:0" json:"child_count"`
+	ReviewCount         int        `gorm:"not null;default:0" json:"review_count"`
+	ErrorMessage        *string    `gorm:"type:text" json:"error_message,omitempty"`
+	Trigger             *string    `gorm:"type:varchar(24);index:idx_media_atomization_runs_trigger" json:"trigger,omitempty"`
+	RequestedBy         *uuid.UUID `gorm:"type:uuid" json:"requested_by,omitempty"`
 
 	StartedAt   *time.Time `gorm:"type:timestamp;index:idx_media_atomization_runs_started_at" json:"started_at,omitempty"`
 	CompletedAt *time.Time `gorm:"type:timestamp" json:"completed_at,omitempty"`

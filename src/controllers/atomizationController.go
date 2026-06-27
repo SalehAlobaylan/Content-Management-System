@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,9 @@ const (
 	feedVisibilityHidden           = "hidden"
 	feedVisibilityReview           = "review"
 	feedVisibilityEmbeddingPending = "embedding_pending"
+	atomizationOverrideInherit     = "inherit"
+	atomizationOverrideDisabled    = "disabled"
+	atomizationOverrideEnabled     = "enabled"
 )
 
 type mediaAtomizationSchemaInfo struct {
@@ -79,12 +83,47 @@ func defaultAtomizationPolicy() atomizationPolicy {
 	}
 }
 
-func mergeAtomizationPolicy(raw datatypes.JSON) atomizationPolicy {
-	p := defaultAtomizationPolicy()
+func policyFromModel(model models.MediaAtomizationPolicy) atomizationPolicy {
+	return atomizationPolicy{
+		ChapteringEnabled:           model.ChapteringEnabled,
+		AutoPublishHighConfidence:   model.AutoPublishHighConfidence,
+		ParentFeedVisible:           model.ParentFeedVisible,
+		PreserveVideo:               model.PreserveVideo,
+		RemoveSponsorSegments:       model.RemoveSponsorSegments,
+		MinChapterMinutes:           model.MinChapterMinutes,
+		MinFeedUnitSeconds:          model.MinFeedUnitSeconds,
+		SoftMaxChapterMinutes:       model.SoftMaxChapterMinutes,
+		HardMaxChapterMinutes:       model.HardMaxChapterMinutes,
+		AtomizationMinParentSeconds: model.AtomizationMinParentSeconds,
+		MaxChaptersPerParent:        model.MaxChaptersPerParent,
+		ChapteringMode:              model.ChapteringMode,
+		HighConfidenceThreshold:     model.HighConfidenceThreshold,
+		PreferredPlaybackRendition:  model.PreferredPlaybackRendition,
+		FallbackPlaybackRendition:   model.FallbackPlaybackRendition,
+		AudioOnlyAllowed:            model.AudioOnlyAllowed,
+	}
+}
+
+func getOrCreateMediaAtomizationPolicy(db *gorm.DB, tenantID string) models.MediaAtomizationPolicy {
+	var policy models.MediaAtomizationPolicy
+	if err := db.Where("tenant_id = ?", tenantID).First(&policy).Error; err == nil {
+		return policy
+	}
+	policy = models.DefaultMediaAtomizationPolicy(tenantID)
+	_ = db.Create(&policy).Error
+	return policy
+}
+
+func mergeAtomizationPolicy(base atomizationPolicy, raw datatypes.JSON) atomizationPolicy {
+	p := base
 	cfg, _ := parseSourceAPIConfig(raw)
 	if len(cfg) == 0 {
 		return p
 	}
+	return applyAtomizationPolicyConfig(p, cfg)
+}
+
+func applyAtomizationPolicyConfig(p atomizationPolicy, cfg map[string]interface{}) atomizationPolicy {
 	p.ChapteringEnabled = boolConfig(cfg, "chaptering_enabled", p.ChapteringEnabled)
 	p.AutoPublishHighConfidence = boolConfig(cfg, "auto_publish_high_confidence", p.AutoPublishHighConfidence)
 	p.ParentFeedVisible = boolConfig(cfg, "parent_feed_visible", p.ParentFeedVisible)
@@ -101,6 +140,61 @@ func mergeAtomizationPolicy(raw datatypes.JSON) atomizationPolicy {
 	p.ChapteringMode = stringConfig(cfg, "chaptering_mode", p.ChapteringMode)
 	p.PreferredPlaybackRendition = stringConfig(cfg, "preferred_playback_rendition", p.PreferredPlaybackRendition)
 	p.FallbackPlaybackRendition = stringConfig(cfg, "fallback_playback_rendition", p.FallbackPlaybackRendition)
+	return p
+}
+
+func atomizationPolicyToMap(p atomizationPolicy) map[string]interface{} {
+	return map[string]interface{}{
+		"chaptering_enabled":             p.ChapteringEnabled,
+		"auto_publish_high_confidence":   p.AutoPublishHighConfidence,
+		"parent_feed_visible":            p.ParentFeedVisible,
+		"preserve_video":                 p.PreserveVideo,
+		"remove_sponsor_segments":        p.RemoveSponsorSegments,
+		"min_chapter_minutes":            p.MinChapterMinutes,
+		"min_feed_unit_seconds":          p.MinFeedUnitSeconds,
+		"soft_max_chapter_minutes":       p.SoftMaxChapterMinutes,
+		"hard_max_chapter_minutes":       p.HardMaxChapterMinutes,
+		"atomization_min_parent_seconds": p.AtomizationMinParentSeconds,
+		"max_chapters_per_parent":        p.MaxChaptersPerParent,
+		"chaptering_mode":                p.ChapteringMode,
+		"high_confidence_threshold":      p.HighConfidenceThreshold,
+		"preferred_playback_rendition":   p.PreferredPlaybackRendition,
+		"fallback_playback_rendition":    p.FallbackPlaybackRendition,
+		"audio_only_allowed":             p.AudioOnlyAllowed,
+	}
+}
+
+func validateAtomizationPolicy(p atomizationPolicy) atomizationPolicy {
+	if p.MinFeedUnitSeconds < forYouMinDurationSec {
+		p.MinFeedUnitSeconds = forYouMinDurationSec
+	}
+	if p.AtomizationMinParentSeconds < atomizationMinParentDurationSec {
+		p.AtomizationMinParentSeconds = atomizationMinParentDurationSec
+	}
+	if p.HardMaxChapterMinutes <= 0 || p.HardMaxChapterMinutes*60 > forYouHardMaxDurationSec {
+		p.HardMaxChapterMinutes = forYouHardMaxDurationSec / 60
+	}
+	if p.SoftMaxChapterMinutes <= 0 || p.SoftMaxChapterMinutes > p.HardMaxChapterMinutes {
+		p.SoftMaxChapterMinutes = 30
+	}
+	if p.MinChapterMinutes <= 0 {
+		p.MinChapterMinutes = 5
+	}
+	if p.MaxChaptersPerParent <= 0 {
+		p.MaxChaptersPerParent = 5
+	}
+	if p.HighConfidenceThreshold <= 0 || p.HighConfidenceThreshold > 1 {
+		p.HighConfidenceThreshold = 0.82
+	}
+	if strings.TrimSpace(p.ChapteringMode) == "" {
+		p.ChapteringMode = "contextual"
+	}
+	if strings.TrimSpace(p.PreferredPlaybackRendition) == "" {
+		p.PreferredPlaybackRendition = "hls"
+	}
+	if strings.TrimSpace(p.FallbackPlaybackRendition) == "" {
+		p.FallbackPlaybackRendition = "mp4"
+	}
 	return p
 }
 
@@ -172,16 +266,56 @@ func sourceForItem(db *gorm.DB, item *models.ContentItem) *models.ContentSource 
 	return &source
 }
 
+type effectiveAtomizationPolicy struct {
+	Policy         atomizationPolicy
+	PolicySource   string
+	DisabledReason *string
+}
+
 func atomizationPolicyForItem(db *gorm.DB, item *models.ContentItem) atomizationPolicy {
+	return effectiveAtomizationPolicyForItem(db, item).Policy
+}
+
+func effectiveAtomizationPolicyForItem(db *gorm.DB, item *models.ContentItem) effectiveAtomizationPolicy {
+	base := validateAtomizationPolicy(policyFromModel(getOrCreateMediaAtomizationPolicy(db, item.TenantID)))
+	sourceName := "tenant"
 	if source := sourceForItem(db, item); source != nil {
-		return mergeAtomizationPolicy(source.APIConfig)
+		cfg, _ := parseSourceAPIConfig(source.APIConfig)
+		if len(cfg) > 0 {
+			base = validateAtomizationPolicy(applyAtomizationPolicyConfig(base, cfg))
+			sourceName = "source"
+		}
 	}
-	return defaultAtomizationPolicy()
+	override := atomizationOverrideInherit
+	if item.AtomizationOverride != nil && strings.TrimSpace(*item.AtomizationOverride) != "" {
+		override = strings.TrimSpace(*item.AtomizationOverride)
+	}
+	if override == atomizationOverrideDisabled {
+		reason := "Episode atomization is disabled by admin override."
+		if item.AtomizationOverrideReason != nil && strings.TrimSpace(*item.AtomizationOverrideReason) != "" {
+			reason = strings.TrimSpace(*item.AtomizationOverrideReason)
+		}
+		base.ChapteringEnabled = false
+		return effectiveAtomizationPolicy{Policy: base, PolicySource: "episode", DisabledReason: &reason}
+	}
+	if override == atomizationOverrideEnabled {
+		base.ChapteringEnabled = true
+		return effectiveAtomizationPolicy{Policy: base, PolicySource: "episode"}
+	}
+	if !base.ChapteringEnabled {
+		reason := "Atomization is disabled by " + sourceName + " policy."
+		return effectiveAtomizationPolicy{Policy: base, PolicySource: sourceName, DisabledReason: &reason}
+	}
+	return effectiveAtomizationPolicy{Policy: base, PolicySource: sourceName}
 }
 
 type atomizationInputResponse struct {
 	Item             map[string]interface{} `json:"item"`
 	Policy           atomizationPolicy      `json:"policy"`
+	EffectivePolicy  atomizationPolicy      `json:"effective_policy"`
+	PolicySource     string                 `json:"policy_source"`
+	DisabledReason   *string                `json:"atomization_disabled_reason,omitempty"`
+	ManualRequested  bool                   `json:"manual_requested"`
 	Transcript       *studioTranscriptDTO   `json:"transcript,omitempty"`
 	Segments         []segmentData          `json:"segments"`
 	SponsorSegments  []sponsorSegment       `json:"sponsor_segments,omitempty"`
@@ -199,26 +333,30 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 	limit := boundedLimit(c.Query("limit"), 25, 100)
 
 	type candidateRow struct {
-		ID                 string  `json:"id"`
-		TenantID           string  `json:"tenant_id"`
-		Type               string  `json:"type"`
-		Title              *string `json:"title"`
-		Excerpt            *string `json:"excerpt"`
-		BodyText           *string `json:"body_text"`
-		SourceName         *string `json:"source_name"`
-		DurationSec        *int    `json:"duration_sec"`
-		ChapteringStatus   *string `json:"chaptering_status"`
-		TranscriptID       *string `json:"transcript_id"`
-		ExistingChildCount int64   `json:"existing_child_count"`
-		MediaURL           *string `json:"media_url"`
-		ThumbnailURL       *string `json:"thumbnail_url"`
+		ID                  string  `json:"id"`
+		TenantID            string  `json:"tenant_id"`
+		Type                string  `json:"type"`
+		Title               *string `json:"title"`
+		Excerpt             *string `json:"excerpt"`
+		BodyText            *string `json:"body_text"`
+		SourceName          *string `json:"source_name"`
+		DurationSec         *int    `json:"duration_sec"`
+		ChapteringStatus    *string `json:"chaptering_status"`
+		TranscriptID        *string `json:"transcript_id"`
+		ExistingChildCount  int64   `json:"existing_child_count"`
+		MediaURL            *string `json:"media_url"`
+		ThumbnailURL        *string `json:"thumbnail_url"`
+		AtomizationOverride *string `json:"atomization_override"`
 	}
 	rows := []candidateRow{}
 	if err := db.Raw(`
 		SELECT p.public_id::text AS id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name,
 			p.duration_sec, p.chaptering_status, p.transcript_id::text AS transcript_id,
-			COUNT(c.id) AS existing_child_count, p.media_url, p.thumbnail_url
+			COUNT(c.id) AS existing_child_count, p.media_url, p.thumbnail_url, p.atomization_override
 		FROM content_items p
+		LEFT JOIN content_sources s
+			ON s.tenant_id = p.tenant_id
+			AND s.feed_url = p.source_feed_url
 		LEFT JOIN content_items c
 			ON c.parent_content_item_id = p.public_id
 			AND c.tenant_id = p.tenant_id
@@ -230,6 +368,11 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 				AND p.transcript_id IS NOT NULL
 				AND p.duration_sec IS NOT NULL
 				AND p.duration_sec > ?
+				AND COALESCE(p.atomization_override, 'inherit') <> 'disabled'
+				AND (
+					COALESCE(s.api_config->>'chaptering_enabled', 'true') <> 'false'
+					OR COALESCE(p.atomization_override, 'inherit') = 'enabled'
+				)
 				AND p.status IN ('READY','ARCHIVED')
 				AND NOT EXISTS (
 					SELECT 1 FROM transcription_jobs tj
@@ -249,7 +392,7 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 						AND p.updated_at < NOW() - INTERVAL '2 hours'
 					)
 				)
-			GROUP BY p.public_id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name, p.duration_sec, p.chaptering_status, p.transcript_id, p.media_url, p.thumbnail_url, p.updated_at
+			GROUP BY p.public_id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name, p.duration_sec, p.chaptering_status, p.transcript_id, p.media_url, p.thumbnail_url, p.atomization_override, p.updated_at
 			HAVING COUNT(c.id) = 0
 			ORDER BY
 				CASE WHEN p.duration_sec IS NOT NULL AND p.duration_sec > ? THEN 0 ELSE 1 END,
@@ -258,13 +401,17 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list atomization candidates: " + err.Error()})
 		return
 	}
+	rows = filterAtomizationCandidateRows(db, rows)
 
 	transcriptRows := []candidateRow{}
 	if err := db.Raw(`
 		SELECT p.public_id::text AS id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name,
 			p.duration_sec, p.chaptering_status, p.transcript_id::text AS transcript_id,
-			COUNT(c.id) AS existing_child_count, p.media_url, p.thumbnail_url
+			COUNT(c.id) AS existing_child_count, p.media_url, p.thumbnail_url, p.atomization_override
 		FROM content_items p
+		LEFT JOIN content_sources s
+			ON s.tenant_id = p.tenant_id
+			AND s.feed_url = p.source_feed_url
 		LEFT JOIN content_items c
 			ON c.parent_content_item_id = p.public_id
 			AND c.tenant_id = p.tenant_id
@@ -276,6 +423,11 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 			AND p.transcript_id IS NULL
 			AND p.duration_sec IS NOT NULL
 			AND p.duration_sec > ?
+			AND COALESCE(p.atomization_override, 'inherit') <> 'disabled'
+			AND (
+				COALESCE(s.api_config->>'chaptering_enabled', 'true') <> 'false'
+				OR COALESCE(p.atomization_override, 'inherit') = 'enabled'
+			)
 			AND p.status IN ('READY','ARCHIVED')
 			AND NOT EXISTS (
 				SELECT 1 FROM transcription_jobs tj
@@ -287,15 +439,42 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 				'cutting','renditions','children','embedding','embedding_pending',
 				'completed','needs_review','published','archived'
 			)
-		GROUP BY p.public_id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name, p.duration_sec, p.chaptering_status, p.transcript_id, p.media_url, p.thumbnail_url, p.updated_at
+		GROUP BY p.public_id, p.tenant_id, p.type, p.title, p.excerpt, p.body_text, p.source_name, p.duration_sec, p.chaptering_status, p.transcript_id, p.media_url, p.thumbnail_url, p.atomization_override, p.updated_at
 		HAVING COUNT(c.id) = 0
 		ORDER BY p.updated_at ASC
 		LIMIT ?`, tenantID, atomizationMinParentDurationSec, limit).Scan(&transcriptRows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list atomization transcript candidates: " + err.Error()})
 		return
 	}
+	transcriptRows = filterAtomizationCandidateRows(db, transcriptRows)
 
 	c.JSON(http.StatusOK, gin.H{"items": rows, "transcript_candidates": transcriptRows})
+}
+
+func filterAtomizationCandidateRows[T interface{}](db *gorm.DB, rows []T) []T {
+	filtered := make([]T, 0, len(rows))
+	for _, row := range rows {
+		raw, _ := json.Marshal(row)
+		var probe struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(raw, &probe) != nil || strings.TrimSpace(probe.ID) == "" {
+			continue
+		}
+		id, err := uuid.Parse(probe.ID)
+		if err != nil {
+			continue
+		}
+		var item models.ContentItem
+		if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+			continue
+		}
+		effective := effectiveAtomizationPolicyForItem(db, &item)
+		if effective.Policy.ChapteringEnabled {
+			filtered = append(filtered, row)
+		}
+	}
+	return filtered
 }
 
 func InternalGetAtomizationInput(c *gin.Context) {
@@ -318,7 +497,8 @@ func InternalGetAtomizationInput(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "Atomization only applies to media longer than 40 minutes"})
 		return
 	}
-	policy := atomizationPolicyForItem(db, &item)
+	effective := effectiveAtomizationPolicyForItem(db, &item)
+	policy := effective.Policy
 	var transcript *models.Transcript
 	if item.TranscriptID != nil {
 		var t models.Transcript
@@ -352,7 +532,10 @@ func InternalGetAtomizationInput(c *gin.Context) {
 			"fallback_playback_url": item.FallbackPlaybackURL,
 			"storage_tier":          item.StorageTier, "media_version": item.MediaVersion,
 		},
-		Policy: policy, Transcript: transcriptDTO, Segments: segments,
+		Policy: policy, EffectivePolicy: policy, PolicySource: effective.PolicySource,
+		DisabledReason:  effective.DisabledReason,
+		ManualRequested: item.ManualAtomizationRequestedAt != nil,
+		Transcript:      transcriptDTO, Segments: segments,
 		SponsorSegments: meta.SponsorSegments, ExistingChapters: existing,
 	})
 }
@@ -465,6 +648,8 @@ type reportAtomizationRunRequest struct {
 	ChildCount   *int    `json:"child_count"`
 	ReviewCount  *int    `json:"review_count"`
 	ErrorMessage *string `json:"error_message"`
+	Trigger      *string `json:"trigger"`
+	RequestedBy  *string `json:"requested_by"`
 }
 
 func InternalCreateAtomizedChildren(c *gin.Context) {
@@ -574,6 +759,15 @@ func InternalReportAtomizationRun(c *gin.Context) {
 			run.ReviewCount = *req.ReviewCount
 		}
 		run.ErrorMessage = req.ErrorMessage
+		if req.Trigger != nil {
+			trigger := strings.TrimSpace(*req.Trigger)
+			run.Trigger = &trigger
+		}
+		if req.RequestedBy != nil {
+			if requestedBy, parseErr := uuid.Parse(*req.RequestedBy); parseErr == nil {
+				run.RequestedBy = &requestedBy
+			}
+		}
 		if status == "completed" || status == "needs_review" || status == "failed" {
 			run.CompletedAt = &now
 		}
@@ -823,8 +1017,376 @@ func AdminRepairMediaAtomizationLeaks(c *gin.Context) {
 	}})
 }
 
+type atomizationPolicyPatchRequest struct {
+	ChapteringEnabled           *bool    `json:"chaptering_enabled"`
+	AutoPublishHighConfidence   *bool    `json:"auto_publish_high_confidence"`
+	ParentFeedVisible           *bool    `json:"parent_feed_visible"`
+	PreserveVideo               *bool    `json:"preserve_video"`
+	RemoveSponsorSegments       *bool    `json:"remove_sponsor_segments"`
+	MinChapterMinutes           *int     `json:"min_chapter_minutes"`
+	MinFeedUnitSeconds          *int     `json:"min_feed_unit_seconds"`
+	SoftMaxChapterMinutes       *int     `json:"soft_max_chapter_minutes"`
+	HardMaxChapterMinutes       *int     `json:"hard_max_chapter_minutes"`
+	AtomizationMinParentSeconds *int     `json:"atomization_min_parent_seconds"`
+	MaxChaptersPerParent        *int     `json:"max_chapters_per_parent"`
+	ChapteringMode              *string  `json:"chaptering_mode"`
+	HighConfidenceThreshold     *float64 `json:"high_confidence_threshold"`
+	PreferredPlaybackRendition  *string  `json:"preferred_playback_rendition"`
+	FallbackPlaybackRendition   *string  `json:"fallback_playback_rendition"`
+	AudioOnlyAllowed            *bool    `json:"audio_only_allowed"`
+}
+
+func applyAtomizationPolicyPatch(policy atomizationPolicy, req atomizationPolicyPatchRequest) atomizationPolicy {
+	if req.ChapteringEnabled != nil {
+		policy.ChapteringEnabled = *req.ChapteringEnabled
+	}
+	if req.AutoPublishHighConfidence != nil {
+		policy.AutoPublishHighConfidence = *req.AutoPublishHighConfidence
+	}
+	if req.ParentFeedVisible != nil {
+		policy.ParentFeedVisible = *req.ParentFeedVisible
+	}
+	if req.PreserveVideo != nil {
+		policy.PreserveVideo = *req.PreserveVideo
+	}
+	if req.RemoveSponsorSegments != nil {
+		policy.RemoveSponsorSegments = *req.RemoveSponsorSegments
+	}
+	if req.MinChapterMinutes != nil {
+		policy.MinChapterMinutes = *req.MinChapterMinutes
+	}
+	if req.MinFeedUnitSeconds != nil {
+		policy.MinFeedUnitSeconds = *req.MinFeedUnitSeconds
+	}
+	if req.SoftMaxChapterMinutes != nil {
+		policy.SoftMaxChapterMinutes = *req.SoftMaxChapterMinutes
+	}
+	if req.HardMaxChapterMinutes != nil {
+		policy.HardMaxChapterMinutes = *req.HardMaxChapterMinutes
+	}
+	if req.AtomizationMinParentSeconds != nil {
+		policy.AtomizationMinParentSeconds = *req.AtomizationMinParentSeconds
+	}
+	if req.MaxChaptersPerParent != nil {
+		policy.MaxChaptersPerParent = *req.MaxChaptersPerParent
+	}
+	if req.ChapteringMode != nil {
+		policy.ChapteringMode = strings.TrimSpace(*req.ChapteringMode)
+	}
+	if req.HighConfidenceThreshold != nil {
+		policy.HighConfidenceThreshold = *req.HighConfidenceThreshold
+	}
+	if req.PreferredPlaybackRendition != nil {
+		policy.PreferredPlaybackRendition = strings.TrimSpace(*req.PreferredPlaybackRendition)
+	}
+	if req.FallbackPlaybackRendition != nil {
+		policy.FallbackPlaybackRendition = strings.TrimSpace(*req.FallbackPlaybackRendition)
+	}
+	if req.AudioOnlyAllowed != nil {
+		policy.AudioOnlyAllowed = *req.AudioOnlyAllowed
+	}
+	return validateAtomizationPolicy(policy)
+}
+
+func AdminGetMediaAtomizationPolicy(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	policy := validateAtomizationPolicy(policyFromModel(getOrCreateMediaAtomizationPolicy(db, principal.TenantID)))
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy fetched", Data: gin.H{"policy": policy}})
+}
+
+func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	var req atomizationPolicyPatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid request"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	model := getOrCreateMediaAtomizationPolicy(db, principal.TenantID)
+	updated := applyAtomizationPolicyPatch(policyFromModel(model), req)
+	model.ChapteringEnabled = updated.ChapteringEnabled
+	model.AutoPublishHighConfidence = updated.AutoPublishHighConfidence
+	model.ParentFeedVisible = updated.ParentFeedVisible
+	model.PreserveVideo = updated.PreserveVideo
+	model.RemoveSponsorSegments = updated.RemoveSponsorSegments
+	model.MinChapterMinutes = updated.MinChapterMinutes
+	model.MinFeedUnitSeconds = updated.MinFeedUnitSeconds
+	model.SoftMaxChapterMinutes = updated.SoftMaxChapterMinutes
+	model.HardMaxChapterMinutes = updated.HardMaxChapterMinutes
+	model.AtomizationMinParentSeconds = updated.AtomizationMinParentSeconds
+	model.MaxChaptersPerParent = updated.MaxChaptersPerParent
+	model.ChapteringMode = updated.ChapteringMode
+	model.HighConfidenceThreshold = updated.HighConfidenceThreshold
+	model.PreferredPlaybackRendition = updated.PreferredPlaybackRendition
+	model.FallbackPlaybackRendition = updated.FallbackPlaybackRendition
+	model.AudioOnlyAllowed = updated.AudioOnlyAllowed
+	if err := db.Save(&model).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy updated", Data: gin.H{"policy": updated}})
+}
+
 func AdminRunAtomizationSweepNow(c *gin.Context) {
 	proxyAggregationSimple(c, "/admin/atomization/sweep-now")
+}
+
+func AdminListMediaAtomizationSources(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	base := validateAtomizationPolicy(policyFromModel(getOrCreateMediaAtomizationPolicy(db, principal.TenantID)))
+	var sources []models.ContentSource
+	q := db.Where("tenant_id = ? AND category = ?", principal.TenantID, models.SourceCategoryMedia)
+	if search := strings.TrimSpace(c.Query("q")); search != "" {
+		q = q.Where("(name ILIKE ? OR feed_url ILIKE ?)", "%"+search+"%", "%"+search+"%")
+	}
+	if err := q.Order("updated_at DESC").Limit(boundedLimit(c.Query("limit"), 80, 200)).Find(&sources).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	rows := make([]gin.H, 0, len(sources))
+	for _, source := range sources {
+		cfg, _ := parseSourceAPIConfig(source.APIConfig)
+		effective := validateAtomizationPolicy(applyAtomizationPolicyConfig(base, cfg))
+		rows = append(rows, gin.H{
+			"id": source.PublicID.String(), "name": source.Name, "type": source.Type,
+			"feed_url": source.FeedURL, "is_active": source.IsActive,
+			"policy": effective, "overrides": cfg, "chaptering_enabled": effective.ChapteringEnabled,
+			"updated_at": source.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization sources fetched", Data: gin.H{"items": rows}})
+}
+
+func AdminUpdateMediaAtomizationSourcePolicy(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid source id"})
+		return
+	}
+	var req atomizationPolicyPatchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid request"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var source models.ContentSource
+	if err := db.Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&source).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Source not found"})
+		return
+	}
+	cfg, _ := parseSourceAPIConfig(source.APIConfig)
+	applyAtomizationPatchToConfig(cfg, req)
+	raw, _ := json.Marshal(cfg)
+	source.APIConfig = datatypes.JSON(raw)
+	if err := db.Save(&source).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	base := policyFromModel(getOrCreateMediaAtomizationPolicy(db, principal.TenantID))
+	effective := validateAtomizationPolicy(applyAtomizationPolicyConfig(base, cfg))
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Source atomization policy updated", Data: gin.H{"source_id": source.PublicID.String(), "policy": effective}})
+}
+
+func applyAtomizationPatchToConfig(cfg map[string]interface{}, req atomizationPolicyPatchRequest) {
+	if req.ChapteringEnabled != nil {
+		cfg["chaptering_enabled"] = *req.ChapteringEnabled
+	}
+	if req.AutoPublishHighConfidence != nil {
+		cfg["auto_publish_high_confidence"] = *req.AutoPublishHighConfidence
+	}
+	if req.ParentFeedVisible != nil {
+		cfg["parent_feed_visible"] = *req.ParentFeedVisible
+	}
+	if req.PreserveVideo != nil {
+		cfg["preserve_video"] = *req.PreserveVideo
+	}
+	if req.RemoveSponsorSegments != nil {
+		cfg["remove_sponsor_segments"] = *req.RemoveSponsorSegments
+	}
+	if req.MinChapterMinutes != nil {
+		cfg["min_chapter_minutes"] = *req.MinChapterMinutes
+	}
+	if req.MinFeedUnitSeconds != nil {
+		cfg["min_feed_unit_seconds"] = *req.MinFeedUnitSeconds
+	}
+	if req.SoftMaxChapterMinutes != nil {
+		cfg["soft_max_chapter_minutes"] = *req.SoftMaxChapterMinutes
+	}
+	if req.HardMaxChapterMinutes != nil {
+		cfg["hard_max_chapter_minutes"] = *req.HardMaxChapterMinutes
+	}
+	if req.AtomizationMinParentSeconds != nil {
+		cfg["atomization_min_parent_seconds"] = *req.AtomizationMinParentSeconds
+	}
+	if req.MaxChaptersPerParent != nil {
+		cfg["max_chapters_per_parent"] = *req.MaxChaptersPerParent
+	}
+	if req.ChapteringMode != nil {
+		cfg["chaptering_mode"] = strings.TrimSpace(*req.ChapteringMode)
+	}
+	if req.HighConfidenceThreshold != nil {
+		cfg["high_confidence_threshold"] = *req.HighConfidenceThreshold
+	}
+	if req.PreferredPlaybackRendition != nil {
+		cfg["preferred_playback_rendition"] = strings.TrimSpace(*req.PreferredPlaybackRendition)
+	}
+	if req.FallbackPlaybackRendition != nil {
+		cfg["fallback_playback_rendition"] = strings.TrimSpace(*req.FallbackPlaybackRendition)
+	}
+	if req.AudioOnlyAllowed != nil {
+		cfg["audio_only_allowed"] = *req.AudioOnlyAllowed
+	}
+}
+
+type atomizationOverrideRequest struct {
+	Override string  `json:"override"`
+	Reason   *string `json:"reason"`
+}
+
+func AdminUpdateMediaAtomizationParentOverride(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	parent, ok := loadAdminAtomizationParent(c, principal.TenantID)
+	if !ok {
+		return
+	}
+	var req atomizationOverrideRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid request"})
+		return
+	}
+	override := strings.TrimSpace(req.Override)
+	if override == "" {
+		override = atomizationOverrideInherit
+	}
+	if override != atomizationOverrideInherit && override != atomizationOverrideDisabled && override != atomizationOverrideEnabled {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "override must be inherit, disabled, or enabled"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	now := time.Now().UTC()
+	parent.AtomizationOverride = &override
+	parent.AtomizationOverrideReason = req.Reason
+	if principal.UserID != "" {
+		if id, err := uuid.Parse(principal.UserID); err == nil {
+			parent.AtomizationOverrideBy = &id
+		}
+	}
+	parent.AtomizationOverrideAt = &now
+	if override == atomizationOverrideInherit {
+		parent.AtomizationOverrideReason = nil
+		parent.AtomizationOverrideBy = nil
+		parent.AtomizationOverrideAt = nil
+	}
+	if err := db.Save(parent).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Parent atomization override updated", Data: gin.H{"item": parent}})
+}
+
+func AdminAtomizeMediaParent(c *gin.Context) { adminQueueMediaParentAtomization(c, false) }
+
+func AdminReatomizeMediaParent(c *gin.Context) { adminQueueMediaParentAtomization(c, true) }
+
+func loadAdminAtomizationParent(c *gin.Context, tenantID string) (*models.ContentItem, bool) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid parent id"})
+		return nil, false
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var parent models.ContentItem
+	if err := db.Where("tenant_id = ? AND public_id = ? AND type IN ?", tenantID, id, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).First(&parent).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Parent media not found"})
+		return nil, false
+	}
+	return &parent, true
+}
+
+func adminQueueMediaParentAtomization(c *gin.Context, reatomize bool) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	parent, ok := loadAdminAtomizationParent(c, principal.TenantID)
+	if !ok {
+		return
+	}
+	if parent.DurationSec == nil || *parent.DurationSec <= atomizationMinParentDurationSec {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Manual atomization only applies to media longer than 40 minutes"})
+		return
+	}
+	if parent.MediaURL == nil || strings.TrimSpace(*parent.MediaURL) == "" {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Parent has no media artifact to atomize"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	effective := effectiveAtomizationPolicyForItem(db, parent)
+	if !effective.Policy.ChapteringEnabled {
+		msg := "Atomization is disabled for this parent"
+		if effective.DisabledReason != nil {
+			msg = *effective.DisabledReason
+		}
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: msg})
+		return
+	}
+	now := time.Now().UTC()
+	trigger := "manual"
+	if reatomize {
+		trigger = "reatomize"
+	}
+	parent.ManualAtomizationRequestedAt = &now
+	status := "queued"
+	parent.ChapteringStatus = &status
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(parent).Error; err != nil {
+			return err
+		}
+		run := models.MediaAtomizationRun{TenantID: parent.TenantID, ParentContentItemID: parent.PublicID, Status: "queued", Phase: "planning", StartedAt: &now, Trigger: &trigger}
+		if principal.UserID != "" {
+			if id, err := uuid.Parse(principal.UserID); err == nil {
+				run.RequestedBy = &id
+			}
+		}
+		return tx.Create(&run).Error
+	}); err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Aggregation service URL is not configured"})
+		return
+	}
+	payload := gin.H{
+		"contentItemId": parent.PublicID.String(), "reason": trigger, "hasTranscript": parent.TranscriptID != nil,
+		"contentType": parent.Type, "mediaUrl": parent.MediaURL, "thumbnailUrl": parent.ThumbnailURL,
+		"title": parent.Title, "excerpt": parent.Excerpt, "bodyText": parent.BodyText,
+	}
+	body, statusCode, err := proxyAggregationRequest(aggregationBaseURL, "/admin/atomization/parents/"+parent.PublicID.String()+"/atomize", c.GetHeader("Authorization"), payload)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, utils.HTTPError{Code: http.StatusBadGateway, Message: "Aggregation request failed: " + err.Error()})
+		return
+	}
+	c.Data(statusCode, "application/json", body)
 }
 
 func AdminGetMediaAtomizationOverview(c *gin.Context) {
@@ -888,6 +1450,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	}
 
 	var autoPublished, reviewNeeded, failedOrStuck, parentCount, childCount, durationViolationCount int64
+	var disabledEpisodeCount, disabledSourceCount, manualRequestedCount int64
 	var visibleUnderFloorCount, visibleOverHardMaxCount, shortParentActiveChildCount, shortChapterReviewCount int64
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ? AND parent_content_item_id IS NOT NULL AND feed_visibility = ? AND status = ?", principal.TenantID, feedVisibilityVisible, models.ContentStatusReady).
@@ -922,6 +1485,24 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ? AND parent_content_item_id IS NOT NULL", principal.TenantID).
 		Count(&childCount).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	if err := db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND type IN ? AND parent_content_item_id IS NULL AND atomization_override = ?", principal.TenantID, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, atomizationOverrideDisabled).
+		Count(&disabledEpisodeCount).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	if err := db.Model(&models.ContentSource{}).
+		Where("tenant_id = ? AND category = ? AND api_config->>'chaptering_enabled' = 'false'", principal.TenantID, models.SourceCategoryMedia).
+		Count(&disabledSourceCount).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	if err := db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND type IN ? AND parent_content_item_id IS NULL AND manual_atomization_requested_at IS NOT NULL", principal.TenantID, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+		Count(&manualRequestedCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -1023,6 +1604,9 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 		"review_needed_count":             reviewNeeded,
 		"failed_stuck_count":              failedOrStuck,
 		"duration_violation_count":        durationViolationCount,
+		"disabled_episode_count":          disabledEpisodeCount,
+		"disabled_source_count":           disabledSourceCount,
+		"manual_requested_count":          manualRequestedCount,
 		"visible_under_floor_count":       visibleUnderFloorCount,
 		"visible_over_hard_max_count":     visibleOverHardMaxCount,
 		"short_parent_active_child_count": shortParentActiveChildCount,
@@ -1059,20 +1643,23 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 		return
 	}
 	type parentRow struct {
-		ID                    string    `json:"id"`
-		Title                 *string   `json:"title"`
-		Status                string    `json:"status"`
-		ChapteringStatus      *string   `json:"chaptering_status"`
-		SourceName            *string   `json:"source_name"`
-		SourceFeedURL         *string   `json:"source_feed_url"`
-		DurationSec           *int      `json:"duration_sec"`
-		TranscriptID          *string   `json:"transcript_id"`
-		ChildCount            int64     `json:"child_count"`
-		PublishedCount        int64     `json:"published_count"`
-		ReviewCount           int64     `json:"review_count"`
-		EmbeddingPendingCount int64     `json:"embedding_pending_count"`
-		LatestError           *string   `json:"latest_error"`
-		UpdatedAt             time.Time `json:"updated_at"`
+		ID                           string     `json:"id"`
+		Title                        *string    `json:"title"`
+		Status                       string     `json:"status"`
+		ChapteringStatus             *string    `json:"chaptering_status"`
+		SourceName                   *string    `json:"source_name"`
+		SourceFeedURL                *string    `json:"source_feed_url"`
+		DurationSec                  *int       `json:"duration_sec"`
+		TranscriptID                 *string    `json:"transcript_id"`
+		ChildCount                   int64      `json:"child_count"`
+		PublishedCount               int64      `json:"published_count"`
+		ReviewCount                  int64      `json:"review_count"`
+		EmbeddingPendingCount        int64      `json:"embedding_pending_count"`
+		LatestError                  *string    `json:"latest_error"`
+		AtomizationOverride          *string    `json:"atomization_override"`
+		AtomizationOverrideReason    *string    `json:"atomization_override_reason"`
+		ManualAtomizationRequestedAt *time.Time `json:"manual_atomization_requested_at"`
+		UpdatedAt                    time.Time  `json:"updated_at"`
 	}
 	where := []string{"p.tenant_id = ?", "p.type IN ('VIDEO','PODCAST')", "p.parent_content_item_id IS NULL"}
 	args := []interface{}{principal.TenantID}
@@ -1110,11 +1697,14 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 				THEN (SELECT r.error_message FROM media_atomization_runs r WHERE r.parent_content_item_id = p.public_id ORDER BY r.updated_at DESC LIMIT 1)
 				ELSE NULL
 			END AS latest_error,
+			p.atomization_override,
+			p.atomization_override_reason,
+			p.manual_atomization_requested_at,
 			p.updated_at
 		FROM content_items p
 		LEFT JOIN content_items c ON c.parent_content_item_id = p.public_id AND c.tenant_id = p.tenant_id AND c.status <> 'ARCHIVED' AND c.feed_visibility <> 'hidden'
 		WHERE `+strings.Join(where, " AND ")+`
-		GROUP BY p.public_id, p.title, p.status, p.chaptering_status, p.source_name, p.source_feed_url, p.duration_sec, p.transcript_id, p.updated_at
+		GROUP BY p.public_id, p.title, p.status, p.chaptering_status, p.source_name, p.source_feed_url, p.duration_sec, p.transcript_id, p.atomization_override, p.atomization_override_reason, p.manual_atomization_requested_at, p.updated_at
 		ORDER BY p.updated_at DESC
 		LIMIT ?`, args...).Scan(&rows).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
@@ -1236,25 +1826,28 @@ func AdminListMediaAtomizationRuns(c *gin.Context) {
 }
 
 type mediaAtomizationPipelineItem struct {
-	ID                    string    `json:"id"`
-	Title                 *string   `json:"title"`
-	Status                string    `json:"status"`
-	ChapteringStatus      *string   `json:"chaptering_status"`
-	SourceName            *string   `json:"source_name"`
-	DurationSec           *int      `json:"duration_sec"`
-	TranscriptID          *string   `json:"transcript_id"`
-	TranscriptState       string    `json:"transcript_state"`
-	ChildCount            int64     `json:"child_count"`
-	PublishedCount        int64     `json:"published_count"`
-	ReviewCount           int64     `json:"review_count"`
-	EmbeddingPendingCount int64     `json:"embedding_pending_count"`
-	LatestError           *string   `json:"latest_error"`
-	RunStatus             *string   `json:"run_status"`
-	RunPhase              *string   `json:"run_phase"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	AgeSeconds            int64     `json:"age_seconds"`
-	PrimaryAction         string    `json:"primary_action"`
-	ActionHref            string    `json:"action_href"`
+	ID                           string     `json:"id"`
+	Title                        *string    `json:"title"`
+	Status                       string     `json:"status"`
+	ChapteringStatus             *string    `json:"chaptering_status"`
+	SourceName                   *string    `json:"source_name"`
+	DurationSec                  *int       `json:"duration_sec"`
+	TranscriptID                 *string    `json:"transcript_id"`
+	TranscriptState              string     `json:"transcript_state"`
+	ChildCount                   int64      `json:"child_count"`
+	PublishedCount               int64      `json:"published_count"`
+	ReviewCount                  int64      `json:"review_count"`
+	EmbeddingPendingCount        int64      `json:"embedding_pending_count"`
+	LatestError                  *string    `json:"latest_error"`
+	RunStatus                    *string    `json:"run_status"`
+	RunPhase                     *string    `json:"run_phase"`
+	AtomizationOverride          *string    `json:"atomization_override"`
+	AtomizationOverrideReason    *string    `json:"atomization_override_reason"`
+	ManualAtomizationRequestedAt *time.Time `json:"manual_atomization_requested_at"`
+	UpdatedAt                    time.Time  `json:"updated_at"`
+	AgeSeconds                   int64      `json:"age_seconds"`
+	PrimaryAction                string     `json:"primary_action"`
+	ActionHref                   string     `json:"action_href"`
 }
 
 type mediaAtomizationPipelineColumn struct {
@@ -1319,11 +1912,14 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 			END AS latest_error,
 			(SELECT r.status FROM media_atomization_runs r WHERE r.parent_content_item_id = p.public_id ORDER BY r.updated_at DESC LIMIT 1) AS run_status,
 			(SELECT r.phase FROM media_atomization_runs r WHERE r.parent_content_item_id = p.public_id ORDER BY r.updated_at DESC LIMIT 1) AS run_phase,
+			p.atomization_override,
+			p.atomization_override_reason,
+			p.manual_atomization_requested_at,
 			p.updated_at
 		FROM content_items p
 		LEFT JOIN content_items c ON c.parent_content_item_id = p.public_id AND c.tenant_id = p.tenant_id AND c.status <> 'ARCHIVED' AND c.feed_visibility <> 'hidden'
 		WHERE `+strings.Join(where, " AND ")+`
-		GROUP BY p.public_id, p.title, p.status, p.chaptering_status, p.source_name, p.duration_sec, p.transcript_id, p.updated_at
+		GROUP BY p.public_id, p.title, p.status, p.chaptering_status, p.source_name, p.duration_sec, p.transcript_id, p.atomization_override, p.atomization_override_reason, p.manual_atomization_requested_at, p.updated_at
 		ORDER BY p.updated_at DESC
 		LIMIT ?`, args...).Scan(&rows).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
@@ -1365,11 +1961,15 @@ func defaultPipelineColumns() []mediaAtomizationPipelineColumn {
 		{Key: "embedding", Label: "Embedding"},
 		{Key: "review", Label: "Review"},
 		{Key: "published", Label: "Published"},
+		{Key: "disabled", Label: "Disabled"},
 		{Key: "failed", Label: "Failed"},
 	}
 }
 
 func pipelineStageForItem(item mediaAtomizationPipelineItem) string {
+	if item.AtomizationOverride != nil && *item.AtomizationOverride == atomizationOverrideDisabled {
+		return "disabled"
+	}
 	status := "unstarted"
 	if item.ChapteringStatus != nil && *item.ChapteringStatus != "" {
 		status = *item.ChapteringStatus
@@ -1401,6 +2001,8 @@ func pipelineStageForItem(item mediaAtomizationPipelineItem) string {
 
 func pipelineActionForItem(item mediaAtomizationPipelineItem) string {
 	switch pipelineStageForItem(item) {
+	case "disabled":
+		return "Disabled"
 	case "review":
 		return "Review"
 	case "failed":
@@ -1429,6 +2031,11 @@ func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
 		"fallback_playback_url",
 		"has_video",
 		"media_renditions",
+		"atomization_override",
+		"atomization_override_reason",
+		"atomization_override_by",
+		"atomization_override_at",
+		"manual_atomization_requested_at",
 	}
 	for _, column := range contentColumns {
 		if !db.Migrator().HasColumn(&models.ContentItem{}, column) {
@@ -1455,6 +2062,9 @@ func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
 	if !db.Migrator().HasTable(&models.MediaAtomizationRun{}) {
 		missing = append(missing, "media_atomization_runs")
 	}
+	if !db.Migrator().HasTable(&models.MediaAtomizationPolicy{}) {
+		missing = append(missing, "media_atomization_policies")
+	}
 
 	info := mediaAtomizationSchemaInfo{
 		Ready:   len(missing) == 0,
@@ -1462,7 +2072,7 @@ func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
 		Message: "Media atomization schema is ready.",
 	}
 	if !info.Ready {
-		info.Message = "Media atomization schema is incomplete. Apply CMS migrations 20260627000000_media_atomization.sql and 20260627010000_media_atomization_operations.sql, then restart CMS."
+		info.Message = "Media atomization schema is incomplete. Apply CMS migrations 20260627000000_media_atomization.sql, 20260627010000_media_atomization_operations.sql, 20260627020000_media_atomization_manual_controls.sql, and 20260627030000_media_atomization_unique_index_repair.sql, then restart CMS."
 	}
 	return info
 }
@@ -1765,7 +2375,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 func mediaAtomizationQueryError(c *gin.Context, err error) {
 	c.JSON(http.StatusInternalServerError, utils.HTTPError{
 		Code:    http.StatusInternalServerError,
-		Message: "Media atomization schema is not available. Apply the CMS migrations 20260627000000_media_atomization.sql and 20260627010000_media_atomization_operations.sql, then restart CMS. Details: " + err.Error(),
+		Message: "Media atomization schema is not available. Apply the CMS migrations 20260627000000_media_atomization.sql, 20260627010000_media_atomization_operations.sql, 20260627020000_media_atomization_manual_controls.sql, and 20260627030000_media_atomization_unique_index_repair.sql, then restart CMS. Details: " + err.Error(),
 	})
 }
 

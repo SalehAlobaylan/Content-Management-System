@@ -41,7 +41,7 @@ Apply canonical CMS SQL migrations explicitly:
 
 ```bash
 go run ./cmd/migrate --status
-go run ./cmd/migrate 20260627000000_media_atomization.sql 20260627010000_media_atomization_operations.sql
+go run ./cmd/migrate 20260627000000_media_atomization.sql 20260627010000_media_atomization_operations.sql 20260627020000_media_atomization_manual_controls.sql 20260627030000_media_atomization_unique_index_repair.sql
 ```
 
 Use `go run ./cmd/migrate --all` only when the target database has a reliable `cms_schema_migrations` ledger or is a fresh database. Production never auto-migrates.
@@ -126,13 +126,14 @@ Content write-back pipeline (`POST /content-items` → PATCH `…/artifacts` →
 
 ## Media Atomization Rules
 
-CMS is the source of truth for atomization policy, workflow state, review state, repair, and For You visibility.
+CMS is the source of truth for atomization policy, workflow state, source/episode overrides, manual queue validation, review state, repair, and For You visibility.
 
 - Atomization candidates must be parent media longer than 2400 seconds (>40m). Parent media at or under 40m normally remains a raw feed unit when otherwise eligible.
+- Policy precedence is episode override → source override → tenant default → code defaults. Admins can exclude a whole media source or a single parent episode; manual atomization still cannot override the >40m rule.
 - Visible For You media units must be 270-2400 seconds. 4:30-4:59 is valid and belongs to the `5m` bucket; anything below 4:30 must merge or stay hidden/review-only.
 - Child chapters are first-class `content_items` linked to their parent. `chapters` remains the editorial/review marker table.
 - For You returns playback metadata (`playback_url`, `playback_type`, fallback/renditions), not an MP4-only contract.
-- Re-atomization must archive/replace prior child feed units so duplicates cannot remain visible.
+- Manual atomize/re-atomize APIs validate in CMS, record run state, then proxy queueing to Aggregation. Re-atomization must archive/replace prior child feed units so duplicates cannot remain visible.
 
 ## Testing
 

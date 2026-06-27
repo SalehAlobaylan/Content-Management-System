@@ -133,6 +133,7 @@ func main() {
 			&models.TranscriptVersion{},
 			// Media Studio — first-class editable chapters
 			&models.Chapter{},
+			&models.MediaAtomizationPolicy{},
 			&models.MediaAtomizationRun{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
