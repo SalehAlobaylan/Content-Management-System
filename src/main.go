@@ -133,6 +133,7 @@ func main() {
 			&models.TranscriptVersion{},
 			// Media Studio — first-class editable chapters
 			&models.Chapter{},
+			&models.MediaAtomizationRun{},
 			// First-class topics (LLM-labeled + centroid embedding)
 			&models.Topic{},
 			// Feeds Finding — auto source discovery (profiles + suggestions + config)
@@ -181,6 +182,9 @@ func main() {
 				log.Fatalf("Failed to seed Wahb data: %v", err)
 			}
 		}
+	} else if env == "development" || env == "dev" {
+		log.Println("Skipping GORM AutoMigrate because AUTO_MIGRATE=false")
+		log.Println("SQL migrations are not run by CMS startup; apply them explicitly with: go run ./cmd/migrate <migration.sql>")
 	}
 	if env == "production" {
 		gin.SetMode(gin.ReleaseMode)

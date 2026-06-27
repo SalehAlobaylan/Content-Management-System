@@ -36,6 +36,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 
 	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
+	internal.GET("/atomization/candidates", controllers.InternalListAtomizationCandidates)
+	internal.GET("/content-items/:id/atomization", controllers.InternalGetAtomizationInput)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)
 	internal.PUT("/content-items/:id", controllers.InternalUpdateContentItem)
 	internal.PATCH("/content-items/:id/status", controllers.InternalUpdateContentStatus)
@@ -43,6 +45,9 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.PATCH("/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
 	internal.PATCH("/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
 	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
+	internal.POST("/content-items/:id/atomization/plan", controllers.InternalSaveAtomizationPlan)
+	internal.POST("/content-items/:id/atomization/children", controllers.InternalCreateAtomizedChildren)
+	internal.POST("/content-items/:id/atomization/runs", controllers.InternalReportAtomizationRun)
 	// Auto-STT path (Aggregation AI worker) — guard-enforced (toggle + budget).
 	internal.POST("/content-items/:id/request-stt", controllers.InternalRequestSTT)
 	internal.PATCH("/transcription-jobs/:id", controllers.InternalUpdateTranscriptionJob)

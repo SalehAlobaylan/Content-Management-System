@@ -116,6 +116,24 @@ type ContentItem struct {
 	OriginalURL  *string `gorm:"type:text" json:"original_url,omitempty"`
 	DurationSec  *int    `gorm:"type:integer" json:"duration_sec,omitempty"`
 
+	// Media atomization/feed-unit lineage. Parent long-form media rows keep
+	// IsFeedUnit=false by default; chapter children become the feed units.
+	ParentContentItemID *uuid.UUID     `gorm:"type:uuid;index:idx_content_items_parent" json:"parent_content_item_id,omitempty"`
+	IsFeedUnit          bool           `gorm:"not null;default:true;index:idx_content_items_feed_unit" json:"is_feed_unit"`
+	FeedVisibility      string         `gorm:"type:varchar(24);not null;default:'visible';index:idx_content_items_feed_visibility" json:"feed_visibility"`
+	ChapterIndex        *int           `gorm:"type:integer" json:"chapter_index,omitempty"`
+	ChapterStartMs      *int           `gorm:"type:integer" json:"chapter_start_ms,omitempty"`
+	ChapterEndMs        *int           `gorm:"type:integer" json:"chapter_end_ms,omitempty"`
+	ChapterConfidence   *float64       `gorm:"type:double precision" json:"chapter_confidence,omitempty"`
+	ChapteringStatus    *string        `gorm:"type:varchar(32);index:idx_content_items_chaptering_status" json:"chaptering_status,omitempty"`
+	DurationBucket      *string        `gorm:"type:varchar(8);index:idx_content_items_duration_bucket" json:"duration_bucket,omitempty"`
+	SourceEpisodeID     *string        `gorm:"type:varchar(255)" json:"source_episode_id,omitempty"`
+	PlaybackURL         *string        `gorm:"type:text" json:"playback_url,omitempty"`
+	PlaybackType        *string        `gorm:"type:varchar(16)" json:"playback_type,omitempty"`
+	FallbackPlaybackURL *string        `gorm:"type:text" json:"fallback_playback_url,omitempty"`
+	HasVideo            *bool          `gorm:"type:boolean" json:"has_video,omitempty"`
+	MediaRenditions     datatypes.JSON `gorm:"type:jsonb" json:"media_renditions,omitempty"`
+
 	// Attribution
 	Author        *string `gorm:"type:varchar(255)" json:"author,omitempty"`
 	SourceName    *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`

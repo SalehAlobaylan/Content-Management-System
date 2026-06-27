@@ -61,16 +61,23 @@ type internalUpdateContentItemRequest struct {
 }
 
 type internalUpdateStatusRequest struct {
-	Status        string  `json:"status"`
-	FailureReason *string `json:"failure_reason"`
+	Status           string  `json:"status"`
+	FailureReason    *string `json:"failure_reason"`
+	FeedVisibility   *string `json:"feed_visibility"`
+	ChapteringStatus *string `json:"chaptering_status"`
 }
 
 type internalUpdateArtifactsRequest struct {
-	MediaURL      *string `json:"media_url"`
-	ThumbnailURL  *string `json:"thumbnail_url"`
-	DurationSec   *int    `json:"duration_sec"`
-	FileSizeBytes *int64  `json:"file_size_bytes"`
-	StorageTier   *string `json:"storage_tier"`
+	MediaURL            *string                  `json:"media_url"`
+	ThumbnailURL        *string                  `json:"thumbnail_url"`
+	DurationSec         *int                     `json:"duration_sec"`
+	FileSizeBytes       *int64                   `json:"file_size_bytes"`
+	StorageTier         *string                  `json:"storage_tier"`
+	PlaybackURL         *string                  `json:"playback_url"`
+	PlaybackType        *string                  `json:"playback_type"`
+	FallbackPlaybackURL *string                  `json:"fallback_playback_url"`
+	HasVideo            *bool                    `json:"has_video"`
+	MediaRenditions     []map[string]interface{} `json:"media_renditions"`
 
 	// Quality bookkeeping. These are recorded once per item at first ingest;
 	// the controller writes them only if the existing column is NULL.
@@ -207,6 +214,12 @@ func InternalCreateContentItem(c *gin.Context) {
 		Metadata:       datatypes.JSON(metadataJSON),
 		PublishedAt:    publishedAt,
 	}
+	if kind == models.ContentTypeVideo || kind == models.ContentTypePodcast {
+		waiting := "waiting_media"
+		item.IsFeedUnit = false
+		item.FeedVisibility = "hidden"
+		item.ChapteringStatus = &waiting
+	}
 
 	if err := db.Create(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create content item"})
@@ -311,6 +324,13 @@ func InternalUpdateContentStatus(c *gin.Context) {
 	}
 
 	item.Status = models.ContentStatus(strings.ToUpper(req.Status))
+	if req.FeedVisibility != nil && strings.TrimSpace(*req.FeedVisibility) != "" {
+		item.FeedVisibility = strings.TrimSpace(*req.FeedVisibility)
+	}
+	if req.ChapteringStatus != nil && strings.TrimSpace(*req.ChapteringStatus) != "" {
+		status := strings.TrimSpace(*req.ChapteringStatus)
+		item.ChapteringStatus = &status
+	}
 
 	if req.FailureReason != nil {
 		metadata := map[string]interface{}{}
@@ -326,6 +346,11 @@ func InternalUpdateContentStatus(c *gin.Context) {
 	if err := db.Save(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update status"})
 		return
+	}
+	if shouldPublishLinkedChapter(item) {
+		_ = db.Model(&models.Chapter{}).
+			Where("tenant_id = ? AND child_content_item_id = ?", item.TenantID, item.PublicID).
+			Update("status", chapterStatusPublished).Error
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -355,6 +380,23 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 
 	if req.MediaURL != nil {
 		item.MediaURL = req.MediaURL
+	}
+	if req.PlaybackURL != nil {
+		item.PlaybackURL = req.PlaybackURL
+	}
+	if req.PlaybackType != nil {
+		item.PlaybackType = req.PlaybackType
+	}
+	if req.FallbackPlaybackURL != nil {
+		item.FallbackPlaybackURL = req.FallbackPlaybackURL
+	}
+	if req.HasVideo != nil {
+		item.HasVideo = req.HasVideo
+	}
+	if req.MediaRenditions != nil {
+		if raw, err := json.Marshal(req.MediaRenditions); err == nil {
+			item.MediaRenditions = datatypes.JSON(raw)
+		}
 	}
 	if req.ThumbnailURL != nil {
 		item.ThumbnailURL = req.ThumbnailURL
@@ -1101,5 +1143,12 @@ func InternalGetContentItem(c *gin.Context) {
 		"current_quality_profile_id": item.CurrentQualityProfileID,
 		"current_bitrate_kbps":       item.CurrentBitrateKbps,
 		"duration_sec":               item.DurationSec,
+		"transcript_id":              item.TranscriptID,
+		"source_feed_url":            item.SourceFeedURL,
+		"parent_content_item_id":     item.ParentContentItemID,
+		"is_feed_unit":               item.IsFeedUnit,
+		"feed_visibility":            item.FeedVisibility,
+		"chaptering_status":          item.ChapteringStatus,
+		"metadata":                   item.Metadata,
 	})
 }

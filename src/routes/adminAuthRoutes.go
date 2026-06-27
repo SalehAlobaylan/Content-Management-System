@@ -113,6 +113,18 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/transcription/quality", perm("content", "read"), controllers.ListTranscriptQuality)
 	adminGroup.POST("/transcription/quality/repair-sweep", perm("content", "write"), controllers.RepairTranscriptionQualitySweep)
 
+	// Media Atomization — operations dashboard and chapter review queue
+	adminGroup.GET("/media-atomization/overview", perm("content", "read"), controllers.AdminGetMediaAtomizationOverview)
+	adminGroup.GET("/media-atomization/pipeline", perm("content", "read"), controllers.AdminGetMediaAtomizationPipeline)
+	adminGroup.GET("/media-atomization/parents", perm("content", "read"), controllers.AdminListMediaAtomizationParents)
+	adminGroup.GET("/media-atomization/chapters", perm("content", "read"), controllers.AdminListMediaAtomizationChapters)
+	adminGroup.GET("/media-atomization/runs", perm("content", "read"), controllers.AdminListMediaAtomizationRuns)
+	adminGroup.GET("/media-atomization/review", perm("content", "read"), controllers.AdminListAtomizationReview)
+	adminGroup.POST("/media-atomization/repair-leaks", perm("content", "write"), controllers.AdminRepairMediaAtomizationLeaks)
+	adminGroup.POST("/media-atomization/sweep-now", perm("content", "write"), controllers.AdminRunAtomizationSweepNow)
+	adminGroup.POST("/media-atomization/chapters/:chapter_id/approve", perm("content", "publish"), controllers.AdminApproveAtomizedChapter)
+	adminGroup.POST("/media-atomization/chapters/:chapter_id/reject", perm("content", "publish"), controllers.AdminRejectAtomizedChapter)
+
 	// Media Studio — per-item transcript + chapter editor
 	adminGroup.GET("/content/:id/studio", perm("content", "read"), controllers.GetStudio)
 	adminGroup.POST("/content/:id/chapters/generate", perm("content", "write"), controllers.GenerateChapters)

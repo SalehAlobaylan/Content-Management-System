@@ -576,9 +576,16 @@ type chaptersGenOpts struct {
 }
 
 type generatedChapter struct {
-	StartIndex int     `json:"start_index"`
-	Title      string  `json:"title"`
-	Summary    *string `json:"summary"`
+	StartIndex             int      `json:"start_index"`
+	EndIndex               *int     `json:"end_index"`
+	Title                  string   `json:"title"`
+	Summary                *string  `json:"summary"`
+	ContextLabel           *string  `json:"context_label"`
+	Confidence             *float64 `json:"confidence"`
+	BoundaryReason         *string  `json:"boundary_reason"`
+	StandaloneScore        *float64 `json:"standalone_score"`
+	ContainsSponsorOrIntro bool     `json:"contains_sponsor_or_intro"`
+	NeedsReviewReason      *string  `json:"needs_review_reason"`
 }
 
 type chaptersGenerateResult struct {

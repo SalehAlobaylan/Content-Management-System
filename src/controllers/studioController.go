@@ -86,12 +86,21 @@ type studioTranscriptDTO struct {
 }
 
 type studioChapterDTO struct {
-	ID      string  `json:"id,omitempty"`
-	Title   string  `json:"title"`
-	Summary *string `json:"summary,omitempty"`
-	StartMs int     `json:"start_ms"`
-	EndMs   int     `json:"end_ms"`
-	Source  string  `json:"source"`
+	ID                   string   `json:"id,omitempty"`
+	Title                string   `json:"title"`
+	Summary              *string  `json:"summary,omitempty"`
+	StartMs              int      `json:"start_ms"`
+	EndMs                int      `json:"end_ms"`
+	Source               string   `json:"source"`
+	Status               string   `json:"status,omitempty"`
+	Confidence           *float64 `json:"confidence,omitempty"`
+	ContextLabel         *string  `json:"context_label,omitempty"`
+	BoundaryReason       *string  `json:"boundary_reason,omitempty"`
+	StandaloneScore      *float64 `json:"standalone_score,omitempty"`
+	ContainsSponsorIntro bool     `json:"contains_sponsor_intro,omitempty"`
+	NeedsReviewReason    *string  `json:"needs_review_reason,omitempty"`
+	DurationBucket       *string  `json:"duration_bucket,omitempty"`
+	ChildContentItemID   *string  `json:"child_content_item_id,omitempty"`
 }
 
 type studioResponse struct {
@@ -196,10 +205,13 @@ func durationMs(item *models.ContentItem) int {
 	return 0
 }
 
-// computeEnds fills EndMs from the next chapter's start (or the media duration
-// for the last). Input must be sorted by StartMs.
+// computeEnds fills missing EndMs from the next chapter's start (or the media
+// duration for the last). Explicit atomization/editor ends are preserved.
 func computeEnds(chapters []studioChapterDTO, durMs int) {
 	for i := range chapters {
+		if chapters[i].EndMs > chapters[i].StartMs {
+			continue
+		}
 		if i+1 < len(chapters) {
 			chapters[i].EndMs = chapters[i+1].StartMs
 		} else if durMs > 0 {
@@ -380,12 +392,27 @@ func chaptersToDTO(chapters []models.Chapter, durMs int) []studioChapterDTO {
 	out := make([]studioChapterDTO, 0, len(chapters))
 	for _, ch := range chapters {
 		out = append(out, studioChapterDTO{
-			ID:      ch.PublicID.String(),
-			Title:   ch.Title,
-			Summary: ch.Summary,
-			StartMs: ch.StartMs,
-			Source:  ch.Source,
+			ID:                   ch.PublicID.String(),
+			Title:                ch.Title,
+			Summary:              ch.Summary,
+			StartMs:              ch.StartMs,
+			Source:               ch.Source,
+			Status:               ch.Status,
+			Confidence:           ch.Confidence,
+			ContextLabel:         ch.ContextLabel,
+			BoundaryReason:       ch.BoundaryReason,
+			StandaloneScore:      ch.StandaloneScore,
+			ContainsSponsorIntro: ch.ContainsSponsorIntro,
+			NeedsReviewReason:    ch.NeedsReviewReason,
+			DurationBucket:       ch.DurationBucket,
 		})
+		if ch.EndMs != nil {
+			out[len(out)-1].EndMs = *ch.EndMs
+		}
+		if ch.ChildContentItemID != nil {
+			id := ch.ChildContentItemID.String()
+			out[len(out)-1].ChildContentItemID = &id
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartMs < out[j].StartMs })
 	computeEnds(out, durMs)
@@ -474,10 +501,17 @@ func GenerateChapters(c *gin.Context) {
 			continue
 		}
 		preview = append(preview, studioChapterDTO{
-			Title:   gc.Title,
-			Summary: gc.Summary,
-			StartMs: int(math.Round(windows[gc.StartIndex].StartSec * 1000)),
-			Source:  models.ChapterSourceDerived,
+			Title:                gc.Title,
+			Summary:              gc.Summary,
+			StartMs:              int(math.Round(windows[gc.StartIndex].StartSec * 1000)),
+			Source:               models.ChapterSourceDerived,
+			Status:               chapterStatusDraft,
+			Confidence:           gc.Confidence,
+			ContextLabel:         gc.ContextLabel,
+			BoundaryReason:       gc.BoundaryReason,
+			StandaloneScore:      gc.StandaloneScore,
+			ContainsSponsorIntro: gc.ContainsSponsorOrIntro,
+			NeedsReviewReason:    gc.NeedsReviewReason,
 		})
 	}
 	sort.Slice(preview, func(i, j int) bool { return preview[i].StartMs < preview[j].StartMs })
@@ -499,10 +533,18 @@ func GenerateChapters(c *gin.Context) {
 
 type saveChaptersRequest struct {
 	Chapters []struct {
-		Title   string  `json:"title"`
-		Summary *string `json:"summary"`
-		StartMs int     `json:"start_ms"`
-		Source  string  `json:"source"`
+		Title                string   `json:"title"`
+		Summary              *string  `json:"summary"`
+		StartMs              int      `json:"start_ms"`
+		EndMs                *int     `json:"end_ms"`
+		Source               string   `json:"source"`
+		Status               string   `json:"status"`
+		Confidence           *float64 `json:"confidence"`
+		ContextLabel         *string  `json:"context_label"`
+		BoundaryReason       *string  `json:"boundary_reason"`
+		StandaloneScore      *float64 `json:"standalone_score"`
+		ContainsSponsorIntro bool     `json:"contains_sponsor_intro"`
+		NeedsReviewReason    *string  `json:"needs_review_reason"`
 	} `json:"chapters"`
 }
 
@@ -560,12 +602,20 @@ func SaveChapters(c *gin.Context) {
 			src = models.ChapterSourceManual
 		}
 		rows = append(rows, models.Chapter{
-			TranscriptID: transcript.PublicID,
-			TenantID:     principal.TenantID,
-			Title:        title,
-			Summary:      ch.Summary,
-			StartMs:      start,
-			Source:       src,
+			TranscriptID:         transcript.PublicID,
+			TenantID:             principal.TenantID,
+			Title:                title,
+			Summary:              ch.Summary,
+			StartMs:              start,
+			EndMs:                ch.EndMs,
+			Source:               src,
+			Status:               defaultStr(ch.Status, chapterStatusDraft),
+			Confidence:           ch.Confidence,
+			ContextLabel:         ch.ContextLabel,
+			BoundaryReason:       ch.BoundaryReason,
+			StandaloneScore:      ch.StandaloneScore,
+			ContainsSponsorIntro: ch.ContainsSponsorIntro,
+			NeedsReviewReason:    ch.NeedsReviewReason,
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].StartMs < rows[j].StartMs })

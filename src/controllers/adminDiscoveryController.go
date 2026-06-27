@@ -907,14 +907,42 @@ func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.Source
 		if category == "" {
 			category = models.DefaultCategoryForType(suggestion.Type)
 		}
-		// Storage guard: cap a newly-approved MEDIA source to the N most-recent
-		// episodes/videos so a deep podcast back-catalog doesn't flood ingestion
-		// + S3 on first fetch. Ongoing interval fetches still pick up new items.
+		// Storage guard + atomization policy: cap a newly-approved MEDIA source
+		// to the N most-recent episodes/videos and mark it as a source whose
+		// parent items should be atomized into chapter feed units.
 		var apiConfig datatypes.JSON
+		var sourceMetadata datatypes.JSON
 		if category == models.SourceCategoryMedia {
+			settings := defaultMediaAtomizationPolicy()
 			if cfg := loadDiscoveryConfig(db, tenantID); cfg.MediaInitialMaxEpisodes > 0 {
-				if raw, err := json.Marshal(map[string]interface{}{"max_results": cfg.MediaInitialMaxEpisodes}); err == nil {
-					apiConfig = datatypes.JSON(raw)
+				settings["max_results"] = cfg.MediaInitialMaxEpisodes
+				settings["initial_atomization_limit"] = cfg.MediaInitialMaxEpisodes
+			}
+			if raw, err := json.Marshal(settings); err == nil {
+				apiConfig = datatypes.JSON(raw)
+			}
+			meta := map[string]interface{}{}
+			if len(suggestion.Health) > 0 {
+				var health map[string]interface{}
+				if json.Unmarshal(suggestion.Health, &health) == nil {
+					meta["media_finding_health"] = health
+				}
+			}
+			if len(suggestion.Evidence) > 0 {
+				var evidence map[string]interface{}
+				if json.Unmarshal(suggestion.Evidence, &evidence) == nil {
+					meta["media_finding_evidence"] = evidence
+				}
+			}
+			if len(suggestion.SampleItems) > 0 {
+				var sampleItems []map[string]interface{}
+				if json.Unmarshal(suggestion.SampleItems, &sampleItems) == nil {
+					meta["media_finding_sample_items"] = sampleItems
+				}
+			}
+			if len(meta) > 0 {
+				if raw, err := json.Marshal(meta); err == nil {
+					sourceMetadata = datatypes.JSON(raw)
 				}
 			}
 		}
@@ -926,6 +954,7 @@ func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.Source
 			FeedURL:              &feedURL,
 			ImageURL:             suggestion.ImageURL,
 			APIConfig:            apiConfig,
+			Metadata:             sourceMetadata,
 			IsActive:             true,
 			FetchIntervalMinutes: 60,
 			DiscoveryProfileID:   suggestion.ProfileID,
@@ -945,6 +974,27 @@ func approveSuggestionTx(db *gorm.DB, tenantID string, suggestion *models.Source
 		return nil, err
 	}
 	return &result, nil
+}
+
+func defaultMediaAtomizationPolicy() map[string]interface{} {
+	return map[string]interface{}{
+		"chaptering_enabled":             true,
+		"auto_publish_high_confidence":   true,
+		"parent_feed_visible":            false,
+		"preserve_video":                 true,
+		"remove_sponsor_segments":        true,
+		"min_chapter_minutes":            5,
+		"min_feed_unit_seconds":          forYouMinDurationSec,
+		"soft_max_chapter_minutes":       30,
+		"hard_max_chapter_minutes":       40,
+		"atomization_min_parent_seconds": atomizationMinParentDurationSec,
+		"max_chapters_per_parent":        5,
+		"chaptering_mode":                "contextual",
+		"high_confidence_threshold":      0.82,
+		"preferred_playback_rendition":   "hls",
+		"fallback_playback_rendition":    "mp4",
+		"audio_only_allowed":             true,
+	}
 }
 
 // triggerSourceFirstFetch best-effort kicks off the first ingestion for a

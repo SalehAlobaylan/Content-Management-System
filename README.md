@@ -1,6 +1,6 @@
 # Content-Management-System
 
-The system of record and read API for the Wahb platform. CMS owns content CRUD, the PostgreSQL + pgvector store, feed assembly (For You + News), interactions, syndication output (RSS/Atom/JSON), and the full admin/intelligence/storage surface for Platform-Console.
+The system of record and read API for the Wahb platform. CMS owns content CRUD, the PostgreSQL + pgvector store, feed assembly (For You + News), media atomization workflow state, interactions, syndication output (RSS/Atom/JSON), and the full admin/intelligence/storage surface for Platform-Console.
 
 It does **not** scrape sources, run FFmpeg, run ML models, or orchestrate the ingest pipeline — those belong to Aggregation, Enrichment, and Media. CMS calls Enrichment on demand and receives ingested content from Aggregation via `/internal/*`.
 
@@ -35,7 +35,16 @@ go build ./...
 docker build -t wahb-cms .
 ```
 
-In `development` the server auto-migrates the schema on boot (GORM `AutoMigrate`). Set `AUTO_MIGRATE=false` to skip the sweep against a slow remote DB (e.g. Neon); schema changes are tracked as SQL files in `migrations/` and applied directly. Production never auto-migrates.
+In `development` the server can auto-migrate the schema on boot with GORM `AutoMigrate`. `./start.sh` defaults CMS to `AUTO_MIGRATE=false` so the full local stack does not spend minutes introspecting a remote Supabase database. GORM AutoMigrate also does not execute SQL files from `migrations/`.
+
+Apply canonical CMS SQL migrations explicitly:
+
+```bash
+go run ./cmd/migrate --status
+go run ./cmd/migrate 20260627000000_media_atomization.sql 20260627010000_media_atomization_operations.sql
+```
+
+Use `go run ./cmd/migrate --all` only when the target database has a reliable `cms_schema_migrations` ledger or is a fresh database. Production never auto-migrates.
 
 ### Go API docs (terminal)
 
@@ -85,7 +94,7 @@ CMS **does not log anyone in** — IAM issues JWTs (HS256). Platform-Console and
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/feed/foryou` | For You feed (VIDEO + PODCAST, MP4 only, cursor-paginated) |
+| GET | `/feed/foryou` | For You feed (VIDEO + PODCAST feed units with playback metadata, optional duration preference, cursor-paginated) |
 | GET | `/feed/news` | News feed — story-slides (1 featured + up to 3 related) |
 | GET | `/feed/rss.xml` · `/feed/atom.xml` · `/feed/feed.json` | Syndication output (`type`, `topic`, `limit`) |
 | GET | `/feed/saved/:slug` | A saved named feed |
@@ -105,7 +114,7 @@ Grouped capabilities (see the full route list in [`../docs/content-management-sy
 - **Content moderation** — list/filter, status updates, bulk delete/status/tags/topic, stats, status-counts, topics.
 - **Topics** — rename, delete, merge, reclassify, recluster, label-batch.
 - **Intelligence** — ranking config + modes, content flags (boost/suppress/pin/exclude), embeddings explorer (clusters/similar/stats), feed analytics (score-distribution, velocity, trending, source-performance, signal-health), feed preview (foryou/news with score breakdown), news-snapshot refresh.
-- **Media Studio & transcription** — per-item transcript/chapter editor, transcription config + jobs/batches, quality.
+- **Media Studio, transcription, atomization** — per-item transcript/chapter editor, transcription config + jobs/batches, Media Atomization overview/pipeline/parents/chapters/runs/review/repair, quality.
 - **Enrichment** — stats, missing, trigger (single/batch/all), bulk-status, health.
 - **Storage** — stats, candidates, purge, restore, policy + overrides, sweep runs/preview, reconcile, operations.
 - **Quality** — profiles CRUD, resolve, probe-item.
@@ -113,7 +122,17 @@ Grouped capabilities (see the full route list in [`../docs/content-management-sy
 
 ### Internal (`/internal/*`, service token) — for Aggregation / Enrichment / Media
 
-Content write-back pipeline (`POST /content-items` → PATCH `…/artifacts` → POST `/transcripts` → PATCH `…/transcript` → PATCH `…/embedding` → PATCH `…/status`), image-embedding + STT hooks, vector retrieval (`/content-items/knn`, `…/embeddings`, `…/missing-embedding`, `batch-text`), discovery/intel candidate exchange, and storage/quality policy endpoints.
+Content write-back pipeline (`POST /content-items` → PATCH `…/artifacts` → POST `/transcripts` → PATCH `…/transcript` → PATCH `…/embedding` → PATCH `…/status`), image-embedding + STT hooks, vector retrieval (`/content-items/knn`, `…/embeddings`, `…/missing-embedding`, `batch-text`), discovery/intel candidate exchange, media atomization candidate/input/plan/children/run endpoints, and storage/quality policy endpoints.
+
+## Media Atomization Rules
+
+CMS is the source of truth for atomization policy, workflow state, review state, repair, and For You visibility.
+
+- Atomization candidates must be parent media longer than 2400 seconds (>40m). Parent media at or under 40m normally remains a raw feed unit when otherwise eligible.
+- Visible For You media units must be 270-2400 seconds. 4:30-4:59 is valid and belongs to the `5m` bucket; anything below 4:30 must merge or stay hidden/review-only.
+- Child chapters are first-class `content_items` linked to their parent. `chapters` remains the editorial/review marker table.
+- For You returns playback metadata (`playback_url`, `playback_type`, fallback/renditions), not an MP4-only contract.
+- Re-atomization must archive/replace prior child feed units so duplicates cannot remain visible.
 
 ## Testing
 
