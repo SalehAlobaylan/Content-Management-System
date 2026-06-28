@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -33,11 +34,27 @@ const (
 	atomizationOverrideEnabled     = "enabled"
 )
 
+const (
+	mediaPublicationPathAtomized           = "atomized"
+	mediaPublicationPathDirectTranscript   = "direct_transcript"
+	mediaPublicationPathDirectNoTranscript = "direct_no_transcript"
+	mediaPublicationPathBlockedTranscript  = "blocked_transcript"
+	mediaPublicationPathInvalid            = "invalid"
+)
+
 type mediaAtomizationSchemaInfo struct {
 	Ready   bool     `json:"ready"`
 	Missing []string `json:"missing"`
 	Message string   `json:"message"`
 }
+
+var mediaAtomizationSchemaCache = struct {
+	sync.Mutex
+	info      mediaAtomizationSchemaInfo
+	checkedAt time.Time
+}{}
+
+const mediaAtomizationSchemaCacheTTL = 5 * time.Minute
 
 type atomizationPolicy struct {
 	ChapteringEnabled           bool    `json:"chaptering_enabled"`
@@ -354,6 +371,8 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 			p.duration_sec, p.chaptering_status, p.transcript_id::text AS transcript_id,
 			COUNT(c.id) AS existing_child_count, p.media_url, p.thumbnail_url, p.atomization_override
 		FROM content_items p
+		JOIN transcripts t
+			ON t.public_id = p.transcript_id
 		LEFT JOIN content_sources s
 			ON s.tenant_id = p.tenant_id
 			AND s.feed_url = p.source_feed_url
@@ -366,6 +385,10 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 				AND p.parent_content_item_id IS NULL
 				AND p.media_url IS NOT NULL AND p.media_url <> ''
 				AND p.transcript_id IS NOT NULL
+				AND (
+					(jsonb_typeof(t.segments) = 'array' AND jsonb_array_length(t.segments) > 0)
+					OR (jsonb_typeof(t.word_timestamps) = 'array' AND jsonb_array_length(t.word_timestamps) > 0)
+				)
 				AND p.duration_sec IS NOT NULL
 				AND p.duration_sec > ?
 				AND COALESCE(p.atomization_override, 'inherit') <> 'disabled'
@@ -373,7 +396,7 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 					COALESCE(s.api_config->>'chaptering_enabled', 'true') <> 'false'
 					OR COALESCE(p.atomization_override, 'inherit') = 'enabled'
 				)
-				AND p.status IN ('READY','ARCHIVED')
+				AND p.status = 'READY'
 				AND NOT EXISTS (
 					SELECT 1 FROM transcription_jobs tj
 					WHERE tj.content_item_id = p.public_id
@@ -420,7 +443,18 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 			AND p.type IN ('VIDEO','PODCAST')
 			AND p.parent_content_item_id IS NULL
 			AND p.media_url IS NOT NULL AND p.media_url <> ''
-			AND p.transcript_id IS NULL
+			AND (
+				p.transcript_id IS NULL
+				OR NOT EXISTS (
+					SELECT 1
+					FROM transcripts t
+					WHERE t.public_id = p.transcript_id
+						AND (
+							(jsonb_typeof(t.segments) = 'array' AND jsonb_array_length(t.segments) > 0)
+							OR (jsonb_typeof(t.word_timestamps) = 'array' AND jsonb_array_length(t.word_timestamps) > 0)
+						)
+				)
+			)
 			AND p.duration_sec IS NOT NULL
 			AND p.duration_sec > ?
 			AND COALESCE(p.atomization_override, 'inherit') <> 'disabled'
@@ -428,7 +462,7 @@ func InternalListAtomizationCandidates(c *gin.Context) {
 				COALESCE(s.api_config->>'chaptering_enabled', 'true') <> 'false'
 				OR COALESCE(p.atomization_override, 'inherit') = 'enabled'
 			)
-			AND p.status IN ('READY','ARCHIVED')
+			AND p.status = 'READY'
 			AND NOT EXISTS (
 				SELECT 1 FROM transcription_jobs tj
 				WHERE tj.content_item_id = p.public_id
@@ -989,6 +1023,15 @@ func AdminRepairMediaAtomizationLeaks(c *gin.Context) {
 	if !ok {
 		return
 	}
+	repairMediaAtomizationLeaksForTenant(c, principal.TenantID, true)
+}
+
+func InternalRepairMediaAtomizationLeaks(c *gin.Context) {
+	tenantID := strings.TrimSpace(c.DefaultQuery("tenant_id", "default"))
+	repairMediaAtomizationLeaksForTenant(c, tenantID, false)
+}
+
+func repairMediaAtomizationLeaksForTenant(c *gin.Context, tenantID string, enveloped bool) {
 	db := c.MustGet("db").(*gorm.DB)
 	schema := getMediaAtomizationSchemaInfo(db)
 	if !schema.Ready {
@@ -999,12 +1042,12 @@ func AdminRepairMediaAtomizationLeaks(c *gin.Context) {
 		return
 	}
 
-	result, err := repairMediaAtomizationDurationLeaks(db, principal.TenantID)
+	result, err := repairMediaAtomizationDurationLeaks(db, tenantID)
 	if err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization feed leaks repaired", Data: gin.H{
+	data := gin.H{
 		"updated_count":                         result.UpdatedCount,
 		"remaining_count":                       result.RemainingCount,
 		"hidden_duration_violation_count":       result.HiddenDurationViolationCount,
@@ -1014,7 +1057,12 @@ func AdminRepairMediaAtomizationLeaks(c *gin.Context) {
 		"remaining_visible_under_floor_count":   result.RemainingVisibleUnderFloorCount,
 		"remaining_visible_over_hard_max_count": result.RemainingVisibleOverHardMaxCount,
 		"schema_status":                         schema,
-	}})
+	}
+	if !enveloped {
+		c.JSON(http.StatusOK, data)
+		return
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization feed leaks repaired", Data: data})
 }
 
 type atomizationPolicyPatchRequest struct {
@@ -1306,6 +1354,50 @@ func AdminAtomizeMediaParent(c *gin.Context) { adminQueueMediaParentAtomization(
 
 func AdminReatomizeMediaParent(c *gin.Context) { adminQueueMediaParentAtomization(c, true) }
 
+func countMediaPublicationPath(db *gorm.DB, tenantID, path string) (int64, error) {
+	var count int64
+	query := db.Model(&models.ContentItem{}).
+		Where("tenant_id = ?", tenantID).
+		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast})
+	switch path {
+	case mediaPublicationPathAtomized:
+		query = query.Where("parent_content_item_id IS NOT NULL").
+			Where(validVisibleFeedUnitPredicate()).
+			Where("EXISTS (SELECT 1 FROM content_items p WHERE p.public_id = content_items.parent_content_item_id AND p.tenant_id = content_items.tenant_id AND p.duration_sec > ?)", atomizationMinParentDurationSec)
+	case mediaPublicationPathDirectTranscript:
+		query = query.Where("parent_content_item_id IS NULL").Where("transcript_id IS NOT NULL").Where(validVisibleFeedUnitPredicate())
+	case mediaPublicationPathDirectNoTranscript:
+		query = query.Where("parent_content_item_id IS NULL").Where("transcript_id IS NULL").Where(validVisibleFeedUnitPredicate())
+	case mediaPublicationPathBlockedTranscript:
+		query = query.Where("parent_content_item_id IS NULL").
+			Where("transcript_id IS NULL").
+			Where("duration_sec > ?", forYouHardMaxDurationSec).
+			Where("NOT (is_feed_unit = TRUE AND feed_visibility = ?)", feedVisibilityVisible).
+			Where("status <> ?", models.ContentStatusArchived)
+	case "hidden_long_parent":
+		query = query.Where("parent_content_item_id IS NULL").
+			Where("duration_sec > ?", forYouHardMaxDurationSec).
+			Where("(feed_visibility = ? OR is_feed_unit = FALSE)", feedVisibilityHidden).
+			Where("status <> ?", models.ContentStatusArchived)
+	case mediaPublicationPathInvalid:
+		query = query.Where(invalidVisibleFeedUnitPredicate())
+	default:
+		return 0, nil
+	}
+	if err := query.Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func validVisibleFeedUnitPredicate() string {
+	return "is_feed_unit = TRUE AND feed_visibility = 'visible' AND status = 'READY' AND duration_sec BETWEEN 270 AND 2400 AND COALESCE(playback_url, media_url) IS NOT NULL AND COALESCE(playback_url, media_url) <> '' AND thumbnail_url IS NOT NULL AND thumbnail_url <> ''"
+}
+
+func invalidVisibleFeedUnitPredicate() string {
+	return "is_feed_unit = TRUE AND feed_visibility = 'visible' AND status = 'READY' AND (duration_sec IS NULL OR duration_sec < 270 OR duration_sec > 2400 OR COALESCE(playback_url, media_url) IS NULL OR COALESCE(playback_url, media_url) = '' OR thumbnail_url IS NULL OR thumbnail_url = '' OR EXISTS (SELECT 1 FROM content_items p WHERE p.public_id = content_items.parent_content_item_id AND p.tenant_id = content_items.tenant_id AND COALESCE(p.duration_sec, 0) <= 2400))"
+}
+
 func loadAdminAtomizationParent(c *gin.Context, tenantID string) (*models.ContentItem, bool) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -1452,6 +1544,22 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	var autoPublished, reviewNeeded, failedOrStuck, parentCount, childCount, durationViolationCount int64
 	var disabledEpisodeCount, disabledSourceCount, manualRequestedCount int64
 	var visibleUnderFloorCount, visibleOverHardMaxCount, shortParentActiveChildCount, shortChapterReviewCount int64
+	publicationSummary := map[string]int64{}
+	for _, path := range []string{
+		mediaPublicationPathAtomized,
+		mediaPublicationPathDirectTranscript,
+		mediaPublicationPathDirectNoTranscript,
+		mediaPublicationPathBlockedTranscript,
+		"hidden_long_parent",
+		mediaPublicationPathInvalid,
+	} {
+		count, err := countMediaPublicationPath(db, principal.TenantID, path)
+		if err != nil {
+			mediaAtomizationQueryError(c, err)
+			return
+		}
+		publicationSummary[path] = count
+	}
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ? AND parent_content_item_id IS NOT NULL AND feed_visibility = ? AND status = ?", principal.TenantID, feedVisibilityVisible, models.ContentStatusReady).
 		Count(&autoPublished).Error; err != nil {
@@ -1513,7 +1621,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ?", principal.TenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status IN ?", feedVisibilityVisible, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
 		Where("(duration_sec IS NULL OR duration_sec < ?)", forYouMinDurationSec).
 		Count(&visibleUnderFloorCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
@@ -1522,7 +1630,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ?", principal.TenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status IN ?", feedVisibilityVisible, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
 		Where("duration_sec > ?", forYouHardMaxDurationSec).
 		Count(&visibleOverHardMaxCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
@@ -1552,8 +1660,29 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	}
 
 	avgChaptersPerParent := 0.0
-	if parentCount > 0 {
-		avgChaptersPerParent = float64(childCount) / float64(parentCount)
+	var avgChapterRow struct {
+		Average *float64 `gorm:"column:average"`
+	}
+	if err := db.Raw(`
+		SELECT AVG(child_count)::float AS average
+		FROM (
+			SELECT COUNT(c.id) AS child_count
+			FROM content_items p
+			JOIN content_items c
+				ON c.parent_content_item_id = p.public_id
+				AND c.tenant_id = p.tenant_id
+				AND c.status <> 'ARCHIVED'
+			WHERE p.tenant_id = ?
+				AND p.type IN ('VIDEO','PODCAST')
+				AND p.parent_content_item_id IS NULL
+				AND COALESCE(p.duration_sec, 0) > ?
+			GROUP BY p.public_id
+		) atomized_parent_counts`, principal.TenantID, atomizationMinParentDurationSec).Scan(&avgChapterRow).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	if avgChapterRow.Average != nil {
+		avgChaptersPerParent = *avgChapterRow.Average
 	}
 	var avgRow struct {
 		AvgProcessingSeconds *float64 `gorm:"column:avg_processing_seconds"`
@@ -1568,7 +1697,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 
 	if err := db.Raw(`
 		SELECT COALESCE(duration_bucket, 'unknown') AS bucket,
-			SUM(CASE WHEN feed_visibility = 'visible' THEN 1 ELSE 0 END) AS published,
+			SUM(CASE WHEN feed_visibility = 'visible' AND status = 'READY' THEN 1 ELSE 0 END) AS published,
 			SUM(CASE WHEN feed_visibility = 'review' THEN 1 ELSE 0 END) AS needs_review,
 			SUM(CASE WHEN feed_visibility = 'embedding_pending' THEN 1 ELSE 0 END) AS embedding_pending
 		FROM content_items
@@ -1584,9 +1713,9 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 			p.source_feed_url AS source_feed_url,
 			COUNT(DISTINCT p.public_id) AS parents_processed,
 			COUNT(c.id) AS children_produced,
-			SUM(CASE WHEN c.feed_visibility = 'visible' THEN 1 ELSE 0 END) AS published_count,
+			SUM(CASE WHEN c.feed_visibility = 'visible' AND c.status = 'READY' THEN 1 ELSE 0 END) AS published_count,
 			SUM(CASE WHEN c.feed_visibility = 'review' THEN 1 ELSE 0 END) AS review_count,
-			SUM(CASE WHEN p.status = 'FAILED' OR p.chaptering_status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+			COUNT(DISTINCT CASE WHEN p.status = 'FAILED' OR p.chaptering_status = 'failed' THEN p.public_id END) AS failed_count
 		FROM content_items p
 		LEFT JOIN content_items c ON c.parent_content_item_id = p.public_id AND c.tenant_id = p.tenant_id
 		WHERE p.tenant_id = ? AND p.type IN ('VIDEO','PODCAST') AND p.parent_content_item_id IS NULL
@@ -1598,15 +1727,23 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization overview fetched", Data: gin.H{
-		"parent_status_counts":            parentStatus,
-		"child_state_counts":              childState,
-		"auto_published_count":            autoPublished,
-		"review_needed_count":             reviewNeeded,
-		"failed_stuck_count":              failedOrStuck,
-		"duration_violation_count":        durationViolationCount,
-		"disabled_episode_count":          disabledEpisodeCount,
-		"disabled_source_count":           disabledSourceCount,
-		"manual_requested_count":          manualRequestedCount,
+		"parent_status_counts":     parentStatus,
+		"child_state_counts":       childState,
+		"auto_published_count":     autoPublished,
+		"review_needed_count":      reviewNeeded,
+		"failed_stuck_count":       failedOrStuck,
+		"duration_violation_count": durationViolationCount,
+		"disabled_episode_count":   disabledEpisodeCount,
+		"disabled_source_count":    disabledSourceCount,
+		"manual_requested_count":   manualRequestedCount,
+		"publication_summary": gin.H{
+			"atomized_published_count":         publicationSummary[mediaPublicationPathAtomized],
+			"direct_with_transcript_count":     publicationSummary[mediaPublicationPathDirectTranscript],
+			"direct_without_transcript_count":  publicationSummary[mediaPublicationPathDirectNoTranscript],
+			"blocked_waiting_transcript_count": publicationSummary[mediaPublicationPathBlockedTranscript],
+			"hidden_long_parent_count":         publicationSummary["hidden_long_parent"],
+			"invalid_visible_count":            publicationSummary[mediaPublicationPathInvalid],
+		},
 		"visible_under_floor_count":       visibleUnderFloorCount,
 		"visible_over_hard_max_count":     visibleOverHardMaxCount,
 		"short_parent_active_child_count": shortParentActiveChildCount,
@@ -1652,6 +1789,8 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 		DurationSec                  *int       `json:"duration_sec"`
 		TranscriptID                 *string    `json:"transcript_id"`
 		ChildCount                   int64      `json:"child_count"`
+		ChildDurationSec             int64      `json:"child_duration_sec"`
+		CoveragePercent              *float64   `json:"coverage_percent"`
 		PublishedCount               int64      `json:"published_count"`
 		ReviewCount                  int64      `json:"review_count"`
 		EmbeddingPendingCount        int64      `json:"embedding_pending_count"`
@@ -1689,7 +1828,13 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 		SELECT p.public_id::text AS id, p.title, p.status, p.chaptering_status, p.source_name, p.source_feed_url,
 			p.duration_sec, p.transcript_id::text AS transcript_id,
 			COUNT(c.id) AS child_count,
-			SUM(CASE WHEN c.feed_visibility = 'visible' THEN 1 ELSE 0 END) AS published_count,
+			COALESCE(SUM(COALESCE(c.duration_sec, 0)), 0) AS child_duration_sec,
+			CASE
+				WHEN COALESCE(p.duration_sec, 0) > 0
+				THEN ROUND((COALESCE(SUM(COALESCE(c.duration_sec, 0)), 0)::numeric / p.duration_sec::numeric) * 100, 1)::float
+				ELSE NULL
+			END AS coverage_percent,
+			SUM(CASE WHEN c.feed_visibility = 'visible' AND c.status = 'READY' THEN 1 ELSE 0 END) AS published_count,
 			SUM(CASE WHEN c.feed_visibility = 'review' THEN 1 ELSE 0 END) AS review_count,
 			SUM(CASE WHEN c.feed_visibility = 'embedding_pending' THEN 1 ELSE 0 END) AS embedding_pending_count,
 			CASE
@@ -1711,6 +1856,161 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization parents fetched", Data: gin.H{"items": rows}})
+}
+
+func AdminListMediaAtomizationFeedUnits(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	schema := getMediaAtomizationSchemaInfo(db)
+	if !schema.Ready {
+		c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media publication ledger unavailable until schema migration is applied", Data: gin.H{"items": []interface{}{}, "schema_status": schema}})
+		return
+	}
+	type feedUnitRow struct {
+		ID                  string    `json:"id"`
+		Title               *string   `json:"title"`
+		SourceName          *string   `json:"source_name"`
+		DurationSec         *int      `json:"duration_sec"`
+		TranscriptID        *string   `json:"transcript_id"`
+		TranscriptState     string    `json:"transcript_state"`
+		PublicationPath     string    `json:"publication_path"`
+		FeedVisibility      string    `json:"feed_visibility"`
+		Status              string    `json:"status"`
+		ParentID            *string   `json:"parent_id"`
+		ParentTitle         *string   `json:"parent_title"`
+		ChildCount          int64     `json:"child_count"`
+		LatestError         *string   `json:"latest_error"`
+		PlaybackURL         *string   `json:"playback_url"`
+		PlaybackType        *string   `json:"playback_type"`
+		FallbackPlaybackURL *string   `json:"fallback_playback_url"`
+		HasVideo            *bool     `json:"has_video"`
+		UpdatedAt           time.Time `json:"updated_at"`
+	}
+
+	where := []string{"publication_path <> 'other'"}
+	args := []interface{}{principal.TenantID}
+	if path := strings.TrimSpace(c.Query("path")); path != "" && path != "all" {
+		where = append(where, "publication_path = ?")
+		args = append(args, path)
+	}
+	if source := strings.TrimSpace(c.Query("source")); source != "" {
+		where = append(where, "(source_name ILIKE ? OR parent_title ILIKE ?)")
+		args = append(args, "%"+source+"%", "%"+source+"%")
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		where = append(where, "(title ILIKE ? OR parent_title ILIKE ? OR source_name ILIKE ?)")
+		args = append(args, "%"+q+"%", "%"+q+"%", "%"+q+"%")
+	}
+	limit := boundedLimit(c.Query("limit"), 80, 200)
+	args = append(args, limit)
+	rawArgs := []interface{}{
+		forYouMinDurationSec, forYouHardMaxDurationSec, atomizationMinParentDurationSec,
+		forYouMinDurationSec, forYouHardMaxDurationSec,
+		forYouMinDurationSec, forYouHardMaxDurationSec,
+		forYouMinDurationSec, forYouHardMaxDurationSec,
+		forYouHardMaxDurationSec,
+	}
+	rawArgs = append(rawArgs, args...)
+
+	rows := []feedUnitRow{}
+	if err := db.Raw(`
+		SELECT *
+		FROM (
+			SELECT
+				i.public_id::text AS id,
+				i.title,
+				COALESCE(i.source_name, p.source_name) AS source_name,
+				i.duration_sec,
+				i.transcript_id::text AS transcript_id,
+				CASE WHEN i.transcript_id IS NULL THEN 'missing' ELSE 'ready' END AS transcript_state,
+				CASE
+					WHEN i.is_feed_unit = TRUE
+						AND i.feed_visibility = 'visible'
+						AND i.status = 'READY'
+						AND (
+							i.duration_sec IS NULL OR i.duration_sec < ? OR i.duration_sec > ?
+							OR COALESCE(i.playback_url, i.media_url) IS NULL OR COALESCE(i.playback_url, i.media_url) = ''
+							OR i.thumbnail_url IS NULL OR i.thumbnail_url = ''
+							OR (p.public_id IS NOT NULL AND COALESCE(p.duration_sec, 0) <= ?)
+						)
+						THEN 'invalid'
+					WHEN i.parent_content_item_id IS NOT NULL
+						AND i.is_feed_unit = TRUE
+						AND i.feed_visibility = 'visible'
+						AND i.status = 'READY'
+						AND i.duration_sec BETWEEN ? AND ?
+						AND COALESCE(i.playback_url, i.media_url) IS NOT NULL AND COALESCE(i.playback_url, i.media_url) <> ''
+						AND i.thumbnail_url IS NOT NULL AND i.thumbnail_url <> ''
+						THEN 'atomized'
+					WHEN i.parent_content_item_id IS NULL
+						AND i.transcript_id IS NOT NULL
+						AND i.is_feed_unit = TRUE
+						AND i.feed_visibility = 'visible'
+						AND i.status = 'READY'
+						AND i.duration_sec BETWEEN ? AND ?
+						AND COALESCE(i.playback_url, i.media_url) IS NOT NULL AND COALESCE(i.playback_url, i.media_url) <> ''
+						AND i.thumbnail_url IS NOT NULL AND i.thumbnail_url <> ''
+						THEN 'direct_transcript'
+					WHEN i.parent_content_item_id IS NULL
+						AND i.transcript_id IS NULL
+						AND i.is_feed_unit = TRUE
+						AND i.feed_visibility = 'visible'
+						AND i.status = 'READY'
+						AND i.duration_sec BETWEEN ? AND ?
+						AND COALESCE(i.playback_url, i.media_url) IS NOT NULL AND COALESCE(i.playback_url, i.media_url) <> ''
+						AND i.thumbnail_url IS NOT NULL AND i.thumbnail_url <> ''
+						THEN 'direct_no_transcript'
+					WHEN i.parent_content_item_id IS NULL
+						AND i.transcript_id IS NULL
+						AND i.duration_sec > ?
+						AND NOT (i.is_feed_unit = TRUE AND i.feed_visibility = 'visible')
+						AND i.status <> 'ARCHIVED'
+						THEN 'blocked_transcript'
+					ELSE 'other'
+				END AS publication_path,
+				i.feed_visibility,
+				i.status,
+				i.parent_content_item_id::text AS parent_id,
+				p.title AS parent_title,
+				(SELECT COUNT(child.id) FROM content_items child WHERE child.tenant_id = i.tenant_id AND child.parent_content_item_id = i.public_id AND child.status <> 'ARCHIVED') AS child_count,
+				CASE
+					WHEN (
+						SELECT r.status
+						FROM media_atomization_runs r
+						WHERE r.parent_content_item_id = COALESCE(i.parent_content_item_id, i.public_id)
+						ORDER BY r.updated_at DESC
+						LIMIT 1
+					) = 'failed'
+					THEN (
+						SELECT r.error_message
+						FROM media_atomization_runs r
+						WHERE r.parent_content_item_id = COALESCE(i.parent_content_item_id, i.public_id)
+						ORDER BY r.updated_at DESC
+						LIMIT 1
+					)
+					ELSE NULL
+				END AS latest_error,
+				COALESCE(i.playback_url, i.media_url) AS playback_url,
+				i.playback_type,
+				i.fallback_playback_url,
+				i.has_video,
+				i.updated_at
+			FROM content_items i
+			LEFT JOIN content_items p ON p.public_id = i.parent_content_item_id AND p.tenant_id = i.tenant_id
+			WHERE i.tenant_id = ? AND i.type IN ('VIDEO','PODCAST')
+		) publication_rows
+		WHERE `+strings.Join(where, " AND ")+`
+		ORDER BY updated_at DESC
+		LIMIT ?`,
+		rawArgs...,
+	).Scan(&rows).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media publication ledger fetched", Data: gin.H{"items": rows, "schema_status": schema}})
 }
 
 func AdminListMediaAtomizationChapters(c *gin.Context) {
@@ -1835,6 +2135,8 @@ type mediaAtomizationPipelineItem struct {
 	TranscriptID                 *string    `json:"transcript_id"`
 	TranscriptState              string     `json:"transcript_state"`
 	ChildCount                   int64      `json:"child_count"`
+	ChildDurationSec             int64      `json:"child_duration_sec"`
+	CoveragePercent              *float64   `json:"coverage_percent"`
 	PublishedCount               int64      `json:"published_count"`
 	ReviewCount                  int64      `json:"review_count"`
 	EmbeddingPendingCount        int64      `json:"embedding_pending_count"`
@@ -1902,7 +2204,13 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 			p.duration_sec, p.transcript_id::text AS transcript_id,
 			CASE WHEN p.transcript_id IS NULL THEN 'missing' ELSE 'ready' END AS transcript_state,
 			COUNT(c.id) AS child_count,
-			SUM(CASE WHEN c.feed_visibility = 'visible' THEN 1 ELSE 0 END) AS published_count,
+			COALESCE(SUM(COALESCE(c.duration_sec, 0)), 0) AS child_duration_sec,
+			CASE
+				WHEN COALESCE(p.duration_sec, 0) > 0
+				THEN ROUND((COALESCE(SUM(COALESCE(c.duration_sec, 0)), 0)::numeric / p.duration_sec::numeric) * 100, 1)::float
+				ELSE NULL
+			END AS coverage_percent,
+			SUM(CASE WHEN c.feed_visibility = 'visible' AND c.status = 'READY' THEN 1 ELSE 0 END) AS published_count,
 			SUM(CASE WHEN c.feed_visibility = 'review' THEN 1 ELSE 0 END) AS review_count,
 			SUM(CASE WHEN c.feed_visibility = 'embedding_pending' THEN 1 ELSE 0 END) AS embedding_pending_count,
 			CASE
@@ -2015,55 +2323,115 @@ func pipelineActionForItem(item mediaAtomizationPipelineItem) string {
 }
 
 func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
+	mediaAtomizationSchemaCache.Lock()
+	defer mediaAtomizationSchemaCache.Unlock()
+	if !mediaAtomizationSchemaCache.checkedAt.IsZero() && time.Since(mediaAtomizationSchemaCache.checkedAt) < mediaAtomizationSchemaCacheTTL {
+		return mediaAtomizationSchemaCache.info
+	}
+
+	expectedColumns := map[string][]string{
+		"content_items": {
+			"parent_content_item_id",
+			"is_feed_unit",
+			"feed_visibility",
+			"chapter_index",
+			"chapter_start_ms",
+			"chapter_end_ms",
+			"chapter_confidence",
+			"chaptering_status",
+			"duration_bucket",
+			"playback_url",
+			"playback_type",
+			"fallback_playback_url",
+			"has_video",
+			"media_renditions",
+			"atomization_override",
+			"atomization_override_reason",
+			"atomization_override_by",
+			"atomization_override_at",
+			"manual_atomization_requested_at",
+		},
+		"chapters": {
+			"end_ms",
+			"status",
+			"confidence",
+			"context_label",
+			"boundary_reason",
+			"standalone_score",
+			"contains_sponsor_intro",
+			"needs_review_reason",
+			"duration_bucket",
+			"child_content_item_id",
+		},
+	}
+	expectedTables := []string{"media_atomization_runs", "media_atomization_policies"}
+
+	type columnRow struct {
+		TableName  string `gorm:"column:table_name"`
+		ColumnName string `gorm:"column:column_name"`
+	}
+	columnRows := []columnRow{}
+	if err := db.Raw(`
+		SELECT table_name, column_name
+		FROM information_schema.columns
+		WHERE table_schema = CURRENT_SCHEMA()
+			AND table_name IN ('content_items', 'chapters')
+	`).Scan(&columnRows).Error; err != nil {
+		info := mediaAtomizationSchemaInfo{
+			Ready:   false,
+			Missing: []string{"schema_probe"},
+			Message: "Media atomization schema could not be verified: " + err.Error(),
+		}
+		mediaAtomizationSchemaCache.info = info
+		mediaAtomizationSchemaCache.checkedAt = time.Now().UTC()
+		return info
+	}
+
+	type tableRow struct {
+		TableName string `gorm:"column:table_name"`
+	}
+	tableRows := []tableRow{}
+	if err := db.Raw(`
+		SELECT table_name
+		FROM information_schema.tables
+		WHERE table_schema = CURRENT_SCHEMA()
+			AND table_name IN ('media_atomization_runs', 'media_atomization_policies')
+			AND table_type = 'BASE TABLE'
+	`).Scan(&tableRows).Error; err != nil {
+		info := mediaAtomizationSchemaInfo{
+			Ready:   false,
+			Missing: []string{"schema_probe"},
+			Message: "Media atomization schema could not be verified: " + err.Error(),
+		}
+		mediaAtomizationSchemaCache.info = info
+		mediaAtomizationSchemaCache.checkedAt = time.Now().UTC()
+		return info
+	}
+
+	foundColumns := map[string]map[string]bool{}
+	for _, row := range columnRows {
+		if foundColumns[row.TableName] == nil {
+			foundColumns[row.TableName] = map[string]bool{}
+		}
+		foundColumns[row.TableName][row.ColumnName] = true
+	}
+	foundTables := map[string]bool{}
+	for _, row := range tableRows {
+		foundTables[row.TableName] = true
+	}
+
 	missing := []string{}
-	contentColumns := []string{
-		"parent_content_item_id",
-		"is_feed_unit",
-		"feed_visibility",
-		"chapter_index",
-		"chapter_start_ms",
-		"chapter_end_ms",
-		"chapter_confidence",
-		"chaptering_status",
-		"duration_bucket",
-		"playback_url",
-		"playback_type",
-		"fallback_playback_url",
-		"has_video",
-		"media_renditions",
-		"atomization_override",
-		"atomization_override_reason",
-		"atomization_override_by",
-		"atomization_override_at",
-		"manual_atomization_requested_at",
-	}
-	for _, column := range contentColumns {
-		if !db.Migrator().HasColumn(&models.ContentItem{}, column) {
-			missing = append(missing, "content_items."+column)
+	for table, columns := range expectedColumns {
+		for _, column := range columns {
+			if !foundColumns[table][column] {
+				missing = append(missing, table+"."+column)
+			}
 		}
 	}
-	chapterColumns := []string{
-		"end_ms",
-		"status",
-		"confidence",
-		"context_label",
-		"boundary_reason",
-		"standalone_score",
-		"contains_sponsor_intro",
-		"needs_review_reason",
-		"duration_bucket",
-		"child_content_item_id",
-	}
-	for _, column := range chapterColumns {
-		if !db.Migrator().HasColumn(&models.Chapter{}, column) {
-			missing = append(missing, "chapters."+column)
+	for _, table := range expectedTables {
+		if !foundTables[table] {
+			missing = append(missing, table)
 		}
-	}
-	if !db.Migrator().HasTable(&models.MediaAtomizationRun{}) {
-		missing = append(missing, "media_atomization_runs")
-	}
-	if !db.Migrator().HasTable(&models.MediaAtomizationPolicy{}) {
-		missing = append(missing, "media_atomization_policies")
 	}
 
 	info := mediaAtomizationSchemaInfo{
@@ -2074,6 +2442,8 @@ func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
 	if !info.Ready {
 		info.Message = "Media atomization schema is incomplete. Apply CMS migrations 20260627000000_media_atomization.sql, 20260627010000_media_atomization_operations.sql, 20260627020000_media_atomization_manual_controls.sql, and 20260627030000_media_atomization_unique_index_repair.sql, then restart CMS."
 	}
+	mediaAtomizationSchemaCache.info = info
+	mediaAtomizationSchemaCache.checkedAt = time.Now().UTC()
 	return info
 }
 
@@ -2105,10 +2475,10 @@ func adminGetMediaAtomizationOverviewCompat(c *gin.Context, db *gorm.DB, tenantI
 	parentStatus = append(parentStatus, nameCount{Name: "schema_missing", Count: parentCount})
 
 	if err := db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND type IN ? AND status IN ? AND (duration_sec < ? OR duration_sec > ?) AND media_url IS NOT NULL AND media_url != '' AND thumbnail_url IS NOT NULL AND thumbnail_url != ''",
+		Where("tenant_id = ? AND type IN ? AND status = ? AND (duration_sec < ? OR duration_sec > ?) AND media_url IS NOT NULL AND media_url != '' AND thumbnail_url IS NOT NULL AND thumbnail_url != ''",
 			tenantID,
 			[]models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast},
-			[]models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived},
+			models.ContentStatusReady,
 			forYouMinDurationSec,
 			forYouHardMaxDurationSec,
 		).Count(&durationViolationCount).Error; err != nil {
@@ -2231,7 +2601,7 @@ func visibleLongParentLeakQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("parent_content_item_id IS NULL").
 		Where("is_feed_unit = TRUE").
 		Where("feed_visibility = ?", feedVisibilityVisible).
-		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("status = ?", models.ContentStatusReady).
 		Where("duration_sec > ?", forYouHardMaxDurationSec)
 }
 
@@ -2241,7 +2611,7 @@ func visibleFeedDurationViolationQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("is_feed_unit = TRUE").
 		Where("feed_visibility = ?", feedVisibilityVisible).
-		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("status = ?", models.ContentStatusReady).
 		Where("(duration_sec IS NULL OR duration_sec < ? OR duration_sec > ?)", forYouMinDurationSec, forYouHardMaxDurationSec)
 }
 
@@ -2356,7 +2726,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status IN ?", feedVisibilityVisible, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
 		Where("(duration_sec IS NULL OR duration_sec < ?)", forYouMinDurationSec).
 		Count(&out.RemainingVisibleUnderFloorCount).Error; err != nil {
 		return out, err
@@ -2364,7 +2734,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 	if err := db.Model(&models.ContentItem{}).
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status IN ?", feedVisibilityVisible, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
+		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
 		Where("duration_sec > ?", forYouHardMaxDurationSec).
 		Count(&out.RemainingVisibleOverHardMaxCount).Error; err != nil {
 		return out, err

@@ -37,6 +37,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.GET("/content-items", controllers.InternalListContentItems)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
 	internal.GET("/atomization/candidates", controllers.InternalListAtomizationCandidates)
+	internal.POST("/atomization/repair-leaks", controllers.InternalRepairMediaAtomizationLeaks)
 	internal.GET("/content-items/:id/atomization", controllers.InternalGetAtomizationInput)
 	internal.POST("/content-items", controllers.InternalCreateContentItem)
 	internal.PUT("/content-items/:id", controllers.InternalUpdateContentItem)
