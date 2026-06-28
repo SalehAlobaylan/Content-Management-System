@@ -743,6 +743,138 @@ func BuildGraph(c *gin.Context) {
 	proxyAggregationSimple(c, "/admin/discovery/build-graph-now")
 }
 
+// ImportYouTube handles POST /admin/discovery/import-youtube — the manual seed
+// path. The admin pastes a youtubei/v1 payload (e.g. their personalized home
+// feed); we proxy it to Aggregation, which parses the channels via guest
+// InnerTube, enriches each, and posts them as suggestions for review. We attach
+// the target profile's keywords + tenant so the suggestions score + file under
+// the right interest. No credentials are stored — the admin stays the session.
+func ImportYouTube(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req struct {
+		Raw       json.RawMessage `json:"raw"`
+		ProfileID string          `json:"profile_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request body", Code: "INVALID_BODY"})
+		return
+	}
+	if len(req.Raw) == 0 {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "raw youtubei/v1 payload is required", Code: "MISSING_RAW"})
+		return
+	}
+
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Aggregation service URL is not configured", Code: "AGGREGATION_NOT_CONFIGURED"})
+		return
+	}
+
+	// Resolve the target interest (optional) → keywords + canonical public id.
+	var keywords []string
+	profileID := ""
+	if pid := strings.TrimSpace(req.ProfileID); pid != "" {
+		if uid, err := uuid.Parse(pid); err == nil {
+			var profile models.DiscoveryProfile
+			if err := db.Where("public_id = ? AND tenant_id = ?", uid, principal.TenantID).First(&profile).Error; err == nil {
+				keywords = []string(profile.Keywords)
+				profileID = profile.PublicID.String()
+			}
+		}
+	}
+
+	payload := map[string]interface{}{
+		"raw":       req.Raw,
+		"profileId": profileID,
+		"tenantId":  principal.TenantID,
+		"keywords":  keywords,
+	}
+	body, status, err := proxyAggregationRequest(aggregationBaseURL, "/admin/discovery/import-youtube", c.GetHeader("Authorization"), payload)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation request failed: " + err.Error(), Code: "AGGREGATION_FAILED"})
+		return
+	}
+	audit := "success"
+	if status >= http.StatusBadRequest {
+		audit = "failure"
+	}
+	writeDiscoveryAudit(db, principal, "discovery.import_youtube", profileID, audit, "")
+	c.Data(status, "application/json", body)
+}
+
+// ImportYouTubeLinks handles POST /admin/discovery/import-youtube-links — the
+// low-friction seed path. The admin pastes YouTube references (one per line: a
+// @handle, channel URL, or any video/share link); we proxy them to Aggregation,
+// which resolves each to its channel via guest InnerTube, enriches it, and posts
+// suggestions for review. Same path as ImportYouTube, minus the 1 MB JSON paste.
+func ImportYouTubeLinks(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var req struct {
+		Inputs    []string `json:"inputs"`
+		ProfileID string   `json:"profile_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request body", Code: "INVALID_BODY"})
+		return
+	}
+	cleaned := make([]string, 0, len(req.Inputs))
+	for _, s := range req.Inputs {
+		if t := strings.TrimSpace(s); t != "" {
+			cleaned = append(cleaned, t)
+		}
+	}
+	if len(cleaned) == 0 {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "inputs (YouTube links/@handles) is required", Code: "MISSING_INPUTS"})
+		return
+	}
+
+	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if aggregationBaseURL == "" {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Aggregation service URL is not configured", Code: "AGGREGATION_NOT_CONFIGURED"})
+		return
+	}
+
+	var keywords []string
+	profileID := ""
+	if pid := strings.TrimSpace(req.ProfileID); pid != "" {
+		if uid, err := uuid.Parse(pid); err == nil {
+			var profile models.DiscoveryProfile
+			if err := db.Where("public_id = ? AND tenant_id = ?", uid, principal.TenantID).First(&profile).Error; err == nil {
+				keywords = []string(profile.Keywords)
+				profileID = profile.PublicID.String()
+			}
+		}
+	}
+
+	payload := map[string]interface{}{
+		"inputs":    cleaned,
+		"profileId": profileID,
+		"tenantId":  principal.TenantID,
+		"keywords":  keywords,
+	}
+	body, status, err := proxyAggregationRequest(aggregationBaseURL, "/admin/discovery/import-youtube-links", c.GetHeader("Authorization"), payload)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation request failed: " + err.Error(), Code: "AGGREGATION_FAILED"})
+		return
+	}
+	audit := "success"
+	if status >= http.StatusBadRequest {
+		audit = "failure"
+	}
+	writeDiscoveryAudit(db, principal, "discovery.import_youtube_links", profileID, audit, "")
+	c.Data(status, "application/json", body)
+}
+
 func proxyAggregationSimple(c *gin.Context, path string) {
 	if _, ok := requireAdminPrincipal(c); !ok {
 		return
