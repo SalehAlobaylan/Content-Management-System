@@ -330,6 +330,34 @@ func computeSourceHealth(s models.ContentSource, now time.Time) string {
 	return "healthy"
 }
 
+func isMediaConsoleSource(s models.ContentSource) bool {
+	if s.Category == models.SourceCategoryMedia {
+		return true
+	}
+	if s.Type != models.SourceTypeTelegram || len(s.APIConfig) == 0 {
+		return false
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(s.APIConfig, &cfg); err != nil {
+		return false
+	}
+	rawTypes, ok := cfg["media_types"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, raw := range rawTypes {
+		kind, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(kind) {
+		case "audio", "voice", "video":
+			return true
+		}
+	}
+	return false
+}
+
 // GetSourceStats handles GET /admin/sources/stats. It returns source-centric
 // aggregates powering the Sources monitoring dashboard. Honors an optional
 // `category` filter (news|media) so the dashboard can scope All / News / Media.
@@ -341,22 +369,41 @@ func GetSourceStats(c *gin.Context) {
 	}
 
 	db := c.MustGet("db").(*gorm.DB)
-	now := time.Now()
-
 	categoryFilter := strings.ToLower(strings.TrimSpace(c.Query("category")))
 
-	query := db.Model(&models.ContentSource{}).Where("tenant_id = ?", principal.TenantID)
-	if categoryFilter != "" {
+	resp, err := buildSourceStats(db, principal.TenantID, categoryFilter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{
+			Message: "Failed to fetch source stats",
+			Code:    "STATS_FAILED",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+func buildSourceStats(db *gorm.DB, tenantID string, categoryFilter string) (sourceStatsResponse, error) {
+	now := time.Now()
+	categoryFilter = strings.ToLower(strings.TrimSpace(categoryFilter))
+
+	query := db.Model(&models.ContentSource{}).Where("tenant_id = ?", tenantID)
+	if categoryFilter != "" && categoryFilter != models.SourceCategoryMedia {
 		query = query.Where("category = ?", categoryFilter)
 	}
 
 	var sources []models.ContentSource
 	if err := query.Find(&sources).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to fetch sources",
-			Code:    "STATS_FAILED",
-		})
-		return
+		return sourceStatsResponse{}, err
+	}
+	if categoryFilter == models.SourceCategoryMedia {
+		filtered := make([]models.ContentSource, 0, len(sources))
+		for _, s := range sources {
+			if isMediaConsoleSource(s) {
+				filtered = append(filtered, s)
+			}
+		}
+		sources = filtered
 	}
 
 	resp := sourceStatsResponse{
@@ -394,6 +441,9 @@ func GetSourceStats(c *gin.Context) {
 		cat := s.Category
 		if cat == "" {
 			cat = models.SourceCategoryNews
+		}
+		if categoryFilter == models.SourceCategoryMedia && isMediaConsoleSource(s) {
+			cat = models.SourceCategoryMedia
 		}
 		resp.ByCategory[cat]++
 
@@ -461,7 +511,7 @@ func GetSourceStats(c *gin.Context) {
 		Failed     int64
 		LastItemAt *time.Time
 	}
-	itemQuery := db.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
+	itemQuery := db.Model(&models.ContentItem{}).Where("tenant_id = ?", tenantID)
 	skipTop := false
 	if categoryFilter != "" {
 		if len(names) == 0 {
@@ -478,11 +528,7 @@ func GetSourceStats(c *gin.Context) {
 			Order("count DESC").
 			Limit(10).
 			Scan(&rows).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, authErrorResponse{
-				Message: "Failed to aggregate source output",
-				Code:    "STATS_FAILED",
-			})
-			return
+			return sourceStatsResponse{}, err
 		}
 		for _, r := range rows {
 			stat := sourceOutputStat{
@@ -523,7 +569,7 @@ func GetSourceStats(c *gin.Context) {
 		resp.RecentFailures = append(resp.RecentFailures, row)
 	}
 
-	c.JSON(http.StatusOK, resp)
+	return resp, nil
 }
 
 // GetContentSource handles GET /admin/sources/:id

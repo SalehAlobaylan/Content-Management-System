@@ -105,6 +105,80 @@ type aggregationDiscoveryRequest struct {
 	Profile aggregationDiscoveryProfile `json:"profile"`
 }
 
+type mediaSourcesContextRollups struct {
+	Pending        int   `json:"pending"`
+	Imported       int   `json:"imported"`
+	AutoDiscovered int   `json:"auto_discovered"`
+	Active         int   `json:"active"`
+	Healthy        int64 `json:"healthy"`
+	Stale          int64 `json:"stale"`
+	NeverRun       int64 `json:"never_run"`
+	Disabled       int64 `json:"disabled"`
+	Failed         int   `json:"failed"`
+	NoTranscript   int   `json:"no_transcript"`
+	NeedsTrimming  int   `json:"needs_trimming"`
+	NonAudioFirst  int   `json:"non_audio_first"`
+}
+
+type suggestionRelationshipResponse struct {
+	Relationship      string   `json:"relationship"`
+	MatchedSourceID   *string  `json:"matched_source_id,omitempty"`
+	MatchedSourceName *string  `json:"matched_source_name,omitempty"`
+	Reasons           []string `json:"reasons"`
+}
+
+type mediaSourceApprovalPreviewResponse struct {
+	SourceType           string                 `json:"source_type"`
+	Category             string                 `json:"category"`
+	AttachedProfileID    *string                `json:"attached_profile_id,omitempty"`
+	AttachedProfileName  *string                `json:"attached_profile_name,omitempty"`
+	InitialEpisodeCap    int                    `json:"initial_episode_cap"`
+	FetchIntervalMinutes int                    `json:"fetch_interval_minutes"`
+	AtomizationDefaults  map[string]interface{} `json:"atomization_defaults"`
+	FirstFetch           string                 `json:"first_fetch"`
+}
+
+type mediaSourceApprovalHandoffResponse struct {
+	SuggestionID string  `json:"suggestion_id"`
+	SourceID     *string `json:"source_id,omitempty"`
+	SourceName   string  `json:"source_name"`
+	ProfileID    *string `json:"profile_id,omitempty"`
+	ProfileName  *string `json:"profile_name,omitempty"`
+	Status       string  `json:"status"`
+	ApprovedAt   string  `json:"approved_at"`
+	ItemsCount   int64   `json:"items_count"`
+	Ready        int64   `json:"ready"`
+	Failed       int64   `json:"failed"`
+}
+
+type mediaSourceRecentItemResponse struct {
+	ID               string  `json:"id"`
+	Title            string  `json:"title"`
+	Status           string  `json:"status"`
+	PublishedAt      *string `json:"published_at,omitempty"`
+	DurationSec      *int    `json:"duration_sec,omitempty"`
+	CaptionState     *string `json:"caption_state,omitempty"`
+	ChapteringStatus *string `json:"chaptering_status,omitempty"`
+	FeedVisibility   string  `json:"feed_visibility"`
+}
+
+type mediaSourcesContextResponse struct {
+	Profiles                  []discoveryProfileResponse                `json:"profiles"`
+	Suggestions               []sourceSuggestionResponse                `json:"suggestions"`
+	Sources                   []newsSourceResponse                      `json:"sources"`
+	SourceStats               sourceStatsResponse                       `json:"source_stats"`
+	Config                    models.DiscoveryConfig                    `json:"config"`
+	Rollups                   mediaSourcesContextRollups                `json:"rollups"`
+	SuggestionRelationships   map[string]suggestionRelationshipResponse `json:"suggestion_relationships"`
+	RecentApprovals           []mediaSourceApprovalHandoffResponse      `json:"recent_approvals"`
+	ApprovalPreview           *mediaSourceApprovalPreviewResponse       `json:"approval_preview,omitempty"`
+	SelectedProfile           *discoveryProfileResponse                 `json:"selected_profile,omitempty"`
+	SelectedSuggestion        *sourceSuggestionResponse                 `json:"selected_suggestion,omitempty"`
+	SelectedSource            *newsSourceResponse                       `json:"selected_source,omitempty"`
+	SelectedSourceRecentItems []mediaSourceRecentItemResponse           `json:"selected_source_recent_items,omitempty"`
+	SchemaStatus              map[string]bool                           `json:"schema_status"`
+}
+
 // ---------- Profiles ----------
 
 // ListDiscoveryProfiles handles GET /admin/discovery/profiles
@@ -598,6 +672,131 @@ func ListNewsSources(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": data, "total": len(data)})
 }
 
+// GetMediaSourcesContext handles GET /admin/discovery/media-sources/context.
+// It is a read model for the Console's unified Media Sources page: discovery
+// profiles + pending suggestions + active media sources + fleet stats.
+func GetMediaSourcesContext(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+
+	var profiles []models.DiscoveryProfile
+	if err := db.Where("tenant_id = ? AND category = ?", principal.TenantID, models.SourceCategoryMedia).
+		Order("created_at desc").Find(&profiles).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch media profiles", Code: "FETCH_FAILED"})
+		return
+	}
+	profileData := make([]discoveryProfileResponse, 0, len(profiles))
+	for _, p := range profiles {
+		profileData = append(profileData, mapDiscoveryProfileResponse(p))
+	}
+	profileIDs := loadProfilePublicIDs(db, principal.TenantID)
+
+	var suggestions []models.SourceSuggestion
+	if err := db.Where("tenant_id = ? AND category = ? AND status = ?", principal.TenantID, models.SourceCategoryMedia, models.SuggestionStatusPending).
+		Order("relevance_score DESC NULLS LAST, confidence DESC, created_at DESC").
+		Limit(200).Find(&suggestions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch media suggestions", Code: "FETCH_FAILED"})
+		return
+	}
+	suggestionData := make([]sourceSuggestionResponse, 0, len(suggestions))
+	for _, s := range suggestions {
+		suggestionData = append(suggestionData, mapSourceSuggestionResponse(s, profileIDs))
+	}
+
+	var recentApproved []models.SourceSuggestion
+	if err := db.Where("tenant_id = ? AND category = ? AND status = ?", principal.TenantID, models.SourceCategoryMedia, models.SuggestionStatusApproved).
+		Order("updated_at DESC").
+		Limit(12).Find(&recentApproved).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch recent media approvals", Code: "FETCH_FAILED"})
+		return
+	}
+	approvedSuggestionData := make([]sourceSuggestionResponse, 0, len(recentApproved))
+	for _, s := range recentApproved {
+		approvedSuggestionData = append(approvedSuggestionData, mapSourceSuggestionResponse(s, profileIDs))
+	}
+
+	rawSources, err := listContentSourcesForDiscoveryCategory(db, principal.TenantID, models.SourceCategoryMedia)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch media sources", Code: "FETCH_FAILED"})
+		return
+	}
+	sourceData := mapContentSourcesToDiscoveryResponses(db, principal.TenantID, rawSources)
+	stats, err := buildSourceStats(db, principal.TenantID, models.SourceCategoryMedia)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to fetch media source stats", Code: "STATS_FAILED"})
+		return
+	}
+
+	cfg := loadDiscoveryConfig(db, principal.TenantID)
+	allRelationshipSuggestions := make([]models.SourceSuggestion, 0, len(suggestions)+len(recentApproved))
+	allRelationshipSuggestions = append(allRelationshipSuggestions, suggestions...)
+	allRelationshipSuggestions = append(allRelationshipSuggestions, recentApproved...)
+	rollups := buildMediaSourcesContextRollups(suggestionData, sourceData, stats)
+	resp := mediaSourcesContextResponse{
+		Profiles:                profileData,
+		Suggestions:             suggestionData,
+		Sources:                 sourceData,
+		SourceStats:             stats,
+		Config:                  cfg,
+		Rollups:                 rollups,
+		SuggestionRelationships: buildSuggestionRelationships(allRelationshipSuggestions, rawSources, sourceData),
+		RecentApprovals:         buildMediaSourceApprovalHandoffs(recentApproved, sourceData, rawSources, profileData, profileIDs),
+		SchemaStatus: map[string]bool{
+			"profiles":    true,
+			"suggestions": true,
+			"sources":     true,
+			"stats":       true,
+			"config":      true,
+		},
+	}
+
+	if selectedProfileID := strings.TrimSpace(c.Query("profile")); selectedProfileID != "" {
+		for _, p := range profileData {
+			if p.ID == selectedProfileID {
+				selected := p
+				resp.SelectedProfile = &selected
+				break
+			}
+		}
+	}
+	if selectedSuggestionID := strings.TrimSpace(c.Query("suggestion")); selectedSuggestionID != "" {
+		for _, s := range suggestionData {
+			if s.ID == selectedSuggestionID {
+				selected := s
+				resp.SelectedSuggestion = &selected
+				break
+			}
+		}
+		if resp.SelectedSuggestion == nil {
+			for _, s := range approvedSuggestionData {
+				if s.ID == selectedSuggestionID {
+					selected := s
+					resp.SelectedSuggestion = &selected
+					break
+				}
+			}
+		}
+		if resp.SelectedSuggestion != nil {
+			resp.ApprovalPreview = buildMediaSourceApprovalPreview(*resp.SelectedSuggestion, profileData, cfg)
+		}
+	}
+	if selectedSourceID := strings.TrimSpace(c.Query("source")); selectedSourceID != "" {
+		for _, s := range sourceData {
+			if s.ID == selectedSourceID {
+				selected := s
+				resp.SelectedSource = &selected
+				resp.SelectedSourceRecentItems = listMediaSourceRecentItems(db, principal.TenantID, selected.Name)
+				break
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
 // ---------- Suggest profiles from topics ----------
 
 type suggestedProfileDraft struct {
@@ -1006,6 +1205,495 @@ func mapSourceSuggestionResponse(s models.SourceSuggestion, profileIDs map[uint]
 		}
 	}
 	return resp
+}
+
+func listDiscoverySourcesForCategory(db *gorm.DB, tenantID string, category string) ([]newsSourceResponse, error) {
+	sources, err := listContentSourcesForDiscoveryCategory(db, tenantID, category)
+	if err != nil {
+		return nil, err
+	}
+	return mapContentSourcesToDiscoveryResponses(db, tenantID, sources), nil
+}
+
+func listContentSourcesForDiscoveryCategory(db *gorm.DB, tenantID string, category string) ([]models.ContentSource, error) {
+	var sources []models.ContentSource
+	query := db.Where("tenant_id = ?", tenantID)
+	if category != models.SourceCategoryMedia {
+		query = query.Where("category = ?", category)
+	}
+	if err := query.Order("created_at desc").Find(&sources).Error; err != nil {
+		return nil, err
+	}
+	if category == models.SourceCategoryMedia {
+		filtered := make([]models.ContentSource, 0, len(sources))
+		for _, s := range sources {
+			if isMediaConsoleSource(s) {
+				filtered = append(filtered, s)
+			}
+		}
+		sources = filtered
+	}
+	return sources, nil
+}
+
+func mapContentSourcesToDiscoveryResponses(db *gorm.DB, tenantID string, sources []models.ContentSource) []newsSourceResponse {
+	var statRows []newsSourceStatsRow
+	db.Model(&models.ContentItem{}).
+		Where("tenant_id = ? AND source_name IS NOT NULL AND source_name != ''", tenantID).
+		Select("source_name, COUNT(*) AS items, " +
+			"COALESCE(SUM(CASE WHEN status = 'READY' THEN 1 ELSE 0 END), 0) AS ready, " +
+			"COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed, " +
+			"MAX(published_at) AS last_item_at, " +
+			"COALESCE(SUM(like_count + comment_count + share_count), 0) AS engagement").
+		Group("source_name").Scan(&statRows)
+
+	normName := func(s string) string { return strings.ToLower(strings.TrimPrefix(s, "@")) }
+	statByName := make(map[string]newsSourceStatsRow, len(statRows))
+	for _, r := range statRows {
+		statByName[normName(r.SourceName)] = r
+	}
+
+	profileIDs := loadProfilePublicIDs(db, tenantID)
+	data := make([]newsSourceResponse, 0, len(sources))
+	for _, s := range sources {
+		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(s)}
+		if s.DiscoveryProfileID != nil {
+			if pub, exists := profileIDs[*s.DiscoveryProfileID]; exists {
+				row.DiscoveryProfileID = &pub
+			}
+		}
+		if st, exists := statByName[normName(s.Name)]; exists {
+			row.ItemsCount = st.Items
+			row.Ready = st.Ready
+			row.Failed = st.Failed
+			row.Engagement = st.Engagement
+			if st.LastItemAt != nil {
+				formatted := st.LastItemAt.UTC().Format(time.RFC3339)
+				row.LastItemAt = &formatted
+			}
+		}
+		data = append(data, row)
+	}
+	return data
+}
+
+func buildMediaSourcesContextRollups(
+	suggestions []sourceSuggestionResponse,
+	sources []newsSourceResponse,
+	stats sourceStatsResponse,
+) mediaSourcesContextRollups {
+	rollups := mediaSourcesContextRollups{
+		Pending:        len(suggestions),
+		Active:         len(sources),
+		Healthy:        stats.ByHealth["healthy"],
+		Stale:          stats.ByHealth["stale"],
+		NeverRun:       stats.ByHealth["never_run"],
+		Disabled:       stats.ByHealth["disabled"],
+		AutoDiscovered: 0,
+	}
+	for _, s := range sources {
+		if s.Failed > 0 {
+			rollups.Failed++
+		}
+	}
+	for _, s := range suggestions {
+		if s.DiscoveredVia == "youtube-import" {
+			rollups.Imported++
+		} else {
+			rollups.AutoDiscovered++
+		}
+		if rawJSONHasString(s.Evidence, "caption_state", "none") {
+			rollups.NoTranscript++
+		}
+		if rawJSONBoolIs(s.Evidence, "needs_chaptering", true) {
+			rollups.NeedsTrimming++
+		}
+		if rawJSONBoolIs(s.Health, "audio_first", false) {
+			rollups.NonAudioFirst++
+		}
+	}
+	return rollups
+}
+
+func rawJSONHasString(raw json.RawMessage, key string, value string) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return false
+	}
+	got, ok := obj[key].(string)
+	return ok && got == value
+}
+
+func rawJSONBoolIs(raw json.RawMessage, key string, value bool) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return false
+	}
+	got, ok := obj[key].(bool)
+	return ok && got == value
+}
+
+func rawJSONString(raw json.RawMessage, key string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	got, _ := obj[key].(string)
+	return got
+}
+
+func rawJSONArrayLen(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var arr []interface{}
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return 0
+	}
+	return len(arr)
+}
+
+func buildSuggestionRelationships(
+	suggestions []models.SourceSuggestion,
+	sources []models.ContentSource,
+	sourceData []newsSourceResponse,
+) map[string]suggestionRelationshipResponse {
+	sourceByID := make(map[uint]models.ContentSource, len(sources))
+	for _, source := range sources {
+		sourceByID[source.ID] = source
+	}
+	failedBySourceID := make(map[string]bool, len(sourceData))
+	for _, source := range sourceData {
+		failedBySourceID[source.ID] = source.Failed > 0
+	}
+
+	relationships := make(map[string]suggestionRelationshipResponse, len(suggestions))
+	for _, suggestion := range suggestions {
+		rel := suggestionRelationshipResponse{
+			Relationship: "new",
+			Reasons:      []string{},
+		}
+
+		if suggestion.ApprovedSourceID != nil {
+			if source, ok := sourceByID[*suggestion.ApprovedSourceID]; ok {
+				rel.Relationship = "already_approved"
+				rel.Reasons = []string{"approved_source"}
+				setRelationshipSource(&rel, source)
+				relationships[suggestion.PublicID.String()] = rel
+				continue
+			}
+		}
+
+		suggestionFeed := normalizeDiscoveryURL(suggestion.FeedURL)
+		suggestionSite := normalizeDiscoveryURL(discoveryPtrString(suggestion.SiteURL))
+		suggestionName := normalizeDiscoveryName(suggestion.Name)
+
+		var similar *suggestionRelationshipResponse
+		for _, source := range sources {
+			sourceFeed := normalizeDiscoveryURL(discoveryPtrString(source.FeedURL))
+			sourceName := normalizeDiscoveryName(source.Name)
+
+			if suggestionFeed != "" && sourceFeed != "" && suggestionFeed == sourceFeed {
+				rel.Relationship = "duplicate"
+				rel.Reasons = []string{"same_feed_url"}
+				if suggestion.ProfileID != nil && source.DiscoveryProfileID != nil && *suggestion.ProfileID == *source.DiscoveryProfileID {
+					rel.Reasons = append(rel.Reasons, "same_interest_profile")
+				}
+				setRelationshipSource(&rel, source)
+				break
+			}
+
+			reasons := []string{}
+			if suggestionName != "" && sourceName != "" && suggestionName == sourceName {
+				reasons = append(reasons, "same_normalized_name")
+			}
+			if suggestionSite != "" && sourceFeed != "" && suggestionSite == sourceFeed {
+				reasons = append(reasons, "same_site_url")
+			}
+			if len(reasons) > 0 && suggestion.ProfileID != nil && source.DiscoveryProfileID != nil && *suggestion.ProfileID == *source.DiscoveryProfileID {
+				reasons = append(reasons, "same_interest_profile")
+			}
+			if len(reasons) > 0 && similar == nil {
+				relationship := "similar"
+				reasons = append(reasons, improvementReasonsForSuggestion(
+					suggestion,
+					source,
+					failedBySourceID[source.PublicID.String()],
+				)...)
+				if hasImprovementReason(reasons) {
+					relationship = "improves_existing"
+				}
+				candidate := suggestionRelationshipResponse{Relationship: relationship, Reasons: dedupeStrings(reasons)}
+				setRelationshipSource(&candidate, source)
+				similar = &candidate
+			}
+		}
+		if rel.Relationship == "new" && similar != nil {
+			rel = *similar
+		}
+
+		relationships[suggestion.PublicID.String()] = rel
+	}
+	return relationships
+}
+
+func improvementReasonsForSuggestion(suggestion models.SourceSuggestion, source models.ContentSource, sourceFailed bool) []string {
+	reasons := []string{}
+	sourceHealth := sourceMetadataObject(source.Metadata, "media_finding_health")
+	sourceEvidence := sourceMetadataObject(source.Metadata, "media_finding_evidence")
+	sourceSampleCount := sourceMetadataArrayLen(source.Metadata, "media_finding_sample_items")
+
+	if rawJSONBoolIs(json.RawMessage(suggestion.Health), "audio_first", true) && !rawJSONBoolIs(sourceHealth, "audio_first", true) {
+		reasons = append(reasons, "stronger_audio_evidence")
+	}
+	if captionState := rawJSONString(json.RawMessage(suggestion.Evidence), "caption_state"); captionState != "" && captionState != "none" {
+		sourceCaptionState := rawJSONString(sourceEvidence, "caption_state")
+		if sourceCaptionState == "" || sourceCaptionState == "none" {
+			reasons = append(reasons, "transcript_available")
+		}
+	}
+	if sampleCount := rawJSONArrayLen(json.RawMessage(suggestion.SampleItems)); sampleCount >= 3 && sampleCount > sourceSampleCount {
+		reasons = append(reasons, "richer_sample_items")
+	}
+	if !source.IsActive {
+		reasons = append(reasons, "existing_source_disabled")
+	}
+	if sourceFailed {
+		reasons = append(reasons, "existing_source_failed")
+	}
+	if source.LastFetchedAt == nil {
+		reasons = append(reasons, "existing_source_stale")
+	} else if source.FetchIntervalMinutes > 0 {
+		staleAfter := time.Duration(source.FetchIntervalMinutes*2) * time.Minute
+		if time.Since(*source.LastFetchedAt) > staleAfter {
+			reasons = append(reasons, "existing_source_stale")
+		}
+	}
+	return reasons
+}
+
+func hasImprovementReason(reasons []string) bool {
+	for _, reason := range reasons {
+		switch reason {
+		case "stronger_audio_evidence", "transcript_available", "richer_sample_items", "existing_source_disabled", "existing_source_failed", "existing_source_stale":
+			return true
+		}
+	}
+	return false
+}
+
+func sourceMetadataObject(metadata datatypes.JSON, key string) json.RawMessage {
+	if len(metadata) == 0 {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(metadata, &obj); err != nil {
+		return nil
+	}
+	return obj[key]
+}
+
+func sourceMetadataArrayLen(metadata datatypes.JSON, key string) int {
+	return rawJSONArrayLen(sourceMetadataObject(metadata, key))
+}
+
+func dedupeStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func setRelationshipSource(rel *suggestionRelationshipResponse, source models.ContentSource) {
+	id := source.PublicID.String()
+	name := source.Name
+	rel.MatchedSourceID = &id
+	rel.MatchedSourceName = &name
+}
+
+func normalizeDiscoveryName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(value, "@")))
+	replacer := strings.NewReplacer(" ", "", "-", "", "_", "", ".", "", ":", "", "/", "")
+	return replacer.Replace(value)
+}
+
+func normalizeDiscoveryURL(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "https://")
+	value = strings.TrimPrefix(value, "http://")
+	value = strings.TrimPrefix(value, "www.")
+	if idx := strings.IndexAny(value, "?#"); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimRight(value, "/")
+}
+
+func discoveryPtrString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func buildMediaSourceApprovalPreview(
+	suggestion sourceSuggestionResponse,
+	profiles []discoveryProfileResponse,
+	cfg models.DiscoveryConfig,
+) *mediaSourceApprovalPreviewResponse {
+	var profileName *string
+	if suggestion.ProfileID != nil {
+		for _, profile := range profiles {
+			if profile.ID == *suggestion.ProfileID {
+				name := profile.Name
+				profileName = &name
+				break
+			}
+		}
+	}
+	defaults := defaultMediaAtomizationPolicy()
+	if cfg.MediaInitialMaxEpisodes > 0 {
+		defaults["max_results"] = cfg.MediaInitialMaxEpisodes
+		defaults["initial_atomization_limit"] = cfg.MediaInitialMaxEpisodes
+	}
+	return &mediaSourceApprovalPreviewResponse{
+		SourceType:           suggestion.Type,
+		Category:             defaultStr(suggestion.Category, models.SourceCategoryMedia),
+		AttachedProfileID:    suggestion.ProfileID,
+		AttachedProfileName:  profileName,
+		InitialEpisodeCap:    cfg.MediaInitialMaxEpisodes,
+		FetchIntervalMinutes: 60,
+		AtomizationDefaults:  defaults,
+		FirstFetch:           "queued_on_approve",
+	}
+}
+
+func buildMediaSourceApprovalHandoffs(
+	approved []models.SourceSuggestion,
+	sourceData []newsSourceResponse,
+	rawSources []models.ContentSource,
+	profiles []discoveryProfileResponse,
+	profileIDs map[uint]string,
+) []mediaSourceApprovalHandoffResponse {
+	sourceByInternalID := make(map[uint]models.ContentSource, len(rawSources))
+	sourceByPublicID := make(map[string]newsSourceResponse, len(sourceData))
+	for _, source := range rawSources {
+		sourceByInternalID[source.ID] = source
+	}
+	for _, source := range sourceData {
+		sourceByPublicID[source.ID] = source
+	}
+	profileNameByID := make(map[string]string, len(profiles))
+	for _, profile := range profiles {
+		profileNameByID[profile.ID] = profile.Name
+	}
+
+	out := make([]mediaSourceApprovalHandoffResponse, 0, len(approved))
+	for _, suggestion := range approved {
+		handoff := mediaSourceApprovalHandoffResponse{
+			SuggestionID: suggestion.PublicID.String(),
+			SourceName:   suggestion.Name,
+			Status:       "approved",
+			ApprovedAt:   suggestion.UpdatedAt.UTC().Format(time.RFC3339),
+		}
+		if suggestion.ProfileID != nil {
+			if pub, ok := profileIDs[*suggestion.ProfileID]; ok {
+				profileID := pub
+				handoff.ProfileID = &profileID
+				if name, exists := profileNameByID[pub]; exists {
+					profileName := name
+					handoff.ProfileName = &profileName
+				}
+			}
+		}
+		if suggestion.ApprovedSourceID != nil {
+			if source, ok := sourceByInternalID[*suggestion.ApprovedSourceID]; ok {
+				sourceID := source.PublicID.String()
+				handoff.SourceID = &sourceID
+				handoff.SourceName = source.Name
+				if resp, exists := sourceByPublicID[sourceID]; exists {
+					handoff.ItemsCount = resp.ItemsCount
+					handoff.Ready = resp.Ready
+					handoff.Failed = resp.Failed
+					handoff.Status = mediaApprovalHandoffStatus(resp)
+				}
+			}
+		}
+		out = append(out, handoff)
+	}
+	return out
+}
+
+func mediaApprovalHandoffStatus(source newsSourceResponse) string {
+	if !source.IsActive || source.Failed > 0 {
+		return "needs_attention"
+	}
+	if source.ItemsCount > 0 || source.Ready > 0 {
+		return "producing"
+	}
+	if source.LastFetchedAt != nil {
+		return "waiting_for_items"
+	}
+	return "first_fetch_queued"
+}
+
+func listMediaSourceRecentItems(db *gorm.DB, tenantID string, sourceName string) []mediaSourceRecentItemResponse {
+	normalized := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(sourceName), "@"))
+	if normalized == "" {
+		return []mediaSourceRecentItemResponse{}
+	}
+	var items []models.ContentItem
+	err := db.Where("tenant_id = ?", tenantID).
+		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+		Where("source_name IS NOT NULL AND source_name <> ''").
+		Where("LOWER(TRIM(LEADING '@' FROM source_name)) = ?", normalized).
+		Order("COALESCE(published_at, created_at) DESC").
+		Limit(5).
+		Find(&items).Error
+	if err != nil {
+		return []mediaSourceRecentItemResponse{}
+	}
+	out := make([]mediaSourceRecentItemResponse, 0, len(items))
+	for _, item := range items {
+		out = append(out, mapMediaSourceRecentItemResponse(item))
+	}
+	return out
+}
+
+func mapMediaSourceRecentItemResponse(item models.ContentItem) mediaSourceRecentItemResponse {
+	title := ""
+	if item.Title != nil {
+		title = *item.Title
+	}
+	var publishedAt *string
+	if item.PublishedAt != nil {
+		formatted := item.PublishedAt.UTC().Format(time.RFC3339)
+		publishedAt = &formatted
+	}
+	return mediaSourceRecentItemResponse{
+		ID:               item.PublicID.String(),
+		Title:            title,
+		Status:           string(item.Status),
+		PublishedAt:      publishedAt,
+		DurationSec:      item.DurationSec,
+		CaptionState:     item.CaptionState,
+		ChapteringStatus: item.ChapteringStatus,
+		FeedVisibility:   item.FeedVisibility,
+	}
 }
 
 // approveSuggestionTx creates (or links to an existing) ContentSource from a

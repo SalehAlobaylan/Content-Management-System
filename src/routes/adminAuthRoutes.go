@@ -48,6 +48,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/discovery/suggestions/:id/approve", perm("source", "write"), controllers.ApproveSuggestion)
 	adminGroup.POST("/discovery/suggestions/:id/reject", perm("source", "write"), controllers.RejectSuggestion)
 	adminGroup.GET("/discovery/sources", perm("source", "read"), controllers.ListNewsSources)
+	adminGroup.GET("/discovery/media-sources/context", perm("source", "read"), controllers.GetMediaSourcesContext)
 	adminGroup.GET("/discovery/config", perm("source", "read"), controllers.GetDiscoveryConfig)
 	adminGroup.PUT("/discovery/config", perm("source", "write"), controllers.UpdateDiscoveryConfig)
 	adminGroup.POST("/discovery/sweep-now", perm("source", "write"), controllers.SweepNow)
