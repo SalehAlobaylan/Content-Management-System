@@ -1858,6 +1858,232 @@ func AdminListMediaAtomizationParents(c *gin.Context) {
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization parents fetched", Data: gin.H{"items": rows}})
 }
 
+type mediaAtomizationContextFeedUnit struct {
+	ID                  string     `json:"id"`
+	Title               *string    `json:"title"`
+	Status              string     `json:"status"`
+	FeedVisibility      string     `json:"feed_visibility"`
+	DurationSec         *int       `json:"duration_sec"`
+	DurationBucket      *string    `json:"duration_bucket"`
+	ChapterIndex        *int       `json:"chapter_index"`
+	ChapterStartMs      *int       `json:"chapter_start_ms"`
+	ChapterEndMs        *int       `json:"chapter_end_ms"`
+	PlaybackURL         *string    `json:"playback_url"`
+	PlaybackType        *string    `json:"playback_type"`
+	FallbackPlaybackURL *string    `json:"fallback_playback_url"`
+	HasVideo            *bool      `json:"has_video"`
+	UpdatedAt           *time.Time `json:"updated_at"`
+}
+
+func AdminGetMediaAtomizationParentContext(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	schema := getMediaAtomizationSchemaInfo(db)
+	if !schema.Ready {
+		c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization context unavailable until schema migration is applied", Data: gin.H{
+			"schema_status": schema,
+		}})
+		return
+	}
+
+	parent, selectedChapter, selectedChild, found, err := resolveMediaAtomizationContextParent(db, principal.TenantID, c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: err.Error()})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Media atomization parent context not found"})
+		return
+	}
+
+	effective := effectiveAtomizationPolicyForItem(db, parent)
+	var transcript *models.Transcript
+	if parent.TranscriptID != nil {
+		var t models.Transcript
+		if err := db.Where("public_id = ?", *parent.TranscriptID).First(&t).Error; err == nil {
+			transcript = &t
+		}
+	}
+
+	chapterDTOs := []studioChapterDTO{}
+	var selectedChapterDTO *studioChapterDTO
+	if transcript != nil {
+		chapterDTOs = chaptersToDTO(loadOrSeedChapters(db, parent.TenantID, transcript), durationMs(parent))
+		selectedID := ""
+		if selectedChapter != nil {
+			selectedID = selectedChapter.PublicID.String()
+		}
+		if selectedID == "" && selectedChild != nil {
+			selectedID = selectedChild.PublicID.String()
+		}
+		for i := range chapterDTOs {
+			childID := ""
+			if chapterDTOs[i].ChildContentItemID != nil {
+				childID = *chapterDTOs[i].ChildContentItemID
+			}
+			if chapterDTOs[i].ID == selectedID || childID == selectedID {
+				selectedChapterDTO = &chapterDTOs[i]
+				break
+			}
+		}
+	}
+
+	children := []mediaAtomizationContextFeedUnit{}
+	if err := db.Table("content_items").
+		Select(`
+			public_id::text AS id, title, status, feed_visibility, duration_sec,
+			duration_bucket, chapter_index, chapter_start_ms, chapter_end_ms,
+			playback_url, playback_type, fallback_playback_url, has_video, updated_at
+		`).
+		Where("tenant_id = ? AND parent_content_item_id = ? AND status <> ?", parent.TenantID, parent.PublicID, models.ContentStatusArchived).
+		Order("COALESCE(chapter_index, 999999) ASC, chapter_start_ms ASC, updated_at DESC").
+		Find(&children).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+
+	runs := []models.MediaAtomizationRun{}
+	if err := db.Where("tenant_id = ? AND parent_content_item_id = ?", parent.TenantID, parent.PublicID).
+		Order("updated_at DESC").Limit(8).Find(&runs).Error; err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization parent context fetched", Data: gin.H{
+		"parent":                      mapMediaAtomizationContextParent(parent),
+		"effective_policy":            effective.Policy,
+		"policy_source":               effective.PolicySource,
+		"atomization_disabled_reason": effective.DisabledReason,
+		"manual_requested":            parent.ManualAtomizationRequestedAt != nil,
+		"transcript":                  transcriptContextDTO(transcript),
+		"chapters":                    chapterDTOs,
+		"children":                    children,
+		"recent_runs":                 runs,
+		"selected_chapter":            selectedChapterDTO,
+		"selected_child":              mapMediaAtomizationSelectedChild(selectedChild),
+		"schema_status":               schema,
+	}})
+}
+
+func resolveMediaAtomizationContextParent(db *gorm.DB, tenantID, rawID string) (*models.ContentItem, *models.Chapter, *models.ContentItem, bool, error) {
+	id, err := uuid.Parse(strings.TrimSpace(rawID))
+	if err != nil {
+		return nil, nil, nil, false, errors.New("Invalid media atomization context id")
+	}
+
+	var item models.ContentItem
+	if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, id).First(&item).Error; err == nil {
+		if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+			return nil, nil, nil, false, errors.New("Media Studio only applies to VIDEO/PODCAST items")
+		}
+		if item.ParentContentItemID != nil {
+			var parent models.ContentItem
+			if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, *item.ParentContentItemID).First(&parent).Error; err != nil {
+				return nil, nil, nil, false, nil
+			}
+			var chapter models.Chapter
+			var selectedChapter *models.Chapter
+			if err := db.Where("tenant_id = ? AND child_content_item_id = ?", tenantID, item.PublicID).First(&chapter).Error; err == nil {
+				selectedChapter = &chapter
+			}
+			return &parent, selectedChapter, &item, true, nil
+		}
+		return &item, nil, nil, true, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil, nil, false, err
+	}
+
+	var chapter models.Chapter
+	if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, id).First(&chapter).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, nil, false, nil
+		}
+		return nil, nil, nil, false, err
+	}
+	var parent models.ContentItem
+	if err := db.Where("tenant_id = ? AND transcript_id = ? AND parent_content_item_id IS NULL", tenantID, chapter.TranscriptID).First(&parent).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, nil, false, nil
+		}
+		return nil, nil, nil, false, err
+	}
+	var child *models.ContentItem
+	if chapter.ChildContentItemID != nil {
+		var childItem models.ContentItem
+		if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, *chapter.ChildContentItemID).First(&childItem).Error; err == nil {
+			child = &childItem
+		}
+	}
+	return &parent, &chapter, child, true, nil
+}
+
+func mapMediaAtomizationContextParent(item *models.ContentItem) gin.H {
+	return gin.H{
+		"id":                              item.PublicID.String(),
+		"tenant_id":                       item.TenantID,
+		"type":                            item.Type,
+		"title":                           item.Title,
+		"status":                          item.Status,
+		"source":                          item.Source,
+		"source_name":                     item.SourceName,
+		"source_feed_url":                 item.SourceFeedURL,
+		"media_url":                       item.MediaURL,
+		"thumbnail_url":                   item.ThumbnailURL,
+		"duration_sec":                    item.DurationSec,
+		"transcript_id":                   uuidPtrString(item.TranscriptID),
+		"chaptering_status":               item.ChapteringStatus,
+		"atomization_override":            item.AtomizationOverride,
+		"atomization_override_reason":     item.AtomizationOverrideReason,
+		"manual_atomization_requested_at": item.ManualAtomizationRequestedAt,
+		"playback_url":                    item.PlaybackURL,
+		"playback_type":                   item.PlaybackType,
+		"fallback_playback_url":           item.FallbackPlaybackURL,
+		"has_video":                       item.HasVideo,
+		"updated_at":                      item.UpdatedAt,
+	}
+}
+
+func mapMediaAtomizationSelectedChild(item *models.ContentItem) interface{} {
+	if item == nil {
+		return nil
+	}
+	return gin.H{
+		"id":                    item.PublicID.String(),
+		"title":                 item.Title,
+		"status":                item.Status,
+		"feed_visibility":       item.FeedVisibility,
+		"duration_sec":          item.DurationSec,
+		"duration_bucket":       item.DurationBucket,
+		"chapter_index":         item.ChapterIndex,
+		"chapter_start_ms":      item.ChapterStartMs,
+		"chapter_end_ms":        item.ChapterEndMs,
+		"playback_url":          item.PlaybackURL,
+		"playback_type":         item.PlaybackType,
+		"fallback_playback_url": item.FallbackPlaybackURL,
+		"has_video":             item.HasVideo,
+		"updated_at":            item.UpdatedAt,
+	}
+}
+
+func transcriptContextDTO(transcript *models.Transcript) interface{} {
+	if transcript == nil {
+		return nil
+	}
+	dto := mapStudioTranscript(transcript)
+	return dto
+}
+
+func uuidPtrString(id *uuid.UUID) *string {
+	if id == nil {
+		return nil
+	}
+	value := id.String()
+	return &value
+}
+
 func AdminListMediaAtomizationFeedUnits(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -2243,7 +2469,7 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 	}
 	for i := range rows {
 		rows[i].AgeSeconds = int64(now.Sub(rows[i].UpdatedAt).Seconds())
-		rows[i].ActionHref = "/platform/media-studio/" + rows[i].ID
+		rows[i].ActionHref = "/platform/media/atomization?tab=studio&item=" + rows[i].ID
 		rows[i].PrimaryAction = pipelineActionForItem(rows[i])
 		key := pipelineStageForItem(rows[i])
 		col := index[key]

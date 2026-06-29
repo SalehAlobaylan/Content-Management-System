@@ -127,6 +127,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/media-atomization/chapters", perm("content", "read"), controllers.AdminListMediaAtomizationChapters)
 	adminGroup.GET("/media-atomization/runs", perm("content", "read"), controllers.AdminListMediaAtomizationRuns)
 	adminGroup.GET("/media-atomization/review", perm("content", "read"), controllers.AdminListAtomizationReview)
+	adminGroup.GET("/media-atomization/parents/:id/context", perm("content", "read"), controllers.AdminGetMediaAtomizationParentContext)
 	adminGroup.POST("/media-atomization/repair-leaks", perm("content", "write"), controllers.AdminRepairMediaAtomizationLeaks)
 	adminGroup.POST("/media-atomization/sweep-now", perm("content", "write"), controllers.AdminRunAtomizationSweepNow)
 	adminGroup.PATCH("/media-atomization/parents/:id/override", perm("content", "write"), controllers.AdminUpdateMediaAtomizationParentOverride)
