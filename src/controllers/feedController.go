@@ -451,21 +451,39 @@ func supportsAtomizedForYouSchema(db *gorm.DB) bool {
 		db.Migrator().HasColumn(&models.ContentItem{}, "playback_url")
 }
 
+func supportsStorageStateSchema(db *gorm.DB) bool {
+	return db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
+}
+
 func forYouEligibleMediaQuery(db *gorm.DB, atomizedFeedSchema bool) *gorm.DB {
+	storageUnavailableStates := []string{
+		models.StorageStateRecoverableDeleted,
+		models.StorageStateMissing,
+		models.StorageStateRecoveryPending,
+		models.StorageStateUnrecoverable,
+	}
 	if !atomizedFeedSchema {
-		return db.Model(&models.ContentItem{}).
+		q := db.Model(&models.ContentItem{}).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
 			Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).
 			Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
+		if supportsStorageStateSchema(db) {
+			q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
+		}
+		return q
 	}
 
-	return db.Model(&models.ContentItem{}).
+	q := db.Model(&models.ContentItem{}).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
 		Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).
 		Where("is_feed_unit = TRUE AND feed_visibility = ?", feedVisibilityVisible).
 		Where("COALESCE(playback_url, media_url) IS NOT NULL AND COALESCE(playback_url, media_url) != '' AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
+	if supportsStorageStateSchema(db) {
+		q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
+	}
+	return q
 }
 
 func chapterSiblingKey(item models.ContentItem) string {

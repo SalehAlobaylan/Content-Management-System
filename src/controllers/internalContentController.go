@@ -68,16 +68,19 @@ type internalUpdateStatusRequest struct {
 }
 
 type internalUpdateArtifactsRequest struct {
-	MediaURL            *string                  `json:"media_url"`
-	ThumbnailURL        *string                  `json:"thumbnail_url"`
-	DurationSec         *int                     `json:"duration_sec"`
-	FileSizeBytes       *int64                   `json:"file_size_bytes"`
-	StorageTier         *string                  `json:"storage_tier"`
-	PlaybackURL         *string                  `json:"playback_url"`
-	PlaybackType        *string                  `json:"playback_type"`
-	FallbackPlaybackURL *string                  `json:"fallback_playback_url"`
-	HasVideo            *bool                    `json:"has_video"`
-	MediaRenditions     []map[string]interface{} `json:"media_renditions"`
+	MediaURL              *string                  `json:"media_url"`
+	ThumbnailURL          *string                  `json:"thumbnail_url"`
+	DurationSec           *int                     `json:"duration_sec"`
+	FileSizeBytes         *int64                   `json:"file_size_bytes"`
+	StorageTier           *string                  `json:"storage_tier"`
+	PlaybackURL           *string                  `json:"playback_url"`
+	PlaybackType          *string                  `json:"playback_type"`
+	FallbackPlaybackURL   *string                  `json:"fallback_playback_url"`
+	HasVideo              *bool                    `json:"has_video"`
+	MediaRenditions       []map[string]interface{} `json:"media_renditions"`
+	MediaSuitability      *string                  `json:"media_suitability"`
+	SuitabilityConfidence *float64                 `json:"media_suitability_confidence"`
+	SuitabilityReasons    []string                 `json:"media_suitability_reasons"`
 
 	// Quality bookkeeping. These are recorded once per item at first ingest;
 	// the controller writes them only if the existing column is NULL.
@@ -123,6 +126,21 @@ type internalLinkTranscriptRequest struct {
 }
 
 const maxIdempotencyKeyLength = 512
+
+func normalizeMediaSuitability(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case models.MediaSuitabilityAudioFirstTalkingHead:
+		return models.MediaSuitabilityAudioFirstTalkingHead
+	case models.MediaSuitabilityAudioFirstShow:
+		return models.MediaSuitabilityAudioFirstShow
+	case models.MediaSuitabilityVisualDependent:
+		return models.MediaSuitabilityVisualDependent
+	case models.MediaSuitabilityUnsuitable:
+		return models.MediaSuitabilityUnsuitable
+	default:
+		return models.MediaSuitabilityUnknown
+	}
+}
 
 func normalizeIdempotencyKey(key string) string {
 	normalized := strings.TrimSpace(key)
@@ -396,6 +414,25 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if req.MediaRenditions != nil {
 		if raw, err := json.Marshal(req.MediaRenditions); err == nil {
 			item.MediaRenditions = datatypes.JSON(raw)
+		}
+	}
+	if req.MediaSuitability != nil {
+		verdict := normalizeMediaSuitability(*req.MediaSuitability)
+		item.MediaSuitability = verdict
+		if req.SuitabilityConfidence != nil {
+			conf := *req.SuitabilityConfidence
+			if conf < 0 {
+				conf = 0
+			}
+			if conf > 1 {
+				conf = 1
+			}
+			item.MediaSuitabilityConfidence = &conf
+		}
+		if req.SuitabilityReasons != nil {
+			if raw, err := json.Marshal(req.SuitabilityReasons); err == nil {
+				item.MediaSuitabilityReasons = datatypes.JSON(raw)
+			}
 		}
 	}
 	if req.ThumbnailURL != nil {
@@ -1130,25 +1167,28 @@ func InternalGetContentItem(c *gin.Context) {
 		// — without it the resolver can never pick a source-scoped ingest
 		// profile (e.g. "YouTube items use mobile-720p"). Stringified so
 		// callers can match against the string values in QualityProfile.SourceType.
-		"source_type":                string(item.Source),
-		"title":                      item.Title,
-		"excerpt":                    item.Excerpt,
-		"source_name":                item.SourceName,
-		"published_at":               publishedAt,
-		"media_url":                  item.MediaURL,
-		"thumbnail_url":              item.ThumbnailURL,
-		"storage_tier":               item.StorageTier, // nil = primary
-		"media_version":              item.MediaVersion,
-		"file_size_bytes":            item.FileSizeBytes,
-		"current_quality_profile_id": item.CurrentQualityProfileID,
-		"current_bitrate_kbps":       item.CurrentBitrateKbps,
-		"duration_sec":               item.DurationSec,
-		"transcript_id":              item.TranscriptID,
-		"source_feed_url":            item.SourceFeedURL,
-		"parent_content_item_id":     item.ParentContentItemID,
-		"is_feed_unit":               item.IsFeedUnit,
-		"feed_visibility":            item.FeedVisibility,
-		"chaptering_status":          item.ChapteringStatus,
-		"metadata":                   item.Metadata,
+		"source_type":                  string(item.Source),
+		"title":                        item.Title,
+		"excerpt":                      item.Excerpt,
+		"source_name":                  item.SourceName,
+		"published_at":                 publishedAt,
+		"media_url":                    item.MediaURL,
+		"thumbnail_url":                item.ThumbnailURL,
+		"storage_tier":                 item.StorageTier, // nil = primary
+		"media_version":                item.MediaVersion,
+		"file_size_bytes":              item.FileSizeBytes,
+		"current_quality_profile_id":   item.CurrentQualityProfileID,
+		"current_bitrate_kbps":         item.CurrentBitrateKbps,
+		"duration_sec":                 item.DurationSec,
+		"transcript_id":                item.TranscriptID,
+		"source_feed_url":              item.SourceFeedURL,
+		"parent_content_item_id":       item.ParentContentItemID,
+		"is_feed_unit":                 item.IsFeedUnit,
+		"feed_visibility":              item.FeedVisibility,
+		"chaptering_status":            item.ChapteringStatus,
+		"media_suitability":            item.MediaSuitability,
+		"media_suitability_confidence": item.MediaSuitabilityConfidence,
+		"media_suitability_reasons":    item.MediaSuitabilityReasons,
+		"metadata":                     item.Metadata,
 	})
 }

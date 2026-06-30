@@ -19,12 +19,18 @@ import (
 )
 
 const (
-	defaultMaxStorageBytes      int64 = 5 * 1024 * 1024 * 1024 // 5 GB
-	defaultTargetUtilizationPct       = 80
-	defaultMinAgeDays                 = 14
-	defaultMinViewCountForKeep        = 5
-	defaultSweepIntervalMinutes       = 60
-	purgeIDsLimit                     = 500
+	defaultMaxStorageBytes            int64 = 5 * 1024 * 1024 * 1024 // 5 GB
+	defaultTargetUtilizationPct             = 80
+	defaultMinAgeDays                       = 14
+	defaultMinViewCountForKeep              = 5
+	defaultSweepIntervalMinutes             = 60
+	purgeIDsLimit                           = 500
+	storageRoleHotFeedUnit                  = "hot_feed_unit"
+	storageRoleNormalFeedUnit               = "normal_feed_unit"
+	storageRoleDormantFeedUnit              = "dormant_feed_unit"
+	storageRoleAtomizedParentSource         = "atomized_parent_source"
+	storageRoleUnsuitableMedia              = "unsuitable_media"
+	storageRoleFailedOrOrphanArtifact       = "failed_or_orphan_artifact"
 )
 
 // -----------------------------------------------------------------------------
@@ -41,6 +47,8 @@ type storageStatsResponse struct {
 	DBTrackedBytes   int64                  `json:"db_tracked_bytes"`
 	LiveStatsAt      string                 `json:"live_stats_at"`
 	AggregationError string                 `json:"aggregation_error,omitempty"`
+	ColdEnabled      bool                   `json:"cold_enabled"`
+	Cold             *aggColdStats          `json:"cold,omitempty"`
 }
 
 type contentSize struct {
@@ -51,6 +59,14 @@ type contentSize struct {
 // aggStatsResponse mirrors the shape Aggregation-Service returns from
 // GET /admin/storage/stats.
 type aggStatsResponse struct {
+	UsedBytes      int64            `json:"used_bytes"`
+	ObjectCount    int64            `json:"object_count"`
+	ByArtifactType map[string]int64 `json:"by_artifact_type"`
+	ColdEnabled    bool             `json:"cold_enabled"`
+	Cold           *aggColdStats    `json:"cold,omitempty"`
+}
+
+type aggColdStats struct {
 	UsedBytes      int64            `json:"used_bytes"`
 	ObjectCount    int64            `json:"object_count"`
 	ByArtifactType map[string]int64 `json:"by_artifact_type"`
@@ -107,6 +123,8 @@ func GetStorageStats(c *gin.Context) {
 		resp.UsedBytes = live.UsedBytes
 		resp.ObjectCount = live.ObjectCount
 		resp.ByArtifactType = live.ByArtifactType
+		resp.ColdEnabled = live.ColdEnabled
+		resp.Cold = live.Cold
 	}
 
 	if resp.QuotaBytes > 0 {
@@ -121,17 +139,27 @@ func GetStorageStats(c *gin.Context) {
 // -----------------------------------------------------------------------------
 
 type storageCandidate struct {
-	ID            string  `json:"id"`
-	Type          string  `json:"type"`
-	Status        string  `json:"status"`
-	Title         string  `json:"title"`
-	SourceName    *string `json:"source_name,omitempty"`
-	ViewCount     int     `json:"view_count"`
-	FileSizeBytes int64   `json:"file_size_bytes"`
-	CreatedAt     string  `json:"created_at"`
-	PublishedAt   *string `json:"published_at,omitempty"`
-	MediaURL      *string `json:"media_url,omitempty"`
-	ThumbnailURL  *string `json:"thumbnail_url,omitempty"`
+	ID                  string  `json:"id"`
+	Type                string  `json:"type"`
+	Status              string  `json:"status"`
+	Title               string  `json:"title"`
+	SourceName          *string `json:"source_name,omitempty"`
+	ViewCount           int     `json:"view_count"`
+	FileSizeBytes       int64   `json:"file_size_bytes"`
+	CreatedAt           string  `json:"created_at"`
+	PublishedAt         *string `json:"published_at,omitempty"`
+	MediaURL            *string `json:"media_url,omitempty"`
+	ThumbnailURL        *string `json:"thumbnail_url,omitempty"`
+	ParentContentItemID *string `json:"parent_content_item_id,omitempty"`
+	IsFeedUnit          bool    `json:"is_feed_unit"`
+	FeedVisibility      string  `json:"feed_visibility"`
+	DurationSec         *int    `json:"duration_sec,omitempty"`
+	OriginalURL         *string `json:"original_url,omitempty"`
+	SourceFeedURL       *string `json:"source_feed_url,omitempty"`
+	SourceEpisodeID     *string `json:"source_episode_id,omitempty"`
+	MediaSuitability    string  `json:"media_suitability"`
+	ContentRole         string  `json:"content_role"`
+	ProtectionReason    string  `json:"protection_reason,omitempty"`
 }
 
 type storageCandidatesResponse struct {
@@ -215,6 +243,8 @@ type candidateFilter struct {
 	protectTopNByViews      int
 	protectTopNWindowDays   int
 	excludeColdTier         bool
+	includeAtomizedParents  bool
+	archiveAction           string
 }
 
 func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
@@ -230,32 +260,57 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		q = q.Where("(storage_tier IS NULL OR storage_tier != 'cold')")
 	}
 
+	var eligibility *gorm.DB
 	switch {
 	case f.status != "":
-		q = q.Where("status = ?", f.status)
+		eligibility = db.Where("status = ?", f.status)
 	case f.deleteFailedImmediately:
-		q = q.Where(
-			db.Where("status = ?", models.ContentStatusFailed).
-				Or(db.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount)),
-		)
+		eligibility = db.Where("status = ?", models.ContentStatusFailed).
+			Or(db.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount))
 	default:
-		q = q.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount)
+		eligibility = db.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount)
+	}
+	if f.includeAtomizedParents {
+		atomizedParent := db.Where("parent_content_item_id IS NULL").
+			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+			Where("duration_sec IS NOT NULL AND duration_sec > ?", forYouHardMaxDurationSec).
+			Where("EXISTS (SELECT 1 FROM content_items child WHERE child.parent_content_item_id = content_items.public_id AND child.status = ? AND child.is_feed_unit = TRUE)", models.ContentStatusReady)
+		eligibility = db.Where(eligibility).Or(atomizedParent)
+	}
+	lowSuitability := db.Where("media_suitability IN ?", []string{
+		models.MediaSuitabilityVisualDependent,
+		models.MediaSuitabilityUnsuitable,
+	})
+	eligibility = db.Where(eligibility).Or(lowSuitability)
+	q = q.Where(eligibility)
+
+	if f.archiveAction == "delete" {
+		hasRecoveryPointer := db.Where("original_url IS NOT NULL").Or("source_feed_url IS NOT NULL").Or("source_episode_id IS NOT NULL").Or("idempotency_key IS NOT NULL")
+		atomizedParentDelete := db.Where("parent_content_item_id IS NULL").
+			Where("is_feed_unit = FALSE").
+			Where("duration_sec IS NOT NULL AND duration_sec > ?", forYouHardMaxDurationSec).
+			Where("EXISTS (SELECT 1 FROM content_items child WHERE child.parent_content_item_id = content_items.public_id AND child.status = ? AND child.is_feed_unit = TRUE AND child.feed_visibility = 'visible' AND child.media_url IS NOT NULL)", models.ContentStatusReady)
+		failedNeverReady := db.Where("status = ?", models.ContentStatusFailed)
+		unsuitableHidden := db.Where("is_feed_unit = FALSE").
+			Where("feed_visibility != 'visible'").
+			Where("media_suitability IN ?", []string{models.MediaSuitabilityVisualDependent, models.MediaSuitabilityUnsuitable})
+		q = q.Where(hasRecoveryPointer).
+			Where("NOT (is_feed_unit = TRUE AND status = ?)", models.ContentStatusReady).
+			Where("media_suitability IS NULL OR media_suitability != ?", models.MediaSuitabilityUnknown).
+			Where(db.Where(atomizedParentDelete).Or(failedNeverReady).Or(unsuitableHidden))
 	}
 
 	if f.sourceName != "" {
 		q = q.Where("source_name = ?", f.sourceName)
 	}
 
-	// Hot-content protection: subquery returning the IDs of the top-N most-viewed
-	// items in the recent window. Anything in that set is exempt from purge.
+	// Hot-content protection: hybrid deterministic model. Feed performance only
+	// changes storage protection; it does not mutate feed visibility or ranking.
 	if f.protectTopNByViews > 0 && f.protectTopNWindowDays >= 0 {
-		windowCutoff := time.Now().UTC().AddDate(0, 0, -f.protectTopNWindowDays)
-		protectedIDs := db.Model(&models.ContentItem{}).
-			Select("id").
-			Where("tenant_id = ?", f.tenantID).
-			Where("created_at > ?", windowCutoff).
-			Order("view_count DESC, created_at DESC").
-			Limit(f.protectTopNByViews)
+		protectedIDs := protectedStorageItemsQuery(db, f.tenantID, models.StoragePolicy{
+			ProtectTopNByViews:    f.protectTopNByViews,
+			ProtectTopNWindowDays: f.protectTopNWindowDays,
+		}).Select("id")
 		q = q.Where("id NOT IN (?)", protectedIDs)
 	}
 
@@ -279,6 +334,8 @@ func filterFromPolicy(p models.StoragePolicy, tenantID, status, sourceName strin
 		protectTopNByViews:      p.ProtectTopNByViews,
 		protectTopNWindowDays:   p.ProtectTopNWindowDays,
 		excludeColdTier:         true,
+		includeAtomizedParents:  true,
+		archiveAction:           p.ArchiveAction,
 	}
 }
 
@@ -292,19 +349,54 @@ func mapStorageCandidate(it models.ContentItem) storageCandidate {
 		s := it.PublishedAt.UTC().Format(time.RFC3339)
 		pub = &s
 	}
-	return storageCandidate{
-		ID:            it.PublicID.String(),
-		Type:          string(it.Type),
-		Status:        string(it.Status),
-		Title:         title,
-		SourceName:    it.SourceName,
-		ViewCount:     it.ViewCount,
-		FileSizeBytes: it.FileSizeBytes,
-		CreatedAt:     it.CreatedAt.UTC().Format(time.RFC3339),
-		PublishedAt:   pub,
-		MediaURL:      it.MediaURL,
-		ThumbnailURL:  it.ThumbnailURL,
+	var parentID *string
+	if it.ParentContentItemID != nil {
+		s := it.ParentContentItemID.String()
+		parentID = &s
 	}
+	role, reason := storageRoleForContentItem(it)
+	return storageCandidate{
+		ID:                  it.PublicID.String(),
+		Type:                string(it.Type),
+		Status:              string(it.Status),
+		Title:               title,
+		SourceName:          it.SourceName,
+		ViewCount:           it.ViewCount,
+		FileSizeBytes:       it.FileSizeBytes,
+		CreatedAt:           it.CreatedAt.UTC().Format(time.RFC3339),
+		PublishedAt:         pub,
+		MediaURL:            it.MediaURL,
+		ThumbnailURL:        it.ThumbnailURL,
+		ParentContentItemID: parentID,
+		IsFeedUnit:          it.IsFeedUnit,
+		FeedVisibility:      it.FeedVisibility,
+		DurationSec:         it.DurationSec,
+		OriginalURL:         it.OriginalURL,
+		SourceFeedURL:       it.SourceFeedURL,
+		SourceEpisodeID:     it.SourceEpisodeID,
+		MediaSuitability:    it.MediaSuitability,
+		ContentRole:         role,
+		ProtectionReason:    reason,
+	}
+}
+
+func storageRoleForContentItem(it models.ContentItem) (string, string) {
+	if it.Status == models.ContentStatusFailed {
+		return storageRoleFailedOrOrphanArtifact, "failed ingest artifact"
+	}
+	if it.MediaSuitability == models.MediaSuitabilityVisualDependent || it.MediaSuitability == models.MediaSuitabilityUnsuitable {
+		return storageRoleUnsuitableMedia, "unsuitable media has low storage protection"
+	}
+	if it.ParentContentItemID == nil && !it.IsFeedUnit && it.DurationSec != nil && *it.DurationSec > forYouHardMaxDurationSec {
+		return storageRoleAtomizedParentSource, "parent source after atomization"
+	}
+	if it.IsFeedUnit && it.FeedVisibility == "visible" && it.Status == models.ContentStatusReady {
+		if it.ViewCount <= defaultMinViewCountForKeep {
+			return storageRoleDormantFeedUnit, "old or low-engagement feed unit"
+		}
+		return storageRoleNormalFeedUnit, "visible feed unit"
+	}
+	return storageRoleDormantFeedUnit, "storage candidate"
 }
 
 // -----------------------------------------------------------------------------
@@ -409,10 +501,12 @@ func PurgeStorage(c *gin.Context) {
 	for _, it := range items {
 		freed += it.FileSizeBytes
 		updates := map[string]interface{}{
-			"status":          models.ContentStatusArchived,
-			"archived_at":     &now,
-			"file_size_bytes": 0,
-			"media_url":       nil,
+			"file_size_bytes":         0,
+			"media_url":               nil,
+			"storage_state":           models.StorageStateRecoverableDeleted,
+			"storage_state_reason":    "manual_purge",
+			"storage_recovery_status": models.StorageRecoveryRecoverable,
+			"storage_deleted_at":      &now,
 		}
 		if !preserveThumbs {
 			updates["thumbnail_url"] = nil
@@ -420,6 +514,25 @@ func PurgeStorage(c *gin.Context) {
 		if err := db.Model(&models.ContentItem{}).Where("id = ?", it.ID).Updates(updates).Error; err != nil {
 			// Don't abort the whole batch; just log and continue
 			fmt.Println("storage purge: failed to update content item", it.PublicID, err)
+		} else {
+			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+				TenantID:              it.TenantID,
+				ContentItemID:         it.PublicID,
+				ParentContentItemID:   it.ParentContentItemID,
+				EventType:             models.StorageArtifactEventRecoverableDeleted,
+				Status:                models.StorageArtifactEventStatusSuccess,
+				Reason:                "Manual storage purge",
+				Trigger:               triggerFromPurge(req),
+				Source:                "cms_admin",
+				OldMediaURL:           stringValue(it.MediaURL),
+				OldSizeBytes:          it.FileSizeBytes,
+				DeletedBytes:          it.FileSizeBytes,
+				FreedBytes:            it.FileSizeBytes,
+				RecoveryPayload:       storageRecoveryPayloadForItem(it),
+				StorageState:          models.StorageStateRecoverableDeleted,
+				StorageStateReason:    "manual_purge",
+				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
+			})
 		}
 	}
 
@@ -443,6 +556,13 @@ func PurgeStorage(c *gin.Context) {
 		FreedBytes:   freed,
 		Message:      "Purge complete",
 	})
+}
+
+func triggerFromPurge(req storagePurgeRequest) string {
+	if req.Filters != nil && req.Filters.Trigger != nil && strings.TrimSpace(*req.Filters.Trigger) != "" {
+		return *req.Filters.Trigger
+	}
+	return "manual"
 }
 
 func resolvePurgeTargets(db *gorm.DB, tenantID string, req storagePurgeRequest, policy models.StoragePolicy) ([]models.ContentItem, error) {
@@ -485,6 +605,7 @@ func resolvePurgeTargets(db *gorm.DB, tenantID string, req storagePurgeRequest, 
 		protectTopNByViews:      policy.ProtectTopNByViews,
 		protectTopNWindowDays:   policy.ProtectTopNWindowDays,
 		excludeColdTier:         true,
+		archiveAction:           policy.ArchiveAction,
 	}).
 		Order("view_count ASC, created_at ASC")
 
@@ -546,16 +667,67 @@ func RestoreStorageItem(c *gin.Context) {
 	item.Status = models.ContentStatusPending
 	item.ArchivedAt = nil
 	item.LastRestoredAt = &now
+	item.StorageState = models.StorageStateRecoveryPending
+	reason := "restore_requested"
+	item.StorageStateReason = &reason
+	item.StorageRecoveryStatus = models.StorageRecoveryPending
 	if err := db.Save(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to flip status", Code: "UPDATE_FAILED"})
 		return
 	}
+	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+		TenantID:              item.TenantID,
+		ContentItemID:         item.PublicID,
+		ParentContentItemID:   item.ParentContentItemID,
+		EventType:             models.StorageArtifactEventRestoreRequested,
+		Status:                models.StorageArtifactEventStatusSuccess,
+		Reason:                "Restore requested from storage cockpit",
+		Trigger:               "manual",
+		Source:                "cms_admin",
+		RecoveryPayload:       storageRecoveryPayloadForItem(item),
+		StorageState:          models.StorageStateRecoveryPending,
+		StorageStateReason:    "restore_requested",
+		StorageRecoveryStatus: models.StorageRecoveryPending,
+	})
 
-	// Ask Aggregation to enqueue a media job for this id.
-	if _, err := callAggregationRetryPending(c.GetHeader("Authorization"), 1); err != nil {
+	// Ask Aggregation to enqueue a media job for this exact id.
+	if _, err := callAggregationRetryPending(c.GetHeader("Authorization"), 1, item.PublicID.String()); err != nil {
+		item.StorageRecoveryStatus = models.StorageRecoveryFailed
+		failReason := "reingest_queue_failed"
+		item.StorageStateReason = &failReason
+		_ = db.Save(&item).Error
+		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+			TenantID:              item.TenantID,
+			ContentItemID:         item.PublicID,
+			ParentContentItemID:   item.ParentContentItemID,
+			EventType:             models.StorageArtifactEventRecoveryFailed,
+			Status:                models.StorageArtifactEventStatusError,
+			Reason:                "Failed to queue best-effort re-ingestion",
+			Trigger:               "manual",
+			Source:                "cms_admin",
+			Error:                 err.Error(),
+			RecoveryPayload:       storageRecoveryPayloadForItem(item),
+			StorageState:          models.StorageStateRecoveryPending,
+			StorageStateReason:    "reingest_queue_failed",
+			StorageRecoveryStatus: models.StorageRecoveryFailed,
+		})
 		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation retry failed: " + err.Error(), Code: "RETRY_FAILED"})
 		return
 	}
+	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+		TenantID:              item.TenantID,
+		ContentItemID:         item.PublicID,
+		ParentContentItemID:   item.ParentContentItemID,
+		EventType:             models.StorageArtifactEventReingestQueued,
+		Status:                models.StorageArtifactEventStatusSuccess,
+		Reason:                "Best-effort re-ingestion queued",
+		Trigger:               "manual",
+		Source:                "cms_admin",
+		RecoveryPayload:       storageRecoveryPayloadForItem(item),
+		StorageState:          models.StorageStateRecoveryPending,
+		StorageStateReason:    "reingest_queued",
+		StorageRecoveryStatus: models.StorageRecoveryPending,
+	})
 
 	c.JSON(http.StatusOK, restoreResponse{Success: true, Message: "Restore enqueued"})
 }
@@ -607,6 +779,7 @@ type updatePolicyRequest struct {
 	Scope                   string  `json:"scope"` // "global" | "tenant"
 	TenantID                string  `json:"tenant_id"`
 	Enabled                 *bool   `json:"enabled"`
+	Preset                  *string `json:"preset"`
 	MaxStorageBytes         *int64  `json:"max_storage_bytes"`
 	TargetUtilizationPct    *int    `json:"target_utilization_pct"`
 	MinAgeDays              *int    `json:"min_age_days"`
@@ -666,6 +839,22 @@ func UpdateStoragePolicy(c *gin.Context) {
 
 	if req.Enabled != nil {
 		p.Enabled = *req.Enabled
+	}
+	if req.Preset != nil {
+		preset := strings.ToLower(strings.TrimSpace(*req.Preset))
+		if preset == "" {
+			preset = "balanced"
+		}
+		switch preset {
+		case "balanced", "conservative", "storage_saver", "critical_pressure":
+			p.Preset = preset
+		default:
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: "preset must be 'balanced', 'conservative', 'storage_saver', or 'critical_pressure'",
+				Code:    "INVALID_PRESET",
+			})
+			return
+		}
 	}
 	if req.MaxStorageBytes != nil && *req.MaxStorageBytes > 0 {
 		p.MaxStorageBytes = *req.MaxStorageBytes
@@ -871,13 +1060,8 @@ func GetSweepPreview(c *gin.Context) {
 	// How big is the protected set? Useful diagnostic — "we'd purge more if you
 	// dropped your protected count."
 	if policy.ProtectTopNByViews > 0 {
-		windowCutoff := time.Now().UTC().AddDate(0, 0, -policy.ProtectTopNWindowDays)
-		protectedSub := db.Model(&models.ContentItem{}).
-			Select("id, file_size_bytes").
-			Where("tenant_id = ?", principal.TenantID).
-			Where("created_at > ?", windowCutoff).
-			Order("view_count DESC, created_at DESC").
-			Limit(policy.ProtectTopNByViews)
+		protectedSub := protectedStorageItemsQuery(db, principal.TenantID, policy).
+			Select("id, file_size_bytes")
 
 		var protectedCount int64
 		var protectedBytes int64
@@ -997,6 +1181,7 @@ func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 	p = models.StoragePolicy{
 		TenantID:                nil,
 		Enabled:                 false,
+		Preset:                  "balanced",
 		MaxStorageBytes:         defaultMaxStorageBytes,
 		TargetUtilizationPct:    defaultTargetUtilizationPct,
 		MinAgeDays:              defaultMinAgeDays,
@@ -1006,7 +1191,7 @@ func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 		PreserveThumbnails:      true,
 		ProtectTopNByViews:      50,
 		ProtectTopNWindowDays:   30,
-		ArchiveAction:           "delete",
+		ArchiveAction:           "re_encode",
 		// R2 free-tier defaults — admin can override per tenant.
 		ClassAFreeBudget: 1_000_000,
 		ClassBFreeBudget: 10_000_000,
@@ -1028,6 +1213,7 @@ func loadOrCreateTenantPolicy(db *gorm.DB, tenantID string) models.StoragePolicy
 	p = models.StoragePolicy{
 		TenantID:                &tenantID,
 		Enabled:                 base.Enabled,
+		Preset:                  base.Preset,
 		MaxStorageBytes:         base.MaxStorageBytes,
 		TargetUtilizationPct:    base.TargetUtilizationPct,
 		MinAgeDays:              base.MinAgeDays,
@@ -1147,8 +1333,12 @@ func callAggregationPolicyChanged(authHeader string) error {
 	return nil
 }
 
-func callAggregationRetryPending(authHeader string, limit int) ([]byte, error) {
-	body, status, err := proxyAggregationPost(authHeader, "/admin/retry-pending", map[string]any{"limit": limit})
+func callAggregationRetryPending(authHeader string, limit int, ids ...string) ([]byte, error) {
+	payload := map[string]any{"limit": limit}
+	if len(ids) > 0 {
+		payload["ids"] = ids
+	}
+	body, status, err := proxyAggregationPost(authHeader, "/admin/retry-pending", payload)
 	if err != nil {
 		return nil, err
 	}

@@ -51,15 +51,25 @@ type internalCandidatesResponse struct {
 }
 
 type internalCandidate struct {
-	ID            string  `json:"id"`
-	TenantID      string  `json:"tenant_id"`
-	Type          string  `json:"type"`
-	Status        string  `json:"status"`
-	MediaURL      *string `json:"media_url,omitempty"`
-	ThumbnailURL  *string `json:"thumbnail_url,omitempty"`
-	FileSizeBytes int64   `json:"file_size_bytes"`
-	ViewCount     int     `json:"view_count"`
-	CreatedAt     string  `json:"created_at"`
+	ID                  string  `json:"id"`
+	TenantID            string  `json:"tenant_id"`
+	Type                string  `json:"type"`
+	Status              string  `json:"status"`
+	MediaURL            *string `json:"media_url,omitempty"`
+	ThumbnailURL        *string `json:"thumbnail_url,omitempty"`
+	FileSizeBytes       int64   `json:"file_size_bytes"`
+	ViewCount           int     `json:"view_count"`
+	CreatedAt           string  `json:"created_at"`
+	ParentContentItemID *string `json:"parent_content_item_id,omitempty"`
+	IsFeedUnit          bool    `json:"is_feed_unit"`
+	FeedVisibility      string  `json:"feed_visibility"`
+	DurationSec         *int    `json:"duration_sec,omitempty"`
+	OriginalURL         *string `json:"original_url,omitempty"`
+	SourceFeedURL       *string `json:"source_feed_url,omitempty"`
+	SourceEpisodeID     *string `json:"source_episode_id,omitempty"`
+	MediaSuitability    string  `json:"media_suitability"`
+	ContentRole         string  `json:"content_role"`
+	ProtectionReason    string  `json:"protection_reason,omitempty"`
 }
 
 // InternalListStorageCandidates handles GET /internal/storage/candidates
@@ -83,6 +93,8 @@ func InternalListStorageCandidates(c *gin.Context) {
 	deleteFailed := strings.EqualFold(strings.TrimSpace(c.DefaultQuery("delete_failed_immediately", "true")), "true")
 	protectTopN := atoiDefault(c.Query("protect_top_n_by_views"), 0)
 	protectWindow := atoiDefault(c.Query("protect_top_n_window_days"), 30)
+	includeAtomizedParents := strings.EqualFold(strings.TrimSpace(c.DefaultQuery("include_atomized_parents", "false")), "true")
+	archiveAction := strings.ToLower(strings.TrimSpace(c.DefaultQuery("archive_action", "re_encode")))
 
 	q := buildCandidateQuery(db, candidateFilter{
 		tenantID:                tenantID,
@@ -92,6 +104,8 @@ func InternalListStorageCandidates(c *gin.Context) {
 		protectTopNByViews:      protectTopN,
 		protectTopNWindowDays:   protectWindow,
 		excludeColdTier:         true,
+		includeAtomizedParents:  includeAtomizedParents,
+		archiveAction:           archiveAction,
 	})
 
 	var total int64
@@ -108,16 +122,32 @@ func InternalListStorageCandidates(c *gin.Context) {
 
 	out := make([]internalCandidate, 0, len(items))
 	for _, it := range items {
+		role, reason := storageRoleForContentItem(it)
+		var parentID *string
+		if it.ParentContentItemID != nil {
+			s := it.ParentContentItemID.String()
+			parentID = &s
+		}
 		out = append(out, internalCandidate{
-			ID:            it.PublicID.String(),
-			TenantID:      it.TenantID,
-			Type:          string(it.Type),
-			Status:        string(it.Status),
-			MediaURL:      it.MediaURL,
-			ThumbnailURL:  it.ThumbnailURL,
-			FileSizeBytes: it.FileSizeBytes,
-			ViewCount:     it.ViewCount,
-			CreatedAt:     it.CreatedAt.UTC().Format(time.RFC3339),
+			ID:                  it.PublicID.String(),
+			TenantID:            it.TenantID,
+			Type:                string(it.Type),
+			Status:              string(it.Status),
+			MediaURL:            it.MediaURL,
+			ThumbnailURL:        it.ThumbnailURL,
+			FileSizeBytes:       it.FileSizeBytes,
+			ViewCount:           it.ViewCount,
+			CreatedAt:           it.CreatedAt.UTC().Format(time.RFC3339),
+			ParentContentItemID: parentID,
+			IsFeedUnit:          it.IsFeedUnit,
+			FeedVisibility:      it.FeedVisibility,
+			DurationSec:         it.DurationSec,
+			OriginalURL:         it.OriginalURL,
+			SourceFeedURL:       it.SourceFeedURL,
+			SourceEpisodeID:     it.SourceEpisodeID,
+			MediaSuitability:    it.MediaSuitability,
+			ContentRole:         role,
+			ProtectionReason:    reason,
 		})
 	}
 
@@ -154,9 +184,9 @@ type internalArchiveItemsResponse struct {
 	FreedBytes   int64 `json:"freed_bytes"`
 }
 
-// InternalArchiveItems handles POST /internal/storage/archive
-// Marks items archived (status=ARCHIVED), nulls media_url, zeroes
-// file_size_bytes, sets archived_at.
+// InternalArchiveItems handles POST /internal/storage/archive.
+// It deletes artifact references and records storage_state without using
+// content status as the artifact lifecycle marker.
 func InternalArchiveItems(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var req internalArchiveItemsRequest
@@ -176,18 +206,21 @@ func InternalArchiveItems(c *gin.Context) {
 		return
 	}
 
+	var items []models.ContentItem
+	db.Where("public_id IN ?", ids).Find(&items)
 	var freed int64
-	db.Model(&models.ContentItem{}).
-		Where("public_id IN ?", ids).
-		Select("COALESCE(SUM(file_size_bytes),0)").
-		Scan(&freed)
+	for _, item := range items {
+		freed += item.FileSizeBytes
+	}
 
 	now := time.Now().UTC()
 	updates := map[string]interface{}{
-		"status":          models.ContentStatusArchived,
-		"archived_at":     &now,
-		"file_size_bytes": 0,
-		"media_url":       nil,
+		"file_size_bytes":         0,
+		"media_url":               nil,
+		"storage_state":           models.StorageStateRecoverableDeleted,
+		"storage_state_reason":    "storage_archive",
+		"storage_recovery_status": models.StorageRecoveryRecoverable,
+		"storage_deleted_at":      &now,
 	}
 	if !req.PreserveThumbnails {
 		updates["thumbnail_url"] = nil
@@ -197,6 +230,26 @@ func InternalArchiveItems(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to archive"})
 		return
 	}
+	for _, item := range items {
+		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+			TenantID:              item.TenantID,
+			ContentItemID:         item.PublicID,
+			ParentContentItemID:   item.ParentContentItemID,
+			EventType:             models.StorageArtifactEventRecoverableDeleted,
+			Status:                models.StorageArtifactEventStatusSuccess,
+			Reason:                "Archived by storage sweep",
+			Trigger:               "auto",
+			Source:                "aggregation",
+			OldMediaURL:           stringValue(item.MediaURL),
+			OldSizeBytes:          item.FileSizeBytes,
+			DeletedBytes:          item.FileSizeBytes,
+			FreedBytes:            item.FileSizeBytes,
+			RecoveryPayload:       storageRecoveryPayloadForItem(item),
+			StorageState:          models.StorageStateRecoverableDeleted,
+			StorageStateReason:    "storage_archive",
+			StorageRecoveryStatus: models.StorageRecoveryRecoverable,
+		})
+	}
 
 	c.JSON(http.StatusOK, internalArchiveItemsResponse{
 		UpdatedCount: int(res.RowsAffected),
@@ -205,10 +258,10 @@ func InternalArchiveItems(c *gin.Context) {
 }
 
 type internalMoveToColdItem struct {
-	ID              string  `json:"id"`
-	MediaURL        *string `json:"media_url"`
-	ThumbnailURL    *string `json:"thumbnail_url"`
-	NewSizeBytes    *int64  `json:"new_size_bytes"`
+	ID           string  `json:"id"`
+	MediaURL     *string `json:"media_url"`
+	ThumbnailURL *string `json:"thumbnail_url"`
+	NewSizeBytes *int64  `json:"new_size_bytes"`
 }
 
 type internalMoveToColdRequest struct {
@@ -249,8 +302,12 @@ func InternalMoveItemsToCold(c *gin.Context) {
 
 		oldSize := item.FileSizeBytes
 		updates := map[string]interface{}{
-			"storage_tier":       &cold,
-			"last_storage_check": &now,
+			"storage_tier":             &cold,
+			"last_storage_check":       &now,
+			"storage_state":            models.StorageStateCold,
+			"storage_state_reason":     "moved_to_cold",
+			"storage_recovery_status":  models.StorageRecoveryRecoverable,
+			"storage_last_verified_at": &now,
 		}
 		if it.MediaURL != nil {
 			updates["media_url"] = it.MediaURL
@@ -270,6 +327,35 @@ func InternalMoveItemsToCold(c *gin.Context) {
 
 		if err := db.Model(&models.ContentItem{}).Where("id = ?", item.ID).Updates(updates).Error; err == nil {
 			updated++
+			newSize := int64Value(it.NewSizeBytes, oldSize)
+			eventFreed := oldSize - newSize
+			if it.NewSizeBytes == nil {
+				eventFreed = oldSize
+			}
+			if eventFreed < 0 {
+				eventFreed = 0
+			}
+			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+				TenantID:              item.TenantID,
+				ContentItemID:         item.PublicID,
+				ParentContentItemID:   item.ParentContentItemID,
+				EventType:             models.StorageArtifactEventMovedCold,
+				Status:                models.StorageArtifactEventStatusSuccess,
+				Reason:                "Moved to cold storage by storage sweep",
+				Trigger:               "auto",
+				Source:                "aggregation",
+				StorageTier:           "cold",
+				OldStorageTier:        tierFromItem(item),
+				OldMediaURL:           stringValue(item.MediaURL),
+				NewMediaURL:           stringValue(it.MediaURL),
+				OldSizeBytes:          oldSize,
+				NewSizeBytes:          newSize,
+				FreedBytes:            eventFreed,
+				RecoveryPayload:       storageRecoveryPayloadForItem(item),
+				StorageState:          models.StorageStateCold,
+				StorageStateReason:    "moved_to_cold",
+				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
+			})
 		}
 	}
 

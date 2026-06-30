@@ -133,6 +133,11 @@ type ContentItem struct {
 	FallbackPlaybackURL          *string        `gorm:"type:text" json:"fallback_playback_url,omitempty"`
 	HasVideo                     *bool          `gorm:"type:boolean" json:"has_video,omitempty"`
 	MediaRenditions              datatypes.JSON `gorm:"type:jsonb" json:"media_renditions,omitempty"`
+	MediaSuitability             string         `gorm:"type:varchar(40);not null;default:'unknown';index:idx_content_items_media_suitability" json:"media_suitability"`
+	MediaSuitabilityConfidence   *float64       `gorm:"type:double precision" json:"media_suitability_confidence,omitempty"`
+	MediaSuitabilityReasons      datatypes.JSON `gorm:"type:jsonb" json:"media_suitability_reasons,omitempty"`
+	MediaSuitabilityReviewedAt   *time.Time     `gorm:"type:timestamp" json:"media_suitability_reviewed_at,omitempty"`
+	MediaSuitabilityReviewedBy   *uuid.UUID     `gorm:"type:uuid" json:"media_suitability_reviewed_by,omitempty"`
 	AtomizationOverride          *string        `gorm:"type:varchar(16);index:idx_content_items_atomization_override" json:"atomization_override,omitempty"`
 	AtomizationOverrideReason    *string        `gorm:"type:text" json:"atomization_override_reason,omitempty"`
 	AtomizationOverrideBy        *uuid.UUID     `gorm:"type:uuid" json:"atomization_override_by,omitempty"`
@@ -201,6 +206,15 @@ type ContentItem struct {
 	// Storage tier — which configured S3 backend currently holds the artifacts.
 	// NULL = primary (default). 'cold' = moved to the secondary bucket.
 	StorageTier *string `gorm:"type:varchar(16)" json:"storage_tier,omitempty"`
+
+	// Storage lifecycle state is separate from content/feed Status. It describes
+	// the current artifact posture (hot/cold/recoverable_deleted/missing/etc.)
+	// without implying a feed visibility change.
+	StorageState          string     `gorm:"type:varchar(32);not null;default:'hot';index:idx_content_items_storage_state" json:"storage_state"`
+	StorageStateReason    *string    `gorm:"type:text" json:"storage_state_reason,omitempty"`
+	StorageRecoveryStatus string     `gorm:"type:varchar(32);not null;default:'recoverable';index:idx_content_items_storage_recovery_status" json:"storage_recovery_status"`
+	StorageDeletedAt      *time.Time `gorm:"type:timestamp;index:idx_content_items_storage_deleted_at" json:"storage_deleted_at,omitempty"`
+	StorageLastVerifiedAt *time.Time `gorm:"type:timestamp" json:"storage_last_verified_at,omitempty"`
 
 	// Quality accounting (set by Aggregation on first ingest, updated on re-encode).
 	// CurrentQualityProfileID points at quality_profiles.id; NULL = unknown / never re-encoded.

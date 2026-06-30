@@ -82,8 +82,8 @@ func ListQualityProfiles(c *gin.Context) {
 // -----------------------------------------------------------------------------
 
 type qualityProfileRequest struct {
-	Scope             string  `json:"scope"`        // global | tenant — only used at create time
-	SourceType        *string `json:"source_type"`  // nullable: NULL = any source
+	Scope             string  `json:"scope"`       // global | tenant — only used at create time
+	SourceType        *string `json:"source_type"` // nullable: NULL = any source
 	Name              string  `json:"name"`
 	Description       string  `json:"description"`
 	VideoCodec        string  `json:"video_codec"`
@@ -359,10 +359,10 @@ type resolveResult struct {
 // Used by the Console "what would apply" preview AND (via the internal route)
 // by Aggregation on every ingest job. Resolution order, most-specific first:
 //
-//	1. tenant_id=X AND source_type=Y
-//	2. tenant_id=X AND source_type=NULL
-//	3. tenant_id=NULL AND source_type=Y
-//	4. tenant_id=NULL AND source_type=NULL  (the global default)
+//  1. tenant_id=X AND source_type=Y
+//  2. tenant_id=X AND source_type=NULL
+//  3. tenant_id=NULL AND source_type=Y
+//  4. tenant_id=NULL AND source_type=NULL  (the global default)
 func ResolveQualityProfile(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -389,6 +389,10 @@ func ResolveQualityProfile(c *gin.Context) {
 // in pure Go via pickMostSpecificProfile. One DB roundtrip + testable
 // without DB mocking.
 func resolveProfile(db *gorm.DB, tenantID, sourceType string) (*models.QualityProfile, string) {
+	return resolveProfileWithPreset(db, tenantID, sourceType, "")
+}
+
+func resolveProfileWithPreset(db *gorm.DB, tenantID, sourceType, presetKey string) (*models.QualityProfile, string) {
 	q := db.Model(&models.QualityProfile{}).Where("is_active = TRUE")
 	if tenantID != "" {
 		q = q.Where("tenant_id IS NULL OR tenant_id = ?", tenantID)
@@ -399,6 +403,9 @@ func resolveProfile(db *gorm.DB, tenantID, sourceType string) (*models.QualityPr
 		q = q.Where("source_type IS NULL OR source_type = ?", sourceType)
 	} else {
 		q = q.Where("source_type IS NULL")
+	}
+	if strings.TrimSpace(presetKey) != "" {
+		q = q.Where("preset_key = ?", strings.TrimSpace(presetKey))
 	}
 
 	var candidates []models.QualityProfile

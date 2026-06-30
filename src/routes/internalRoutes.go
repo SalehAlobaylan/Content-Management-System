@@ -78,6 +78,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.POST("/storage/archive", controllers.InternalArchiveItems)
 	internal.POST("/storage/move-to-cold", controllers.InternalMoveItemsToCold)
 	internal.POST("/storage/sweep-runs", controllers.InternalCreateSweepRun)
+	internal.POST("/storage/artifact-events", controllers.InternalRecordStorageArtifactEvent)
 	internal.POST("/storage/op-metrics", controllers.InternalWriteOpMetrics)
 	internal.GET("/storage/op-budget", controllers.InternalGetStorageOpBudget)
 

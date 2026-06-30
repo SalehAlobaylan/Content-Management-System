@@ -127,7 +127,7 @@ func mapToContentItemResponse(item models.ContentItem, isLiked, isBookmarked boo
 		CreatedAt:    item.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		IsLiked:      isLiked,
 		IsBookmarked: isBookmarked,
-		IsArchived:   item.Status == models.ContentStatusArchived,
+		IsArchived:   item.Status == models.ContentStatusArchived || item.StorageState == models.StorageStateRecoverableDeleted,
 	}
 
 	if item.Title != nil {
@@ -205,7 +205,13 @@ func RequestRestore(c *gin.Context) {
 		return
 	}
 
-	if item.Status != models.ContentStatusArchived {
+	if item.StorageState == models.StorageStateRecoveryPending {
+		c.JSON(http.StatusOK, requestRestoreResponse{Status: "pending", Message: "Restore is already pending"})
+		return
+	}
+	if item.StorageState != models.StorageStateRecoverableDeleted &&
+		item.StorageState != models.StorageStateMissing &&
+		item.StorageRecoveryStatus != models.StorageRecoveryFailed {
 		c.JSON(http.StatusOK, requestRestoreResponse{Status: "available", Message: "Content is already available"})
 		return
 	}
@@ -229,13 +235,69 @@ func RequestRestore(c *gin.Context) {
 	item.Status = models.ContentStatusPending
 	item.ArchivedAt = nil
 	item.LastRestoredAt = &now
+	item.StorageState = models.StorageStateRecoveryPending
+	reason := "restore_requested"
+	item.StorageStateReason = &reason
+	item.StorageRecoveryStatus = models.StorageRecoveryPending
 	if err := db.Save(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to flip status"})
 		return
 	}
+	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+		TenantID:              item.TenantID,
+		ContentItemID:         item.PublicID,
+		ParentContentItemID:   item.ParentContentItemID,
+		EventType:             models.StorageArtifactEventRestoreRequested,
+		Status:                models.StorageArtifactEventStatusSuccess,
+		Reason:                "Public restore requested",
+		Trigger:               "user",
+		Source:                "platform",
+		RecoveryPayload:       storageRecoveryPayloadForItem(item),
+		StorageState:          models.StorageStateRecoveryPending,
+		StorageStateReason:    "restore_requested",
+		StorageRecoveryStatus: models.StorageRecoveryPending,
+	})
 
 	go func() {
-		_, _ = callAggregationRetryPending("", 1)
+		if _, err := callAggregationRetryPending("", 1, item.PublicID.String()); err != nil {
+			failReason := "reingest_queue_failed"
+			_ = db.Model(&models.ContentItem{}).
+				Where("public_id = ?", item.PublicID).
+				Updates(map[string]interface{}{
+					"storage_state_reason":    failReason,
+					"storage_recovery_status": models.StorageRecoveryFailed,
+				}).Error
+			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+				TenantID:              item.TenantID,
+				ContentItemID:         item.PublicID,
+				ParentContentItemID:   item.ParentContentItemID,
+				EventType:             models.StorageArtifactEventRecoveryFailed,
+				Status:                models.StorageArtifactEventStatusError,
+				Reason:                "Failed to queue public best-effort re-ingestion",
+				Trigger:               "user",
+				Source:                "platform",
+				Error:                 err.Error(),
+				RecoveryPayload:       storageRecoveryPayloadForItem(item),
+				StorageState:          models.StorageStateRecoveryPending,
+				StorageStateReason:    "reingest_queue_failed",
+				StorageRecoveryStatus: models.StorageRecoveryFailed,
+			})
+			return
+		}
+		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
+			TenantID:              item.TenantID,
+			ContentItemID:         item.PublicID,
+			ParentContentItemID:   item.ParentContentItemID,
+			EventType:             models.StorageArtifactEventReingestQueued,
+			Status:                models.StorageArtifactEventStatusSuccess,
+			Reason:                "Public best-effort re-ingestion queued",
+			Trigger:               "user",
+			Source:                "platform",
+			RecoveryPayload:       storageRecoveryPayloadForItem(item),
+			StorageState:          models.StorageStateRecoveryPending,
+			StorageStateReason:    "reingest_queued",
+			StorageRecoveryStatus: models.StorageRecoveryPending,
+		})
 	}()
 
 	c.JSON(http.StatusOK, requestRestoreResponse{

@@ -10,14 +10,15 @@ type StoragePolicy struct {
 	ID       uint    `gorm:"primaryKey" json:"id"`
 	TenantID *string `gorm:"type:varchar(64);uniqueIndex:idx_storage_policy_tenant" json:"tenant_id,omitempty"`
 
-	Enabled                 bool  `gorm:"default:false" json:"enabled"`
-	MaxStorageBytes         int64 `gorm:"type:bigint;default:5368709120" json:"max_storage_bytes"`
-	TargetUtilizationPct    int   `gorm:"default:80" json:"target_utilization_pct"`
-	MinAgeDays              int   `gorm:"default:14" json:"min_age_days"`
-	MinViewCountForKeep     int   `gorm:"default:5" json:"min_view_count_for_keep"`
-	SweepIntervalMinutes    int   `gorm:"default:60" json:"sweep_interval_minutes"`
-	DeleteFailedImmediately bool  `gorm:"default:true" json:"delete_failed_immediately"`
-	PreserveThumbnails      bool  `gorm:"default:true" json:"preserve_thumbnails"`
+	Enabled                 bool   `gorm:"default:false" json:"enabled"`
+	Preset                  string `gorm:"type:varchar(32);not null;default:'balanced'" json:"preset"`
+	MaxStorageBytes         int64  `gorm:"type:bigint;default:5368709120" json:"max_storage_bytes"`
+	TargetUtilizationPct    int    `gorm:"default:80" json:"target_utilization_pct"`
+	MinAgeDays              int    `gorm:"default:14" json:"min_age_days"`
+	MinViewCountForKeep     int    `gorm:"default:5" json:"min_view_count_for_keep"`
+	SweepIntervalMinutes    int    `gorm:"default:60" json:"sweep_interval_minutes"`
+	DeleteFailedImmediately bool   `gorm:"default:true" json:"delete_failed_immediately"`
+	PreserveThumbnails      bool   `gorm:"default:true" json:"preserve_thumbnails"`
 
 	// Hot-content protection: items in the top-N by view_count within the last
 	// `ProtectTopNWindowDays` days are excluded from circulation regardless of
@@ -26,14 +27,14 @@ type StoragePolicy struct {
 	ProtectTopNWindowDays int `gorm:"default:30" json:"protect_top_n_window_days"`
 
 	// What to do with eligible content when a sweep fires.
-	//   "delete"       — remove from primary storage, mark ARCHIVED
+	//   "re_encode"    — default safe action: re-encode in place to a smaller
+	//                    profile. Item stays READY at the same tier; bytes shrink.
 	//   "move_to_cold" — copy to the cold-tier bucket, then remove from primary,
-	//                    keep status READY but set storage_tier='cold'
-	//   "re_encode"    — re-encode in place to a smaller profile. Item stays
-	//                    READY at the same tier; bytes shrink. Picks the
-	//                    profile from ReEncodeTargetProfileID, or falls back
-	//                    to per-item resolved ingest profile when null.
-	ArchiveAction string `gorm:"type:varchar(20);default:'delete'" json:"archive_action"`
+	//                    keep status READY but set storage_tier='cold'.
+	//   "delete"       — approval/manual recoverable artifact deletion, guarded
+	//                    by storage_state and the artifact ledger instead of
+	//                    content status.
+	ArchiveAction string `gorm:"type:varchar(20);default:'re_encode'" json:"archive_action"`
 
 	// When ArchiveAction='re_encode', which QualityProfile to shrink down to.
 	// NULL = "auto" (each item is encoded with its (tenant, source_type)
@@ -50,8 +51,8 @@ type StoragePolicy struct {
 	// Set the corresponding *FreeBudget to 0 to disable the soft cap entirely
 	// for that class (e.g. AWS S3 has no free tier — only cost projection).
 	// Defaults match Cloudflare R2's published free tier.
-	ClassAFreeBudget int64 `gorm:"default:1000000" json:"class_a_free_budget"`   // 1M / month
-	ClassBFreeBudget int64 `gorm:"default:10000000" json:"class_b_free_budget"`  // 10M / month
+	ClassAFreeBudget int64 `gorm:"default:1000000" json:"class_a_free_budget"`  // 1M / month
+	ClassBFreeBudget int64 `gorm:"default:10000000" json:"class_b_free_budget"` // 10M / month
 	ClassAWarnPct    int   `gorm:"default:80" json:"class_a_warn_pct"`
 	ClassACapPct     int   `gorm:"default:95" json:"class_a_cap_pct"`
 	ClassBWarnPct    int   `gorm:"default:80" json:"class_b_warn_pct"`

@@ -109,29 +109,32 @@ type contentStatsResponse struct {
 const stuckThresholdHours = 24
 
 type adminContentItemResponse struct {
-	ID            string                 `json:"id"`
-	Type          string                 `json:"type"`
-	Status        string                 `json:"status"`
-	Title         string                 `json:"title"`
-	BodyText      *string                `json:"body_text,omitempty"`
-	Excerpt       *string                `json:"excerpt,omitempty"`
-	Author        *string                `json:"author,omitempty"`
-	SourceID      *string                `json:"source_id,omitempty"`
-	SourceName    *string                `json:"source_name,omitempty"`
-	MediaURL      *string                `json:"media_url,omitempty"`
-	ThumbnailURL  *string                `json:"thumbnail_url,omitempty"`
-	OriginalURL   *string                `json:"original_url,omitempty"`
-	DurationSec   *int                   `json:"duration_sec,omitempty"`
-	FileSizeBytes int64                  `json:"file_size_bytes"`
-	StorageTier   *string                `json:"storage_tier,omitempty"`
-	TopicTags     []string               `json:"topic_tags,omitempty"`
-	PublishedAt   *string                `json:"published_at,omitempty"`
-	CreatedAt     string                 `json:"created_at"`
-	UpdatedAt     string                 `json:"updated_at"`
-	LikeCount     int                    `json:"like_count"`
-	ViewCount     int                    `json:"view_count"`
-	ShareCount    int                    `json:"share_count"`
-	Metadata      map[string]interface{} `json:"metadata,omitempty"`
+	ID                         string                 `json:"id"`
+	Type                       string                 `json:"type"`
+	Status                     string                 `json:"status"`
+	Title                      string                 `json:"title"`
+	BodyText                   *string                `json:"body_text,omitempty"`
+	Excerpt                    *string                `json:"excerpt,omitempty"`
+	Author                     *string                `json:"author,omitempty"`
+	SourceID                   *string                `json:"source_id,omitempty"`
+	SourceName                 *string                `json:"source_name,omitempty"`
+	MediaURL                   *string                `json:"media_url,omitempty"`
+	ThumbnailURL               *string                `json:"thumbnail_url,omitempty"`
+	OriginalURL                *string                `json:"original_url,omitempty"`
+	DurationSec                *int                   `json:"duration_sec,omitempty"`
+	FileSizeBytes              int64                  `json:"file_size_bytes"`
+	StorageTier                *string                `json:"storage_tier,omitempty"`
+	MediaSuitability           string                 `json:"media_suitability"`
+	MediaSuitabilityConfidence *float64               `json:"media_suitability_confidence,omitempty"`
+	MediaSuitabilityReasons    []string               `json:"media_suitability_reasons,omitempty"`
+	TopicTags                  []string               `json:"topic_tags,omitempty"`
+	PublishedAt                *string                `json:"published_at,omitempty"`
+	CreatedAt                  string                 `json:"created_at"`
+	UpdatedAt                  string                 `json:"updated_at"`
+	LikeCount                  int                    `json:"like_count"`
+	ViewCount                  int                    `json:"view_count"`
+	ShareCount                 int                    `json:"share_count"`
+	Metadata                   map[string]interface{} `json:"metadata,omitempty"`
 	// Caption-first state (Media tab badges + STT action gating).
 	CaptionState           *string                    `json:"caption_state,omitempty"`
 	TranscriptSource       *string                    `json:"transcript_source,omitempty"`
@@ -144,6 +147,12 @@ type adminContentItemResponse struct {
 
 type updateContentStatusRequest struct {
 	Status string `json:"status"`
+}
+
+type updateContentSuitabilityRequest struct {
+	MediaSuitability           string   `json:"media_suitability"`
+	MediaSuitabilityConfidence *float64 `json:"media_suitability_confidence"`
+	MediaSuitabilityReasons    []string `json:"media_suitability_reasons"`
 }
 
 var contentAdminQueryConfig = utils.QueryConfig{
@@ -781,6 +790,63 @@ func UpdateContentStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// UpdateContentSuitability handles PATCH /admin/content/:id/suitability.
+func UpdateContentSuitability(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid id", Code: "INVALID_ID"})
+		return
+	}
+	var req updateContentSuitabilityRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request", Code: "INVALID_REQUEST"})
+		return
+	}
+	verdict := normalizeMediaSuitability(req.MediaSuitability)
+	if verdict == models.MediaSuitabilityUnknown && strings.TrimSpace(req.MediaSuitability) != "" && !strings.EqualFold(strings.TrimSpace(req.MediaSuitability), models.MediaSuitabilityUnknown) {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid media_suitability", Code: "INVALID_SUITABILITY"})
+		return
+	}
+	var item models.ContentItem
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Content not found", Code: "NOT_FOUND"})
+		return
+	}
+	item.MediaSuitability = verdict
+	if req.MediaSuitabilityConfidence != nil {
+		conf := *req.MediaSuitabilityConfidence
+		if conf < 0 {
+			conf = 0
+		}
+		if conf > 1 {
+			conf = 1
+		}
+		item.MediaSuitabilityConfidence = &conf
+	}
+	if req.MediaSuitabilityReasons != nil {
+		if raw, err := json.Marshal(req.MediaSuitabilityReasons); err == nil {
+			item.MediaSuitabilityReasons = raw
+		}
+	}
+	now := time.Now().UTC()
+	item.MediaSuitabilityReviewedAt = &now
+	if reviewer, err := uuid.Parse(principal.UserID); err == nil {
+		item.MediaSuitabilityReviewedBy = &reviewer
+	}
+	if err := db.Save(&item).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update suitability", Code: "UPDATE_FAILED"})
+		return
+	}
+	resp := mapAdminContentItemResponse(item)
+	populateAdminContentTranscription(db, item.PublicID, &resp)
+	c.JSON(http.StatusOK, resp)
+}
+
 // populateAdminContentTranscriptionBatch fills transcription job / quality /
 // approval fields for a whole page of rows with 3 queries total — the per-row
 // variant below costs 3 queries PER ROW, which at 50 rows × 30s auto-refresh
@@ -880,34 +946,41 @@ func mapAdminContentItemResponse(item models.ContentItem) adminContentItemRespon
 	if len(item.Metadata) > 0 {
 		_ = json.Unmarshal(item.Metadata, &metadata)
 	}
+	var suitabilityReasons []string
+	if len(item.MediaSuitabilityReasons) > 0 {
+		_ = json.Unmarshal(item.MediaSuitabilityReasons, &suitabilityReasons)
+	}
 
 	return adminContentItemResponse{
-		ID:               item.PublicID.String(),
-		Type:             string(item.Type),
-		Status:           string(item.Status),
-		Title:            title,
-		BodyText:         item.BodyText,
-		Excerpt:          item.Excerpt,
-		Author:           item.Author,
-		SourceID:         item.SourceFeedURL,
-		SourceName:       item.SourceName,
-		MediaURL:         item.MediaURL,
-		ThumbnailURL:     item.ThumbnailURL,
-		OriginalURL:      item.OriginalURL,
-		DurationSec:      item.DurationSec,
-		FileSizeBytes:    item.FileSizeBytes,
-		StorageTier:      item.StorageTier,
-		TopicTags:        item.TopicTags,
-		PublishedAt:      publishedAt,
-		CreatedAt:        item.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:        item.UpdatedAt.UTC().Format(time.RFC3339),
-		LikeCount:        item.LikeCount,
-		ViewCount:        item.ViewCount,
-		ShareCount:       item.ShareCount,
-		Metadata:         metadata,
-		CaptionState:     item.CaptionState,
-		TranscriptSource: item.TranscriptSource,
-		HasTranscript:    item.TranscriptID != nil,
+		ID:                         item.PublicID.String(),
+		Type:                       string(item.Type),
+		Status:                     string(item.Status),
+		Title:                      title,
+		BodyText:                   item.BodyText,
+		Excerpt:                    item.Excerpt,
+		Author:                     item.Author,
+		SourceID:                   item.SourceFeedURL,
+		SourceName:                 item.SourceName,
+		MediaURL:                   item.MediaURL,
+		ThumbnailURL:               item.ThumbnailURL,
+		OriginalURL:                item.OriginalURL,
+		DurationSec:                item.DurationSec,
+		FileSizeBytes:              item.FileSizeBytes,
+		StorageTier:                item.StorageTier,
+		MediaSuitability:           item.MediaSuitability,
+		MediaSuitabilityConfidence: item.MediaSuitabilityConfidence,
+		MediaSuitabilityReasons:    suitabilityReasons,
+		TopicTags:                  item.TopicTags,
+		PublishedAt:                publishedAt,
+		CreatedAt:                  item.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:                  item.UpdatedAt.UTC().Format(time.RFC3339),
+		LikeCount:                  item.LikeCount,
+		ViewCount:                  item.ViewCount,
+		ShareCount:                 item.ShareCount,
+		Metadata:                   metadata,
+		CaptionState:               item.CaptionState,
+		TranscriptSource:           item.TranscriptSource,
+		HasTranscript:              item.TranscriptID != nil,
 	}
 }
 

@@ -68,6 +68,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/content/topics", perm("content", "read"), controllers.ListContentTopics)
 	adminGroup.GET("/content/:id", perm("content", "read"), controllers.GetAdminContentItem)
 	adminGroup.PATCH("/content/:id/status", perm("content", "write"), controllers.UpdateContentStatus)
+	adminGroup.PATCH("/content/:id/suitability", perm("content", "write"), controllers.UpdateContentSuitability)
 	adminGroup.POST("/content/bulk-delete", perm("content", "delete"), controllers.BulkDeleteContent)
 	adminGroup.POST("/content/bulk-status", perm("content", "write"), controllers.BulkStatusChange)
 	adminGroup.POST("/content/bulk-tags", perm("content", "write"), controllers.BulkEditTags)
@@ -181,6 +182,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	// Storage management
 	adminGroup.GET("/storage/stats", perm("aggregation", "read"), controllers.GetStorageStats)
+	adminGroup.GET("/storage/health", perm("aggregation", "read"), controllers.GetStorageHealth)
+	adminGroup.GET("/storage/recommendations", perm("aggregation", "read"), controllers.GetStorageRecommendations)
 	adminGroup.GET("/storage/candidates", perm("aggregation", "read"), controllers.GetStorageCandidates)
 	adminGroup.POST("/storage/purge", perm("aggregation", "manage"), controllers.PurgeStorage)
 	adminGroup.POST("/storage/restore/:id", perm("aggregation", "manage"), controllers.RestoreStorageItem)
@@ -191,6 +194,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/storage/policy/overrides", perm("aggregation", "read"), controllers.ListStoragePolicyOverrides)
 	adminGroup.DELETE("/storage/policy/overrides/:tenant_id", perm("aggregation", "manage"), controllers.DeleteStoragePolicyOverride)
 	adminGroup.GET("/storage/sweep-runs", perm("aggregation", "read"), controllers.ListSweepRuns)
+	adminGroup.GET("/storage/artifact-events", perm("aggregation", "read"), controllers.ListStorageArtifactEvents)
 	adminGroup.POST("/storage/reconcile", perm("aggregation", "manage"), controllers.ReconcileStorage)
 	adminGroup.GET("/storage/operations", perm("aggregation", "read"), controllers.GetStorageOperations)
 
