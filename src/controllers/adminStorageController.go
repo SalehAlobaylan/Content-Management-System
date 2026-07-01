@@ -255,6 +255,19 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		Where("(media_url IS NOT NULL OR thumbnail_url IS NOT NULL)").
 		Where("status != ?", models.ContentStatusArchived)
 
+	if f.archiveAction == "re_encode" {
+		// Re-encode only saves media bytes when a primary media artifact exists.
+		// Failed/missing rows with only thumbnails are storage-accounting
+		// liabilities, not quality-worker candidates.
+		q = q.Where("media_url IS NOT NULL").
+			Where("status != ?", models.ContentStatusFailed).
+			Where("(storage_state IS NULL OR storage_state NOT IN ?)", []string{
+				models.StorageStateMissing,
+				models.StorageStateRecoverableDeleted,
+				models.StorageStateUnrecoverable,
+			})
+	}
+
 	if f.excludeColdTier {
 		// Cold-tier items already paid the savings dividend; don't re-process them.
 		q = q.Where("(storage_tier IS NULL OR storage_tier != 'cold')")
@@ -1138,10 +1151,14 @@ func ListSweepRuns(c *gin.Context) {
 // -----------------------------------------------------------------------------
 
 type reconcileResponse struct {
-	OrphanKeys     []string `json:"orphan_keys"`     // in S3, not in DB
-	MissingObjects []string `json:"missing_objects"` // in DB (media_url set), not in S3
-	OrphanCount    int      `json:"orphan_count"`
-	MissingCount   int      `json:"missing_count"`
+	OrphanKeys          []string `json:"orphan_keys"`     // in S3, not in DB
+	MissingObjects      []string `json:"missing_objects"` // in DB (media_url set), not in S3
+	OrphanCount         int      `json:"orphan_count"`
+	MissingCount        int      `json:"missing_count"`
+	ScannedObjectCount  int      `json:"scanned_object_count,omitempty"`
+	ScannedCMSItemCount int      `json:"scanned_cms_item_count,omitempty"`
+	Partial             bool     `json:"partial,omitempty"`
+	TruncatedReason     string   `json:"truncated_reason,omitempty"`
 }
 
 // ReconcileStorage handles POST /admin/storage/reconcile
@@ -1167,7 +1184,8 @@ func ReconcileStorage(c *gin.Context) {
 
 func loadEffectiveStoragePolicy(db *gorm.DB, tenantID string) models.StoragePolicy {
 	var p models.StoragePolicy
-	if err := db.Where("tenant_id = ?", tenantID).First(&p).Error; err == nil {
+	result := db.Where("tenant_id = ?", tenantID).Limit(1).Find(&p)
+	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}
 	return loadOrCreateGlobalPolicy(db)
@@ -1175,7 +1193,8 @@ func loadEffectiveStoragePolicy(db *gorm.DB, tenantID string) models.StoragePoli
 
 func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 	var p models.StoragePolicy
-	if err := db.Where("tenant_id IS NULL").First(&p).Error; err == nil {
+	result := db.Where("tenant_id IS NULL").Limit(1).Find(&p)
+	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}
 	p = models.StoragePolicy{
@@ -1206,7 +1225,8 @@ func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 
 func loadOrCreateTenantPolicy(db *gorm.DB, tenantID string) models.StoragePolicy {
 	var p models.StoragePolicy
-	if err := db.Where("tenant_id = ?", tenantID).First(&p).Error; err == nil {
+	result := db.Where("tenant_id = ?", tenantID).Limit(1).Find(&p)
+	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}
 	base := loadOrCreateGlobalPolicy(db)

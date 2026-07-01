@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -47,17 +48,55 @@ type storageHealthResponse struct {
 	Recommendations []storageRecommendation `json:"recommendations"`
 }
 
+type cachedStorageHealthResponse struct {
+	Response  storageHealthResponse
+	CachedAt  time.Time
+	ExpiresAt time.Time
+}
+
+const storageHealthCacheTTL = 10 * time.Second
+
+var (
+	storageHealthCacheMu sync.Mutex
+	storageHealthCache   = map[string]cachedStorageHealthResponse{}
+	storageHealthFlights = map[string]chan struct{}{}
+)
+
 func GetStorageHealth(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadEffectiveStoragePolicy(db, principal.TenantID)
+	cacheKey := principal.TenantID
+	if cached, ok := getCachedStorageHealth(cacheKey); ok {
+		c.JSON(http.StatusOK, cached)
+		return
+	}
+
+	if waitCh, claimed := claimStorageHealthBuild(cacheKey); !claimed {
+		select {
+		case <-waitCh:
+			if cached, ok := getCachedStorageHealth(cacheKey); ok {
+				c.JSON(http.StatusOK, cached)
+				return
+			}
+		case <-c.Request.Context().Done():
+			return
+		}
+	}
+
+	response := buildStorageHealthResponse(db, principal.TenantID, c.GetHeader("Authorization"))
+	storeStorageHealth(cacheKey, response)
+	c.JSON(http.StatusOK, response)
+}
+
+func buildStorageHealthResponse(db *gorm.DB, tenantID string, authorization string) storageHealthResponse {
+	policy := loadEffectiveStoragePolicy(db, tenantID)
 	stats := storageStatsResponse{
 		QuotaBytes: policy.MaxStorageBytes,
 	}
-	if live, err := callAggregationStorageStats(c.GetHeader("Authorization")); err == nil {
+	if live, err := callAggregationStorageStats(authorization); err == nil {
 		stats.UsedBytes = live.UsedBytes
 		stats.ObjectCount = live.ObjectCount
 		stats.ByArtifactType = live.ByArtifactType
@@ -65,17 +104,17 @@ func GetStorageHealth(c *gin.Context) {
 		stats.Cold = live.Cold
 	} else {
 		stats.AggregationError = err.Error()
-		stats.UsedBytes = storageDBTrackedBytes(db, principal.TenantID)
+		stats.UsedBytes = storageDBTrackedBytes(db, tenantID)
 	}
 	if stats.QuotaBytes > 0 {
 		stats.UtilizationPct = float64(stats.UsedBytes) / float64(stats.QuotaBytes) * 100
 	}
 
-	proof := storageProofFor(db, principal.TenantID, policy, stats)
+	proof := storageProofFor(db, tenantID, policy, stats)
 	state := classifyStorageHealth(policy, proof, stats.AggregationError)
 	score := storageHealthScore(state)
 	recs := storageRecommendationsFor(policy, proof, state)
-	c.JSON(http.StatusOK, storageHealthResponse{
+	return storageHealthResponse{
 		State:           state,
 		Score:           score,
 		Summary:         storageHealthSummary(state, proof),
@@ -83,7 +122,44 @@ func GetStorageHealth(c *gin.Context) {
 		Policy:          policy,
 		Proof:           proof,
 		Recommendations: recs,
-	})
+	}
+}
+
+func getCachedStorageHealth(cacheKey string) (storageHealthResponse, bool) {
+	now := time.Now()
+	storageHealthCacheMu.Lock()
+	defer storageHealthCacheMu.Unlock()
+	cached, ok := storageHealthCache[cacheKey]
+	if !ok || now.After(cached.ExpiresAt) {
+		return storageHealthResponse{}, false
+	}
+	return cached.Response, true
+}
+
+func claimStorageHealthBuild(cacheKey string) (chan struct{}, bool) {
+	storageHealthCacheMu.Lock()
+	defer storageHealthCacheMu.Unlock()
+	if ch, ok := storageHealthFlights[cacheKey]; ok {
+		return ch, false
+	}
+	ch := make(chan struct{})
+	storageHealthFlights[cacheKey] = ch
+	return ch, true
+}
+
+func storeStorageHealth(cacheKey string, response storageHealthResponse) {
+	now := time.Now()
+	storageHealthCacheMu.Lock()
+	defer storageHealthCacheMu.Unlock()
+	storageHealthCache[cacheKey] = cachedStorageHealthResponse{
+		Response:  response,
+		CachedAt:  now,
+		ExpiresAt: now.Add(storageHealthCacheTTL),
+	}
+	if ch, ok := storageHealthFlights[cacheKey]; ok {
+		close(ch)
+		delete(storageHealthFlights, cacheKey)
+	}
 }
 
 func GetStorageRecommendations(c *gin.Context) {
@@ -92,19 +168,35 @@ func GetStorageRecommendations(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadEffectiveStoragePolicy(db, principal.TenantID)
-	stats := storageStatsResponse{QuotaBytes: policy.MaxStorageBytes, UsedBytes: storageDBTrackedBytes(db, principal.TenantID)}
-	if stats.QuotaBytes > 0 {
-		stats.UtilizationPct = float64(stats.UsedBytes) / float64(stats.QuotaBytes) * 100
+	cacheKey := principal.TenantID
+	if cached, ok := getCachedStorageHealth(cacheKey); ok {
+		writeStorageRecommendations(c, cached)
+		return
 	}
-	proof := storageProofFor(db, principal.TenantID, policy, stats)
-	state := classifyStorageHealth(policy, proof, "")
-	recs := storageRecommendationsFor(policy, proof, state)
+
+	if waitCh, claimed := claimStorageHealthBuild(cacheKey); !claimed {
+		select {
+		case <-waitCh:
+			if cached, ok := getCachedStorageHealth(cacheKey); ok {
+				writeStorageRecommendations(c, cached)
+				return
+			}
+		case <-c.Request.Context().Done():
+			return
+		}
+	}
+
+	response := buildStorageHealthResponse(db, principal.TenantID, c.GetHeader("Authorization"))
+	storeStorageHealth(cacheKey, response)
+	writeStorageRecommendations(c, response)
+}
+
+func writeStorageRecommendations(c *gin.Context, response storageHealthResponse) {
 	c.JSON(http.StatusOK, gin.H{
-		"state":           state,
-		"data":            recs,
-		"recommendations": recs,
-		"proof":           proof,
+		"state":           response.State,
+		"data":            response.Recommendations,
+		"recommendations": response.Recommendations,
+		"proof":           response.Proof,
 		"dry_run":         true,
 	})
 }
@@ -127,20 +219,26 @@ func storageProofFor(db *gorm.DB, tenantID string, policy models.StoragePolicy, 
 		ColdEnabled:    stats.ColdEnabled,
 	}
 	candidateQ := buildCandidateQuery(db, filterFromPolicy(policy, tenantID, "", ""))
-	candidateQ.Model(&models.ContentItem{}).Count(&proof.CandidateCount)
-	candidateQ.Model(&models.ContentItem{}).Select("COALESCE(SUM(file_size_bytes),0)").Scan(&proof.CandidateBytes)
+	proof.CandidateCount, proof.CandidateBytes = scanStorageCountAndBytes(candidateQ)
 
 	protectedQ := protectedStorageItemsQuery(db, tenantID, policy)
-	protectedQ.Count(&proof.ProtectedCount)
-	protectedQ.Select("COALESCE(SUM(file_size_bytes),0)").Scan(&proof.ProtectedBytes)
+	proof.ProtectedCount, proof.ProtectedBytes = scanStorageCountAndBytes(protectedQ)
 
 	parentQ := atomizedParentSourceQuery(db, tenantID)
-	parentQ.Count(&proof.ParentSourceCount)
-	parentQ.Select("COALESCE(SUM(file_size_bytes),0)").Scan(&proof.ParentSourceBytes)
+	proof.ParentSourceCount, proof.ParentSourceBytes = scanStorageCountAndBytes(parentQ)
 
 	db.Model(&models.ContentItem{}).Where("tenant_id = ? AND storage_state = ?", tenantID, models.StorageStateRecoverableDeleted).Count(&proof.RecoverableDeletedCount)
 	db.Model(&models.ContentItem{}).Where("tenant_id = ? AND storage_state = ?", tenantID, models.StorageStateMissing).Count(&proof.MissingCount)
 	return proof
+}
+
+func scanStorageCountAndBytes(q *gorm.DB) (int64, int64) {
+	var row struct {
+		Count int64
+		Bytes int64
+	}
+	q.Select("COUNT(*) AS count, COALESCE(SUM(file_size_bytes),0) AS bytes").Scan(&row)
+	return row.Count, row.Bytes
 }
 
 func protectedStorageItemsQuery(db *gorm.DB, tenantID string, policy models.StoragePolicy) *gorm.DB {
@@ -323,6 +421,20 @@ func storageRecommendationsFor(policy models.StoragePolicy, proof storageProofMe
 			Action:   "configure_cold_storage",
 		})
 	}
+	if gap := storageUntrackedGapBytes(proof); gap > storageUntrackedGapRecommendationThreshold(proof) {
+		recs = append(recs, storageRecommendation{
+			Key:            "untracked_bucket_gap",
+			Label:          "Reconcile live bucket vs CMS",
+			Detail:         "Live bucket usage is materially higher than CMS-tracked media bytes. Inspect grouped prefixes and reconcile before widening destructive cleanup.",
+			Severity:       severityForState(state),
+			Action:         "run_reconcile",
+			EstimatedBytes: gap,
+			Metadata: map[string]interface{}{
+				"used_bytes":       proof.UsedBytes,
+				"db_tracked_bytes": proof.DBTrackedBytes,
+			},
+		})
+	}
 	if proof.CandidateBytes > 0 {
 		action := "run_storage_sweep"
 		label := "Run bounded storage sweep"
@@ -367,6 +479,25 @@ func storageRecommendationsFor(policy models.StoragePolicy, proof storageProofMe
 		})
 	}
 	return recs
+}
+
+func storageUntrackedGapBytes(proof storageProofMetrics) int64 {
+	if proof.UsedBytes <= proof.DBTrackedBytes {
+		return 0
+	}
+	return proof.UsedBytes - proof.DBTrackedBytes
+}
+
+func storageUntrackedGapRecommendationThreshold(proof storageProofMetrics) int64 {
+	const minimumGapBytes int64 = 512 * 1024 * 1024
+	if proof.QuotaBytes <= 0 {
+		return minimumGapBytes
+	}
+	quotaThreshold := proof.QuotaBytes / 20
+	if quotaThreshold > minimumGapBytes {
+		return quotaThreshold
+	}
+	return minimumGapBytes
 }
 
 func severityForState(state string) string {

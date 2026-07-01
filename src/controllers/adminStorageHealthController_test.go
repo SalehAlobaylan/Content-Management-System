@@ -159,3 +159,26 @@ func TestProtectedStorageItemsQueryUsesHybridHotness(t *testing.T) {
 		}
 	}
 }
+
+func TestStorageRecommendationsFlagUntrackedBucketGap(t *testing.T) {
+	recs := storageRecommendationsFor(models.StoragePolicy{
+		ArchiveAction: "re_encode",
+	}, storageProofMetrics{
+		UsedBytes:      9_000_000_000,
+		DBTrackedBytes: 2_000_000_000,
+		QuotaBytes:     5_000_000_000,
+	}, "degraded_no_cold")
+
+	for _, rec := range recs {
+		if rec.Key == "untracked_bucket_gap" {
+			if rec.Action != "run_reconcile" {
+				t.Fatalf("expected run_reconcile action, got %q", rec.Action)
+			}
+			if rec.EstimatedBytes != 7_000_000_000 {
+				t.Fatalf("expected gap estimate 7000000000, got %d", rec.EstimatedBytes)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected untracked bucket gap recommendation, got %#v", recs)
+}
