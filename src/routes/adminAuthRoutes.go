@@ -198,6 +198,17 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/storage/reconcile", perm("aggregation", "manage"), controllers.ReconcileStorage)
 	adminGroup.GET("/storage/operations", perm("aggregation", "read"), controllers.GetStorageOperations)
 
+	// Media Circulation — advisory verdict/recommendation layer (reads storage-health,
+	// ranking, atomization; owns intake). Slice 1: health read model + tenant policy.
+	adminGroup.GET("/media/circulation/health", perm("aggregation", "read"), controllers.GetMediaCirculationHealth)
+	adminGroup.GET("/media/circulation/cockpit", perm("aggregation", "read"), controllers.GetMediaCirculationCockpit)
+	adminGroup.GET("/media/circulation/policy", perm("aggregation", "read"), controllers.GetMediaCirculationPolicy)
+	adminGroup.PUT("/media/circulation/policy", perm("aggregation", "manage"), controllers.UpdateMediaCirculationPolicy)
+	adminGroup.GET("/media/circulation/recommendations", perm("aggregation", "read"), controllers.ListMediaCirculationRecommendations)
+	adminGroup.POST("/media/circulation/recommendations/generate", perm("aggregation", "manage"), controllers.GenerateMediaCirculationRecommendations)
+	adminGroup.POST("/media/circulation/recommendations/:id/apply", perm("aggregation", "manage"), controllers.ApplyMediaCirculationRecommendation)
+	adminGroup.POST("/media/circulation/recommendations/:id/dismiss", perm("aggregation", "manage"), controllers.DismissMediaCirculationRecommendation)
+
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).
 	// Re-encoding old content moved to the Storage system as
