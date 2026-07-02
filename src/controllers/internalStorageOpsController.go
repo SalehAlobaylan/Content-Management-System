@@ -133,6 +133,11 @@ func InternalGetStorageOpBudget(c *gin.Context) {
 		tenantID = "default"
 	}
 
+	resp := getStorageOpBudgetStatus(db, tenantID)
+	c.JSON(http.StatusOK, resp)
+}
+
+func getStorageOpBudgetStatus(db *gorm.DB, tenantID string) opBudgetStatus {
 	policy := loadEffectiveStoragePolicy(db, tenantID)
 	classA, classB := monthToDateOpCounts(db, tenantID)
 	resp := opBudgetStatus{
@@ -155,7 +160,7 @@ func InternalGetStorageOpBudget(c *gin.Context) {
 			resp.ClassBRemaining = 0
 		}
 	}
-	c.JSON(http.StatusOK, resp)
+	return resp
 }
 
 // classifyBudget returns one of "ok", "warn", "cap" based on usage vs budget.

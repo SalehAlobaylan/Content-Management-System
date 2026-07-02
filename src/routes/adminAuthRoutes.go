@@ -204,10 +204,14 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/media/circulation/cockpit", perm("aggregation", "read"), controllers.GetMediaCirculationCockpit)
 	adminGroup.GET("/media/circulation/policy", perm("aggregation", "read"), controllers.GetMediaCirculationPolicy)
 	adminGroup.PUT("/media/circulation/policy", perm("aggregation", "manage"), controllers.UpdateMediaCirculationPolicy)
+	adminGroup.GET("/media/circulation/overrides", perm("aggregation", "read"), controllers.ListMediaCirculationOverrides)
+	adminGroup.POST("/media/circulation/overrides", perm("aggregation", "manage"), controllers.CreateMediaCirculationOverride)
+	adminGroup.DELETE("/media/circulation/overrides/:id", perm("aggregation", "manage"), controllers.DeleteMediaCirculationOverride)
 	adminGroup.GET("/media/circulation/recommendations", perm("aggregation", "read"), controllers.ListMediaCirculationRecommendations)
 	adminGroup.POST("/media/circulation/recommendations/generate", perm("aggregation", "manage"), controllers.GenerateMediaCirculationRecommendations)
 	adminGroup.POST("/media/circulation/recommendations/:id/apply", perm("aggregation", "manage"), controllers.ApplyMediaCirculationRecommendation)
 	adminGroup.POST("/media/circulation/recommendations/:id/dismiss", perm("aggregation", "manage"), controllers.DismissMediaCirculationRecommendation)
+	adminGroup.POST("/media/circulation/recommendations/:id/revert", perm("aggregation", "manage"), controllers.RevertMediaCirculationRecommendation)
 
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).

@@ -1837,6 +1837,7 @@ func triggerSourceFirstFetch(authHeader string, source *models.ContentSource) {
 		URL:        sourceURL,
 		Name:       source.Name,
 		Settings:   settings,
+		SourceID:   source.PublicID.String(),
 	})
 }
 

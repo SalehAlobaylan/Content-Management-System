@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,8 +23,9 @@ import (
 // into a single library headline. Intake scoring, evict aggregation, recommendation
 // generation, and execution belong to later slices. See docs/media-circulation-engine.md.
 
-// Duration buckets served by the For You feed (duration=5|10|15|20|30|40).
-var mediaCirculationBuckets = []string{"5", "10", "15", "20", "30", "40"}
+// Duration buckets served by the For You feed, stored canonically with the "m"
+// suffix to match atomization child writes.
+var mediaCirculationBuckets = []string{"5m", "10m", "15m", "20m", "30m", "40m"}
 
 // Code-default bucket thresholds (Config Discipline: capacity constants, not env,
 // not policy yet). A bucket below the thin floor is under-supplied; above the
@@ -42,10 +44,13 @@ type libraryBucketHealth struct {
 }
 
 type mediaCirculationProof struct {
-	Storage        storageProofMetrics   `json:"storage"`
-	Buckets        []libraryBucketHealth `json:"buckets"`
-	ThinBuckets    []string              `json:"thin_buckets"`
-	EvictByVerdict map[string]int64      `json:"evict_by_verdict"`
+	Storage              storageProofMetrics             `json:"storage"`
+	OpBudget             opBudgetStatus                  `json:"op_budget"`
+	AtomizationBacklog   mediaCircAtomizationBacklog     `json:"atomization_backlog"`
+	Buckets              []libraryBucketHealth           `json:"buckets"`
+	ThinBuckets          []string                        `json:"thin_buckets"`
+	EvictByVerdict       map[string]int64                `json:"evict_by_verdict"`
+	AppliedYieldByBucket map[string]mediaCircBucketYield `json:"applied_yield_by_bucket,omitempty"`
 }
 
 type mediaCirculationHealthResponse struct {
@@ -135,8 +140,11 @@ func GenerateMediaCirculationRecommendations(c *gin.Context) {
 	storagePolicy := loadEffectiveStoragePolicy(db, principal.TenantID)
 	// Cold availability + cost headroom come from live storage stats — reuse the path.
 	storage := buildStorageHealthResponse(db, principal.TenantID, c.GetHeader("Authorization"))
+	overrides := loadActiveMediaCircOverrides(db, principal.TenantID)
+	enrichAppliedIntakeYields(db, principal.TenantID)
 
 	evict := computeEvictRecommendations(db, principal.TenantID, storagePolicy, circPolicy, storage.Proof.ColdEnabled)
+	evict = append(evict, computeAtomizationRecommendations(db, principal.TenantID, overrides)...)
 	intake := computeIntakeRecommendations(db, principal.TenantID, circPolicy, storagePolicy, storage)
 
 	if err := persistRecommendationsForUnit(db, principal.TenantID, models.MediaCirculationUnitItemFamily, evict); err != nil {
@@ -147,6 +155,10 @@ func GenerateMediaCirculationRecommendations(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to persist intake recommendations", Code: "SAVE_FAILED"})
 		return
 	}
+	now := time.Now().UTC()
+	_ = db.Model(&models.MediaCirculationPolicy{}).
+		Where("tenant_id = ?", principal.TenantID).
+		Updates(map[string]interface{}{"last_generated_at": now, "last_evaluated_at": now}).Error
 	invalidateMediaCircHealth(principal.TenantID)
 
 	evictCounts := evictVerdictCounts(evict)
@@ -215,6 +227,10 @@ func ApplyMediaCirculationRecommendation(c *gin.Context) {
 		writeCirculationAudit(db, principal, "media_circulation.recommendation.apply", rec.PublicID.String(), map[string]interface{}{
 			"unit_type": rec.UnitType, "verdict": rec.Verdict, "outcome": mediaCircOutcomeFailed, "error": applyErr.Error(),
 		})
+		if errors.Is(applyErr, errMediaCircIntakeBudgetExhausted) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: applyErr.Error(), Code: "INTAKE_BUDGET_EXHAUSTED"})
+			return
+		}
 		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Execution failed: " + applyErr.Error(), Code: "APPLY_EXEC_FAILED"})
 		return
 	}
@@ -232,6 +248,42 @@ func ApplyMediaCirculationRecommendation(c *gin.Context) {
 	invalidateMediaCircHealth(principal.TenantID)
 	writeCirculationAudit(db, principal, "media_circulation.recommendation.apply", rec.PublicID.String(), map[string]interface{}{
 		"unit_type": rec.UnitType, "verdict": rec.Verdict, "outcome": outcome,
+	})
+	c.JSON(http.StatusOK, gin.H{"data": rec})
+}
+
+func RevertMediaCirculationRecommendation(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	recID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid recommendation ID", Code: "INVALID_ID"})
+		return
+	}
+	var rec models.MediaCirculationRecommendation
+	if err := db.Where("tenant_id = ? AND public_id = ?", principal.TenantID, recID).First(&rec).Error; err != nil {
+		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Recommendation not found", Code: "NOT_FOUND"})
+		return
+	}
+	if rec.Status != models.MediaCirculationRecStatusApplied {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Only applied recommendations can be reverted", Code: "NOT_APPLIED"})
+		return
+	}
+	if err := revertRecommendation(db, principal.TenantID, rec); err != nil {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Recommendation cannot be reverted: " + err.Error(), Code: "NOT_REVERTIBLE"})
+		return
+	}
+	rec.Outcome = mediaCircOutcomeReverted
+	if err := db.Save(&rec).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to record revert", Code: "SAVE_FAILED"})
+		return
+	}
+	invalidateMediaCircHealth(principal.TenantID)
+	writeCirculationAudit(db, principal, "media_circulation.recommendation.revert", rec.PublicID.String(), map[string]interface{}{
+		"unit_type": rec.UnitType, "verdict": rec.Verdict,
 	})
 	c.JSON(http.StatusOK, gin.H{"data": rec})
 }
@@ -320,6 +372,8 @@ func sanitizeMediaCirculationPolicy(p models.MediaCirculationPolicy) models.Medi
 func buildMediaCirculationHealth(db *gorm.DB, tenantID, authorization string) mediaCirculationHealthResponse {
 	// Storage/cost side — reuse wholesale, do not re-derive (D10).
 	storage := buildStorageHealthResponse(db, tenantID, authorization)
+	opBudget := getStorageOpBudgetStatus(db, tenantID)
+	backlog := computeMediaCircAtomizationBacklog(db, tenantID)
 	// Intake-demand side — circulation-owned.
 	buckets := computeLibraryBucketInventory(db, tenantID)
 	policy := loadEffectiveMediaCirculationPolicy(db, tenantID)
@@ -340,10 +394,13 @@ func buildMediaCirculationHealth(db *gorm.DB, tenantID, authorization string) me
 		Reasons:      reasons,
 		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
 		Proof: mediaCirculationProof{
-			Storage:        storage.Proof,
-			Buckets:        buckets,
-			ThinBuckets:    thin,
-			EvictByVerdict: countPendingEvictByVerdict(db, tenantID),
+			Storage:              storage.Proof,
+			OpBudget:             opBudget,
+			AtomizationBacklog:   backlog,
+			Buckets:              buckets,
+			ThinBuckets:          thin,
+			EvictByVerdict:       countPendingEvictByVerdict(db, tenantID),
+			AppliedYieldByBucket: computeAppliedIntakeYieldByBucket(db, tenantID),
 		},
 		Policy: policy,
 	}
@@ -421,7 +478,7 @@ func composeMediaCirculationHeadline(storageState string, thinBuckets []string) 
 	}
 
 	if len(thinBuckets) > 0 {
-		reasons = append(reasons, "Feed inventory is thin in duration buckets: "+strings.Join(thinBuckets, ", ")+"m.")
+		reasons = append(reasons, "Feed inventory is thin in duration buckets: "+strings.Join(thinBuckets, ", ")+".")
 		if base == "healthy" || base == "watch" {
 			base = "feed_thin"
 		}

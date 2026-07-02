@@ -55,12 +55,15 @@ type mediaCirculationCockpitRecommendation struct {
 }
 
 type mediaCirculationCockpitResponse struct {
-	Health          mediaCirculationCockpitHealth           `json:"health"`
-	Storage         storageProofMetrics                     `json:"storage"`
-	Buckets         []mediaCirculationCockpitBucket         `json:"buckets"`
-	Summary         mediaCirculationCockpitSummary          `json:"summary"`
-	Policy          models.MediaCirculationPolicy           `json:"policy"`
-	Recommendations []mediaCirculationCockpitRecommendation `json:"recommendations"`
+	Health               mediaCirculationCockpitHealth           `json:"health"`
+	Storage              storageProofMetrics                     `json:"storage"`
+	OpBudget             opBudgetStatus                          `json:"op_budget"`
+	AtomizationBacklog   mediaCircAtomizationBacklog             `json:"atomization_backlog"`
+	AppliedYieldByBucket map[string]mediaCircBucketYield         `json:"applied_yield_by_bucket"`
+	Buckets              []mediaCirculationCockpitBucket         `json:"buckets"`
+	Summary              mediaCirculationCockpitSummary          `json:"summary"`
+	Policy               models.MediaCirculationPolicy           `json:"policy"`
+	Recommendations      []mediaCirculationCockpitRecommendation `json:"recommendations"`
 }
 
 func GetMediaCirculationCockpit(c *gin.Context) {
@@ -80,10 +83,13 @@ func GetMediaCirculationCockpit(c *gin.Context) {
 			GeneratedAt: health.GeneratedAt,
 			Enabled:     health.Policy.Enabled,
 		},
-		Storage:         health.Proof.Storage,
-		Buckets:         cockpitBuckets(health.Proof.Buckets),
-		Policy:          health.Policy,
-		Recommendations: rows,
+		Storage:              health.Proof.Storage,
+		OpBudget:             health.Proof.OpBudget,
+		AtomizationBacklog:   health.Proof.AtomizationBacklog,
+		AppliedYieldByBucket: health.Proof.AppliedYieldByBucket,
+		Buckets:              cockpitBuckets(health.Proof.Buckets),
+		Policy:               health.Policy,
+		Recommendations:      rows,
 	}
 	resp.Summary = summarizeCockpitRecommendations(rows)
 	c.JSON(http.StatusOK, resp)
@@ -215,6 +221,8 @@ func mediaCircActionLane(verdict string) string {
 	switch verdict {
 	case mediaCircVerdictPullNow, mediaCircVerdictDeepPull:
 		return "pull"
+	case mediaCircVerdictAtomizeNow:
+		return "atomize"
 	case mediaCircVerdictPullLimited, mediaCircVerdictSkipSource, mediaCircVerdictPauseSource:
 		return "limit_skip"
 	case mediaCircVerdictProtect:
@@ -224,6 +232,8 @@ func mediaCircActionLane(verdict string) string {
 	case mediaCircVerdictRankDown:
 		return "downrank"
 	case mediaCircVerdictNeedsAdminReview:
+		return "review"
+	case mediaCircVerdictBlockedTranscript, mediaCircVerdictAtomizationLeak:
 		return "review"
 	default:
 		return "review"
@@ -236,14 +246,16 @@ func mediaCircLaneOrder(lane string) int {
 		return 0
 	case "downrank":
 		return 1
-	case "cool":
+	case "atomize":
 		return 2
-	case "review":
+	case "cool":
 		return 3
-	case "limit_skip":
+	case "review":
 		return 4
-	case "protect":
+	case "limit_skip":
 		return 5
+	case "protect":
+		return 6
 	default:
 		return 9
 	}
@@ -260,6 +272,12 @@ func mediaCircPriorityLabel(rec models.MediaCirculationRecommendation) string {
 		return "Pull now"
 	case mediaCircVerdictRankDown:
 		return "Reduce exposure"
+	case mediaCircVerdictAtomizeNow:
+		return "Atomize now"
+	case mediaCircVerdictBlockedTranscript:
+		return "Transcript blocked"
+	case mediaCircVerdictAtomizationLeak:
+		return "Atomization leak"
 	case mediaCircVerdictRecoverableDelete:
 		return "Cost reclaim"
 	case mediaCircVerdictMoveToCold:
@@ -370,7 +388,7 @@ func cockpitProofPoints(rec models.MediaCirculationRecommendation, metrics map[s
 		points = append(points, fmt.Sprintf("Bucket demand %.2f", bm))
 	}
 	if thin := stringSliceMetric(metrics, "matched_thin_buckets"); len(thin) > 0 {
-		points = append(points, "Fills thin buckets: "+strings.Join(thin, ", ")+"m")
+		points = append(points, "Fills thin buckets: "+strings.Join(thin, ", "))
 	}
 	if role := stringMetric(metrics, "role"); role != "" {
 		points = append(points, "Storage role: "+strings.ReplaceAll(role, "_", " "))

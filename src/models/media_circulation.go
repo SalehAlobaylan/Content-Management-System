@@ -35,6 +35,12 @@ const (
 	MediaCirculationRecStatusApplied    = "applied"
 	MediaCirculationRecStatusDismissed  = "dismissed"
 	MediaCirculationRecStatusSuperseded = "superseded"
+
+	MediaCirculationOverrideNeverArchive   = "never_archive"
+	MediaCirculationOverrideKeepLatestNHot = "keep_latest_n_hot"
+	MediaCirculationOverridePremiumSource  = "premium_source"
+	MediaCirculationOverrideNoAtomize      = "no_atomize"
+	MediaCirculationOverrideEditorialHold  = "editorial_hold"
 )
 
 // MediaCirculationPolicy stores the tenant-level circulation knobs. It holds ONLY
@@ -67,6 +73,7 @@ type MediaCirculationPolicy struct {
 	FreshnessDemandWeight float64 `gorm:"type:double precision;not null;default:0.20" json:"freshness_demand_weight"`
 
 	LastEvaluatedAt *time.Time `gorm:"type:timestamp" json:"last_evaluated_at,omitempty"`
+	LastGeneratedAt *time.Time `gorm:"type:timestamp" json:"last_generated_at,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
@@ -129,4 +136,28 @@ type MediaCirculationRecommendation struct {
 
 func (MediaCirculationRecommendation) TableName() string {
 	return "media_circulation_recommendations"
+}
+
+// MediaCirculationOverride is the standing human-exception layer consulted before
+// any recommendation is emitted. These are policy exceptions, not one-shot actions.
+type MediaCirculationOverride struct {
+	ID       uint      `gorm:"primaryKey" json:"-"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_media_circ_overrides_public_id" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;index:idx_media_circ_overrides_subject,priority:1;index:idx_media_circ_overrides_type,priority:1" json:"tenant_id"`
+
+	SubjectKind  string    `gorm:"type:varchar(24);not null;index:idx_media_circ_overrides_subject,priority:2" json:"subject_kind"`
+	SubjectID    uuid.UUID `gorm:"type:uuid;not null;index:idx_media_circ_overrides_subject,priority:3" json:"subject_id"`
+	OverrideType string    `gorm:"type:varchar(32);not null;index:idx_media_circ_overrides_type,priority:2" json:"override_type"`
+
+	Params    datatypes.JSON `gorm:"type:jsonb" json:"params,omitempty"`
+	ExpiresAt *time.Time     `gorm:"type:timestamp;index:idx_media_circ_overrides_expires" json:"expires_at,omitempty"`
+	SetBy     string         `gorm:"type:varchar(255)" json:"set_by,omitempty"`
+	Notes     string         `gorm:"type:text" json:"notes,omitempty"`
+
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+}
+
+func (MediaCirculationOverride) TableName() string {
+	return "media_circulation_overrides"
 }

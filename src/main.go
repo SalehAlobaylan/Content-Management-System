@@ -163,6 +163,7 @@ func main() {
 			// Media Circulation Engine — advisory verdict/recommendation layer
 			&models.MediaCirculationPolicy{},
 			&models.MediaCirculationRecommendation{},
+			&models.MediaCirculationOverride{},
 			// Quality management — ingest configuration only.
 			// quality_rules and quality_history were removed in Phase 7;
 			// re-encoding is now driven by storage policies (archive_action='re_encode').

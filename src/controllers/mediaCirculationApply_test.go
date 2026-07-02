@@ -22,6 +22,9 @@ func TestPlannedApplyOutcome(t *testing.T) {
 		{"pause executes", models.MediaCirculationUnitSource, mediaCircVerdictPauseSource, mediaCircOutcomePaused, true},
 		{"skip acknowledges", models.MediaCirculationUnitSource, mediaCircVerdictSkipSource, mediaCircOutcomeAcknowledged, false},
 		{"needs_review acknowledges", models.MediaCirculationUnitSource, mediaCircVerdictNeedsAdminReview, mediaCircOutcomeAcknowledged, false},
+		{"atomize now executes", models.MediaCirculationUnitItemFamily, mediaCircVerdictAtomizeNow, mediaCircOutcomeAtomizationEnqueued, true},
+		{"blocked transcript acknowledges", models.MediaCirculationUnitItemFamily, mediaCircVerdictBlockedTranscript, mediaCircOutcomeAcknowledged, false},
+		{"atomization leak acknowledges", models.MediaCirculationUnitItemFamily, mediaCircVerdictAtomizationLeak, mediaCircOutcomeAcknowledged, false},
 		{"rank_down executes", models.MediaCirculationUnitItemFamily, mediaCircVerdictRankDown, mediaCircOutcomeRankedDown, true},
 		{"re_encode deferred", models.MediaCirculationUnitItemFamily, mediaCircVerdictReEncode, mediaCircOutcomeDeferredToSweep, false},
 		{"move_to_cold deferred", models.MediaCirculationUnitItemFamily, mediaCircVerdictMoveToCold, mediaCircOutcomeDeferredToSweep, false},
@@ -36,6 +39,27 @@ func TestPlannedApplyOutcome(t *testing.T) {
 					tt.unit, tt.verdict, kind, exec, tt.wantKind, tt.wantExec)
 			}
 		})
+	}
+}
+
+func TestRollingIntakeBudgetAllows(t *testing.T) {
+	if !rollingIntakeBudgetAllows(20, 5, 25) {
+		t.Error("exactly exhausted budget should be allowed")
+	}
+	if rollingIntakeBudgetAllows(21, 5, 25) {
+		t.Error("over-budget intake should be refused")
+	}
+	if !rollingIntakeBudgetAllows(100, 100, 0) {
+		t.Error("zero max should disable the budget cap")
+	}
+}
+
+func TestAtomizationBacklogIntakeFactor(t *testing.T) {
+	if got := atomizationBacklogIntakeFactor(mediaCircAtomizationBacklog{BacklogDepth: 0}); got != 1 {
+		t.Errorf("empty backlog factor = %.2f, want 1", got)
+	}
+	if got := atomizationBacklogIntakeFactor(mediaCircAtomizationBacklog{BacklogDepth: 20}); got != 0.6 {
+		t.Errorf("large backlog factor = %.2f, want 0.6", got)
 	}
 }
 

@@ -31,17 +31,22 @@ const (
 	mediaCircIntakeFailureRateHigh  = 0.35
 	mediaCircDeepPullHeadroom       = 0.5
 	mediaCircDeepPullPrior          = 0.6
+	mediaCircOrderingFloor          = 0.1
+	mediaCircSaturatedDemandWeight  = 0.05
 )
 
 type sourceOpportunity struct {
-	QualityPrior   float64
-	BucketMatch    float64
-	Freshness      float64
-	CostHeadroom   float64
-	FailureRate    float64
-	Score          float64
-	FillsThin      bool
-	MatchedBuckets []string
+	QualityPrior     float64
+	BucketMatch      float64
+	Freshness        float64
+	CostHeadroom     float64
+	OrderingHeadroom float64
+	FailureRate      float64
+	BacklogFactor    float64
+	PremiumBoost     float64
+	Score            float64
+	FillsThin        bool
+	MatchedBuckets   []string
 }
 
 // computeIntakeRecommendations scores every active media source and returns bounded
@@ -60,12 +65,15 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		bucketState[b.Bucket] = b.State
 	}
 	costHeadroom := storageCostHeadroom(storagePolicy, storage.Proof)
+	opBudget := getStorageOpBudgetStatus(db, tenantID)
+	backlog := computeMediaCircAtomizationBacklog(db, tenantID)
+	backlogFactor := atomizationBacklogIntakeFactor(backlog)
 
 	// Gate baseline (D8): value floor below target; at/above target, incoming must
-	// beat what we'd evict (lowest visible value + margin).
+	// beat what we'd evict (P25 visible value + margin).
 	baseline := circPolicy.ValueFloor
 	if costHeadroom <= 0 {
-		baseline = clampFloat(lowestVisibleValue(db, tenantID)+circPolicy.MarginalMargin, 0, 1)
+		baseline = clampFloat(visibleValuePercentile(db, tenantID, 0.25)+circPolicy.MarginalMargin, 0, 1)
 	}
 
 	ids := make([]uuid.UUID, len(sources))
@@ -73,6 +81,7 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		ids[i] = s.PublicID
 	}
 	stats := sourceTelemetryStats(db, tenantID, ids)
+	overrides := loadActiveMediaCircOverrides(db, tenantID)
 
 	type evaluated struct {
 		src     models.ContentSource
@@ -86,34 +95,56 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		meanVal, count, dist := sourceProducedProfile(db, tenantID, s.Name)
 		st := stats[s.PublicID]
 		prior, hasHistory := sourceQualityPrior(st, meanVal, count)
+		premiumOverride, premium := mediaCircHasOverride(overrides, "source", s.PublicID, models.MediaCirculationOverridePremiumSource)
+		_, sourceHold := mediaCircHasOverride(overrides, "source", s.PublicID, models.MediaCirculationOverrideEditorialHold)
 		match, matchedThin, fillsThin := bucketDemandMatch(dist, bucketState)
 		fresh := freshnessComponentAt(s, circPolicy.FreshnessDemandWeight, circPolicy.SourceMinIntervalMinutes, circPolicy.SourceMaxIntervalMinutes, now)
 		failRate := sourceFailureRate(st)
 		cadenceOK, cadenceReason := sourceCadenceEligibleAt(s, circPolicy, now)
+		premiumBoost := 1.0
+		if premium {
+			premiumBoost = 1.15
+		}
 
 		opp := sourceOpportunity{
-			QualityPrior:   prior,
-			BucketMatch:    match,
-			Freshness:      fresh,
-			CostHeadroom:   costHeadroom,
-			FailureRate:    failRate,
-			Score:          prior * match * fresh * costHeadroom,
-			FillsThin:      fillsThin,
-			MatchedBuckets: matchedThin,
+			QualityPrior:     prior,
+			BucketMatch:      match,
+			Freshness:        fresh,
+			CostHeadroom:     costHeadroom,
+			OrderingHeadroom: maxFloat(costHeadroom, mediaCircOrderingFloor),
+			FailureRate:      failRate,
+			BacklogFactor:    backlogFactor,
+			PremiumBoost:     premiumBoost,
+			Score:            prior * match * fresh * maxFloat(costHeadroom, mediaCircOrderingFloor) * backlogFactor * premiumBoost,
+			FillsThin:        fillsThin,
+			MatchedBuckets:   matchedThin,
 		}
 
 		reasons := []string{}
+		if premium {
+			reasons = append(reasons, mediaCircOverrideReason(premiumOverride))
+		}
 		hard := ""
 		switch {
+		case sourceHold:
+			hard = mediaCircVerdictSkipSource
+			reasons = append(reasons, "Editorial hold blocks automated intake for this source.")
 		case !cadenceOK:
 			hard = mediaCircVerdictSkipSource
 			reasons = append(reasons, cadenceReason)
+		case opBudget.ClassAStatus == "cap":
+			hard = mediaCircVerdictSkipSource
+			reasons = append(reasons, "Op budget cap reached; pulling would risk object-store Class A overage.")
 		case !hasHistory:
 			hard = mediaCircVerdictNeedsAdminReview
 			reasons = append(reasons, "No fetch history or produced items yet; an admin should decide before intake.")
 		case failRate > mediaCircIntakeFailureRateHigh:
-			hard = mediaCircVerdictPauseSource
-			reasons = append(reasons, fmt.Sprintf("High failure rate (%.0f%%); pause until the source recovers.", failRate*100))
+			if premium {
+				reasons = append(reasons, fmt.Sprintf("High failure rate (%.0f%%); premium source is not auto-paused.", failRate*100))
+			} else {
+				hard = mediaCircVerdictPauseSource
+				reasons = append(reasons, fmt.Sprintf("High failure rate (%.0f%%); pause until the source recovers.", failRate*100))
+			}
 		case prior < baseline:
 			hard = mediaCircVerdictSkipSource
 			reasons = append(reasons, fmt.Sprintf("Predicted value %.2f is below the bar %.2f; pulling would replace better content with worse.", prior, baseline))
@@ -146,6 +177,9 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		}
 		verdict := mediaCircVerdictPullNow
 		reason := "Library needs this source's content and predicted quality clears the bar."
+		if e.opp.BacklogFactor < 1 {
+			reason += " Atomization backlog is damping intake priority."
+		}
 		switch {
 		case e.opp.QualityPrior >= mediaCircDeepPullPrior && e.opp.FillsThin && e.opp.CostHeadroom >= mediaCircDeepPullHeadroom:
 			verdict = mediaCircVerdictDeepPull
@@ -177,14 +211,17 @@ func sourceRec(s models.ContentSource, verdict string, opp sourceOpportunity, re
 		Score:       opp.Score,
 		Reasons:     reasons,
 		Metrics: map[string]interface{}{
-			"source_name":          s.Name,
-			"quality_prior":        opp.QualityPrior,
-			"bucket_demand_match":  opp.BucketMatch,
-			"freshness":            opp.Freshness,
-			"cost_headroom":        opp.CostHeadroom,
-			"failure_rate":         opp.FailureRate,
-			"allowed_intake":       allowed,
-			"matched_thin_buckets": opp.MatchedBuckets,
+			"source_name":                s.Name,
+			"quality_prior":              opp.QualityPrior,
+			"bucket_demand_match":        opp.BucketMatch,
+			"freshness":                  opp.Freshness,
+			"cost_headroom":              opp.CostHeadroom,
+			"ordering_headroom":          opp.OrderingHeadroom,
+			"failure_rate":               opp.FailureRate,
+			"atomization_backlog_factor": opp.BacklogFactor,
+			"premium_boost":              opp.PremiumBoost,
+			"allowed_intake":             allowed,
+			"matched_thin_buckets":       opp.MatchedBuckets,
 		},
 	}
 }
@@ -250,7 +287,7 @@ func demandWeight(state string) float64 {
 	case "ok":
 		return 0.3
 	default: // saturated / unknown
-		return 0.0
+		return mediaCircSaturatedDemandWeight
 	}
 }
 
@@ -376,9 +413,7 @@ func sourceTelemetryStats(db *gorm.DB, tenantID string, sourceIDs []uuid.UUID) m
 	return m
 }
 
-// lowestVisibleValue is the displacement baseline when at/over the cost target: the
-// value of the weakest thing we'd evict to make room.
-func lowestVisibleValue(db *gorm.DB, tenantID string) float64 {
+func visibleValuePercentile(db *gorm.DB, tenantID string, percentile float64) float64 {
 	var items []models.ContentItem
 	db.Where("tenant_id = ? AND is_feed_unit = TRUE AND feed_visibility = ? AND status = ?",
 		tenantID, "visible", models.ContentStatusReady).
@@ -389,11 +424,31 @@ func lowestVisibleValue(db *gorm.DB, tenantID string) float64 {
 	if len(items) == 0 {
 		return 0
 	}
-	min := 1.0
+	values := make([]float64, 0, len(items))
 	for _, it := range items {
-		if v := circulationMediaValue(it); v < min {
-			min = v
-		}
+		values = append(values, circulationMediaValue(it))
 	}
-	return min
+	sort.Float64s(values)
+	return percentileValue(values, percentile)
+}
+
+func percentileValue(sortedValues []float64, percentile float64) float64 {
+	if len(sortedValues) == 0 {
+		return 0
+	}
+	if percentile <= 0 {
+		return sortedValues[0]
+	}
+	if percentile >= 1 {
+		return sortedValues[len(sortedValues)-1]
+	}
+	idx := int(float64(len(sortedValues)-1) * percentile)
+	return sortedValues[idx]
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }

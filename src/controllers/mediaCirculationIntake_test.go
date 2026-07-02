@@ -26,19 +26,39 @@ func TestSourceQualityPrior(t *testing.T) {
 }
 
 func TestBucketDemandMatch(t *testing.T) {
-	state := map[string]string{"5": "thin", "10": "saturated", "20": "ok"}
-	thinFiller := map[string]float64{"5": 1.0} // fills a thin bucket
-	satFiller := map[string]float64{"10": 1.0} // fills a saturated bucket
+	state := map[string]string{"5m": "thin", "10m": "saturated", "20m": "ok"}
+	thinFiller := map[string]float64{"5m": 1.0} // fills a thin bucket
+	satFiller := map[string]float64{"10m": 1.0} // fills a saturated bucket
 	mThin, matched, fills := bucketDemandMatch(thinFiller, state)
 	mSat, _, _ := bucketDemandMatch(satFiller, state)
 	if mThin <= mSat {
 		t.Errorf("thin-filling match %.2f should exceed saturated-filling match %.2f", mThin, mSat)
 	}
-	if !fills || len(matched) != 1 || matched[0] != "5" {
-		t.Errorf("expected fillsThin with matched=[5], got fills=%v matched=%v", fills, matched)
+	if !fills || len(matched) != 1 || matched[0] != "5m" {
+		t.Errorf("expected fillsThin with matched=[5m], got fills=%v matched=%v", fills, matched)
 	}
-	if mSat != 0 {
-		t.Errorf("saturated-only source should have zero demand match, got %.2f", mSat)
+	if mSat <= 0 || mSat >= mThin {
+		t.Errorf("saturated-only source should have a low nonzero ordering match below thin, got saturated=%.2f thin=%.2f", mSat, mThin)
+	}
+}
+
+func TestPercentileValueUsesP25NotMinimum(t *testing.T) {
+	values := []float64{0.01, 0.40, 0.50, 0.60, 0.70}
+	if got := percentileValue(values, 0.25); got != 0.40 {
+		t.Errorf("P25 = %.2f, want 0.40", got)
+	}
+}
+
+func TestSetFeedUnitDurationBucketCanonicalLabels(t *testing.T) {
+	duration := 16 * 60
+	item := models.ContentItem{
+		Type:        models.ContentTypePodcast,
+		IsFeedUnit:  true,
+		DurationSec: &duration,
+	}
+	setFeedUnitDurationBucket(&item)
+	if item.DurationBucket == nil || *item.DurationBucket != "15m" {
+		t.Fatalf("duration bucket = %v, want 15m", item.DurationBucket)
 	}
 }
 

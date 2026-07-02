@@ -82,6 +82,8 @@ func subjectKindForRole(role string) string {
 func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy models.StoragePolicy, circPolicy models.MediaCirculationPolicy, coldEnabled bool) []evictRecommendation {
 	recs := []evictRecommendation{}
 	protectedIDs := map[uuid.UUID]bool{}
+	overrideProtectedIDs := map[uuid.UUID]bool{}
+	overrides := loadActiveMediaCircOverrides(db, tenantID)
 
 	// 1. protect ← hot-protection set (reused). Also the exclusion set for everything below.
 	var protectedItems []models.ContentItem
@@ -112,6 +114,13 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 	for _, it := range candidates {
 		if protectedIDs[it.PublicID] {
 			continue // chapter independence: never evict a protected item
+		}
+		if row, ok := mediaCircProtectiveItemOverride(overrides, it.PublicID); ok {
+			if !overrideProtectedIDs[it.PublicID] {
+				recs = append(recs, overrideProtectRec(it, row))
+				overrideProtectedIDs[it.PublicID] = true
+			}
+			continue
 		}
 		role, reason := storageRoleForContentItem(it)
 		verdict, action, ok := mapRoleToEvictVerdict(role, storagePolicy, coldEnabled)
@@ -156,6 +165,13 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 		if protectedIDs[it.PublicID] {
 			continue
 		}
+		if row, ok := mediaCircProtectiveItemOverride(overrides, it.PublicID); ok {
+			if !overrideProtectedIDs[it.PublicID] {
+				recs = append(recs, overrideProtectRec(it, row))
+				overrideProtectedIDs[it.PublicID] = true
+			}
+			continue
+		}
 		v := circulationMediaValue(it)
 		if v < circPolicy.ValueFloor {
 			rd = append(rd, rankDownCand{item: it, value: v})
@@ -178,6 +194,39 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 	}
 
 	return recs
+}
+
+func mediaCircProtectiveItemOverride(overrides mediaCircOverrideIndex, id uuid.UUID) (models.MediaCirculationOverride, bool) {
+	if row, ok := mediaCircHasOverride(overrides, "item", id,
+		models.MediaCirculationOverrideNeverArchive,
+		models.MediaCirculationOverrideKeepLatestNHot,
+		models.MediaCirculationOverrideEditorialHold); ok {
+		return row, true
+	}
+	if row, ok := mediaCircHasOverride(overrides, "family", id,
+		models.MediaCirculationOverrideNeverArchive,
+		models.MediaCirculationOverrideKeepLatestNHot,
+		models.MediaCirculationOverrideEditorialHold); ok {
+		return row, true
+	}
+	return models.MediaCirculationOverride{}, false
+}
+
+func overrideProtectRec(it models.ContentItem, override models.MediaCirculationOverride) evictRecommendation {
+	return evictRecommendation{
+		SubjectID:   it.PublicID,
+		SubjectKind: "content_item",
+		Verdict:     mediaCircVerdictProtect,
+		Action:      mediaCircVerdictProtect,
+		Score:       1,
+		Reasons:     []string{mediaCircOverrideReason(override)},
+		Metrics: map[string]interface{}{
+			"override_type":   override.OverrideType,
+			"override_id":     override.PublicID.String(),
+			"file_size_bytes": it.FileSizeBytes,
+			"view_count":      it.ViewCount,
+		},
+	}
 }
 
 // parentAtomizationComplete returns true when the parent's latest atomization run

@@ -153,6 +153,17 @@ func normalizeIdempotencyKey(key string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+func setFeedUnitDurationBucket(item *models.ContentItem) {
+	if item == nil || item.DurationSec == nil || *item.DurationSec <= 0 || !item.IsFeedUnit {
+		return
+	}
+	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+		return
+	}
+	bucket := durationBucketLabel(*item.DurationSec * 1000)
+	item.DurationBucket = &bucket
+}
+
 // InternalCreateContentItem handles POST /internal/content-items
 func InternalCreateContentItem(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -349,6 +360,7 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		status := strings.TrimSpace(*req.ChapteringStatus)
 		item.ChapteringStatus = &status
 	}
+	setFeedUnitDurationBucket(&item)
 
 	if req.FailureReason != nil {
 		metadata := map[string]interface{}{}
@@ -441,6 +453,7 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if req.DurationSec != nil {
 		item.DurationSec = req.DurationSec
 	}
+	setFeedUnitDurationBucket(&item)
 	if req.FileSizeBytes != nil {
 		item.FileSizeBytes = *req.FileSizeBytes
 	}

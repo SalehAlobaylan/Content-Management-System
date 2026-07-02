@@ -250,6 +250,17 @@ func stringConfig(cfg map[string]interface{}, key, fallback string) string {
 	return fallback
 }
 
+// durationBucketSQLExpr is the SQL mirror of durationBucketLabel (and of the
+// stage-3 backfill migration): nearest of 5/10/15/20/30/40 minutes, suffixed "m".
+// Used by bulk updates that flip rows into feed units so the bucket-at-write
+// invariant holds without loading each row.
+const durationBucketSQLExpr = `CASE WHEN content_items.duration_sec IS NULL THEN content_items.duration_bucket ELSE (
+	SELECT v.bucket::text || 'm'
+	FROM (VALUES (5), (10), (15), (20), (30), (40)) AS v(bucket)
+	ORDER BY ABS(ROUND(content_items.duration_sec::numeric / 60.0) - v.bucket), v.bucket
+	LIMIT 1
+) END`
+
 func durationBucketLabel(ms int) string {
 	minutes := int(math.Round(float64(ms) / 60000.0))
 	buckets := []int{5, 10, 15, 20, 30, 40}
@@ -2919,6 +2930,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 	if result := validParents.Updates(map[string]interface{}{
 		"is_feed_unit":    true,
 		"feed_visibility": feedVisibilityVisible,
+		"duration_bucket": gorm.Expr(durationBucketSQLExpr),
 		"updated_at":      now,
 	}); result.Error != nil {
 		return out, result.Error
@@ -2938,6 +2950,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 	if result := fuzzyChapters.Updates(map[string]interface{}{
 		"is_feed_unit":    true,
 		"feed_visibility": feedVisibilityVisible,
+		"duration_bucket": gorm.Expr(durationBucketSQLExpr),
 		"updated_at":      now,
 	}); result.Error != nil {
 		return out, result.Error

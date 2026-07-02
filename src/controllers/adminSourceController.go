@@ -181,6 +181,10 @@ type aggregationTriggerRequest struct {
 	URL        string                 `json:"url"`
 	Name       string                 `json:"name,omitempty"`
 	Settings   map[string]interface{} `json:"settings,omitempty"`
+	// SourceID is the source's public UUID. Aggregation uses it as the run's
+	// sourceId so fetch/normalize telemetry reports back to source_run_telemetry
+	// (the workers skip reporting for non-UUID synthetic ids).
+	SourceID string `json:"sourceId,omitempty"`
 }
 
 type aggregationTriggerResponse struct {
@@ -1034,6 +1038,7 @@ func RunContentSource(c *gin.Context) {
 		URL:        sourceURL,
 		Name:       source.Name,
 		Settings:   settings,
+		SourceID:   source.PublicID.String(),
 	}
 
 	triggerRes, err := triggerAggregationSourceRun(
