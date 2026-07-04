@@ -1,9 +1,11 @@
 package controllers
 
 import (
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,6 +35,12 @@ const (
 	mediaCircDeepPullPrior          = 0.6
 	mediaCircOrderingFloor          = 0.1
 	mediaCircSaturatedDemandWeight  = 0.05
+
+	// mediaCircTopicShareCap: no intake cycle spends more than this share of
+	// its budget on sources sharing one dominant topic (D5-C interim guard;
+	// full (source × topic × bucket) scoring is the documented post-stage-4
+	// upgrade once measured topic demand accumulates).
+	mediaCircTopicShareCap = 0.4
 )
 
 type sourceOpportunity struct {
@@ -58,11 +66,12 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		return nil
 	}
 
-	// Bucket demand (D5) + cost headroom (D7).
+	// Bucket demand (D5) + cost headroom (D7). Bucket health now carries the
+	// measured demand gap (stage 4); the matcher prefers it over supply counts.
 	buckets := computeLibraryBucketInventory(db, tenantID)
-	bucketState := make(map[string]string, len(buckets))
+	bucketHealth := make(map[string]libraryBucketHealth, len(buckets))
 	for _, b := range buckets {
-		bucketState[b.Bucket] = b.State
+		bucketHealth[b.Bucket] = b
 	}
 	costHeadroom := storageCostHeadroom(storagePolicy, storage.Proof)
 	opBudget := getStorageOpBudgetStatus(db, tenantID)
@@ -86,18 +95,19 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 	type evaluated struct {
 		src     models.ContentSource
 		opp     sourceOpportunity
+		topic   string // dominant produced topic — feeds the per-topic share cap
 		hard    string // non-empty = terminal verdict, not eligible for budget
 		reasons []string
 	}
 	evals := make([]evaluated, 0, len(sources))
 	now := time.Now()
 	for _, s := range sources {
-		meanVal, count, dist := sourceProducedProfile(db, tenantID, s.Name)
+		meanVal, count, dist, dominantTopic := sourceProducedProfile(db, tenantID, s.Name)
 		st := stats[s.PublicID]
 		prior, hasHistory := sourceQualityPrior(st, meanVal, count)
 		premiumOverride, premium := mediaCircHasOverride(overrides, "source", s.PublicID, models.MediaCirculationOverridePremiumSource)
 		_, sourceHold := mediaCircHasOverride(overrides, "source", s.PublicID, models.MediaCirculationOverrideEditorialHold)
-		match, matchedThin, fillsThin := bucketDemandMatch(dist, bucketState)
+		match, matchedThin, fillsThin := bucketDemandMatch(dist, bucketHealth)
 		fresh := freshnessComponentAt(s, circPolicy.FreshnessDemandWeight, circPolicy.SourceMinIntervalMinutes, circPolicy.SourceMaxIntervalMinutes, now)
 		failRate := sourceFailureRate(st)
 		cadenceOK, cadenceReason := sourceCadenceEligibleAt(s, circPolicy, now)
@@ -152,7 +162,7 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 			hard = mediaCircVerdictSkipSource
 			reasons = append(reasons, "Source only fills already-saturated duration buckets; no library need right now.")
 		}
-		evals = append(evals, evaluated{src: s, opp: opp, hard: hard, reasons: reasons})
+		evals = append(evals, evaluated{src: s, opp: opp, topic: dominantTopic, hard: hard, reasons: reasons})
 	}
 
 	recs := make([]circulationRecInput, 0, len(evals))
@@ -165,15 +175,35 @@ func computeIntakeRecommendations(db *gorm.DB, tenantID string, circPolicy model
 		eligible = append(eligible, e)
 	}
 
-	// Budget allocation (D12): highest score first.
+	// Budget allocation (D12): highest score first, with the coarse per-topic
+	// share cap on top (D5-C interim guard): no cycle spends more than
+	// mediaCircTopicShareCap of its intake on one dominant topic — a bucket
+	// looking thin must not buy endless content of a topic users don't want.
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i].opp.Score > eligible[j].opp.Score })
 	allocs := allocateIntakeBudget(len(eligible), circPolicy.MaxIntakePerCycle, circPolicy.MaxIntakePerSourcePerCycle)
+	topicCap := int(float64(circPolicy.MaxIntakePerCycle) * mediaCircTopicShareCap)
+	if topicCap < 1 {
+		topicCap = 1
+	}
+	topicSpend := map[string]int{}
 	for i, e := range eligible {
 		allowed := allocs[i]
 		if allowed <= 0 {
 			recs = append(recs, sourceRec(e.src, mediaCircVerdictSkipSource, e.opp,
 				append(e.reasons, "This cycle's intake budget is already spent."), 0))
 			continue
+		}
+		if e.topic != "" && circPolicy.MaxIntakePerCycle > 0 {
+			remaining := topicCap - topicSpend[e.topic]
+			if remaining <= 0 {
+				recs = append(recs, sourceRec(e.src, mediaCircVerdictSkipSource, e.opp,
+					append(e.reasons, fmt.Sprintf("Per-topic share cap: this cycle already spends its %q allowance (%d items).", e.topic, topicCap)), 0))
+				continue
+			}
+			if allowed > remaining {
+				allowed = remaining
+			}
+			topicSpend[e.topic] += allowed
 		}
 		verdict := mediaCircVerdictPullNow
 		reason := "Library needs this source's content and predicted quality clears the bar."
@@ -291,14 +321,23 @@ func demandWeight(state string) float64 {
 	}
 }
 
-// bucketDemandMatch weights a source's produced-bucket distribution by current demand.
-func bucketDemandMatch(dist map[string]float64, bucketState map[string]string) (float64, []string, bool) {
+// bucketDemandMatch weights a source's produced-bucket distribution by current
+// demand. In the measured regime (serve-side telemetry accumulated) the weight
+// comes from the demand gap; otherwise from the supply-count state — the
+// bucket's State field is already gap-derived when measured, so the thin match
+// works identically in both regimes.
+func bucketDemandMatch(dist map[string]float64, bucketHealth map[string]libraryBucketHealth) (float64, []string, bool) {
 	match := 0.0
 	matchedThin := []string{}
 	fillsThin := false
 	for bucket, share := range dist {
-		match += share * demandWeight(bucketState[bucket])
-		if bucketState[bucket] == "thin" && share > 0 {
+		health := bucketHealth[bucket]
+		w := demandWeight(health.State)
+		if health.Measured {
+			w = intelligence.GapDemandWeight(health.Gap)
+		}
+		match += share * w
+		if health.State == "thin" && share > 0 {
 			matchedThin = append(matchedThin, bucket)
 			fillsThin = true
 		}
@@ -366,9 +405,11 @@ func storageCostHeadroom(policy models.StoragePolicy, proof storageProofMetrics)
 
 // ---- data-gathering helpers ----
 
-// sourceProducedProfile returns the mean circulation value, item count, and
-// duration-bucket distribution of a source's recent produced feed units.
-func sourceProducedProfile(db *gorm.DB, tenantID, sourceName string) (float64, int, map[string]float64) {
+// sourceProducedProfile returns the mean circulation value, item count,
+// duration-bucket distribution, and dominant topic of a source's recent
+// produced feed units. The dominant topic feeds the coarse per-topic intake
+// share cap (D5-C interim guard).
+func sourceProducedProfile(db *gorm.DB, tenantID, sourceName string) (float64, int, map[string]float64, string) {
 	var items []models.ContentItem
 	db.Where("tenant_id = ? AND source_name = ?", tenantID, sourceName).
 		Where("is_feed_unit = TRUE").
@@ -377,16 +418,23 @@ func sourceProducedProfile(db *gorm.DB, tenantID, sourceName string) (float64, i
 		Limit(mediaCircSourceRecentItemsLimit).
 		Find(&items)
 	if len(items) == 0 {
-		return 0, 0, map[string]float64{}
+		return 0, 0, map[string]float64{}, ""
 	}
+	values := circulationMediaValues(db, tenantID, items)
 	sum := 0.0
 	bucketCounts := map[string]float64{}
 	bucketed := 0.0
+	topicCounts := map[string]int{}
 	for _, it := range items {
-		sum += circulationMediaValue(it)
+		sum += values[it.PublicID]
 		if it.DurationBucket != nil && *it.DurationBucket != "" {
 			bucketCounts[*it.DurationBucket]++
 			bucketed++
+		}
+		for _, tag := range it.TopicTags {
+			if trimmed := strings.TrimSpace(tag); trimmed != "" {
+				topicCounts[trimmed]++
+			}
 		}
 	}
 	dist := map[string]float64{}
@@ -395,7 +443,15 @@ func sourceProducedProfile(db *gorm.DB, tenantID, sourceName string) (float64, i
 			dist[b] = c / bucketed
 		}
 	}
-	return sum / float64(len(items)), len(items), dist
+	dominantTopic := ""
+	best := 0
+	for topic, n := range topicCounts {
+		if n > best || (n == best && topic < dominantTopic) {
+			dominantTopic = topic
+			best = n
+		}
+	}
+	return sum / float64(len(items)), len(items), dist, dominantTopic
 }
 
 func sourceTelemetryStats(db *gorm.DB, tenantID string, sourceIDs []uuid.UUID) map[uuid.UUID]sourceRecommendationStats {
@@ -424,9 +480,10 @@ func visibleValuePercentile(db *gorm.DB, tenantID string, percentile float64) fl
 	if len(items) == 0 {
 		return 0
 	}
+	valueByID := circulationMediaValues(db, tenantID, items)
 	values := make([]float64, 0, len(items))
 	for _, it := range items {
-		values = append(values, circulationMediaValue(it))
+		values = append(values, valueByID[it.PublicID])
 	}
 	sort.Float64s(values)
 	return percentileValue(values, percentile)

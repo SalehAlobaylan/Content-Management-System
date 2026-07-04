@@ -2,6 +2,7 @@ package main
 
 import (
 	"content-management-system/src/controllers"
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models" // needs it for automigrate
 	"content-management-system/src/routes"
 	"content-management-system/src/utils"
@@ -164,6 +165,11 @@ func main() {
 			&models.MediaCirculationPolicy{},
 			&models.MediaCirculationRecommendation{},
 			&models.MediaCirculationOverride{},
+			// Ranking/Intelligence System (stage 4) — persisted value surface +
+			// serve-side demand telemetry + per-tenant tuning overrides
+			&models.MediaIntelligenceScore{},
+			&models.MediaDemandStat{},
+			&models.MediaIntelligenceConfig{},
 			// Quality management — ingest configuration only.
 			// quality_rules and quality_history were removed in Phase 7;
 			// re-encoding is now driven by storage policies (archive_action='re_encode').
@@ -225,6 +231,10 @@ func main() {
 	// cadence recommendations (and auto-apply inside guardrails) for tenants that
 	// opted in, so the news pipeline self-tunes without manual admin triggers.
 	controllers.StartCirculationAutomation(db)
+	// Ranking/Intelligence refresh heartbeat — recomputes stale/nudged media
+	// value scores in bounded batches (stage 4; scheduled + event-nudged
+	// triggers in one pass, on-demand scoring happens inside circulation).
+	intelligence.StartRefreshLoop(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

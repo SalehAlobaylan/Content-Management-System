@@ -1,39 +1,33 @@
 package controllers
 
-import "content-management-system/src/models"
+import (
+	"content-management-system/src/intelligence"
+	"content-management-system/src/models"
 
-// circulationMediaValue is the THIN backing of the D3 value seam: a deterministic,
-// durable media-value score in [0,1]. It is NOT the real intelligence engine — that
-// is built at stage 4 (Ranking/Intelligence refinement) and slots into this same
-// function's callers without a reshape. See docs/media-circulation-engine.md (D3).
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+)
+
+// The D3 value seam, stage-4 edition. The thin recomposition that used to live
+// here is now the intelligence package's FallbackValue (identical math); the
+// REAL engine is the persisted six-signal value model in src/intelligence.
 //
-// Composition — freshness is deliberately DEMOTED (absent), because media value is
-// durable, not recency-driven (D2a). It reuses the ranking engine's signal helpers
-// rather than inventing new scoring:
-//   - engagement  ← computeEngagementRaw, squashed into [0,1]
-//   - quality     ← computeQuality (completeness + source tier), already [0,1]
-//   - suitability ← Wahb is audio-first: audio-first bonus, unsuitable/visual penalty
+//   - circulationMediaValue: pure per-item fallback — used where no DB handle
+//     exists and as the fallback for never-scored items. Identical behavior to
+//     the original thin seam, so pre-telemetry decisions don't shift.
+//   - circulationMediaValues: the primary path — batch-reads the persisted
+//     durable value (media_intelligence_scores) with per-item fallback.
 //
-// Used by Slice 2 to pick rank_down candidates (visible units below the value floor)
-// and reused by Slice 3's intake marginal-comparison gate.
+// See docs/media-circulation-engine.md (D3) and
+// docs/ranking-intelligence-stage4-plan.md (slice 1).
 func circulationMediaValue(item models.ContentItem) float64 {
-	// Engagement: reuse the ranking composite, soft-saturate the unbounded log-sum
-	// into [0,1]. engagementHalf is the engagement level that maps to 0.5.
-	const engagementHalf = 4.0
-	engRaw := computeEngagementRaw(item)
-	engagement := engRaw / (engRaw + engagementHalf)
+	return intelligence.FallbackValue(item)
+}
 
-	// Completeness + source tier — already normalized to [0,1].
-	quality := computeQuality(item)
-
-	value := 0.6*engagement + 0.4*quality
-
-	switch item.MediaSuitability {
-	case models.MediaSuitabilityAudioFirstTalkingHead, models.MediaSuitabilityAudioFirstShow:
-		value += 0.05
-	case models.MediaSuitabilityUnsuitable, models.MediaSuitabilityVisualDependent:
-		value -= 0.15
-	}
-
-	return clampFloat(value, 0, 1)
+// circulationMediaValues resolves durable values for a loaded item set through
+// the intelligence engine: persisted score when available, FallbackValue
+// otherwise. Callers that loop items should use this instead of per-item
+// circulationMediaValue so scored items get the real model.
+func circulationMediaValues(db *gorm.DB, tenantID string, items []models.ContentItem) map[uuid.UUID]float64 {
+	return intelligence.Engine{DB: db}.Values(tenantID, items)
 }

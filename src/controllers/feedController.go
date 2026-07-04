@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -123,6 +124,7 @@ func GetForYouFeed(c *gin.Context) {
 		flagMap := LoadContentFlags(db, "default", contentIDs)
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
+		scored = applyIntelligenceFeedHooks(db, "default", scored)
 		scored = spaceScoredSiblingChapters(scored)
 		unfilteredScored := append([]ScoredItem(nil), scored...)
 
@@ -211,6 +213,7 @@ func GetForYouFeed(c *gin.Context) {
 		}
 
 		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems})
+		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
 		return
 	}
 
@@ -295,6 +298,26 @@ func GetForYouFeed(c *gin.Context) {
 	c.JSON(http.StatusOK, ForYouResponse{
 		Cursor: nextCursor,
 		Items:  responseItems,
+	})
+	recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+}
+
+// recordForYouServe fires the Ranking/Intelligence serve-side telemetry
+// (impressions + demand stats) for one For You response. Runs after the
+// response is written and in its own goroutine — the serve path never waits
+// on telemetry.
+func recordForYouServe(db *gorm.DB, items []models.ContentItem, requestedLimit, durationTargetMinutes int) {
+	served := make([]models.ContentItem, len(items))
+	copy(served, items)
+	durationBucket := ""
+	if durationTargetMinutes > 0 {
+		durationBucket = intelligence.BucketLabelForDuration(durationTargetMinutes * 60)
+	}
+	go intelligence.RecordServe(db, intelligence.ServeRecord{
+		TenantID:       "default",
+		Items:          served,
+		RequestedLimit: requestedLimit,
+		DurationBucket: durationBucket,
 	})
 }
 

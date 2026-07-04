@@ -66,6 +66,9 @@ func setup() {
 		&models.NewsStoryOverride{},
 		&models.SourceRunTelemetry{},
 		&models.SourceCirculationRecommendation{},
+		// Ranking/Intelligence (stage 4) — feed serve-side telemetry writes these
+		&models.MediaIntelligenceScore{},
+		&models.MediaDemandStat{},
 	); err != nil {
 		log.Fatalf("failed to migrate test database: %v", err)
 	}
@@ -96,6 +99,8 @@ func cleanup() {
 	}
 	m := testDB.Migrator()
 	// Wahb Platform tables
+	_ = m.DropTable(&models.MediaDemandStat{})
+	_ = m.DropTable(&models.MediaIntelligenceScore{})
 	_ = m.DropTable(&models.SourceCirculationRecommendation{})
 	_ = m.DropTable(&models.SourceRunTelemetry{})
 	_ = m.DropTable(&models.NewsStoryOverride{})

@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"errors"
 	"net/http"
@@ -41,6 +42,15 @@ type libraryBucketHealth struct {
 	Bucket       string `json:"bucket"`
 	VisibleUnits int64  `json:"visible_units"`
 	State        string `json:"state"` // thin | ok | saturated
+
+	// Demand surface (stage 4, measured serve-side telemetry). When Measured
+	// is true, State is derived from Gap (demand − value-weighted coverage)
+	// instead of raw supply counts, and the D13 intake matcher weights buckets
+	// by Gap.
+	DemandScore   float64 `json:"demand_score"`
+	CoverageScore float64 `json:"coverage_score"`
+	Gap           float64 `json:"gap"`
+	Measured      bool    `json:"measured"`
 }
 
 type mediaCirculationProof struct {
@@ -431,13 +441,28 @@ func computeLibraryBucketInventory(db *gorm.DB, tenantID string) []libraryBucket
 		counts[r.DurationBucket] = r.Count
 	}
 
+	// Demand surface: measured serve-side demand/coverage/gap. When measured,
+	// the gap replaces supply counts as the state judgment (W6 — the cache
+	// finally has a miss signal); otherwise the count-based classification
+	// remains the fallback guess.
+	snapshots, measured := intelligence.Engine{DB: db}.DemandSnapshots(tenantID, mediaCirculationBuckets)
+
 	inv := make([]libraryBucketHealth, 0, len(mediaCirculationBuckets))
 	for _, b := range mediaCirculationBuckets {
 		count := counts[b]
+		snap := snapshots[b]
+		state := classifyBucketHealth(count)
+		if measured {
+			state = intelligence.GapState(snap.Gap)
+		}
 		inv = append(inv, libraryBucketHealth{
-			Bucket:       b,
-			VisibleUnits: count,
-			State:        classifyBucketHealth(count),
+			Bucket:        b,
+			VisibleUnits:  count,
+			State:         state,
+			DemandScore:   snap.DemandScore,
+			CoverageScore: snap.CoverageScore,
+			Gap:           snap.Gap,
+			Measured:      measured,
 		})
 	}
 	return inv

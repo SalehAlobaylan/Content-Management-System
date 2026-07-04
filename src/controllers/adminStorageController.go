@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"bytes"
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"encoding/json"
 	"errors"
@@ -160,6 +161,13 @@ type storageCandidate struct {
 	MediaSuitability    string  `json:"media_suitability"`
 	ContentRole         string  `json:"content_role"`
 	ProtectionReason    string  `json:"protection_reason,omitempty"`
+
+	// Ranking/Intelligence value surface (stage 4) — why this candidate sits
+	// where it does in the worst-first ordering. Nil = never scored.
+	Value            *float64 `json:"value,omitempty"`
+	ValueConfidence  *float64 `json:"value_confidence,omitempty"`
+	ExplorationState *string  `json:"exploration_state,omitempty"`
+	ValueReasons     []string `json:"value_reasons,omitempty"`
 }
 
 type storageCandidatesResponse struct {
@@ -208,7 +216,7 @@ func GetStorageCandidates(c *gin.Context) {
 
 	var items []models.ContentItem
 	if err := query.
-		Order("view_count ASC, created_at ASC").
+		Order(storageValueOrderExpr).
 		Limit(limit).
 		Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
@@ -222,12 +230,51 @@ func GetStorageCandidates(c *gin.Context) {
 	for _, it := range items {
 		out = append(out, mapStorageCandidate(it))
 	}
+	attachCandidateValues(db, items, out)
 	c.JSON(http.StatusOK, storageCandidatesResponse{
 		Data:       out,
 		Total:      total,
 		Limit:      limit,
 		TotalBytes: totalBytes,
 	})
+}
+
+// attachCandidateValues decorates a candidate page with the persisted
+// intelligence scores (value, confidence, exploration state, reasons) so the
+// Console — and the stage-5 ledger — can explain every pick. One bounded query
+// per page.
+func attachCandidateValues(db *gorm.DB, items []models.ContentItem, out []storageCandidate) {
+	if len(items) == 0 {
+		return
+	}
+	ids := make([]uuid.UUID, len(items))
+	for i, it := range items {
+		ids[i] = it.PublicID
+	}
+	var rows []models.MediaIntelligenceScore
+	db.Where("content_item_id IN ?", ids).Find(&rows)
+	byID := make(map[string]models.MediaIntelligenceScore, len(rows))
+	for _, r := range rows {
+		byID[r.ContentItemID.String()] = r
+	}
+	for i := range out {
+		row, ok := byID[out[i].ID]
+		if !ok {
+			continue
+		}
+		value := row.Value
+		confidence := row.Confidence
+		state := row.ExplorationState
+		out[i].Value = &value
+		out[i].ValueConfidence = &confidence
+		out[i].ExplorationState = &state
+		if len(row.Reasons) > 0 {
+			var reasons []string
+			if err := json.Unmarshal(row.Reasons, &reasons); err == nil {
+				out[i].ValueReasons = reasons
+			}
+		}
+	}
 }
 
 // candidateFilter captures every variable the candidate query needs. Pulled
@@ -247,6 +294,13 @@ type candidateFilter struct {
 	archiveAction           string
 }
 
+// storageValueOrderExpr orders candidates worst-value-first from the persisted
+// intelligence score (stage 4 — grilling Q3). Unscored rows order at the
+// neutral prior rather than zero so "never scored" is never mistaken for
+// "worthless"; view_count/created_at stay as deterministic tie-breakers (and
+// as the whole ordering for non-feed liabilities that have no score).
+const storageValueOrderExpr = `COALESCE((SELECT s.value FROM media_intelligence_scores s WHERE s.content_item_id = content_items.public_id), 0.4) ASC, view_count ASC, created_at ASC`
+
 func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 	cutoff := time.Now().UTC().AddDate(0, 0, -f.minAgeDays)
 
@@ -254,6 +308,19 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		Where("tenant_id = ?", f.tenantID).
 		Where("(media_url IS NOT NULL OR thumbnail_url IS NOT NULL)").
 		Where("status != ?", models.ContentStatusArchived)
+
+	// Exploration guard (W1): a READY feed unit that is still exploring — or
+	// was never scored at all — is "unseen", not "unpopular". Destroying its
+	// exposure (delete, cold-move) would destroy the exploration valve, so it
+	// is not a candidate for those actions. Re-encode is exempt: it shrinks
+	// bytes while the item stays READY and servable, so exploration continues.
+	// Failed/hidden artifacts are storage liabilities regardless and stay in.
+	if f.archiveAction != "re_encode" {
+		q = q.Where(`NOT (is_feed_unit = TRUE AND status = ? AND NOT EXISTS (
+			SELECT 1 FROM media_intelligence_scores s
+			WHERE s.content_item_id = content_items.public_id AND s.exploration_state = 'established'
+		))`, models.ContentStatusReady)
+	}
 
 	if f.archiveAction == "re_encode" {
 		// Re-encode only saves media bytes when a primary media artifact exists.
@@ -273,15 +340,27 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		q = q.Where("(storage_tier IS NULL OR storage_tier != 'cold')")
 	}
 
+	// Value-aware eligibility (stage 4): past the age floor (a safety invariant
+	// that holds unconditionally), an item is a candidate when the legacy views
+	// proxy marks it dormant OR the intelligence model is confident it is
+	// low-value. Low-confidence value never widens eligibility — it falls back
+	// to the views rule alone.
+	const confidentlyLowValue = `EXISTS (
+		SELECT 1 FROM media_intelligence_scores s
+		WHERE s.content_item_id = content_items.public_id
+			AND s.confidence >= ? AND s.value <= ?
+	)`
 	var eligibility *gorm.DB
 	switch {
 	case f.status != "":
 		eligibility = db.Where("status = ?", f.status)
 	case f.deleteFailedImmediately:
 		eligibility = db.Where("status = ?", models.ContentStatusFailed).
-			Or(db.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount))
+			Or(db.Where("created_at < ? AND (view_count <= ? OR "+confidentlyLowValue+")",
+				cutoff, f.maxViewCount, intelligence.StorageEligibilityMinConfidence, intelligence.StorageEligibilityValueFloor))
 	default:
-		eligibility = db.Where("created_at < ? AND view_count <= ?", cutoff, f.maxViewCount)
+		eligibility = db.Where("created_at < ? AND (view_count <= ? OR "+confidentlyLowValue+")",
+			cutoff, f.maxViewCount, intelligence.StorageEligibilityMinConfidence, intelligence.StorageEligibilityValueFloor)
 	}
 	if f.includeAtomizedParents {
 		atomizedParent := db.Where("parent_content_item_id IS NULL").
@@ -620,7 +699,7 @@ func resolvePurgeTargets(db *gorm.DB, tenantID string, req storagePurgeRequest, 
 		excludeColdTier:         true,
 		archiveAction:           policy.ArchiveAction,
 	}).
-		Order("view_count ASC, created_at ASC")
+		Order(storageValueOrderExpr)
 
 	if req.Filters.MaxBytes != nil && *req.Filters.MaxBytes > 0 {
 		// Caller wants to free up at most N bytes — fetch enough rows to cover that.

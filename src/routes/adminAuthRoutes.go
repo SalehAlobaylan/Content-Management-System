@@ -202,6 +202,12 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// ranking, atomization; owns intake). Slice 1: health read model + tenant policy.
 	adminGroup.GET("/media/circulation/health", perm("aggregation", "read"), controllers.GetMediaCirculationHealth)
 	adminGroup.GET("/media/circulation/cockpit", perm("aggregation", "read"), controllers.GetMediaCirculationCockpit)
+	adminGroup.GET("/media/circulation/intelligence", perm("aggregation", "read"), controllers.GetMediaIntelligenceDiagnostics)
+	// Ranking/Intelligence control room — media-value engine tuning + refresh.
+	adminGroup.GET("/media/intelligence/config", perm("aggregation", "read"), controllers.GetMediaIntelligenceConfig)
+	adminGroup.PUT("/media/intelligence/config", perm("aggregation", "manage"), controllers.UpdateMediaIntelligenceConfig)
+	adminGroup.POST("/media/intelligence/refresh", perm("aggregation", "manage"), controllers.TriggerMediaIntelligenceRefresh)
+	adminGroup.GET("/media/intelligence/observatory", perm("aggregation", "read"), controllers.GetMediaIntelligenceObservatory)
 	adminGroup.GET("/media/circulation/policy", perm("aggregation", "read"), controllers.GetMediaCirculationPolicy)
 	adminGroup.PUT("/media/circulation/policy", perm("aggregation", "manage"), controllers.UpdateMediaCirculationPolicy)
 	adminGroup.GET("/media/circulation/overrides", perm("aggregation", "read"), controllers.ListMediaCirculationOverrides)

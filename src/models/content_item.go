@@ -197,6 +197,15 @@ type ContentItem struct {
 	ShareCount   int `gorm:"default:0" json:"share_count"`
 	ViewCount    int `gorm:"default:0" json:"view_count"`
 
+	// Exposure telemetry (Ranking/Intelligence, stage 4). Impressions are
+	// counted serve-side today (every item in a For You response = 1
+	// impression, batched increment at feed assembly) — an interim proxy until
+	// Wahb-Platform fires real viewport-entry impression events. The value
+	// model's exposure-normalized signals and the exploration state both read
+	// this counter.
+	ImpressionCount int64      `gorm:"type:bigint;not null;default:0" json:"impression_count"`
+	LastServedAt    *time.Time `gorm:"type:timestamp" json:"last_served_at,omitempty"`
+
 	// Storage accounting (set by Aggregation on upload, cleared by storage circulation)
 	FileSizeBytes    int64      `gorm:"type:bigint;default:0" json:"file_size_bytes"`
 	ArchivedAt       *time.Time `gorm:"type:timestamp" json:"archived_at,omitempty"`

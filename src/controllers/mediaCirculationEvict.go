@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"encoding/json"
 	"sort"
@@ -156,6 +157,18 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 		Limit(mediaCircRankDownScanLimit).
 		Find(&visibleTail)
 
+	// On-demand refresh trigger (grilling Q9): the generate pass scores the set
+	// it is about to judge, so persisted values are fresh for this decision and
+	// for every other consumer (storage ordering, cockpit proofs). The returned
+	// scores also carry the exploration state consumed below.
+	valued := intelligence.Engine{DB: db}.ScoreBatch(tenantID, visibleTail)
+	tailValues := make(map[uuid.UUID]float64, len(valued))
+	exploring := make(map[uuid.UUID]bool, len(valued))
+	for _, v := range valued {
+		tailValues[v.ContentItemID] = v.Value
+		exploring[v.ContentItemID] = v.ExplorationState != intelligence.ExplorationEstablished
+	}
+
 	type rankDownCand struct {
 		item  models.ContentItem
 		value float64
@@ -165,6 +178,12 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 		if protectedIDs[it.PublicID] {
 			continue
 		}
+		// Exploration immunity (W1): an item still accumulating impressions is
+		// "unseen", not "unpopular" — negative decisions wait until its value
+		// verdict has real exposure behind it.
+		if exploring[it.PublicID] {
+			continue
+		}
 		if row, ok := mediaCircProtectiveItemOverride(overrides, it.PublicID); ok {
 			if !overrideProtectedIDs[it.PublicID] {
 				recs = append(recs, overrideProtectRec(it, row))
@@ -172,7 +191,7 @@ func computeEvictRecommendations(db *gorm.DB, tenantID string, storagePolicy mod
 			}
 			continue
 		}
-		v := circulationMediaValue(it)
+		v := tailValues[it.PublicID]
 		if v < circPolicy.ValueFloor {
 			rd = append(rd, rankDownCand{item: it, value: v})
 		}

@@ -29,6 +29,12 @@ type mediaCirculationCockpitBucket struct {
 	ThinFloor     int64   `json:"thin_floor"`
 	SaturatedCeil int64   `json:"saturated_ceil"`
 	SharePct      float64 `json:"share_pct"`
+
+	// Demand surface (stage 4): measured demand vs value-weighted coverage.
+	DemandScore   float64 `json:"demand_score"`
+	CoverageScore float64 `json:"coverage_score"`
+	Gap           float64 `json:"gap"`
+	Measured      bool    `json:"measured"`
 }
 
 type mediaCirculationCockpitSummary struct {
@@ -182,6 +188,10 @@ func cockpitBuckets(buckets []libraryBucketHealth) []mediaCirculationCockpitBuck
 			ThinFloor:     mediaCirculationBucketThinFloor,
 			SaturatedCeil: mediaCirculationBucketSaturatedCeil,
 			SharePct:      share,
+			DemandScore:   b.DemandScore,
+			CoverageScore: b.CoverageScore,
+			Gap:           b.Gap,
+			Measured:      b.Measured,
 		})
 	}
 	return out

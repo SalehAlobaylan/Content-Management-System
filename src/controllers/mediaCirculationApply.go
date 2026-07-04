@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,7 @@ import (
 //
 // "Apply" dispatches a recommendation to EXISTING execution paths (no new engine).
 // Per the locked "safe actions only" decision, only clean/reversible actions execute
-// live — intake pull, source pause, and rank_down (suppress flag); destructive storage
+// live — intake pull, source pause, and rank_down (decaying demotion); destructive storage
 // byte-actions are recorded and left to the existing storage sweep. Outcomes are written
 // back onto the recommendation row — the D11 track record the stage-5 Autopilot consumes.
 
@@ -94,7 +95,11 @@ func applyRecommendation(db *gorm.DB, tenantID, setBy, authorization string, rec
 		}
 		return mediaCircOutcomePaused, nil
 	case mediaCircOutcomeRankedDown:
-		if err := upsertSuppressFlag(db, tenantID, rec.SubjectID, setBy); err != nil {
+		// Stage 4: rank_down is an engine-owned decaying demotion on the
+		// intelligence score row — not the editorial Suppress flag (that stays
+		// human-owned). The For You feed applies the half-life-decayed
+		// multiplier; revert clears it.
+		if err := (intelligence.Engine{DB: db}).ApplyDemotion(tenantID, rec.SubjectID); err != nil {
 			return mediaCircOutcomeFailed, err
 		}
 		return mediaCircOutcomeRankedDown, nil
@@ -336,21 +341,6 @@ func positiveIntSetting(value interface{}) int {
 	return 0
 }
 
-// upsertSuppressFlag mirrors UpsertContentFlag's upsert to set Suppress on the item.
-func upsertSuppressFlag(db *gorm.DB, tenantID string, contentID uuid.UUID, setBy string) error {
-	var flag models.ContentFlag
-	isNew := db.Where("content_item_id = ? AND tenant_id = ?", contentID, tenantID).First(&flag).Error != nil
-	if isNew {
-		flag = models.ContentFlag{TenantID: tenantID, ContentItemID: contentID, BoostMultiplier: 1.5}
-	}
-	flag.Suppress = true
-	flag.SetBy = setBy
-	if strings.TrimSpace(flag.Notes) == "" {
-		flag.Notes = "Media circulation rank_down"
-	}
-	return db.Save(&flag).Error
-}
-
 func revertRecommendation(db *gorm.DB, tenantID string, rec models.MediaCirculationRecommendation) error {
 	switch rec.Outcome {
 	case mediaCircOutcomeRankedDown:
@@ -364,13 +354,19 @@ func revertRecommendation(db *gorm.DB, tenantID string, rec models.MediaCirculat
 	}
 }
 
+// revertRankDown clears the engine-owned demotion. Legacy rank_downs applied
+// before stage 4 used the editorial Suppress flag — those are cleaned up too
+// when the circulation marker is present, so old applies stay revertible.
 func revertRankDown(db *gorm.DB, tenantID string, contentID uuid.UUID) error {
-	var flag models.ContentFlag
-	if err := db.Where("tenant_id = ? AND content_item_id = ?", tenantID, contentID).First(&flag).Error; err != nil {
+	if err := (intelligence.Engine{DB: db}).ClearDemotion(contentID); err != nil {
 		return err
 	}
+	var flag models.ContentFlag
+	if err := db.Where("tenant_id = ? AND content_item_id = ?", tenantID, contentID).First(&flag).Error; err != nil {
+		return nil // no legacy suppress flag — demotion clear was the whole revert
+	}
 	if !strings.Contains(flag.Notes, "Media circulation rank_down") {
-		return errors.New("suppress flag was not set by media circulation")
+		return nil // suppress owned by a human editor; leave it alone
 	}
 	flag.Suppress = false
 	if flag.Boost || flag.PinToTop || flag.ExcludeFromFeed {

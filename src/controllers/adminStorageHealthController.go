@@ -313,6 +313,21 @@ func protectedStorageItemsQuery(db *gorm.DB, tenantID string, policy models.Stor
 				AND COALESCE(published_at, created_at) > ?
 		) ranked_bucket_hot
 		WHERE rn <= ? AND hot_score > 0`, tenantID, cutoff, perBucketLimit)
+	// Stage 4 (grilling Q3): the intelligence value model joins the protection
+	// set. Top-N by durable VALUE protects what the engine judges most worth
+	// keeping (the views-based top-N above stays as the emergency fallback
+	// proxy), and confidently-high-value items are protected outright.
+	valueHotIDs := db.Raw(`
+		SELECT ci.id FROM content_items ci
+		JOIN media_intelligence_scores mis ON mis.content_item_id = ci.public_id
+		WHERE ci.tenant_id = ?
+			AND ci.type IN ('VIDEO', 'PODCAST')
+			AND ci.status = 'READY'
+			AND ci.is_feed_unit = TRUE
+			AND ci.feed_visibility = 'visible'
+			AND COALESCE(ci.file_size_bytes, 0) > 0
+		ORDER BY mis.value DESC
+		LIMIT ?`, tenantID, policy.ProtectTopNByViews)
 	return db.Model(&models.ContentItem{}).
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
@@ -326,7 +341,8 @@ func protectedStorageItemsQuery(db *gorm.DB, tenantID string, policy models.Stor
 				Or("public_id IN (?)", velocityIDs).
 				Or("id IN (?)", globalHotIDs).
 				Or("id IN (?)", sourceHotIDs).
-				Or("id IN (?)", bucketHotIDs),
+				Or("id IN (?)", bucketHotIDs).
+				Or("id IN (?)", valueHotIDs),
 		).
 		Session(&gorm.Session{})
 }

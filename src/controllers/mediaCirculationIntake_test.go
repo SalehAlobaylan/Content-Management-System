@@ -26,11 +26,16 @@ func TestSourceQualityPrior(t *testing.T) {
 }
 
 func TestBucketDemandMatch(t *testing.T) {
-	state := map[string]string{"5m": "thin", "10m": "saturated", "20m": "ok"}
+	// Fallback regime: supply-count states drive the weights.
+	health := map[string]libraryBucketHealth{
+		"5m":  {Bucket: "5m", State: "thin"},
+		"10m": {Bucket: "10m", State: "saturated"},
+		"20m": {Bucket: "20m", State: "ok"},
+	}
 	thinFiller := map[string]float64{"5m": 1.0} // fills a thin bucket
 	satFiller := map[string]float64{"10m": 1.0} // fills a saturated bucket
-	mThin, matched, fills := bucketDemandMatch(thinFiller, state)
-	mSat, _, _ := bucketDemandMatch(satFiller, state)
+	mThin, matched, fills := bucketDemandMatch(thinFiller, health)
+	mSat, _, _ := bucketDemandMatch(satFiller, health)
 	if mThin <= mSat {
 		t.Errorf("thin-filling match %.2f should exceed saturated-filling match %.2f", mThin, mSat)
 	}
@@ -39,6 +44,33 @@ func TestBucketDemandMatch(t *testing.T) {
 	}
 	if mSat <= 0 || mSat >= mThin {
 		t.Errorf("saturated-only source should have a low nonzero ordering match below thin, got saturated=%.2f thin=%.2f", mSat, mThin)
+	}
+}
+
+func TestBucketDemandMatchMeasuredGap(t *testing.T) {
+	// Measured regime: the demand gap drives the weights; states are already
+	// gap-derived by the inventory read model.
+	health := map[string]libraryBucketHealth{
+		"30m": {Bucket: "30m", State: "thin", Measured: true, Gap: 0.6},       // starving
+		"5m":  {Bucket: "5m", State: "saturated", Measured: true, Gap: -0.5}, // over-supplied
+		"15m": {Bucket: "15m", State: "ok", Measured: true, Gap: 0},          // balanced
+	}
+	starving := map[string]float64{"30m": 1.0}
+	glutted := map[string]float64{"5m": 1.0}
+	neutral := map[string]float64{"15m": 1.0}
+
+	mStarving, matched, fills := bucketDemandMatch(starving, health)
+	mGlutted, _, _ := bucketDemandMatch(glutted, health)
+	mNeutral, _, _ := bucketDemandMatch(neutral, health)
+
+	if !(mStarving > mNeutral && mNeutral > mGlutted) {
+		t.Errorf("gap ordering broken: starving=%.2f neutral=%.2f glutted=%.2f", mStarving, mNeutral, mGlutted)
+	}
+	if !fills || len(matched) != 1 || matched[0] != "30m" {
+		t.Errorf("measured thin bucket must match: fills=%v matched=%v", fills, matched)
+	}
+	if mGlutted <= 0 {
+		t.Errorf("even glutted buckets keep a nonzero ordering weight, got %.2f", mGlutted)
 	}
 }
 

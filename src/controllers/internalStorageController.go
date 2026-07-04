@@ -115,7 +115,7 @@ func InternalListStorageCandidates(c *gin.Context) {
 	q.Model(&models.ContentItem{}).Select("COALESCE(SUM(file_size_bytes),0)").Scan(&totalBytes)
 
 	var items []models.ContentItem
-	if err := q.Order("view_count ASC, created_at ASC").Limit(limit).Find(&items).Error; err != nil {
+	if err := q.Order(storageValueOrderExpr).Limit(limit).Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list candidates"})
 		return
 	}
