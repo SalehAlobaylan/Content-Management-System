@@ -118,20 +118,30 @@ func checkMediaHealth() (*serviceHealthResponse, error) {
 // endpoints (which set caption_state=stt_done + transcript_source).
 //
 // `force` bypasses the toggle + state-machine checks (manual admin upgrade) but
-// still honors the budget cap.
-func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool) error {
-	trigger := models.TranscriptionTriggerIngestAuto
-	if force {
-		trigger = models.TranscriptionTriggerManual
+// still honors the budget cap. `triggerSource` labels the transcription_jobs row;
+// empty preserves the historical ingest_auto/manual derivation from `force`.
+// Returns the created job's public id (empty when the guard skips) so callers can
+// cross-link it (e.g. the Enrichment Autopilot ledger).
+func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, triggerSource string) (string, error) {
+	trigger := triggerSource
+	if trigger == "" {
+		trigger = models.TranscriptionTriggerIngestAuto
+		if force {
+			trigger = models.TranscriptionTriggerManual
+		}
 	}
 	job, triggered, reason, err := createTranscriptionJobForItem(db, item, trigger, force)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !triggered {
-		return &sttSkippedError{reason: reason}
+		return "", &sttSkippedError{reason: reason}
 	}
-	return submitTranscriptionJobToMedia(db, item, job.PublicID.String())
+	jobID := job.PublicID.String()
+	if err := submitTranscriptionJobToMedia(db, item, jobID); err != nil {
+		return jobID, err
+	}
+	return jobID, nil
 }
 
 func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID string) (string, error) {

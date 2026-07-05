@@ -22,6 +22,9 @@ const (
 	TranscriptionTriggerAutoQuality = "auto_quality"
 	TranscriptionTriggerManual      = "manual"
 	TranscriptionTriggerBulkManual  = "bulk_manual"
+	// EnrichmentAutopilot-originated STT triggers: un-forced, through the guard,
+	// but attributed so Media Studio / the jobs view show autopilot's work.
+	TranscriptionTriggerEnrichmentAutopilot = "enrichment_autopilot"
 )
 
 type TranscriptionJob struct {

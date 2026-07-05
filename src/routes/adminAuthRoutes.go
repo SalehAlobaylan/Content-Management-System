@@ -180,6 +180,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/enrichment/bulk-status", perm("content", "read"), controllers.GetBulkEnrichStatus)
 	adminGroup.GET("/enrichment/health", perm("content", "read"), controllers.GetEnrichmentServiceHealth)
 
+	// Enrichment Coverage Autopilot — scheduled gap-filling supervisor
+	adminGroup.GET("/enrichment/autopilot", perm("content", "read"), controllers.GetEnrichmentAutopilot)
+	adminGroup.PUT("/enrichment/autopilot/policy", perm("content", "write"), controllers.UpdateEnrichmentAutopilotPolicy)
+	adminGroup.POST("/enrichment/autopilot/run", perm("content", "write"), controllers.RunEnrichmentAutopilotNow)
+	adminGroup.POST("/enrichment/autopilot/pause", perm("content", "write"), controllers.PauseEnrichmentAutopilot)
+	adminGroup.POST("/enrichment/autopilot/elevate", perm("content", "write"), controllers.ElevateEnrichmentAutopilot)
+	adminGroup.GET("/enrichment/autopilot/runs", perm("content", "read"), controllers.ListEnrichmentAutopilotRuns)
+	adminGroup.GET("/enrichment/autopilot/runs/:id", perm("content", "read"), controllers.GetEnrichmentAutopilotRun)
+
 	// Storage management
 	adminGroup.GET("/storage/stats", perm("aggregation", "read"), controllers.GetStorageStats)
 	adminGroup.GET("/storage/health", perm("aggregation", "read"), controllers.GetStorageHealth)

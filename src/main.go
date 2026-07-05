@@ -167,6 +167,10 @@ func main() {
 			&models.MediaCirculationOverride{},
 			&models.MediaCirculationRun{},
 			&models.MediaCirculationAction{},
+			// Enrichment Coverage Autopilot — scheduled gap-filling supervisor
+			&models.EnrichmentAutopilotPolicy{},
+			&models.EnrichmentAutopilotRun{},
+			&models.EnrichmentAutopilotAction{},
 			// Ranking/Intelligence System (stage 4) — persisted value surface +
 			// serve-side demand telemetry + per-tenant tuning overrides
 			&models.MediaIntelligenceScore{},
@@ -241,6 +245,7 @@ func main() {
 	// runs for tenants whose autopilot interval has elapsed; Observe tenants
 	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
 	controllers.StartMediaCirculationAutopilotHeartbeat(db)
+	controllers.StartEnrichmentAutopilotHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

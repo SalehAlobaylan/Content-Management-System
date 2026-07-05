@@ -185,7 +185,7 @@ func RequestTranscription(c *gin.Context) {
 	itemCopy := item
 	publicID := item.PublicID.String()
 	go func() {
-		if err := triggerTranscription(&itemCopy, db, false); err != nil {
+		if _, err := triggerTranscription(&itemCopy, db, false, ""); err != nil {
 			log.Printf("[CMS] transcription trigger failed for %s: %v", publicID, err)
 		}
 	}()

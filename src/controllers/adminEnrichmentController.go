@@ -91,6 +91,26 @@ type triggerResultItem struct {
 func GetEnrichmentStats(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
+	stats, err := computeEnrichmentStats(db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{
+			Code:    http.StatusInternalServerError,
+			Message: "Failed to fetch enrichment stats: " + err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, utils.ResponseMessage{
+		Code:    http.StatusOK,
+		Message: "Enrichment stats fetched successfully",
+		Data:    stats,
+	})
+}
+
+// computeEnrichmentStats runs the coverage FILTER query and returns the struct.
+// Extracted so the Enrichment Autopilot can capture before/after snapshots from
+// the exact same read-model the admin sees on the page.
+func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 	var stats enrichmentStatsResponse
 
 	// Single efficient query using PostgreSQL FILTER
@@ -122,18 +142,9 @@ func GetEnrichmentStats(c *gin.Context) {
 		&stats.MissingImageEmbedding,
 		&stats.TotalReady,
 	); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Code:    http.StatusInternalServerError,
-			Message: "Failed to fetch enrichment stats: " + err.Error(),
-		})
-		return
+		return stats, err
 	}
-
-	c.JSON(http.StatusOK, utils.ResponseMessage{
-		Code:    http.StatusOK,
-		Message: "Enrichment stats fetched successfully",
-		Data:    stats,
-	})
+	return stats, nil
 }
 
 // ── GET /admin/enrichment/missing-counts ───────────────────
@@ -486,89 +497,117 @@ func buildMissingQuery(db *gorm.DB, missingParam, contentType, status string) *g
 	return query
 }
 
-// triggerItemArtifacts runs the requested enrichment passes for one item.
-// Already-present artifacts are reported as skips (in results), not errors.
-// Used by the single, batch, and bulk trigger paths so behaviour is identical.
-// `force` only affects the transcript (STT) pass: it bypasses the guard's
-// toggle + state-machine checks for a manual upgrade (budget cap still applies).
-func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string, force bool) (results, errs []string) {
+// Traced-outcome status vocabulary for a single (item × artifact) attempt.
+const (
+	artifactOutcomeTriggered = "triggered"
+	artifactOutcomeAlready   = "already"
+	artifactOutcomeSkipped   = "skipped"
+	artifactOutcomeError     = "error"
+)
+
+// artifactOutcome is the structured result of one (item × artifact) attempt.
+// The Enrichment Autopilot consumes this so it can ledger per-artifact and
+// cross-link the created transcription job; the human trigger paths use the
+// string wrapper below and are byte-for-byte unchanged.
+type artifactOutcome struct {
+	Artifact string
+	Status   string // artifactOutcome* constant
+	Reason   string
+	JobID    string // transcript only, when a job was created
+}
+
+// triggerItemArtifactsTraced runs the requested enrichment passes for one item
+// and returns a structured outcome per artifact. `triggerSource` labels any
+// transcription_jobs row it creates (empty = the historical ingest_auto/manual
+// derivation). `force` only affects the transcript (STT) pass: it bypasses the
+// guard's toggle + state-machine checks for a manual upgrade (budget cap still
+// applies). This is the single place the per-artifact logic lives.
+func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []string, force bool, triggerSource string) []artifactOutcome {
 	id := item.PublicID.String()
+	out := make([]artifactOutcome, 0, len(types))
 	for _, enrichType := range types {
 		switch enrichType {
 		case "transcript":
+			o := artifactOutcome{Artifact: "transcript"}
 			// When not forcing, an already-linked transcript is a skip. A forced
 			// manual upgrade is allowed to re-run (e.g. youtube_auto → STT); the
 			// guard's stt_done check still prevents wasteful re-billing.
 			if item.TranscriptID != nil && !force {
-				results = append(results, "transcript: already exists")
-				continue
-			}
-			if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
-				results = append(results, "transcript: skipped (not VIDEO/PODCAST)")
-				continue
-			}
-			if item.MediaURL == nil || *item.MediaURL == "" {
-				errs = append(errs, "transcript: no media_url available")
-				continue
-			}
-			if err := triggerTranscription(item, db, force); err != nil {
+				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
+			} else if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+				o.Status, o.Reason = artifactOutcomeSkipped, "not VIDEO/PODCAST"
+			} else if item.MediaURL == nil || *item.MediaURL == "" {
+				o.Status, o.Reason = artifactOutcomeError, "no media_url available"
+			} else if jobID, err := triggerTranscription(item, db, force, triggerSource); err != nil {
 				if isSTTSkipped(err) {
-					results = append(results, "transcript: skipped ("+err.Error()+")")
+					o.Status, o.Reason = artifactOutcomeSkipped, err.Error()
 				} else {
-					errs = append(errs, "transcript: "+err.Error())
+					o.Status, o.Reason = artifactOutcomeError, err.Error()
 				}
 			} else {
-				results = append(results, "transcript: triggered")
+				o.Status, o.JobID = artifactOutcomeTriggered, jobID
 			}
+			out = append(out, o)
 
 		case "embedding":
+			o := artifactOutcome{Artifact: "embedding"}
 			if item.Embedding != nil {
-				results = append(results, "embedding: already exists")
-				continue
-			}
-			text := buildEmbeddingText(item)
-			if text == "" {
-				errs = append(errs, "embedding: no text content available")
-				continue
-			}
-			// extract_sparse=true → populates dense + sparse together.
-			if err := triggerEmbedding(text, id, true); err != nil {
-				errs = append(errs, "embedding: "+err.Error())
+				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
+			} else if text := buildEmbeddingText(item); text == "" {
+				o.Status, o.Reason = artifactOutcomeError, "no text content available"
+			} else if err := triggerEmbedding(text, id, true); err != nil {
+				// extract_sparse=true → populates dense + sparse together.
+				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
-				results = append(results, "embedding: triggered")
+				o.Status = artifactOutcomeTriggered
 			}
+			out = append(out, o)
 
 		case "sparse":
+			o := artifactOutcome{Artifact: "sparse"}
 			if item.EmbeddingSparse != nil {
-				results = append(results, "sparse: already exists")
-				continue
-			}
-			text := buildEmbeddingText(item)
-			if text == "" {
-				errs = append(errs, "sparse: no text content available")
-				continue
-			}
-			// Re-embed with sparse on — re-writes dense too (harmless, same value).
-			if err := triggerEmbedding(text, id, true); err != nil {
-				errs = append(errs, "sparse: "+err.Error())
+				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
+			} else if text := buildEmbeddingText(item); text == "" {
+				o.Status, o.Reason = artifactOutcomeError, "no text content available"
+			} else if err := triggerEmbedding(text, id, true); err != nil {
+				// Re-embed with sparse on — re-writes dense too (harmless, same value).
+				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
-				results = append(results, "sparse: triggered")
+				o.Status = artifactOutcomeTriggered
 			}
+			out = append(out, o)
 
 		case "image":
+			o := artifactOutcome{Artifact: "image"}
 			if item.ImageEmbedding != nil {
-				results = append(results, "image: already exists")
-				continue
-			}
-			if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
-				errs = append(errs, "image: no thumbnail_url available")
-				continue
-			}
-			if err := triggerImageEmbedding(*item.ThumbnailURL, id); err != nil {
-				errs = append(errs, "image: "+err.Error())
+				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
+			} else if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
+				o.Status, o.Reason = artifactOutcomeError, "no thumbnail_url available"
+			} else if err := triggerImageEmbedding(*item.ThumbnailURL, id); err != nil {
+				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
-				results = append(results, "image: triggered")
+				o.Status = artifactOutcomeTriggered
 			}
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
+// triggerItemArtifacts is the string-shaped wrapper kept for the single, batch,
+// and bulk human trigger paths so their behaviour is identical. Already-present
+// artifacts are reported as skips (in results), not errors.
+func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string, force bool) (results, errs []string) {
+	for _, o := range triggerItemArtifactsTraced(db, item, types, force, "") {
+		switch o.Status {
+		case artifactOutcomeError:
+			errs = append(errs, o.Artifact+": "+o.Reason)
+		case artifactOutcomeTriggered:
+			results = append(results, o.Artifact+": triggered")
+		case artifactOutcomeAlready:
+			results = append(results, o.Artifact+": already exists")
+		default: // skipped
+			results = append(results, o.Artifact+": skipped ("+o.Reason+")")
 		}
 	}
 	return results, errs
@@ -709,4 +748,13 @@ func GetBulkEnrichStatus(c *gin.Context) {
 		Message: "Bulk enrichment status",
 		Data:    snapshot,
 	})
+}
+
+// bulkEnrichRunning reports whether a manual "Enrich all" run is in flight. The
+// Enrichment Autopilot checks this as a precondition so it never double-loads the
+// CPU-constrained model services against a human bulk run (plan §9 concurrency).
+func bulkEnrichRunning() bool {
+	bulkMu.Lock()
+	defer bulkMu.Unlock()
+	return bulkState.Running
 }
