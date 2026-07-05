@@ -165,6 +165,8 @@ func main() {
 			&models.MediaCirculationPolicy{},
 			&models.MediaCirculationRecommendation{},
 			&models.MediaCirculationOverride{},
+			&models.MediaCirculationRun{},
+			&models.MediaCirculationAction{},
 			// Ranking/Intelligence System (stage 4) — persisted value surface +
 			// serve-side demand telemetry + per-tenant tuning overrides
 			&models.MediaIntelligenceScore{},
@@ -235,6 +237,10 @@ func main() {
 	// value scores in bounded batches (stage 4; scheduled + event-nudged
 	// triggers in one pass, on-demand scoring happens inside circulation).
 	intelligence.StartRefreshLoop(db)
+	// Media Circulation Autopilot heartbeat (stage 5) — fires deterministic
+	// runs for tenants whose autopilot interval has elapsed; Observe tenants
+	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
+	controllers.StartMediaCirculationAutopilotHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

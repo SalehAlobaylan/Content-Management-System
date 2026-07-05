@@ -123,6 +123,12 @@ func UpdateMediaCirculationPolicy(c *gin.Context) {
 			"max_intake_per_source_per_cycle", "max_intake_per_cycle",
 			"source_min_interval_minutes", "source_max_interval_minutes",
 			"freshness_demand_weight", "last_evaluated_at", "updated_at",
+			"autopilot_enabled", "autopilot_mode", "autopilot_interval_minutes",
+			"autopilot_max_actions_per_run", "autopilot_max_atomize_per_run",
+			"autopilot_max_queue_depth", "autopilot_max_bytes_per_run",
+			"autopilot_evict_confidence_floor", "autopilot_trust_min_decisions",
+			"autopilot_trust_max_revert_pct", "autopilot_paused_until",
+			"autopilot_elevated_mode", "autopilot_elevated_until",
 		}),
 	}).Create(&req).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to save policy", Code: "SAVE_FAILED"})
@@ -147,29 +153,11 @@ func GenerateMediaCirculationRecommendations(c *gin.Context) {
 		c.JSON(http.StatusConflict, authErrorResponse{Message: "Media circulation is disabled for this tenant", Code: "MEDIA_CIRCULATION_DISABLED"})
 		return
 	}
-	storagePolicy := loadEffectiveStoragePolicy(db, principal.TenantID)
-	// Cold availability + cost headroom come from live storage stats — reuse the path.
-	storage := buildStorageHealthResponse(db, principal.TenantID, c.GetHeader("Authorization"))
-	overrides := loadActiveMediaCircOverrides(db, principal.TenantID)
-	enrichAppliedIntakeYields(db, principal.TenantID)
-
-	evict := computeEvictRecommendations(db, principal.TenantID, storagePolicy, circPolicy, storage.Proof.ColdEnabled)
-	evict = append(evict, computeAtomizationRecommendations(db, principal.TenantID, overrides)...)
-	intake := computeIntakeRecommendations(db, principal.TenantID, circPolicy, storagePolicy, storage)
-
-	if err := persistRecommendationsForUnit(db, principal.TenantID, models.MediaCirculationUnitItemFamily, evict); err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to persist evict recommendations", Code: "SAVE_FAILED"})
+	evict, intake, genErr := generateMediaCircRecommendationSets(db, principal.TenantID, circPolicy, c.GetHeader("Authorization"))
+	if genErr != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: genErr.Error(), Code: "SAVE_FAILED"})
 		return
 	}
-	if err := persistRecommendationsForUnit(db, principal.TenantID, models.MediaCirculationUnitSource, intake); err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to persist intake recommendations", Code: "SAVE_FAILED"})
-		return
-	}
-	now := time.Now().UTC()
-	_ = db.Model(&models.MediaCirculationPolicy{}).
-		Where("tenant_id = ?", principal.TenantID).
-		Updates(map[string]interface{}{"last_generated_at": now, "last_evaluated_at": now}).Error
-	invalidateMediaCircHealth(principal.TenantID)
 
 	evictCounts := evictVerdictCounts(evict)
 	intakeCounts := evictVerdictCounts(intake)
@@ -333,6 +321,35 @@ func DismissMediaCirculationRecommendation(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": rec})
 }
 
+// generateMediaCircRecommendationSets runs one full generation pass (evict +
+// atomization + intake) and persists the results. Shared by the admin Generate
+// endpoint and the stage-5 Autopilot runner — one generation path, two callers.
+func generateMediaCircRecommendationSets(db *gorm.DB, tenantID string, circPolicy models.MediaCirculationPolicy, authorization string) (evict, intake []circulationRecInput, err error) {
+	storagePolicy := loadEffectiveStoragePolicy(db, tenantID)
+	// Cold availability + cost headroom come from live storage stats — reuse the
+	// path (cached: an Autopilot run composes storage health several times).
+	storage := buildStorageHealthResponseCached(db, tenantID, authorization)
+	overrides := loadActiveMediaCircOverrides(db, tenantID)
+	enrichAppliedIntakeYields(db, tenantID)
+
+	evict = computeEvictRecommendations(db, tenantID, storagePolicy, circPolicy, storage.Proof.ColdEnabled)
+	evict = append(evict, computeAtomizationRecommendations(db, tenantID, overrides)...)
+	intake = computeIntakeRecommendations(db, tenantID, circPolicy, storagePolicy, storage)
+
+	if err := persistRecommendationsForUnit(db, tenantID, models.MediaCirculationUnitItemFamily, evict); err != nil {
+		return nil, nil, errors.New("failed to persist evict recommendations")
+	}
+	if err := persistRecommendationsForUnit(db, tenantID, models.MediaCirculationUnitSource, intake); err != nil {
+		return nil, nil, errors.New("failed to persist intake recommendations")
+	}
+	now := time.Now().UTC()
+	_ = db.Model(&models.MediaCirculationPolicy{}).
+		Where("tenant_id = ?", tenantID).
+		Updates(map[string]interface{}{"last_generated_at": now, "last_evaluated_at": now}).Error
+	invalidateMediaCircHealth(tenantID)
+	return evict, intake, nil
+}
+
 // ----------------------------------------------------------------
 // Policy load / sanitize (mirrors loadCirculationPolicy in news circulation)
 // ----------------------------------------------------------------
@@ -372,7 +389,70 @@ func sanitizeMediaCirculationPolicy(p models.MediaCirculationPolicy) models.Medi
 	if p.SourceMaxIntervalMinutes < p.SourceMinIntervalMinutes {
 		p.SourceMaxIntervalMinutes = p.SourceMinIntervalMinutes
 	}
+	return sanitizeMediaAutopilotFields(p)
+}
+
+// sanitizeMediaAutopilotFields clamps the stage-5 Autopilot knobs (plan §11).
+// Every value is safe regardless of what the DB or a client sends.
+func sanitizeMediaAutopilotFields(p models.MediaCirculationPolicy) models.MediaCirculationPolicy {
+	switch p.AutopilotMode {
+	case models.MediaAutopilotModeObserve, models.MediaAutopilotModeSafeAuto:
+		// valid
+	default:
+		p.AutopilotMode = models.MediaAutopilotModeObserve
+	}
+	switch p.AutopilotElevatedMode {
+	case "", models.MediaAutopilotElevatedStorageRelief,
+		models.MediaAutopilotElevatedQualityRepair,
+		models.MediaAutopilotElevatedAtomizationCatchup:
+		// valid
+	default:
+		p.AutopilotElevatedMode = ""
+	}
+	p.AutopilotIntervalMinutes = clampIntRange(p.AutopilotIntervalMinutes, 15, 1440, 360)
+	p.AutopilotMaxActionsPerRun = clampIntRange(p.AutopilotMaxActionsPerRun, 1, 50, 8)
+	p.AutopilotMaxAtomizePerRun = clampIntRange(p.AutopilotMaxAtomizePerRun, 0, 10, 3)
+	p.AutopilotMaxQueueDepth = clampIntRange(p.AutopilotMaxQueueDepth, 1, 10000, 100)
+	p.AutopilotTrustMinDecisions = clampIntRange(p.AutopilotTrustMinDecisions, 1, 1000, 20)
+	p.AutopilotTrustMaxRevertPct = clampIntRange(p.AutopilotTrustMaxRevertPct, 0, 100, 10)
+	const (
+		minBytesPerRun = int64(64) << 20 // 64 MiB
+		maxBytesPerRun = int64(20) << 30 // 20 GiB
+	)
+	if p.AutopilotMaxBytesPerRun <= 0 {
+		p.AutopilotMaxBytesPerRun = 1 << 30
+	} else if p.AutopilotMaxBytesPerRun < minBytesPerRun {
+		p.AutopilotMaxBytesPerRun = minBytesPerRun
+	} else if p.AutopilotMaxBytesPerRun > maxBytesPerRun {
+		p.AutopilotMaxBytesPerRun = maxBytesPerRun
+	}
+	if p.AutopilotEvictConfidenceFloor <= 0 {
+		p.AutopilotEvictConfidenceFloor = 0.5
+	}
+	p.AutopilotEvictConfidenceFloor = clampFloat(p.AutopilotEvictConfidenceFloor, 0.05, 0.95)
+	// An elevated mode without an expiry (or with a past one) is not elevated.
+	if p.AutopilotElevatedMode != "" &&
+		(p.AutopilotElevatedUntil == nil || !p.AutopilotElevatedUntil.After(time.Now())) {
+		p.AutopilotElevatedMode = ""
+		p.AutopilotElevatedUntil = nil
+	}
 	return p
+}
+
+// clampIntRange clamps v to [min,max]; a zero value means "unset" and takes
+// the default (zero is never a legal value for these knobs except where the
+// range says so — callers with a legal 0 pass min=0).
+func clampIntRange(v, min, max, def int) int {
+	if v == 0 && min > 0 {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 // ----------------------------------------------------------------
@@ -380,8 +460,9 @@ func sanitizeMediaCirculationPolicy(p models.MediaCirculationPolicy) models.Medi
 // ----------------------------------------------------------------
 
 func buildMediaCirculationHealth(db *gorm.DB, tenantID, authorization string) mediaCirculationHealthResponse {
-	// Storage/cost side — reuse wholesale, do not re-derive (D10).
-	storage := buildStorageHealthResponse(db, tenantID, authorization)
+	// Storage/cost side — reuse wholesale, do not re-derive (D10). Cached so the
+	// autopilot before/after snapshots don't each re-hit Aggregation stats.
+	storage := buildStorageHealthResponseCached(db, tenantID, authorization)
 	opBudget := getStorageOpBudgetStatus(db, tenantID)
 	backlog := computeMediaCircAtomizationBacklog(db, tenantID)
 	// Intake-demand side — circulation-owned.

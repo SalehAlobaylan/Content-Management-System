@@ -218,6 +218,12 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/media/circulation/recommendations/:id/apply", perm("aggregation", "manage"), controllers.ApplyMediaCirculationRecommendation)
 	adminGroup.POST("/media/circulation/recommendations/:id/dismiss", perm("aggregation", "manage"), controllers.DismissMediaCirculationRecommendation)
 	adminGroup.POST("/media/circulation/recommendations/:id/revert", perm("aggregation", "manage"), controllers.RevertMediaCirculationRecommendation)
+	// Media Circulation Autopilot — stage 5: manual trigger + runs/actions ledger.
+	adminGroup.POST("/media/circulation/autopilot/run", perm("aggregation", "manage"), controllers.RunMediaCirculationAutopilotNow)
+	adminGroup.GET("/media/circulation/autopilot/runs", perm("aggregation", "read"), controllers.ListMediaCirculationAutopilotRuns)
+	adminGroup.GET("/media/circulation/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetMediaCirculationAutopilotRun)
+	adminGroup.POST("/media/circulation/autopilot/pause", perm("aggregation", "manage"), controllers.PauseMediaCirculationAutopilot)
+	adminGroup.POST("/media/circulation/autopilot/elevate", perm("aggregation", "manage"), controllers.ElevateMediaCirculationAutopilot)
 
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).

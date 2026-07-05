@@ -21,6 +21,11 @@ type internalListPoliciesResponse struct {
 	Global    *models.StoragePolicy  `json:"global"`
 	Overrides []models.StoragePolicy `json:"overrides"`
 	All       []models.StoragePolicy `json:"all"`
+	// AutopilotTenants lists tenants where the Media Circulation Autopilot is
+	// enabled (stage 5, G4 single-actor rule): the storage worker defers its
+	// self-scheduled repeatable sweep tick for these tenants — Autopilot runs
+	// trigger bounded sweeps instead. Manual sweeps are unaffected.
+	AutopilotTenants []string `json:"autopilot_tenants"`
 }
 
 // InternalListStoragePolicies handles GET /internal/storage/policies
@@ -32,7 +37,7 @@ func InternalListStoragePolicies(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list policies"})
 		return
 	}
-	resp := internalListPoliciesResponse{All: all}
+	resp := internalListPoliciesResponse{All: all, AutopilotTenants: []string{}}
 	for i := range all {
 		if all[i].TenantID == nil {
 			p := all[i]
@@ -40,6 +45,21 @@ func InternalListStoragePolicies(c *gin.Context) {
 			continue
 		}
 		resp.Overrides = append(resp.Overrides, all[i])
+	}
+	// The Autopilot-managed tenant list gates the sweep worker's single-actor
+	// rule (G4). If this query fails we must NOT return an empty list — that
+	// would read as "no tenant is autopilot-managed" and let the legacy sweep
+	// run alongside Autopilot. Fail the request so the worker fails closed
+	// (skips its tick) rather than double-acting on stale/incomplete data.
+	var autopilotTenants []string
+	if err := db.Model(&models.MediaCirculationPolicy{}).
+		Where("enabled = ? AND autopilot_enabled = ?", true, true).
+		Pluck("tenant_id", &autopilotTenants).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve autopilot-managed tenants"})
+		return
+	}
+	if autopilotTenants != nil {
+		resp.AutopilotTenants = autopilotTenants
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -95,6 +115,11 @@ func InternalListStorageCandidates(c *gin.Context) {
 	protectWindow := atoiDefault(c.Query("protect_top_n_window_days"), 30)
 	includeAtomizedParents := strings.EqualFold(strings.TrimSpace(c.DefaultQuery("include_atomized_parents", "false")), "true")
 	archiveAction := strings.ToLower(strings.TrimSpace(c.DefaultQuery("archive_action", "re_encode")))
+	filterIDs := parseStorageCandidateIDs(c.Query("ids"))
+	if strings.TrimSpace(c.Query("ids")) != "" && len(filterIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must contain at least one valid UUID"})
+		return
+	}
 
 	q := buildCandidateQuery(db, candidateFilter{
 		tenantID:                tenantID,
@@ -107,6 +132,12 @@ func InternalListStorageCandidates(c *gin.Context) {
 		includeAtomizedParents:  includeAtomizedParents,
 		archiveAction:           archiveAction,
 	})
+	if len(filterIDs) > 0 {
+		q = q.Where("public_id IN ?", filterIDs)
+		if limit > len(filterIDs) {
+			limit = len(filterIDs)
+		}
+	}
 
 	var total int64
 	q.Model(&models.ContentItem{}).Count(&total)
@@ -172,6 +203,21 @@ func InternalListStorageCandidates(c *gin.Context) {
 		Total:      total,
 		TotalBytes: totalBytes,
 	})
+}
+
+func parseStorageCandidateIDs(raw string) []uuid.UUID {
+	parts := strings.Split(raw, ",")
+	out := make([]uuid.UUID, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if id, err := uuid.Parse(part); err == nil {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 type internalArchiveItemsRequest struct {

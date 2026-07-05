@@ -125,6 +125,22 @@ func buildStorageHealthResponse(db *gorm.DB, tenantID string, authorization stri
 	}
 }
 
+// buildStorageHealthResponseCached is a read-through cache over
+// buildStorageHealthResponse for internal composition paths (media-circulation
+// health, cockpit, autopilot) that build storage health several times within
+// one operation. It shares the same 10s cache the GetStorageHealth endpoint
+// uses (and caches with the same semantics that handler already does), so an
+// Autopilot run's before-snapshot, generation pass, and after-snapshot
+// collapse to a single Aggregation stats call.
+func buildStorageHealthResponseCached(db *gorm.DB, tenantID, authorization string) storageHealthResponse {
+	if cached, ok := getCachedStorageHealth(tenantID); ok {
+		return cached
+	}
+	response := buildStorageHealthResponse(db, tenantID, authorization)
+	storeStorageHealth(tenantID, response)
+	return response
+}
+
 func getCachedStorageHealth(cacheKey string) (storageHealthResponse, bool) {
 	now := time.Now()
 	storageHealthCacheMu.Lock()

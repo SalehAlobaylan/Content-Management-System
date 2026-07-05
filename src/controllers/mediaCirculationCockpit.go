@@ -70,6 +70,7 @@ type mediaCirculationCockpitResponse struct {
 	Summary              mediaCirculationCockpitSummary          `json:"summary"`
 	Policy               models.MediaCirculationPolicy           `json:"policy"`
 	Recommendations      []mediaCirculationCockpitRecommendation `json:"recommendations"`
+	Autopilot            mediaAutopilotStatusBlock               `json:"autopilot"`
 }
 
 func GetMediaCirculationCockpit(c *gin.Context) {
@@ -96,6 +97,7 @@ func GetMediaCirculationCockpit(c *gin.Context) {
 		Buckets:              cockpitBuckets(health.Proof.Buckets),
 		Policy:               health.Policy,
 		Recommendations:      rows,
+		Autopilot:            buildMediaAutopilotStatus(db, principal.TenantID, health.Policy),
 	}
 	resp.Summary = summarizeCockpitRecommendations(rows)
 	c.JSON(http.StatusOK, resp)

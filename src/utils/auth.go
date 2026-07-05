@@ -290,6 +290,60 @@ func GetJWTAllowedAudiences() []string {
 	return out
 }
 
+// serviceTokenIssuer / serviceTokenAudience are the identity a CMS-minted
+// service token carries. They match the defaults Aggregation's admin-auth
+// plugin trusts (iss=cms-service, aud=platform-console, role=admin), so a
+// token minted here is accepted by Aggregation's /admin/* routes without any
+// new shared config. Overridable via env for non-default deployments.
+func serviceTokenIssuer() string {
+	if v := strings.TrimSpace(os.Getenv("SERVICE_TOKEN_ISSUER")); v != "" {
+		return v
+	}
+	return "cms-service"
+}
+
+func serviceTokenAudience() string {
+	if v := strings.TrimSpace(os.Getenv("SERVICE_TOKEN_AUDIENCE")); v != "" {
+		return v
+	}
+	return "platform-console"
+}
+
+// MintServiceAdminToken issues a short-lived HS256 admin JWT for CMS→Aggregation
+// service-to-service calls made outside a user request (e.g. the Autopilot
+// scheduler, where there is no inbound Authorization header to forward). CMS
+// holds the shared JWT secret, so it can sign a token Aggregation's admin-auth
+// plugin accepts. Returns the bare token string (no "Bearer " prefix).
+func MintServiceAdminToken(tenantID string, ttl time.Duration) (string, error) {
+	secret, err := GetJWTSecret()
+	if err != nil {
+		return "", err
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if strings.TrimSpace(tenantID) == "" {
+		tenantID = GetDefaultTenantID()
+	}
+	now := time.Now()
+	claims := JWTClaims{
+		UserID:   "autopilot",
+		Email:    "autopilot@" + serviceTokenIssuer(),
+		TenantID: tenantID,
+		Role:     "admin",
+		Roles:    []string{"admin"},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "autopilot",
+			Issuer:    serviceTokenIssuer(),
+			Audience:  jwt.ClaimStrings{serviceTokenAudience()},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secret)
+}
+
 // hasAllowedAudience reports whether the claims carry an audience in the
 // allowlist. Returns true when no allowlist is configured (validation disabled).
 func hasAllowedAudience(claims *JWTClaims) bool {

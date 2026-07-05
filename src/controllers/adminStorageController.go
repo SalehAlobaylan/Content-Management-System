@@ -1411,7 +1411,25 @@ func callAggregationDeleteObjects(authHeader string, payload aggDeleteRequest) (
 }
 
 func callAggregationRunSweep(authHeader string) error {
-	body, status, err := proxyAggregationPost(authHeader, "/admin/storage/sweep", map[string]any{"trigger": "manual"})
+	return callAggregationRunSweepWithPayload(authHeader, map[string]any{"trigger": "manual"})
+}
+
+func callAggregationRunSweepScoped(authHeader, tenantID, archiveAction string, candidateIDs []string, maxBytes int64) error {
+	payload := map[string]any{
+		"trigger":        "manual",
+		"tenant_id":      tenantID,
+		"archive_action": archiveAction,
+		"candidate_ids":  candidateIDs,
+		"limit":          len(candidateIDs),
+	}
+	if maxBytes > 0 {
+		payload["max_bytes"] = maxBytes
+	}
+	return callAggregationRunSweepWithPayload(authHeader, payload)
+}
+
+func callAggregationRunSweepWithPayload(authHeader string, payload map[string]any) error {
+	body, status, err := proxyAggregationPost(authHeader, "/admin/storage/sweep", payload)
 	if err != nil {
 		return err
 	}
