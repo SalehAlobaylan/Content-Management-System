@@ -586,25 +586,29 @@ func InternalGetAtomizationInput(c *gin.Context) {
 }
 
 type atomizationChapterRequest struct {
-	Title                string                   `json:"title"`
-	Summary              *string                  `json:"summary"`
-	StartMs              int                      `json:"start_ms"`
-	EndMs                int                      `json:"end_ms"`
-	Confidence           *float64                 `json:"confidence"`
-	ContextLabel         *string                  `json:"context_label"`
-	BoundaryReason       *string                  `json:"boundary_reason"`
-	StandaloneScore      *float64                 `json:"standalone_score"`
-	ContainsSponsorIntro bool                     `json:"contains_sponsor_intro"`
-	NeedsReviewReason    *string                  `json:"needs_review_reason"`
-	MediaURL             *string                  `json:"media_url"`
-	ThumbnailURL         *string                  `json:"thumbnail_url"`
-	PlaybackURL          *string                  `json:"playback_url"`
-	PlaybackType         *string                  `json:"playback_type"`
-	FallbackPlaybackURL  *string                  `json:"fallback_playback_url"`
-	HasVideo             *bool                    `json:"has_video"`
-	MediaRenditions      []map[string]interface{} `json:"media_renditions"`
-	TranscriptSegments   []segmentData            `json:"transcript_segments"`
-	TranscriptText       string                   `json:"transcript_text"`
+	Title                string   `json:"title"`
+	Summary              *string  `json:"summary"`
+	StartMs              int      `json:"start_ms"`
+	EndMs                int      `json:"end_ms"`
+	Confidence           *float64 `json:"confidence"`
+	ContextLabel         *string  `json:"context_label"`
+	BoundaryReason       *string  `json:"boundary_reason"`
+	StandaloneScore      *float64 `json:"standalone_score"`
+	ContainsSponsorIntro bool     `json:"contains_sponsor_intro"`
+	NeedsReviewReason    *string  `json:"needs_review_reason"`
+	// Stage 6 (S4/S5): Aggregation emits the review-reason code(s) it used. When
+	// absent (older Aggregation, manual paths) CMS derives them from the fields.
+	NeedsReviewCode     *string                  `json:"needs_review_code"`
+	NeedsReviewCodes    []string                 `json:"needs_review_codes"`
+	MediaURL            *string                  `json:"media_url"`
+	ThumbnailURL        *string                  `json:"thumbnail_url"`
+	PlaybackURL         *string                  `json:"playback_url"`
+	PlaybackType        *string                  `json:"playback_type"`
+	FallbackPlaybackURL *string                  `json:"fallback_playback_url"`
+	HasVideo            *bool                    `json:"has_video"`
+	MediaRenditions     []map[string]interface{} `json:"media_renditions"`
+	TranscriptSegments  []segmentData            `json:"transcript_segments"`
+	TranscriptText      string                   `json:"transcript_text"`
 }
 
 type saveAtomizationPlanRequest struct {
@@ -643,6 +647,71 @@ func InternalSaveAtomizationPlan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"chapters": chaptersToDTO(rows, durationMs(item))})
 }
 
+// deriveStudioReviewCodes normalizes a chapter's review flags into the stage-6
+// code taxonomy (S4/S5). It matches the exact free-text constants Aggregation
+// emits (substring, so joined multi-reason strings resolve to every code), plus
+// structural signals (sponsor flag, merged-short boundary, low confidence). The
+// same rules run in the migration backfill so live and historical rows agree.
+func deriveStudioReviewCodes(reason *string, boundaryReason *string, confidence *float64, containsSponsor bool, highConfThreshold float64) (*string, []string) {
+	codes := make([]string, 0, 3)
+	add := func(code string) { codes = append(codes, code) }
+
+	if containsSponsor {
+		add(models.StudioReviewCodeSponsorIntro)
+	}
+	r := ""
+	if reason != nil {
+		r = *reason
+	}
+	if strings.Contains(r, "planner returned no usable chapters") {
+		add(models.StudioReviewCodePlannerFallback)
+	}
+	br := ""
+	if boundaryReason != nil {
+		br = *boundaryReason
+	}
+	mergedShort := strings.Contains(br, "merged_short_chapter")
+	if confidence != nil && *confidence < highConfThreshold && !mergedShort {
+		add(models.StudioReviewCodeLowConfidence)
+	}
+	if mergedShort {
+		add(models.StudioReviewCodeMergedShort)
+	}
+	if strings.Contains(r, "cannot merge without exceeding hard max") {
+		add(models.StudioReviewCodeShortUnmergeable)
+	}
+	if strings.Contains(r, "below the 4:30 minimum feed duration") {
+		add(models.StudioReviewCodeBelowMin)
+	}
+	if strings.Contains(r, "exceeds hard maximum duration") {
+		add(models.StudioReviewCodeAboveHardMax)
+	}
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	primary := models.StudioReviewPrimaryCode(codes)
+	return &primary, codes
+}
+
+// applyStudioReviewCodes writes review codes onto a chapter row, preferring the
+// Aggregation-emitted set (authoritative for new rows) and falling back to
+// CMS-side derivation from the persisted fields.
+func applyStudioReviewCodes(ch *models.Chapter, emittedPrimary *string, emittedCodes []string, highConfThreshold float64) {
+	if len(emittedCodes) > 0 {
+		ch.NeedsReviewCodes = emittedCodes
+		if emittedPrimary != nil && strings.TrimSpace(*emittedPrimary) != "" {
+			ch.NeedsReviewCode = emittedPrimary
+		} else {
+			p := models.StudioReviewPrimaryCode(emittedCodes)
+			ch.NeedsReviewCode = &p
+		}
+		return
+	}
+	primary, codes := deriveStudioReviewCodes(ch.NeedsReviewReason, ch.BoundaryReason, ch.Confidence, ch.ContainsSponsorIntro, highConfThreshold)
+	ch.NeedsReviewCode = primary
+	ch.NeedsReviewCodes = codes
+}
+
 func chaptersFromAtomizationRequest(tenantID string, transcriptID uuid.UUID, chapters []atomizationChapterRequest, policy atomizationPolicy) []models.Chapter {
 	rows := make([]models.Chapter, 0, len(chapters))
 	for _, ch := range chapters {
@@ -669,14 +738,16 @@ func chaptersFromAtomizationRequest(tenantID string, transcriptID uuid.UUID, cha
 		}
 		bucket := durationBucketLabel(ch.EndMs - ch.StartMs)
 		end := ch.EndMs
-		rows = append(rows, models.Chapter{
+		row := models.Chapter{
 			TranscriptID: transcriptID, TenantID: tenantID, Title: title, Summary: ch.Summary,
 			StartMs: ch.StartMs, EndMs: &end, Source: models.ChapterSourceDerived,
 			Status: status, Confidence: ch.Confidence, ContextLabel: ch.ContextLabel,
 			BoundaryReason: ch.BoundaryReason, StandaloneScore: ch.StandaloneScore,
 			ContainsSponsorIntro: ch.ContainsSponsorIntro, NeedsReviewReason: needsReviewReason,
 			DurationBucket: &bucket,
-		})
+		}
+		applyStudioReviewCodes(&row, ch.NeedsReviewCode, ch.NeedsReviewCodes, policy.HighConfidenceThreshold)
+		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].StartMs < rows[j].StartMs })
 	return rows
@@ -1008,9 +1079,20 @@ func upsertAtomizedChild(tx *gorm.DB, parent *models.ContentItem, parentTranscri
 	if published {
 		chapterStatus = feedVisibilityEmbeddingPending
 	}
+	chapterUpdates := map[string]interface{}{"child_content_item_id": item.PublicID, "status": chapterStatus}
+	// Ensure review codes are set even if this child was created without a prior
+	// plan-save (S4/S5): prefer Aggregation-emitted, else derive.
+	var codeSource models.Chapter
+	codeSource.NeedsReviewReason = ch.NeedsReviewReason
+	codeSource.BoundaryReason = ch.BoundaryReason
+	codeSource.Confidence = ch.Confidence
+	codeSource.ContainsSponsorIntro = ch.ContainsSponsorIntro
+	applyStudioReviewCodes(&codeSource, ch.NeedsReviewCode, ch.NeedsReviewCodes, policy.HighConfidenceThreshold)
+	chapterUpdates["needs_review_code"] = codeSource.NeedsReviewCode
+	chapterUpdates["needs_review_codes"] = codeSource.NeedsReviewCodes
 	tx.Model(&models.Chapter{}).
 		Where("transcript_id = ? AND tenant_id = ? AND start_ms = ?", parentTranscript.PublicID, parent.TenantID, ch.StartMs).
-		Updates(map[string]interface{}{"child_content_item_id": item.PublicID, "status": chapterStatus})
+		Updates(chapterUpdates)
 	return &item, nil
 }
 
@@ -3018,57 +3100,146 @@ func updateAtomizedChapterReview(c *gin.Context, approve bool) {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid chapter id"})
 		return
 	}
-	var chapter models.Chapter
-	if err := db.Where("public_id = ? AND tenant_id = ?", chapterID, principal.TenantID).First(&chapter).Error; err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Chapter not found"})
-		return
-	}
-	if chapter.ChildContentItemID == nil {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Chapter has no atomized child item yet"})
-		return
-	}
-	var child models.ContentItem
-	if err := db.Where("public_id = ? AND tenant_id = ?", *chapter.ChildContentItemID, principal.TenantID).First(&child).Error; err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Child item not found"})
-		return
-	}
-	if approve {
-		if child.DurationSec == nil || *child.DurationSec < forYouMinDurationSec {
-			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Cannot publish a chapter shorter than 4:30"})
-			return
-		}
-		if *child.DurationSec > forYouHardMaxDurationSec {
-			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Cannot publish a chapter longer than 40 minutes"})
-			return
-		}
-		chapter.Status = chapterStatusPublished
-		child.Status = models.ContentStatusReady
-		child.FeedVisibility = feedVisibilityVisible
-		status := chapterStatusPublished
-		child.ChapteringStatus = &status
-	} else {
-		chapter.Status = chapterStatusRejected
-		child.FeedVisibility = feedVisibilityHidden
-		child.Status = models.ContentStatusArchived
-		status := chapterStatusRejected
-		child.ChapteringStatus = &status
-	}
-	if err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(&chapter).Error; err != nil {
-			return err
-		}
-		return tx.Save(&child).Error
-	}); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to update chapter review state"})
+	// Human path: act on any current review state (requireNeedsReview=false).
+	res, reviewErr := applyAtomizedChapterReview(db, principal.TenantID, chapterID, approve,
+		chapterReviewActor{UserID: principal.UserID, Email: principal.Email}, false)
+	if reviewErr != nil {
+		c.JSON(reviewErr.httpStatus, utils.HTTPError{Code: reviewErr.httpStatus, Message: reviewErr.message})
 		return
 	}
 	action := "rejected"
 	if approve {
 		action = "approved"
 	}
-	createStudioAudit(db, principal, "media_studio.atomized_chapter_"+action, child.PublicID.String(), "success", "", map[string]interface{}{
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Chapter " + action, Data: gin.H{"chapter": res.Chapter, "child": res.Child}})
+}
+
+// chapterReviewActor identifies who is applying a review decision. The Studio
+// Autopilot passes models.StudioAuditPrincipal so its clears are attributable
+// in the audit stream (H9); humans pass their principal.
+type chapterReviewActor struct {
+	UserID string
+	Email  string
+}
+
+type chapterReviewOutcome struct {
+	Chapter models.Chapter
+	Child   models.ContentItem
+}
+
+// chapterReviewError carries an HTTP status for the human endpoint and a stable
+// machine code for the autopilot runner to map onto its skip taxonomy.
+type chapterReviewError struct {
+	httpStatus int
+	code       string // not_found | no_child | invalid_duration | stale | save_failed
+	message    string
+}
+
+// Machine codes for chapterReviewError.code.
+const (
+	chapterReviewErrNotFound        = "not_found"
+	chapterReviewErrNoChild         = "no_child"
+	chapterReviewErrInvalidDuration = "invalid_duration"
+	chapterReviewErrStale           = "stale"
+	chapterReviewErrSaveFailed      = "save_failed"
+)
+
+// applyAtomizedChapterReview is the single choke point both the human endpoint
+// and the Studio Autopilot use to publish/reject an atomized chapter (§8). When
+// requireNeedsReview is true (autopilot), the chapter status change is a guarded
+// conditional update — if the row is no longer `needs_review` the call returns a
+// `stale` error and nothing is written (S6 concurrency correctness).
+func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUID, approve bool, actor chapterReviewActor, requireNeedsReview bool) (*chapterReviewOutcome, *chapterReviewError) {
+	var chapter models.Chapter
+	if err := db.Where("public_id = ? AND tenant_id = ?", chapterID, tenantID).First(&chapter).Error; err != nil {
+		return nil, &chapterReviewError{http.StatusNotFound, chapterReviewErrNotFound, "Chapter not found"}
+	}
+	if chapter.ChildContentItemID == nil {
+		return nil, &chapterReviewError{http.StatusBadRequest, chapterReviewErrNoChild, "Chapter has no atomized child item yet"}
+	}
+	var child models.ContentItem
+	if err := db.Where("public_id = ? AND tenant_id = ?", *chapter.ChildContentItemID, tenantID).First(&child).Error; err != nil {
+		return nil, &chapterReviewError{http.StatusNotFound, chapterReviewErrNotFound, "Child item not found"}
+	}
+	// Re-read duration from the row and re-enforce the feed invariants before any
+	// publish (§5): the endpoint hard-check is the last line of defense and must
+	// never be bypassed, autopilot or human.
+	if approve {
+		if child.DurationSec == nil || *child.DurationSec < forYouMinDurationSec {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrInvalidDuration, "Cannot publish a chapter shorter than 4:30"}
+		}
+		if *child.DurationSec > forYouHardMaxDurationSec {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrInvalidDuration, "Cannot publish a chapter longer than 40 minutes"}
+		}
+	}
+
+	newChapterStatus := chapterStatusRejected
+	if approve {
+		newChapterStatus = chapterStatusPublished
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if requireNeedsReview {
+			// Guarded conditional update (S6): only act if still in review.
+			res := tx.Model(&models.Chapter{}).
+				Where("public_id = ? AND tenant_id = ? AND status = ?", chapterID, tenantID, chapterStatusReview).
+				Update("status", newChapterStatus)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return errChapterReviewStale
+			}
+			chapter.Status = newChapterStatus
+		} else {
+			chapter.Status = newChapterStatus
+			if err := tx.Save(&chapter).Error; err != nil {
+				return err
+			}
+		}
+		if approve {
+			child.Status = models.ContentStatusReady
+			child.FeedVisibility = feedVisibilityVisible
+			status := chapterStatusPublished
+			child.ChapteringStatus = &status
+		} else {
+			child.FeedVisibility = feedVisibilityHidden
+			child.Status = models.ContentStatusArchived
+			status := chapterStatusRejected
+			child.ChapteringStatus = &status
+		}
+		return tx.Save(&child).Error
+	}); err != nil {
+		if errors.Is(err, errChapterReviewStale) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrStale, "Chapter is no longer awaiting review"}
+		}
+		return nil, &chapterReviewError{http.StatusInternalServerError, chapterReviewErrSaveFailed, "Failed to update chapter review state"}
+	}
+
+	action := "rejected"
+	if approve {
+		action = "approved"
+	}
+	writeAtomizedChapterReviewAudit(db, tenantID, actor, action, chapter, child)
+	return &chapterReviewOutcome{Chapter: chapter, Child: child}, nil
+}
+
+var errChapterReviewStale = errors.New("chapter no longer awaiting review")
+
+func writeAtomizedChapterReviewAudit(db *gorm.DB, tenantID string, actor chapterReviewActor, action string, chapter models.Chapter, child models.ContentItem) {
+	payload := map[string]interface{}{
 		"chapter_id": chapter.PublicID.String(),
 		"child_id":   child.PublicID.String(),
-	})
-	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Chapter " + action, Data: gin.H{"chapter": chapter, "child": child}})
+	}
+	raw, _ := json.Marshal(payload)
+	entry := models.AuditLog{
+		TenantID:       tenantID,
+		UserID:         actor.UserID,
+		UserEmail:      actor.Email,
+		Action:         "media_studio.atomized_chapter_" + action,
+		TargetService:  "cms",
+		TargetResource: child.PublicID.String(),
+		Status:         "success",
+		Payload:        datatypes.JSON(raw),
+	}
+	_ = db.Create(&entry).Error
 }

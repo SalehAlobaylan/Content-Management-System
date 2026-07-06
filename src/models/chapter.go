@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // Chapter source provenance.
@@ -33,15 +34,20 @@ type Chapter struct {
 	Source string `gorm:"type:varchar(16);not null;default:'manual'" json:"source"`
 
 	// Atomization/review metadata. Nullable for legacy/editor-created markers.
-	Status               string     `gorm:"type:varchar(24);not null;default:'draft';index:idx_chapters_status" json:"status"`
-	Confidence           *float64   `gorm:"type:double precision" json:"confidence,omitempty"`
-	ContextLabel         *string    `gorm:"type:text" json:"context_label,omitempty"`
-	BoundaryReason       *string    `gorm:"type:text" json:"boundary_reason,omitempty"`
-	StandaloneScore      *float64   `gorm:"type:double precision" json:"standalone_score,omitempty"`
-	ContainsSponsorIntro bool       `gorm:"not null;default:false" json:"contains_sponsor_intro"`
-	NeedsReviewReason    *string    `gorm:"type:text" json:"needs_review_reason,omitempty"`
-	DurationBucket       *string    `gorm:"type:varchar(8)" json:"duration_bucket,omitempty"`
-	ChildContentItemID   *uuid.UUID `gorm:"type:uuid;index:idx_chapters_child_content" json:"child_content_item_id,omitempty"`
+	Status               string   `gorm:"type:varchar(24);not null;default:'draft';index:idx_chapters_status" json:"status"`
+	Confidence           *float64 `gorm:"type:double precision" json:"confidence,omitempty"`
+	ContextLabel         *string  `gorm:"type:text" json:"context_label,omitempty"`
+	BoundaryReason       *string  `gorm:"type:text" json:"boundary_reason,omitempty"`
+	StandaloneScore      *float64 `gorm:"type:double precision" json:"standalone_score,omitempty"`
+	ContainsSponsorIntro bool     `gorm:"not null;default:false" json:"contains_sponsor_intro"`
+	NeedsReviewReason    *string  `gorm:"type:text" json:"needs_review_reason,omitempty"`
+	// Normalized review-reason codes (stage 6, S4/S5). NeedsReviewCode is the
+	// most-editorial (primary) code; NeedsReviewCodes is the full set. The Studio
+	// Autopilot trust gate keys on these, not the free-text reason above.
+	NeedsReviewCode    *string        `gorm:"type:varchar(32);index:idx_chapters_needs_review_code" json:"needs_review_code,omitempty"`
+	NeedsReviewCodes   pq.StringArray `gorm:"type:text[]" json:"needs_review_codes,omitempty"`
+	DurationBucket     *string        `gorm:"type:varchar(8)" json:"duration_bucket,omitempty"`
+	ChildContentItemID *uuid.UUID     `gorm:"type:uuid;index:idx_chapters_child_content" json:"child_content_item_id,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`

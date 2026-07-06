@@ -280,15 +280,22 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 			job := createSkippedTranscriptionJob(db, item, triggerSource, "human caption present (no STT needed)")
 			return job, false, job.SkipReason, nil
 		}
+		// Quality-driven re-runs: auto_quality (internal quality loop) and
+		// studio_autopilot (stage 6 — same predicate, attributed). Both pass the
+		// same gates; the studio trigger keeps its own attribution (H9/S12).
+		qualityDriven := triggerSource == models.TranscriptionTriggerAutoQuality ||
+			triggerSource == models.TranscriptionTriggerStudioAutopilot
 		if state == models.CaptionStateSTTDone {
 			q := latestTranscriptQuality(db, item.PublicID)
 			if q == nil || q.Status != models.TranscriptQualityAutoRepair || !cfg.AutoRepairEnabled {
 				job := createSkippedTranscriptionJob(db, item, triggerSource, "already upgraded by STT")
 				return job, false, job.SkipReason, nil
 			}
-			triggerSource = models.TranscriptionTriggerAutoQuality
+			if !qualityDriven {
+				triggerSource = models.TranscriptionTriggerAutoQuality
+			}
 		}
-		if state == models.CaptionStateYouTubeAuto && !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerAutoQuality {
+		if state == models.CaptionStateYouTubeAuto && !cfg.AutoSttEnabled && !qualityDriven {
 			job := createSkippedTranscriptionJob(db, item, triggerSource, "auto-STT disabled (manual trigger required)")
 			return job, false, job.SkipReason, nil
 		}

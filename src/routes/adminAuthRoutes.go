@@ -233,6 +233,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/media/circulation/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetMediaCirculationAutopilotRun)
 	adminGroup.POST("/media/circulation/autopilot/pause", perm("aggregation", "manage"), controllers.PauseMediaCirculationAutopilot)
 	adminGroup.POST("/media/circulation/autopilot/elevate", perm("aggregation", "manage"), controllers.ElevateMediaCirculationAutopilot)
+	// Media Studio Clearance Autopilot — stage 6: policy + manual trigger + runs ledger.
+	adminGroup.GET("/media/studio/autopilot/status", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotStatus)
+	adminGroup.GET("/media/studio/autopilot/insights", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotInsights)
+	adminGroup.GET("/media/studio/autopilot/policy", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotPolicy)
+	adminGroup.PUT("/media/studio/autopilot/policy", perm("aggregation", "manage"), controllers.UpdateMediaStudioAutopilotPolicy)
+	adminGroup.POST("/media/studio/autopilot/run", perm("aggregation", "manage"), controllers.RunMediaStudioAutopilotNow)
+	adminGroup.GET("/media/studio/autopilot/runs", perm("aggregation", "read"), controllers.ListMediaStudioAutopilotRuns)
+	adminGroup.GET("/media/studio/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotRun)
+	adminGroup.POST("/media/studio/autopilot/pause", perm("aggregation", "manage"), controllers.PauseMediaStudioAutopilot)
 
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).

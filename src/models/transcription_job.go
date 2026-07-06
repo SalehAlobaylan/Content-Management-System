@@ -25,6 +25,9 @@ const (
 	// EnrichmentAutopilot-originated STT triggers: un-forced, through the guard,
 	// but attributed so Media Studio / the jobs view show autopilot's work.
 	TranscriptionTriggerEnrichmentAutopilot = "enrichment_autopilot"
+	// StudioAutopilot-originated STT re-runs (stage 6, S12): quality re-runs on
+	// auto_repair transcripts, un-forced, through the same budget guard, attributed.
+	TranscriptionTriggerStudioAutopilot = "studio_autopilot"
 )
 
 type TranscriptionJob struct {

@@ -171,6 +171,10 @@ func main() {
 			&models.EnrichmentAutopilotPolicy{},
 			&models.EnrichmentAutopilotRun{},
 			&models.EnrichmentAutopilotAction{},
+			// Media Studio Clearance Autopilot (stage 6) — editorial-clearance helper
+			&models.MediaStudioAutopilotPolicy{},
+			&models.MediaStudioRun{},
+			&models.MediaStudioAction{},
 			// Ranking/Intelligence System (stage 4) — persisted value surface +
 			// serve-side demand telemetry + per-tenant tuning overrides
 			&models.MediaIntelligenceScore{},
@@ -246,6 +250,9 @@ func main() {
 	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
 	controllers.StartMediaCirculationAutopilotHeartbeat(db)
 	controllers.StartEnrichmentAutopilotHeartbeat(db)
+	// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
+	// after the lead executes atomize_now, plus a slower interval sweep-up.
+	controllers.StartMediaStudioAutopilotHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)
