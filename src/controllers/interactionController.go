@@ -4,6 +4,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -54,6 +55,26 @@ func readIdentity(c *gin.Context) (userIDStr string, sessionID string) {
 		return uid.String(), ""
 	}
 	return "", c.Query("session_id")
+}
+
+func isIdempotentInteraction(interactionType models.InteractionType) bool {
+	return interactionType == models.InteractionTypeLike || interactionType == models.InteractionTypeBookmark
+}
+
+func scopedInteractionQuery(db *gorm.DB, contentItemID uuid.UUID, interactionType models.InteractionType, interaction models.UserInteraction) *gorm.DB {
+	query := db.Where("content_item_id = ?", contentItemID).
+		Where("type = ?", interactionType)
+	if interaction.UserID != nil {
+		return query.Where("user_id = ?", *interaction.UserID)
+	}
+	return query.Where("session_id = ?", *interaction.SessionID)
+}
+
+func interactionLockKey(contentItemID uuid.UUID, interactionType models.InteractionType, interaction models.UserInteraction) string {
+	if interaction.UserID != nil {
+		return "user:" + interaction.UserID.String() + ":" + contentItemID.String() + ":" + string(interactionType)
+	}
+	return "session:" + *interaction.SessionID + ":" + contentItemID.String() + ":" + string(interactionType)
 }
 
 // CreateInteraction records a user interaction (like, bookmark, view, share, complete)
@@ -131,31 +152,57 @@ func CreateInteraction(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate (like/bookmark should be unique per user per content)
-	if req.InteractionType == models.InteractionTypeLike || req.InteractionType == models.InteractionTypeBookmark {
-		var existing models.UserInteraction
-		query := db.Where("content_item_id = ?", contentItemID).
-			Where("type = ?", req.InteractionType)
+	if isIdempotentInteraction(req.InteractionType) {
+		var saved models.UserInteraction
+		created := false
+		err := db.Transaction(func(tx *gorm.DB) error {
+			lockKey := interactionLockKey(contentItemID, req.InteractionType, interaction)
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", lockKey).Error; err != nil {
+				return err
+			}
 
-		if interaction.SessionID != nil {
-			query = query.Where("session_id = ?", *interaction.SessionID)
-		}
-		if interaction.UserID != nil {
-			query = query.Where("user_id = ?", *interaction.UserID)
-		}
+			query := scopedInteractionQuery(tx, contentItemID, req.InteractionType, interaction)
+			var existing models.UserInteraction
+			if err := query.First(&existing).Error; err == nil {
+				saved = existing
+				return nil
+			} else if err != gorm.ErrRecordNotFound {
+				return err
+			}
 
-		if err := query.First(&existing).Error; err == nil {
-			// Already exists - return success (idempotent)
-			c.JSON(http.StatusOK, utils.ResponseMessage{
-				Code:    http.StatusOK,
-				Message: "Interaction already exists",
-				Data:    existing,
+			if err := tx.Create(&interaction).Error; err != nil {
+				return err
+			}
+			saved = interaction
+			created = true
+			return nil
+		})
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{
+				Code:    http.StatusInternalServerError,
+				Message: "Failed to create interaction: " + err.Error(),
 			})
 			return
 		}
+		if !created {
+			c.JSON(http.StatusOK, utils.ResponseMessage{
+				Code:    http.StatusOK,
+				Message: "Interaction already exists",
+				Data:    saved,
+			})
+			return
+		}
+		if err := updateEngagementCount(db, contentItemID, req.InteractionType, 1); err != nil {
+			log.Printf("failed to update engagement counter for interaction %s on content %s: %v", req.InteractionType, contentItemID, err)
+		}
+		c.JSON(http.StatusCreated, utils.ResponseMessage{
+			Code:    http.StatusCreated,
+			Message: "Interaction created successfully",
+			Data:    saved,
+		})
+		return
 	}
 
-	// Create the interaction
 	if err := db.Create(&interaction).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
@@ -164,8 +211,9 @@ func CreateInteraction(c *gin.Context) {
 		return
 	}
 
-	// Update engagement counters
-	updateEngagementCount(db, contentItemID, req.InteractionType, 1)
+	if err := updateEngagementCount(db, contentItemID, req.InteractionType, 1); err != nil {
+		log.Printf("failed to update engagement counter for interaction %s on content %s: %v", req.InteractionType, contentItemID, err)
+	}
 
 	c.JSON(http.StatusCreated, utils.ResponseMessage{
 		Code:    http.StatusCreated,
@@ -539,8 +587,9 @@ func DeleteInteraction(c *gin.Context) {
 		}
 	}
 
-	// Decrement engagement counter
-	updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1)
+	if err := updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1); err != nil {
+		log.Printf("failed to decrement engagement counter for interaction %s on content %s: %v", interaction.Type, interaction.ContentItemID, err)
+	}
 
 	// Delete the interaction
 	if err := db.Delete(&interaction).Error; err != nil {
@@ -616,7 +665,9 @@ func DeleteInteractionByContext(c *gin.Context) {
 		return
 	}
 
-	updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1)
+	if err := updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1); err != nil {
+		log.Printf("failed to decrement engagement counter for interaction %s on content %s: %v", interaction.Type, interaction.ContentItemID, err)
+	}
 
 	if err := db.Delete(&interaction).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
@@ -900,7 +951,7 @@ func fetchSeenIDs(db *gorm.DB, sessionID, userIDStr string) []uuid.UUID {
 }
 
 // updateEngagementCount updates the like/share count on a content item
-func updateEngagementCount(db *gorm.DB, contentItemID uuid.UUID, interactionType models.InteractionType, delta int) {
+func updateEngagementCount(db *gorm.DB, contentItemID uuid.UUID, interactionType models.InteractionType, delta int) error {
 	var field string
 	switch interactionType {
 	case models.InteractionTypeLike:
@@ -912,10 +963,10 @@ func updateEngagementCount(db *gorm.DB, contentItemID uuid.UUID, interactionType
 	case models.InteractionTypeComment:
 		field = "comment_count"
 	default:
-		return
+		return nil
 	}
 
-	db.Model(&models.ContentItem{}).
+	return db.Model(&models.ContentItem{}).
 		Where("public_id = ?", contentItemID).
-		UpdateColumn(field, gorm.Expr(field+" + ?", delta))
+		UpdateColumn(field, gorm.Expr(field+" + ?", delta)).Error
 }

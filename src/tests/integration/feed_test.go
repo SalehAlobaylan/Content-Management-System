@@ -218,6 +218,7 @@ func clearWahbTables() {
 	_ = testDB.Exec("DELETE FROM user_interactions").Error
 	_ = testDB.Exec("DELETE FROM transcripts").Error
 	_ = testDB.Exec("DELETE FROM content_items").Error
+	_ = testDB.Exec("DELETE FROM topics").Error
 	_ = testDB.Exec("DELETE FROM content_sources").Error
 	fmt.Println("✅ Wahb tables cleared")
 }
@@ -231,19 +232,28 @@ func seedTestContent() {
 	for i := 0; i < 5; i++ {
 		title := fmt.Sprintf("Test Video %d", i+1)
 		mediaURL := fmt.Sprintf("https://test.cdn/video%d.mp4", i+1)
+		thumbnailURL := fmt.Sprintf("https://test.cdn/video%d.jpg", i+1)
 		author := "Test Author"
-		duration := 120 + i*30
+		duration := 300 + i*30
+		playbackType := "mp4"
+		hasVideo := true
 		pubTime := now.Add(-time.Duration(i) * time.Hour)
 
 		item := models.ContentItem{
-			Type:        models.ContentTypeVideo,
-			Source:      models.SourceTypePodcast,
-			Status:      models.ContentStatusReady,
-			Title:       &title,
-			MediaURL:    &mediaURL,
-			Author:      &author,
-			DurationSec: &duration,
-			PublishedAt: &pubTime,
+			Type:           models.ContentTypeVideo,
+			Source:         models.SourceTypePodcast,
+			Status:         models.ContentStatusReady,
+			Title:          &title,
+			MediaURL:       &mediaURL,
+			PlaybackURL:    &mediaURL,
+			PlaybackType:   &playbackType,
+			HasVideo:       &hasVideo,
+			ThumbnailURL:   &thumbnailURL,
+			Author:         &author,
+			DurationSec:    &duration,
+			IsFeedUnit:     true,
+			FeedVisibility: "visible",
+			PublishedAt:    &pubTime,
 		}
 		testDB.Create(&item)
 	}

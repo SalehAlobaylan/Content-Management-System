@@ -58,9 +58,16 @@ func TestInteractionIntegration(t *testing.T) {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
-		// Should return 200 (already exists) not error
-		if w.Code != http.StatusOK && w.Code != http.StatusCreated {
-			t.Fatalf("Expected 200 or 201, got %d: %s", w.Code, w.Body.String())
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var item models.ContentItem
+		if err := testDB.Where("public_id = ?", testContentID).First(&item).Error; err != nil {
+			t.Fatalf("failed to reload content item: %v", err)
+		}
+		if item.LikeCount != 1 {
+			t.Fatalf("expected like_count to remain 1 after duplicate like, got %d", item.LikeCount)
 		}
 		fmt.Println("  ✅ Idempotent like test passed")
 	})
@@ -125,7 +132,7 @@ func TestInteractionIntegration(t *testing.T) {
 			t.Skip("No interaction ID to delete")
 		}
 		fmt.Println("  🗑️  Testing delete interaction...")
-		req := httptest.NewRequest("DELETE", "/api/v1/interactions/"+testInteractionID, nil)
+		req := httptest.NewRequest("DELETE", "/api/v1/interactions/"+testInteractionID+"?session_id="+testSessionID, nil)
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
@@ -156,8 +163,8 @@ func TestInteractionIntegration(t *testing.T) {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
-		if w.Code != http.StatusBadRequest {
-			t.Fatalf("Expected 400, got %d", w.Code)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("Expected 401, got %d", w.Code)
 		}
 		fmt.Println("  ✅ Missing session ID test passed")
 	})
