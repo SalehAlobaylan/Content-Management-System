@@ -253,6 +253,18 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/media/studio/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotRun)
 	adminGroup.POST("/media/studio/autopilot/pause", perm("aggregation", "manage"), controllers.PauseMediaStudioAutopilot)
 
+	// System Health / Incident Autopilot — platform probes, incident ledger, bounded containment.
+	adminGroup.GET("/system/autopilot/status", perm("aggregation", "read"), controllers.GetSystemAutopilotStatus)
+	adminGroup.GET("/system/autopilot/policy", perm("aggregation", "read"), controllers.GetSystemAutopilotPolicy)
+	adminGroup.PUT("/system/autopilot/policy", perm("aggregation", "manage"), controllers.UpdateSystemAutopilotPolicy)
+	adminGroup.POST("/system/autopilot/run", perm("aggregation", "manage"), controllers.RunSystemAutopilotNow)
+	adminGroup.POST("/system/autopilot/pause", perm("aggregation", "manage"), controllers.PauseSystemAutopilotContainment)
+	adminGroup.GET("/system/autopilot/episodes", perm("aggregation", "read"), controllers.ListSystemIncidentEpisodes)
+	adminGroup.GET("/system/autopilot/episodes/:id", perm("aggregation", "read"), controllers.GetSystemIncidentEpisode)
+	adminGroup.POST("/system/autopilot/episodes/:id/close", perm("aggregation", "manage"), controllers.CloseSystemIncidentEpisode)
+	adminGroup.GET("/system/autopilot/runs", perm("aggregation", "read"), controllers.ListSystemAutopilotRuns)
+	adminGroup.GET("/system/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetSystemAutopilotRun)
+
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).
 	// Re-encoding old content moved to the Storage system as

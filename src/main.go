@@ -179,6 +179,11 @@ func main() {
 			&models.MediaStudioAutopilotPolicy{},
 			&models.MediaStudioRun{},
 			&models.MediaStudioAction{},
+			// System Health / Incident Autopilot — platform probe ledger + containment
+			&models.SystemAutopilotPolicy{},
+			&models.SystemIncidentEpisode{},
+			&models.SystemAutopilotRun{},
+			&models.SystemAutopilotAction{},
 			// Ranking/Intelligence System (stage 4) — persisted value surface +
 			// serve-side demand telemetry + per-tenant tuning overrides
 			&models.MediaIntelligenceScore{},
@@ -258,6 +263,8 @@ func main() {
 	// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
 	// after the lead executes atomize_now, plus a slower interval sweep-up.
 	controllers.StartMediaStudioAutopilotHeartbeat(db)
+	// System Health / Incident Autopilot — CMS-owned probes + incident ledger.
+	controllers.StartSystemHealthAutopilotHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)
