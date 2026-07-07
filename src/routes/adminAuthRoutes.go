@@ -189,6 +189,16 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/enrichment/autopilot/runs", perm("content", "read"), controllers.ListEnrichmentAutopilotRuns)
 	adminGroup.GET("/enrichment/autopilot/runs/:id", perm("content", "read"), controllers.GetEnrichmentAutopilotRun)
 
+	// Pipeline Repair Autopilot — bounded retry/repair supervisor
+	adminGroup.GET("/pipeline/autopilot/status", perm("content", "read"), controllers.GetPipelineAutopilotStatus)
+	adminGroup.GET("/pipeline/autopilot/policy", perm("content", "read"), controllers.GetPipelineAutopilotPolicy)
+	adminGroup.PUT("/pipeline/autopilot/policy", perm("content", "write"), controllers.UpdatePipelineAutopilotPolicy)
+	adminGroup.POST("/pipeline/autopilot/run", perm("content", "write"), controllers.RunPipelineAutopilotNow)
+	adminGroup.POST("/pipeline/autopilot/pause", perm("content", "write"), controllers.PausePipelineAutopilot)
+	adminGroup.POST("/pipeline/autopilot/elevate", perm("content", "write"), controllers.ElevatePipelineAutopilot)
+	adminGroup.GET("/pipeline/autopilot/runs", perm("content", "read"), controllers.ListPipelineAutopilotRuns)
+	adminGroup.GET("/pipeline/autopilot/runs/:id", perm("content", "read"), controllers.GetPipelineAutopilotRun)
+
 	// Storage management
 	adminGroup.GET("/storage/stats", perm("aggregation", "read"), controllers.GetStorageStats)
 	adminGroup.GET("/storage/health", perm("aggregation", "read"), controllers.GetStorageHealth)

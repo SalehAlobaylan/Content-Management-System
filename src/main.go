@@ -171,6 +171,10 @@ func main() {
 			&models.EnrichmentAutopilotPolicy{},
 			&models.EnrichmentAutopilotRun{},
 			&models.EnrichmentAutopilotAction{},
+			// Pipeline Repair Autopilot — bounded retry/repair supervisor
+			&models.PipelineAutopilotPolicy{},
+			&models.PipelineAutopilotRun{},
+			&models.PipelineAutopilotAction{},
 			// Media Studio Clearance Autopilot (stage 6) — editorial-clearance helper
 			&models.MediaStudioAutopilotPolicy{},
 			&models.MediaStudioRun{},
@@ -250,6 +254,7 @@ func main() {
 	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
 	controllers.StartMediaCirculationAutopilotHeartbeat(db)
 	controllers.StartEnrichmentAutopilotHeartbeat(db)
+	controllers.StartPipelineAutopilotHeartbeat(db)
 	// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
 	// after the lead executes atomize_now, plus a slower interval sweep-up.
 	controllers.StartMediaStudioAutopilotHeartbeat(db)
