@@ -602,13 +602,13 @@ func applyAdminContentSpecialFilters(c *gin.Context, query *gorm.DB) (*gorm.DB, 
 	if topic := strings.TrimSpace(c.Query("topic")); topic != "" {
 		query = query.Where("? = ANY(topic_tags)", topic)
 	}
-	// First-class topic filter (the News manager board fetches by topic_id).
-	// The sentinel "none" selects unclassified articles (topic_id IS NULL).
-	if topicID := strings.TrimSpace(c.Query("topic_id")); topicID != "" {
+	// First-class topic filter (the News manager board fetches by story_id).
+	// The sentinel "none" selects unclassified articles (story_id IS NULL).
+	if topicID := strings.TrimSpace(c.Query("story_id")); topicID != "" {
 		if strings.EqualFold(topicID, "none") {
-			query = query.Where("topic_id IS NULL")
+			query = query.Where("story_id IS NULL")
 		} else {
-			query = query.Where("topic_id = ?", topicID)
+			query = query.Where("story_id = ?", topicID)
 		}
 	}
 	if tStatus := strings.TrimSpace(c.Query("transcription_status")); tStatus != "" {
@@ -989,7 +989,7 @@ type bulkDeleteContentRequest struct {
 	SourceName    string   `json:"source_name"`
 	Type          string   `json:"type"`
 	Topic         string   `json:"topic"`
-	TopicID       string   `json:"topic_id"`
+	StoryID       string   `json:"story_id"`
 	CreatedBefore string   `json:"created_before"`
 	IDs           []string `json:"ids"`
 	DryRun        bool     `json:"dry_run"`
@@ -1040,9 +1040,9 @@ func BulkDeleteContent(c *gin.Context) {
 	}
 
 	hasIDs := len(req.IDs) > 0
-	if !hasIDs && req.Status == "" && req.SourceName == "" && req.Type == "" && req.Topic == "" && req.TopicID == "" && req.CreatedBefore == "" {
+	if !hasIDs && req.Status == "" && req.SourceName == "" && req.Type == "" && req.Topic == "" && req.StoryID == "" && req.CreatedBefore == "" {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
-			Message: "At least one filter is required (ids, status, type, topic, topic_id, source_name, or created_before)",
+			Message: "At least one filter is required (ids, status, type, topic, story_id, source_name, or created_before)",
 			Code:    "FILTER_REQUIRED",
 		})
 		return
@@ -1079,11 +1079,11 @@ func BulkDeleteContent(c *gin.Context) {
 			query = query.Where("? = ANY(topic_tags)", req.Topic)
 		}
 
-		if req.TopicID != "" {
-			if strings.EqualFold(req.TopicID, "none") {
-				query = query.Where("topic_id IS NULL")
+		if req.StoryID != "" {
+			if strings.EqualFold(req.StoryID, "none") {
+				query = query.Where("story_id IS NULL")
 			} else {
-				query = query.Where("topic_id = ?", req.TopicID)
+				query = query.Where("story_id = ?", req.StoryID)
 			}
 		}
 
@@ -1179,7 +1179,7 @@ type bulkStatusChangeRequest struct {
 	SourceName    string `json:"source_name"`
 	Type          string `json:"type"`
 	Topic         string `json:"topic"`
-	TopicID       string `json:"topic_id"`
+	StoryID       string `json:"story_id"`
 	CreatedBefore string `json:"created_before"`
 
 	// Always required — the status to move matching items into.
@@ -1318,11 +1318,11 @@ func BulkStatusChange(c *gin.Context) {
 		if req.Topic != "" {
 			q = q.Where("? = ANY(topic_tags)", req.Topic)
 		}
-		if req.TopicID != "" {
-			if strings.EqualFold(req.TopicID, "none") {
-				q = q.Where("topic_id IS NULL")
+		if req.StoryID != "" {
+			if strings.EqualFold(req.StoryID, "none") {
+				q = q.Where("story_id IS NULL")
 			} else {
-				q = q.Where("topic_id = ?", req.TopicID)
+				q = q.Where("story_id = ?", req.StoryID)
 			}
 		}
 		if createdBefore != nil {

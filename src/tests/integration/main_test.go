@@ -60,7 +60,7 @@ func setup() {
 		// Phase 13 — story feed
 		&models.RankingConfig{},
 		&models.ContentFlag{},
-		&models.Topic{},
+		&models.Story{},
 		&models.NewsSnapshot{},
 		&models.NewsCirculationPolicy{},
 		&models.NewsStoryOverride{},
@@ -106,7 +106,7 @@ func cleanup() {
 	_ = m.DropTable(&models.NewsStoryOverride{})
 	_ = m.DropTable(&models.NewsCirculationPolicy{})
 	_ = m.DropTable(&models.NewsSnapshot{})
-	_ = m.DropTable(&models.Topic{})
+	_ = m.DropTable(&models.Story{})
 	_ = m.DropTable(&models.ContentFlag{})
 	_ = m.DropTable(&models.RankingConfig{})
 	_ = m.DropTable(&models.UserInteraction{})

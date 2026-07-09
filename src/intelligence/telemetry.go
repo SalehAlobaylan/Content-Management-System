@@ -2,7 +2,6 @@ package intelligence
 
 import (
 	"log"
-	"strings"
 	"time"
 
 	"content-management-system/src/models"
@@ -34,9 +33,9 @@ const (
 
 // ServeRecord captures one For You response for telemetry purposes.
 type ServeRecord struct {
-	TenantID        string
-	Items           []models.ContentItem
-	RequestedLimit  int
+	TenantID       string
+	Items          []models.ContentItem
+	RequestedLimit int
 	// DurationBucket is the explicit ?duration= filter expressed as a bucket
 	// label ("30m"), or "" when the request was unfiltered.
 	DurationBucket string
@@ -75,6 +74,7 @@ func RecordServe(db *gorm.DB, rec ServeRecord) {
 	byBucket := map[string]*tally{}
 	type topicKey struct{ bucket, topic string }
 	byTopic := map[topicKey]*tally{}
+	topicSlugsByItem := catalogTopicSlugsByItem(db, rec.Items)
 	for _, it := range rec.Items {
 		bucket := itemBucketLabel(it)
 		if bucket == "" {
@@ -90,7 +90,7 @@ func RecordServe(db *gorm.DB, rec ServeRecord) {
 		if repeat {
 			t.repeats++
 		}
-		for _, topic := range itemTopics(it) {
+		for _, topic := range topicSlugsByItem[it.PublicID] {
 			key := topicKey{bucket: bucket, topic: topic}
 			tt, ok := byTopic[key]
 			if !ok {
@@ -122,24 +122,33 @@ func RecordServe(db *gorm.DB, rec ServeRecord) {
 	}
 }
 
-// itemTopics returns the item's topic tags for demand attribution, capped so a
-// tag-heavy item can't flood the topic table (first tags carry the strongest
-// enrichment signal).
-func itemTopics(item models.ContentItem) []string {
+func catalogTopicSlugsByItem(db *gorm.DB, items []models.ContentItem) map[uuid.UUID][]string {
 	const maxTopicsPerItem = 3
-	out := make([]string, 0, maxTopicsPerItem)
-	for _, raw := range item.TopicTags {
-		topic := strings.TrimSpace(raw)
-		if topic == "" {
+	out := map[uuid.UUID][]string{}
+	if len(items) == 0 {
+		return out
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.PublicID)
+	}
+	type row struct {
+		ContentItemID uuid.UUID
+		Slug          string
+		Score         float64
+	}
+	var rows []row
+	db.Table("content_item_topics cit").
+		Select("cit.content_item_id, topics.slug, cit.score").
+		Joins("JOIN topics ON topics.public_id = cit.topic_id").
+		Where("cit.content_item_id IN ? AND topics.active = ?", ids, true).
+		Order("cit.content_item_id ASC, cit.score DESC").
+		Scan(&rows)
+	for _, r := range rows {
+		if r.Slug == "" || len(out[r.ContentItemID]) >= maxTopicsPerItem {
 			continue
 		}
-		if runes := []rune(topic); len(runes) > 120 {
-			topic = string(runes[:120])
-		}
-		out = append(out, topic)
-		if len(out) == maxTopicsPerItem {
-			break
-		}
+		out[r.ContentItemID] = append(out[r.ContentItemID], r.Slug)
 	}
 	return out
 }

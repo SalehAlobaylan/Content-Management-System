@@ -20,8 +20,8 @@ type RSSFeed struct {
 	Title       string `gorm:"type:text" json:"title"`
 	Description string `gorm:"type:text" json:"description"`
 
-	// Filters. TopicID NULL = all topics; ContentType "" = all article types.
-	TopicID     *uuid.UUID `gorm:"type:uuid;index:idx_rss_feeds_topic_id" json:"topic_id,omitempty"`
+	// Filters. StoryID NULL = all topics; ContentType "" = all article types.
+	StoryID     *uuid.UUID `gorm:"type:uuid;index:idx_rss_feeds_story_id" json:"story_id,omitempty"`
 	ContentType string     `gorm:"type:varchar(20)" json:"content_type"`
 	ItemLimit   int        `gorm:"default:50" json:"item_limit"`
 

@@ -34,7 +34,7 @@ type feedMeta struct {
 
 type feedQuery struct {
 	TenantID    string // "" = all tenants (public ad-hoc); set for saved feeds
-	TopicID     string // first-class topic UUID, or ""
+	StoryID     string // first-class topic UUID, or ""
 	Topic       string // legacy free-form tag, or ""
 	ContentType string
 	Limit       int
@@ -59,8 +59,8 @@ func fetchFeedItems(db *gorm.DB, q feedQuery) ([]feedItem, error) {
 	if q.ContentType != "" {
 		query = query.Where("type = ?", models.ContentType(strings.ToUpper(q.ContentType)))
 	}
-	if q.TopicID != "" {
-		query = query.Where("topic_id = ?", q.TopicID)
+	if q.StoryID != "" {
+		query = query.Where("story_id = ?", q.StoryID)
 	}
 	if q.Topic != "" {
 		query = query.Where("? = ANY(topic_tags)", q.Topic)
@@ -308,7 +308,7 @@ func adhocFeedData(c *gin.Context) ([]feedItem, feedMeta, bool) {
 	db := c.MustGet("db").(*gorm.DB)
 
 	q := feedQuery{
-		TopicID:     strings.TrimSpace(c.Query("topic_id")),
+		StoryID:     strings.TrimSpace(c.Query("story_id")),
 		Topic:       strings.TrimSpace(c.Query("topic")),
 		ContentType: strings.TrimSpace(c.Query("type")),
 	}
@@ -327,9 +327,9 @@ func adhocFeedData(c *gin.Context) ([]feedItem, feedMeta, bool) {
 	title := strings.TrimSpace(c.Query("title"))
 	if title == "" {
 		title = "Wahb Content Feed"
-		if q.TopicID != "" {
-			var t models.Topic
-			if db.Select("label").Where("public_id = ?", q.TopicID).First(&t).Error == nil &&
+		if q.StoryID != "" {
+			var t models.Story
+			if db.Select("label").Where("public_id = ?", q.StoryID).First(&t).Error == nil &&
 				strings.TrimSpace(t.Label) != "" {
 				title = "Wahb · " + t.Label
 			}
@@ -343,7 +343,7 @@ func adhocFeedData(c *gin.Context) ([]feedItem, feedMeta, bool) {
 	}, true
 }
 
-// GetRSSFeed handles GET /api/v1/feed/rss.xml?topic_id=&type=&limit=&title=
+// GetRSSFeed handles GET /api/v1/feed/rss.xml?story_id=&type=&limit=&title=
 func GetRSSFeed(c *gin.Context) {
 	items, meta, ok := adhocFeedData(c)
 	if !ok {
@@ -388,8 +388,8 @@ func GetSavedFeed(c *gin.Context) {
 		ContentType: feed.ContentType,
 		Limit:       feed.ItemLimit,
 	}
-	if feed.TopicID != nil {
-		q.TopicID = feed.TopicID.String()
+	if feed.StoryID != nil {
+		q.StoryID = feed.StoryID.String()
 	}
 
 	items, err := fetchFeedItems(db, q)

@@ -101,6 +101,196 @@ func EnsureTenantScopeColumns(db *gorm.DB) error {
 	return nil
 }
 
+// PrepareStoryTopicSplit adapts development databases created before the
+// story/topic vocabulary split. Old schemas used `topics` for News event
+// clusters; new schemas reserve `topics` for canonical user preferences and
+// store event clusters in `stories`.
+func PrepareStoryTopicSplit(db *gorm.DB) error {
+	var legacyTopics bool
+	if err := db.Raw(`
+		SELECT to_regclass('public.topics') IS NOT NULL
+		   AND NOT EXISTS (
+		       SELECT 1
+		       FROM information_schema.columns
+		       WHERE table_schema = 'public'
+		         AND table_name = 'topics'
+		         AND column_name = 'slug'
+		   )
+	`).Scan(&legacyTopics).Error; err != nil {
+		return fmt.Errorf("story/topic split check failed: %w", err)
+	}
+	if !legacyTopics {
+		return nil
+	}
+
+	var storiesExists bool
+	if err := db.Raw(`SELECT to_regclass('public.stories') IS NOT NULL`).Scan(&storiesExists).Error; err != nil {
+		return fmt.Errorf("story/topic split stories check failed: %w", err)
+	}
+	if storiesExists {
+		var storyRows int64
+		if err := db.Raw(`SELECT COUNT(*) FROM stories`).Scan(&storyRows).Error; err != nil {
+			return fmt.Errorf("story/topic split stories count failed: %w", err)
+		}
+		if storyRows > 0 {
+			return mergeAndArchiveLegacyTopics(db)
+		}
+		if err := db.Exec(`DROP TABLE stories`).Error; err != nil {
+			return fmt.Errorf("story/topic split failed to remove empty partial stories table: %w", err)
+		}
+	}
+
+	statements := []string{
+		`ALTER TABLE topics RENAME TO stories`,
+		`DO $$
+		BEGIN
+		    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'topics_pkey')
+		       AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'stories_pkey') THEN
+		        ALTER TABLE stories RENAME CONSTRAINT topics_pkey TO stories_pkey;
+		    END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+		    IF to_regclass('public.topics_id_seq') IS NOT NULL
+		       AND to_regclass('public.stories_id_seq') IS NULL THEN
+		        ALTER SEQUENCE topics_id_seq RENAME TO stories_id_seq;
+		        ALTER TABLE stories ALTER COLUMN id SET DEFAULT nextval('stories_id_seq'::regclass);
+		    END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+		    IF EXISTS (
+		        SELECT 1 FROM information_schema.columns
+		        WHERE table_schema = 'public'
+		          AND table_name = 'content_items'
+		          AND column_name = 'topic_id'
+		    ) AND NOT EXISTS (
+		        SELECT 1 FROM information_schema.columns
+		        WHERE table_schema = 'public'
+		          AND table_name = 'content_items'
+		          AND column_name = 'story_id'
+		    ) THEN
+		        ALTER TABLE content_items RENAME COLUMN topic_id TO story_id;
+		    END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+		    IF EXISTS (
+		        SELECT 1 FROM information_schema.columns
+		        WHERE table_schema = 'public'
+		          AND table_name = 'rss_feeds'
+		          AND column_name = 'topic_id'
+		    ) AND NOT EXISTS (
+		        SELECT 1 FROM information_schema.columns
+		        WHERE table_schema = 'public'
+		          AND table_name = 'rss_feeds'
+		          AND column_name = 'story_id'
+		    ) THEN
+		        ALTER TABLE rss_feeds RENAME COLUMN topic_id TO story_id;
+		    END IF;
+		END $$`,
+		renameIndexIfAvailableSQL("idx_topics_public_id", "idx_stories_public_id"),
+		renameIndexIfAvailableSQL("idx_topics_tenant_label", "idx_stories_tenant_label"),
+		renameIndexIfAvailableSQL("idx_topics_tenant", "idx_stories_tenant"),
+		renameIndexIfAvailableSQL("idx_topics_last_member_at", "idx_stories_last_member_at"),
+		renameIndexIfAvailableSQL("idx_topics_summary_built_at", "idx_stories_summary_built_at"),
+		renameIndexIfAvailableSQL("topics_embedding_idx", "stories_embedding_idx"),
+		renameIndexIfAvailableSQL("idx_content_items_topic_id", "idx_content_items_story_id"),
+		renameIndexIfAvailableSQL("idx_rss_feeds_topic_id", "idx_rss_feeds_story_id"),
+		`DO $$
+		BEGIN
+		    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'content_items_topic_id_fkey')
+		       AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'content_items_story_id_fkey') THEN
+		        ALTER TABLE content_items
+		            RENAME CONSTRAINT content_items_topic_id_fkey TO content_items_story_id_fkey;
+		    END IF;
+
+		    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rss_feeds_topic_id_fkey')
+		       AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'rss_feeds_story_id_fkey') THEN
+		        ALTER TABLE rss_feeds
+		            RENAME CONSTRAINT rss_feeds_topic_id_fkey TO rss_feeds_story_id_fkey;
+		    END IF;
+		END $$`,
+	}
+	for _, stmt := range statements {
+		if err := db.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("story/topic split failed (%s): %w", firstLine(stmt), err)
+		}
+	}
+	return nil
+}
+
+func mergeAndArchiveLegacyTopics(db *gorm.DB) error {
+	var archiveExists bool
+	if err := db.Raw(`SELECT to_regclass('public.legacy_event_topics') IS NOT NULL`).Scan(&archiveExists).Error; err != nil {
+		return fmt.Errorf("legacy event topics archive check failed: %w", err)
+	}
+	if archiveExists {
+		return fmt.Errorf("legacy topics table, populated stories table, and legacy_event_topics archive all exist; manual schema reconciliation required")
+	}
+
+	statements := []string{
+		`INSERT INTO stories (
+		    public_id, tenant_id, label, embedding, article_count, last_member_at,
+		    related_ids, labeled, summary, bullets, summary_built_at, category,
+		    created_at, updated_at
+		)
+		SELECT
+		    t.public_id, t.tenant_id, t.label, t.embedding, t.article_count, t.last_member_at,
+		    t.related_ids, t.labeled, t.summary, t.bullets, t.summary_built_at, t.category,
+		    t.created_at, t.updated_at
+		FROM topics t
+		WHERE NOT EXISTS (
+		    SELECT 1 FROM stories s WHERE s.public_id = t.public_id
+		)`,
+		`ALTER TABLE topics RENAME TO legacy_event_topics`,
+		`DO $$
+		BEGIN
+		    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'topics_pkey')
+		       AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'legacy_event_topics_pkey') THEN
+		        ALTER TABLE legacy_event_topics RENAME CONSTRAINT topics_pkey TO legacy_event_topics_pkey;
+		    END IF;
+		END $$`,
+		`DO $$
+		BEGIN
+		    IF to_regclass('public.topics_id_seq') IS NOT NULL
+		       AND to_regclass('public.legacy_event_topics_id_seq') IS NULL THEN
+		        ALTER SEQUENCE topics_id_seq RENAME TO legacy_event_topics_id_seq;
+		        ALTER TABLE legacy_event_topics ALTER COLUMN id SET DEFAULT nextval('legacy_event_topics_id_seq'::regclass);
+		    END IF;
+		END $$`,
+		renameIndexIfAvailableSQL("idx_topics_public_id", "idx_legacy_event_topics_public_id"),
+		renameIndexIfAvailableSQL("idx_topics_tenant_label", "idx_legacy_event_topics_tenant_label"),
+		renameIndexIfAvailableSQL("idx_topics_tenant", "idx_legacy_event_topics_tenant"),
+		renameIndexIfAvailableSQL("idx_topics_last_member_at", "idx_legacy_event_topics_last_member_at"),
+		renameIndexIfAvailableSQL("idx_topics_summary_built_at", "idx_legacy_event_topics_summary_built_at"),
+		renameIndexIfAvailableSQL("topics_embedding_idx", "legacy_event_topics_embedding_idx"),
+	}
+	for _, stmt := range statements {
+		if err := db.Exec(stmt).Error; err != nil {
+			return fmt.Errorf("legacy topics reconciliation failed (%s): %w", firstLine(stmt), err)
+		}
+	}
+	return nil
+}
+
+func renameIndexIfAvailableSQL(oldName, newName string) string {
+	return fmt.Sprintf(`DO $$
+	BEGIN
+	    IF to_regclass('public.%[1]s') IS NOT NULL
+	       AND to_regclass('public.%[2]s') IS NULL THEN
+	        ALTER INDEX %[1]s RENAME TO %[2]s;
+	    END IF;
+	END $$`, oldName, newName)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
+
 // getDatabaseURL returns the database connection string from DATABASE_URL
 // This is the only supported method for database configuration
 func getDatabaseURL() string {

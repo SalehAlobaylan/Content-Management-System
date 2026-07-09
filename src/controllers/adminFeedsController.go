@@ -111,7 +111,7 @@ type createRSSFeedRequest struct {
 	Name        string  `json:"name"`
 	Title       string  `json:"title"`
 	Description string  `json:"description"`
-	TopicID     *string `json:"topic_id"`
+	StoryID     *string `json:"story_id"`
 	ContentType string  `json:"content_type"`
 	ItemLimit   int     `json:"item_limit"`
 	Slug        string  `json:"slug"`
@@ -140,9 +140,9 @@ func CreateRSSFeed(c *gin.Context) {
 		ItemLimit:   clampLimit(req.ItemLimit),
 		Enabled:     true,
 	}
-	if req.TopicID != nil {
-		if tid, err := uuid.Parse(strings.TrimSpace(*req.TopicID)); err == nil {
-			feed.TopicID = &tid
+	if req.StoryID != nil {
+		if tid, err := uuid.Parse(strings.TrimSpace(*req.StoryID)); err == nil {
+			feed.StoryID = &tid
 		}
 	}
 	slugBase := req.Slug
@@ -162,7 +162,7 @@ type updateRSSFeedRequest struct {
 	Name        *string `json:"name"`
 	Title       *string `json:"title"`
 	Description *string `json:"description"`
-	TopicID     *string `json:"topic_id"` // "" / "null" clears; uuid sets
+	StoryID     *string `json:"story_id"` // "" / "null" clears; uuid sets
 	ContentType *string `json:"content_type"`
 	ItemLimit   *int    `json:"item_limit"`
 	Enabled     *bool   `json:"enabled"`
@@ -214,12 +214,12 @@ func UpdateRSSFeed(c *gin.Context) {
 	if req.Enabled != nil {
 		updates["enabled"] = *req.Enabled
 	}
-	if req.TopicID != nil {
-		v := strings.TrimSpace(*req.TopicID)
+	if req.StoryID != nil {
+		v := strings.TrimSpace(*req.StoryID)
 		if v == "" || strings.EqualFold(v, "null") {
-			updates["topic_id"] = nil
+			updates["story_id"] = nil
 		} else if tid, perr := uuid.Parse(v); perr == nil {
-			updates["topic_id"] = tid
+			updates["story_id"] = tid
 		}
 	}
 	if req.Slug != nil {

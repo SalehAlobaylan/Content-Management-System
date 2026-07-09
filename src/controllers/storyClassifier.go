@@ -60,7 +60,7 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 		Distance float64
 	}
 	var nearest nearestRow
-	_ = db.Model(&models.Topic{}).
+	_ = db.Model(&models.Story{}).
 		Select("public_id, (embedding <=> '"+lit+"') AS distance").
 		Where("tenant_id = ? AND embedding IS NOT NULL", item.TenantID).
 		Where("last_member_at IS NULL OR last_member_at BETWEEN ? AND ?", windowStart, windowEnd).
@@ -82,7 +82,7 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	// No close topic — ask the LLM for a meaningful label and create one.
 	// Classification must NOT depend on LLM availability: on any labeling
 	// failure fall back to a placeholder label derived from the item itself
-	// (Labeled=false, renamed later by /admin/topics/label-batch). Returning
+	// (Labeled=false, renamed later by /admin/stories/label-batch). Returning
 	// without a topic would silently exclude the item from the News feed.
 	labeled := true
 	label, err := generateTopicLabelViaEnrichment(topicSeedTexts(&item))
@@ -92,11 +92,11 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 		label = placeholderStoryLabel(&item)
 	}
 
-	var topic models.Topic
+	var topic models.Story
 	findErr := db.Where("tenant_id = ? AND label = ?", item.TenantID, label).First(&topic).Error
 	if errors.Is(findErr, gorm.ErrRecordNotFound) {
 		vec := pgvector.NewVector(emb)
-		topic = models.Topic{
+		topic = models.Story{
 			TenantID:     item.TenantID,
 			Label:        label,
 			Embedding:    &vec,
@@ -123,17 +123,17 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 // transaction with a row lock so concurrent classifications don't clobber the
 // centroid. Decrements the previous topic's count when an item is moved.
 func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID, emb []float32) {
-	alreadyMember := item.TopicID != nil && *item.TopicID == topicID
+	alreadyMember := item.StoryID != nil && *item.StoryID == topicID
 
 	_ = db.Transaction(func(tx *gorm.DB) error {
-		if item.TopicID != nil && *item.TopicID != topicID {
-			tx.Model(&models.Topic{}).
-				Where("public_id = ?", *item.TopicID).
+		if item.StoryID != nil && *item.StoryID != topicID {
+			tx.Model(&models.Story{}).
+				Where("public_id = ?", *item.StoryID).
 				UpdateColumn("article_count", gorm.Expr("GREATEST(article_count - 1, 0)"))
 		}
 
 		if !alreadyMember {
-			var topic models.Topic
+			var topic models.Story
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 				Where("public_id = ?", topicID).First(&topic).Error; err != nil {
 				return err
@@ -153,7 +153,7 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 			if t := itemTime(*item); topic.LastMemberAt == nil || t.After(*topic.LastMemberAt) {
 				updates["last_member_at"] = t
 			}
-			if err := tx.Model(&models.Topic{}).
+			if err := tx.Model(&models.Story{}).
 				Where("public_id = ?", topicID).
 				Updates(updates).Error; err != nil {
 				return err
@@ -162,13 +162,13 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 
 		if err := tx.Model(&models.ContentItem{}).
 			Where("public_id = ?", item.PublicID).
-			UpdateColumn("topic_id", topicID).Error; err != nil {
+			UpdateColumn("story_id", topicID).Error; err != nil {
 			return err
 		}
 		return nil
 	})
 
-	item.TopicID = &topicID
+	item.StoryID = &topicID
 
 	if !alreadyMember {
 		// A story just gained a member — a news event the feed must reflect.
@@ -248,7 +248,7 @@ func StartClassificationBackfill(db *gorm.DB) {
 		for {
 			var remaining int64
 			db.Model(&models.ContentItem{}).
-				Where("type = ? AND status = ? AND embedding IS NOT NULL AND topic_id IS NULL",
+				Where("type = ? AND status = ? AND embedding IS NOT NULL AND story_id IS NULL",
 					models.ContentTypeNews, models.ContentStatusReady).
 				Count(&remaining)
 			if remaining == 0 {
@@ -268,7 +268,7 @@ func StartClassificationBackfill(db *gorm.DB) {
 			// stories form in event order (an item only joins stories active
 			// near its own publish time), so backfill must replay history.
 			db.Model(&models.ContentItem{}).
-				Where("type = ? AND status = ? AND embedding IS NOT NULL AND topic_id IS NULL",
+				Where("type = ? AND status = ? AND embedding IS NOT NULL AND story_id IS NULL",
 					models.ContentTypeNews, models.ContentStatusReady).
 				Order("COALESCE(published_at, created_at) ASC").
 				Limit(batchSize).
@@ -336,7 +336,7 @@ func StartRelatedBackfill(db *gorm.DB) {
 			TenantID string
 		}
 		var rows []row
-		db.Model(&models.Topic{}).
+		db.Model(&models.Story{}).
 			Select("public_id, tenant_id").
 			Where("related_ids IS NULL AND embedding IS NOT NULL AND article_count > 0").
 			Scan(&rows)

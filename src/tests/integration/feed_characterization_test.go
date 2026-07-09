@@ -194,7 +194,7 @@ func seedCharacterizationMediaItem(t *testing.T, title string, status models.Con
 func seedCharacterizationNewsStory(t *testing.T, label string, count int, latest time.Time) {
 	t.Helper()
 
-	story := models.Topic{
+	story := models.Story{
 		TenantID:     utils.GetDefaultTenantID(),
 		Label:        label,
 		ArticleCount: count,
@@ -222,7 +222,7 @@ func seedCharacterizationNewsStory(t *testing.T, label string, count int, latest
 			Excerpt:     &excerpt,
 			Author:      &author,
 			SourceName:  &sourceName,
-			TopicID:     &story.PublicID,
+			StoryID:     &story.PublicID,
 			PublishedAt: &publishedAt,
 		}
 		if err := testDB.Create(&item).Error; err != nil {

@@ -44,7 +44,7 @@ type topicsListResponse struct {
 	TotalPages    int               `json:"total_pages"`
 }
 
-// ListContentTopics handles GET /admin/content/topics.
+// ListContentTopics handles GET /admin/content/stories.
 //
 // Lists first-class (LLM-labeled) topics with live per-status counts via a
 // LEFT JOIN onto content_items, plus an "uncategorized" bucket for
@@ -73,7 +73,7 @@ func ListContentTopics(c *gin.Context) {
 
 	// Topic count drives pagination.
 	var total int64
-	countQ := db.Model(&models.Topic{}).Where("tenant_id = ?", principal.TenantID)
+	countQ := db.Model(&models.Story{}).Where("tenant_id = ?", principal.TenantID)
 	if search != "" {
 		countQ = countQ.Where("label ILIKE ?", "%"+search+"%")
 	}
@@ -81,20 +81,20 @@ func ListContentTopics(c *gin.Context) {
 
 	// Per-topic live counts. LEFT JOIN keeps empty topics; the join predicate
 	// scopes counts to the requested content type + tenant.
-	listQ := db.Table("topics").
-		Select("topics.public_id::text AS id, topics.label AS label, " +
-			"COUNT(c.id) AS total, " +
-			"COUNT(c.id) FILTER (WHERE c.status = 'READY') AS ready, " +
-			"COUNT(c.id) FILTER (WHERE c.status = 'PENDING') AS pending, " +
-			"COUNT(c.id) FILTER (WHERE c.status = 'ARCHIVED') AS archived, " +
+	listQ := db.Table("stories").
+		Select("stories.public_id::text AS id, stories.label AS label, "+
+			"COUNT(c.id) AS total, "+
+			"COUNT(c.id) FILTER (WHERE c.status = 'READY') AS ready, "+
+			"COUNT(c.id) FILTER (WHERE c.status = 'PENDING') AS pending, "+
+			"COUNT(c.id) FILTER (WHERE c.status = 'ARCHIVED') AS archived, "+
 			"COALESCE(AVG(c.view_count), 0) AS avg_views").
-		Joins("LEFT JOIN content_items c ON c.topic_id = topics.public_id AND c.tenant_id = topics.tenant_id AND c.type = ?", contentType).
-		Where("topics.tenant_id = ?", principal.TenantID)
+		Joins("LEFT JOIN content_items c ON c.story_id = stories.public_id AND c.tenant_id = stories.tenant_id AND c.type = ?", contentType).
+		Where("stories.tenant_id = ?", principal.TenantID)
 	if search != "" {
-		listQ = listQ.Where("topics.label ILIKE ?", "%"+search+"%")
+		listQ = listQ.Where("stories.label ILIKE ?", "%"+search+"%")
 	}
-	listQ = listQ.Group("topics.public_id, topics.label").
-		Order("total DESC, topics.label ASC").
+	listQ = listQ.Group("stories.public_id, stories.label").
+		Order("total DESC, stories.label ASC").
 		Limit(limit).Offset(offset)
 
 	var rows []topicSummary
@@ -112,11 +112,11 @@ func ListContentTopics(c *gin.Context) {
 	// Uncategorized bucket — articles not yet classified.
 	var unc topicStatusCounts
 	db.Model(&models.ContentItem{}).
-		Select("COUNT(*) AS total, " +
-			"COUNT(*) FILTER (WHERE status = 'READY') AS ready, " +
-			"COUNT(*) FILTER (WHERE status = 'PENDING') AS pending, " +
+		Select("COUNT(*) AS total, "+
+			"COUNT(*) FILTER (WHERE status = 'READY') AS ready, "+
+			"COUNT(*) FILTER (WHERE status = 'PENDING') AS pending, "+
 			"COUNT(*) FILTER (WHERE status = 'ARCHIVED') AS archived").
-		Where("tenant_id = ? AND type = ? AND topic_id IS NULL", principal.TenantID, contentType).
+		Where("tenant_id = ? AND type = ? AND story_id IS NULL", principal.TenantID, contentType).
 		Scan(&unc)
 
 	totalPages := 0
@@ -306,7 +306,7 @@ type renameTopicRequest struct {
 	Label string `json:"label"`
 }
 
-// RenameTopic handles PATCH /admin/topics/:id.
+// RenameTopic handles PATCH /admin/stories/:id.
 func RenameTopic(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -328,7 +328,7 @@ func RenameTopic(c *gin.Context) {
 	label := strings.TrimSpace(req.Label)
 
 	// A name collision is a merge, not a rename — steer the caller there.
-	var existing models.Topic
+	var existing models.Story
 	if err := db.Where("tenant_id = ? AND label = ? AND public_id <> ?", principal.TenantID, label, id).
 		First(&existing).Error; err == nil {
 		c.JSON(http.StatusConflict, authErrorResponse{
@@ -338,7 +338,7 @@ func RenameTopic(c *gin.Context) {
 		return
 	}
 
-	res := db.Model(&models.Topic{}).
+	res := db.Model(&models.Story{}).
 		Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).
 		Update("label", label)
 	if res.Error != nil {
@@ -357,7 +357,7 @@ type mergeTopicsRequest struct {
 	TargetID  string   `json:"target_id"`
 }
 
-// MergeTopics handles POST /admin/topics/merge — repoints all content from the
+// MergeTopics handles POST /admin/stories/merge — repoints all content from the
 // source topics onto the target, then deletes the empty sources.
 func MergeTopics(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
@@ -390,19 +390,19 @@ func MergeTopics(c *gin.Context) {
 	var moved int64
 	err = db.Transaction(func(tx *gorm.DB) error {
 		res := tx.Model(&models.ContentItem{}).
-			Where("tenant_id = ? AND topic_id IN ?", principal.TenantID, sources).
-			Update("topic_id", target)
+			Where("tenant_id = ? AND story_id IN ?", principal.TenantID, sources).
+			Update("story_id", target)
 		if res.Error != nil {
 			return res.Error
 		}
 		moved = res.RowsAffected
 
 		var cnt int64
-		tx.Model(&models.ContentItem{}).Where("topic_id = ?", target).Count(&cnt)
-		tx.Model(&models.Topic{}).Where("public_id = ?", target).Update("article_count", cnt)
+		tx.Model(&models.ContentItem{}).Where("story_id = ?", target).Count(&cnt)
+		tx.Model(&models.Story{}).Where("public_id = ?", target).Update("article_count", cnt)
 
 		return tx.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, sources).
-			Delete(&models.Topic{}).Error
+			Delete(&models.Story{}).Error
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to merge topics: " + err.Error(), Code: "MERGE_FAILED"})
@@ -411,7 +411,7 @@ func MergeTopics(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"merged": len(sources), "moved": moved, "target_id": req.TargetID})
 }
 
-// DeleteTopic handles DELETE /admin/topics/:id. Content survives — its topic_id
+// DeleteTopic handles DELETE /admin/stories/:id. Content survives — its story_id
 // is cleared (so the articles fall back into "uncategorized").
 func DeleteTopic(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
@@ -429,11 +429,11 @@ func DeleteTopic(c *gin.Context) {
 	var deleted int64
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(&models.ContentItem{}).
-			Where("topic_id = ? AND tenant_id = ?", id, principal.TenantID).
-			Update("topic_id", nil).Error; e != nil {
+			Where("story_id = ? AND tenant_id = ?", id, principal.TenantID).
+			Update("story_id", nil).Error; e != nil {
 			return e
 		}
-		res := tx.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).Delete(&models.Topic{})
+		res := tx.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).Delete(&models.Story{})
 		if res.Error != nil {
 			return res.Error
 		}
@@ -457,9 +457,9 @@ type bulkAssignTopicRequest struct {
 	Type          string   `json:"type"`
 	SourceName    string   `json:"source_name"`
 	Topic         string   `json:"topic"`
-	TopicID       string   `json:"topic_id"` // current-topic filter (e.g. the active board topic)
+	StoryID       string   `json:"story_id"` // current-topic filter (e.g. the active board topic)
 	CreatedBefore string   `json:"created_before"`
-	TargetTopicID string   `json:"target_topic_id"` // destination; empty/"null" => uncategorize
+	TargetStoryID string   `json:"target_story_id"` // destination; empty/"null" => uncategorize
 	DryRun        bool     `json:"dry_run"`
 }
 
@@ -479,7 +479,7 @@ func BulkAssignTopic(c *gin.Context) {
 	}
 
 	hasIDs := len(req.IDs) > 0
-	if !hasIDs && req.Status == "" && req.Type == "" && req.SourceName == "" && req.Topic == "" && req.TopicID == "" && req.CreatedBefore == "" {
+	if !hasIDs && req.Status == "" && req.Type == "" && req.SourceName == "" && req.Topic == "" && req.StoryID == "" && req.CreatedBefore == "" {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "A selection is required", Code: "SELECTION_REQUIRED"})
 		return
 	}
@@ -511,11 +511,11 @@ func BulkAssignTopic(c *gin.Context) {
 		if req.Topic != "" {
 			q = q.Where("? = ANY(topic_tags)", req.Topic)
 		}
-		if req.TopicID != "" {
-			if strings.EqualFold(req.TopicID, "none") {
-				q = q.Where("topic_id IS NULL")
+		if req.StoryID != "" {
+			if strings.EqualFold(req.StoryID, "none") {
+				q = q.Where("story_id IS NULL")
 			} else {
-				q = q.Where("topic_id = ?", req.TopicID)
+				q = q.Where("story_id = ?", req.StoryID)
 			}
 		}
 		if createdBefore != nil {
@@ -533,19 +533,19 @@ func BulkAssignTopic(c *gin.Context) {
 
 	var target interface{}
 	var targetID *uuid.UUID
-	if req.TargetTopicID == "" || strings.EqualFold(req.TargetTopicID, "null") {
+	if req.TargetStoryID == "" || strings.EqualFold(req.TargetStoryID, "null") {
 		target = nil
 	} else {
-		tid, err := uuid.Parse(req.TargetTopicID)
+		tid, err := uuid.Parse(req.TargetStoryID)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid target_topic_id", Code: "INVALID_ID"})
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid target_story_id", Code: "INVALID_ID"})
 			return
 		}
 		target = tid
 		targetID = &tid
 	}
 
-	res := apply(db.Model(&models.ContentItem{})).Update("topic_id", target)
+	res := apply(db.Model(&models.ContentItem{})).Update("story_id", target)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assign topic: " + res.Error.Error(), Code: "ASSIGN_FAILED"})
 		return
@@ -554,8 +554,8 @@ func BulkAssignTopic(c *gin.Context) {
 	// Keep the target's article_count roughly in sync with live membership.
 	if targetID != nil {
 		var cnt int64
-		db.Model(&models.ContentItem{}).Where("topic_id = ?", *targetID).Count(&cnt)
-		db.Model(&models.Topic{}).Where("public_id = ?", *targetID).Update("article_count", cnt)
+		db.Model(&models.ContentItem{}).Where("story_id = ?", *targetID).Count(&cnt)
+		db.Model(&models.Story{}).Where("public_id = ?", *targetID).Update("article_count", cnt)
 	}
 
 	c.JSON(http.StatusOK, bulkEditTagsResponse{UpdatedCount: res.RowsAffected, Message: "Moved items to topic"})
@@ -571,7 +571,7 @@ type reclassifyResponse struct {
 	Remaining int64 `json:"remaining"`
 }
 
-// ReclassifyTopics handles POST /admin/topics/reclassify — backfill: classify a
+// ReclassifyTopics handles POST /admin/stories/reclassify — backfill: classify a
 // batch of not-yet-classified articles. Synchronous (so it can report
 // progress); the UI loops until remaining == 0. Capped per call.
 func ReclassifyTopics(c *gin.Context) {
@@ -597,7 +597,7 @@ func ReclassifyTopics(c *gin.Context) {
 
 	var ids []uuid.UUID
 	db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND type = ? AND topic_id IS NULL AND embedding IS NOT NULL", principal.TenantID, contentType).
+		Where("tenant_id = ? AND type = ? AND story_id IS NULL AND embedding IS NOT NULL", principal.TenantID, contentType).
 		Order("created_at ASC").
 		Limit(limit).
 		Pluck("public_id", &ids)
@@ -608,7 +608,7 @@ func ReclassifyTopics(c *gin.Context) {
 
 	var remaining int64
 	db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND type = ? AND topic_id IS NULL AND embedding IS NOT NULL", principal.TenantID, contentType).
+		Where("tenant_id = ? AND type = ? AND story_id IS NULL AND embedding IS NOT NULL", principal.TenantID, contentType).
 		Count(&remaining)
 
 	c.JSON(http.StatusOK, reclassifyResponse{Processed: len(ids), Remaining: remaining})
@@ -627,7 +627,7 @@ type reclusterResponse struct {
 	Message  string `json:"message"`
 }
 
-// ReclusterTopics handles POST /admin/topics/recluster — rebuilds the story
+// ReclusterTopics handles POST /admin/stories/recluster — rebuilds the story
 // taxonomy from scratch. Phase 13: replaced the old global k-means pass (which
 // produced broad THEMATIC buckets) with the same threshold-based event
 // clustering the live classifier uses: wipe assignments + topics, then replay
@@ -665,10 +665,10 @@ func ReclusterTopics(c *gin.Context) {
 	err := db.Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(&models.ContentItem{}).
 			Where("tenant_id = ? AND type = ?", principal.TenantID, contentType).
-			Update("topic_id", nil).Error; e != nil {
+			Update("story_id", nil).Error; e != nil {
 			return e
 		}
-		return tx.Where("tenant_id = ?", principal.TenantID).Delete(&models.Topic{}).Error
+		return tx.Where("tenant_id = ?", principal.TenantID).Delete(&models.Story{}).Error
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Re-cluster failed: " + err.Error(), Code: "RECLUSTER_FAILED"})
@@ -693,7 +693,7 @@ type labelBatchResponse struct {
 	Remaining int64 `json:"remaining"`
 }
 
-// LabelTopicsBatch handles POST /admin/topics/label-batch — names a batch of
+// LabelTopicsBatch handles POST /admin/stories/label-batch — names a batch of
 // freshly-clustered (labeled=false) topics via the LLM, biggest first. The UI
 // loops until remaining == 0. Capped per call (each topic = one LLM call).
 func LabelTopicsBatch(c *gin.Context) {
@@ -713,7 +713,7 @@ func LabelTopicsBatch(c *gin.Context) {
 		limit = 20
 	}
 
-	var topics []models.Topic
+	var topics []models.Story
 	db.Where("tenant_id = ? AND labeled = ?", principal.TenantID, false).
 		Order("article_count DESC").
 		Limit(limit).
@@ -725,7 +725,7 @@ func LabelTopicsBatch(c *gin.Context) {
 		if len(texts) == 0 {
 			// No member text to name from — keep the placeholder but mark it
 			// labeled so the loop terminates.
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
+			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
 			processed++
 			continue
 		}
@@ -743,28 +743,28 @@ func LabelTopicsBatch(c *gin.Context) {
 
 		label = strings.TrimSpace(label)
 		if label == "" {
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
+			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
 			processed++
 			continue
 		}
-		if err := db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+		if err := db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
 			Updates(map[string]interface{}{"label": label, "labeled": true}).Error; err != nil {
 			// Unique (tenant,label) collision — disambiguate with a short suffix.
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
 				Updates(map[string]interface{}{"label": label + " " + t.PublicID.String()[:4], "labeled": true})
 		}
 		processed++
 	}
 
 	var remaining int64
-	db.Model(&models.Topic{}).
+	db.Model(&models.Story{}).
 		Where("tenant_id = ? AND labeled = ?", principal.TenantID, false).
 		Count(&remaining)
 
 	c.JSON(http.StatusOK, labelBatchResponse{Processed: processed, Remaining: remaining})
 }
 
-// DigestTopicsBatch handles POST /admin/topics/summary-batch — backfills the
+// DigestTopicsBatch handles POST /admin/stories/summary-batch — backfills the
 // source-grounded AI digest (Slice 8) for multi-member stories that lack one,
 // biggest first. The UI loops until remaining == 0. Capped per call (each story
 // = one LLM call). Future stories self-digest at write time; this fills the
@@ -808,8 +808,8 @@ func DigestTopicsBatch(c *gin.Context) {
 			principal.TenantID, minMembers)
 	}
 
-	var topics []models.Topic
-	selectUndigested(db.Model(&models.Topic{})).
+	var topics []models.Story
+	selectUndigested(db.Model(&models.Story{})).
 		Order("article_count DESC").
 		Limit(limit).
 		Find(&topics)
@@ -821,7 +821,7 @@ func DigestTopicsBatch(c *gin.Context) {
 		if len(texts) < minMembers {
 			// Nothing groundable — mark attempted (both axes) so the loop drains;
 			// write-time will retry it (its gate regenerates while bullets is NULL).
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
 				Updates(map[string]interface{}{"summary_built_at": now, "category": "general"})
 			continue
 		}
@@ -836,12 +836,12 @@ func DigestTopicsBatch(c *gin.Context) {
 			return
 		}
 		if len(bullets) == 0 {
-			db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
 				Updates(map[string]interface{}{"summary_built_at": now, "category": normalizeStoryCategory(category)})
 			continue
 		}
 		bulletsJSON, _ := json.Marshal(bullets)
-		db.Model(&models.Topic{}).Where("public_id = ?", t.PublicID).
+		db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
 			Updates(map[string]interface{}{
 				"summary":          summary,
 				"bullets":          datatypes.JSON(bulletsJSON),
@@ -852,14 +852,14 @@ func DigestTopicsBatch(c *gin.Context) {
 	}
 
 	var remaining int64
-	selectUndigested(db.Model(&models.Topic{})).Count(&remaining)
+	selectUndigested(db.Model(&models.Story{})).Count(&remaining)
 
 	c.JSON(http.StatusOK, labelBatchResponse{Processed: processed, Remaining: remaining})
 }
 
 // topicRepresentativeTexts returns title+excerpt snippets of the members
 // closest to a topic's centroid — the LLM names the cluster from these.
-func topicRepresentativeTexts(db *gorm.DB, tenant string, t models.Topic) []string {
+func topicRepresentativeTexts(db *gorm.DB, tenant string, t models.Story) []string {
 	order := "created_at DESC"
 	if t.Embedding != nil {
 		lit := utils.PgvectorToLiteral(t.Embedding.Slice())
@@ -873,7 +873,7 @@ func topicRepresentativeTexts(db *gorm.DB, tenant string, t models.Topic) []stri
 	var rows []snip
 	db.Model(&models.ContentItem{}).
 		Select("title, excerpt").
-		Where("tenant_id = ? AND topic_id = ?", tenant, t.PublicID).
+		Where("tenant_id = ? AND story_id = ?", tenant, t.PublicID).
 		Order(order).
 		Limit(5).
 		Scan(&rows)

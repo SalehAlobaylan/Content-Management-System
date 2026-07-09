@@ -19,6 +19,7 @@ type ScoreBreakdown struct {
 	Quality    float64 `json:"quality"`
 	Diversity  float64 `json:"diversity"`
 	Trending   float64 `json:"trending"`
+	Preference float64 `json:"preference"`
 	Flags      string  `json:"flags"` // "boosted", "suppressed", "pinned", ""
 }
 

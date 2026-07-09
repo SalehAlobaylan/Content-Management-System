@@ -442,7 +442,7 @@ func PreviewCirculation(c *gin.Context) {
 		policy := sanitizeCirculationPolicy(*req.Policy)
 		ctx = circulationContextFromPolicy(policy, window, time.Now())
 	}
-	slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, limit, nil)
+	slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, limit, nil, "")
 	c.JSON(http.StatusOK, StoryNewsResponse{Cursor: nil, Slides: slides})
 }
 
@@ -470,7 +470,7 @@ func GetCirculationMetrics(c *gin.Context) {
 	metrics := make([]windowMetric, 0, 3)
 	for _, w := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
 		ctx := circulationContextFromPolicy(policy, w, now)
-		slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, 60, nil)
+		slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, 60, nil, "")
 		m := windowMetric{Window: w, PrimaryFrom: ctx.Window.PrimaryStart.Format(time.RFC3339)}
 		for _, slide := range slides {
 			story := slide.Featured.StorySummary
@@ -540,7 +540,7 @@ func UpsertStoryOverride(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid story ID", Code: "INVALID_ID"})
 		return
 	}
-	var topic models.Topic
+	var topic models.Story
 	if err := db.Where("tenant_id = ? AND public_id = ?", principal.TenantID, storyID).First(&topic).Error; err != nil {
 		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Story not found", Code: "NOT_FOUND"})
 		return

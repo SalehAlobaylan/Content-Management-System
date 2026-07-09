@@ -416,7 +416,7 @@ type storyDigestResult struct {
 
 // generateStorySummaryViaEnrichment digests a story's member texts into a
 // source-grounded lede + bullets + one category slug via Enrichment's
-// /v1/topics/digest. Mirrors generateTopicLabelViaEnrichment. Caller treats
+// /v1/stories/digest. Mirrors generateTopicLabelViaEnrichment. Caller treats
 // failure as best-effort.
 func generateStorySummaryViaEnrichment(texts []string) (string, []string, string, error) {
 	baseURL := enrichmentBaseURL()
@@ -434,7 +434,7 @@ func generateStorySummaryViaEnrichment(texts []string) (string, []string, string
 		return "", nil, "", fmt.Errorf("marshal story-digest request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/topics/digest", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/stories/digest", bytes.NewReader(body))
 	if err != nil {
 		return "", nil, "", fmt.Errorf("build story-digest request: %w", err)
 	}
@@ -536,7 +536,7 @@ func generateTopicLabelViaEnrichment(texts []string) (string, error) {
 		return "", fmt.Errorf("marshal topic-label request: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/topics/label", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/stories/label", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("build topic-label request: %w", err)
 	}

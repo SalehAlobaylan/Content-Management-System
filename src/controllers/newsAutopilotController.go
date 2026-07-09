@@ -650,13 +650,13 @@ func cheapTodayStoryMetrics(db *gorm.DB, tenantID string, circ circulationContex
 	}
 
 	var primaryStories int64
-	db.Model(&models.Topic{}).
+	db.Model(&models.Story{}).
 		Where("tenant_id = ? AND last_member_at >= ?", tenantID, circ.Window.PrimaryStart).
 		Count(&primaryStories)
 
 	carryover := int64(0)
 	if primaryStories < int64(circ.Policy.MinTodayStories) {
-		db.Model(&models.Topic{}).
+		db.Model(&models.Story{}).
 			Where("tenant_id = ? AND last_member_at >= ? AND last_member_at < ?", tenantID, circ.Window.QueryStart, circ.Window.PrimaryStart).
 			Count(&carryover)
 		needed := int64(circ.Policy.MinTodayStories) - primaryStories

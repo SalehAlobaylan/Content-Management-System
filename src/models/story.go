@@ -8,16 +8,16 @@ import (
 	"gorm.io/datatypes"
 )
 
-// Topic is a first-class, meaningful news topic. The Label is an
+// Story is a first-class news event cluster. The Label is an
 // LLM-generated sentence (in the content's language); the Embedding is the
 // centroid (running mean) of the dense embeddings of its member articles.
-// Articles point at a topic via content_items.topic_id.
-type Topic struct {
+// Articles point at a story via content_items.story_id.
+type Story struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
-	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_topics_public_id" json:"id"`
-	TenantID string    `gorm:"type:varchar(64);not null;index:idx_topics_tenant;uniqueIndex:idx_topics_tenant_label,priority:1" json:"tenant_id"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_stories_public_id" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;index:idx_stories_tenant;uniqueIndex:idx_stories_tenant_label,priority:1" json:"tenant_id"`
 
-	Label     string           `gorm:"type:text;not null;uniqueIndex:idx_topics_tenant_label,priority:2" json:"label"`
+	Label     string           `gorm:"type:text;not null;uniqueIndex:idx_stories_tenant_label,priority:2" json:"label"`
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
 
 	ArticleCount int `gorm:"default:0" json:"article_count"`
@@ -26,7 +26,7 @@ type Topic struct {
 	// drives the story activity window: an item only joins a story that was
 	// active near the item's own publish time, so stories stay bounded to
 	// their event instead of absorbing semantically-similar items forever.
-	LastMemberAt *time.Time `gorm:"index:idx_topics_last_member_at" json:"last_member_at,omitempty"`
+	LastMemberAt *time.Time `gorm:"index:idx_stories_last_member_at" json:"last_member_at,omitempty"`
 
 	// RelatedIDs is the WRITE-TIME-computed ordered list of related story ids
 	// (JSON array of UUID strings). Recomputed asynchronously whenever this
@@ -49,15 +49,15 @@ type Topic struct {
 	// regeneration on hot stories.
 	Summary        *string        `gorm:"type:text" json:"summary,omitempty"`
 	Bullets        datatypes.JSON `gorm:"type:jsonb" json:"bullets,omitempty"`
-	SummaryBuiltAt *time.Time     `gorm:"index:idx_topics_summary_built_at" json:"summary_built_at,omitempty"`
+	SummaryBuiltAt *time.Time     `gorm:"index:idx_stories_summary_built_at" json:"summary_built_at,omitempty"`
 	// Category is one slug from the finite news taxonomy (politics/economy/...),
 	// classified by the same LLM digest call. "general"/unknown render no chip.
-	Category       *string        `gorm:"type:text" json:"category,omitempty"`
+	Category *string `gorm:"type:text" json:"category,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
 
-func (Topic) TableName() string {
-	return "topics"
+func (Story) TableName() string {
+	return "stories"
 }

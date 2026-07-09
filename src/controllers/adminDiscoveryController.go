@@ -816,7 +816,7 @@ func SuggestProfilesFromTopics(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 
-	var topics []models.Topic
+	var topics []models.Story
 	if err := db.Where("tenant_id = ? AND labeled = ?", principal.TenantID, true).
 		Order("article_count DESC, last_member_at DESC NULLS LAST").
 		Limit(12).Find(&topics).Error; err != nil {

@@ -218,7 +218,7 @@ func clearWahbTables() {
 	_ = testDB.Exec("DELETE FROM user_interactions").Error
 	_ = testDB.Exec("DELETE FROM transcripts").Error
 	_ = testDB.Exec("DELETE FROM content_items").Error
-	_ = testDB.Exec("DELETE FROM topics").Error
+	_ = testDB.Exec("DELETE FROM stories").Error
 	_ = testDB.Exec("DELETE FROM content_sources").Error
 	fmt.Println("✅ Wahb tables cleared")
 }
@@ -298,7 +298,7 @@ func seedTestContent() {
 
 	// Phase 13: group the article fixtures under one story (topic) so the News
 	// feed (story-slides) has a populated story to render.
-	story := models.Topic{
+	story := models.Story{
 		TenantID:     utils.GetDefaultTenantID(),
 		Label:        "Test Story",
 		ArticleCount: 5,
@@ -308,7 +308,7 @@ func seedTestContent() {
 	testDB.Create(&story)
 	testDB.Model(&models.ContentItem{}).
 		Where("type = ? AND format = ?", models.ContentTypeNews, string(models.ContentFormatArticle)).
-		Update("topic_id", story.PublicID)
+		Update("story_id", story.PublicID)
 
 	fmt.Println("✅ Test content seeded")
 }

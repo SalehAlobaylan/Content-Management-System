@@ -64,6 +64,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupInteractionRoutes(v1, db)
 	routes.SetupContentRoutes(v1, db)
 	routes.SetupTranscriptRoutes(v1, db)
+	routes.SetupPreferenceRoutes(v1, db)
 
 	// Internal service-to-service routes
 	routes.SetupInternalRoutes(router, db)
@@ -137,7 +138,18 @@ func main() {
 			&models.MediaAtomizationPolicy{},
 			&models.MediaAtomizationRun{},
 			// First-class topics (LLM-labeled + centroid embedding)
+			&models.Story{},
+			// Canonical preference topic catalog + derived user affinity
+			&models.TopicCategory{},
 			&models.Topic{},
+			&models.TopicProposal{},
+			&models.ContentItemTopic{},
+			&models.StoryTopic{},
+			&models.UserTopicPref{},
+			&models.UserTopicAffinity{},
+			&models.UserCategoryAffinity{},
+			&models.PreferenceSettings{},
+			&models.PreferenceStat{},
 			// Feeds Finding — auto source discovery (profiles + suggestions + config)
 			&models.DiscoveryProfile{},
 			&models.SourceSuggestion{},
@@ -243,6 +255,7 @@ func main() {
 	// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
 	// precompute News snapshot when done. Runs in the background.
 	controllers.StartClassificationBackfill(db)
+	controllers.StartTopicsHeartbeat(db)
 	// Precompute missing topics.related_ids (stories predating the write-time
 	// related feature) so feed reads never fall back to per-slide centroid kNN.
 	controllers.StartRelatedBackfill(db)

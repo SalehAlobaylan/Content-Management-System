@@ -124,6 +124,7 @@ func GetForYouFeed(c *gin.Context) {
 		flagMap := LoadContentFlags(db, "default", contentIDs)
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
+		scored = applyPreferenceFeedHook(db, "default", userIDStr, scored)
 		scored = applyIntelligenceFeedHooks(db, "default", scored)
 		scored = spaceScoredSiblingChapters(scored)
 		unfilteredScored := append([]ScoredItem(nil), scored...)
@@ -214,6 +215,13 @@ func GetForYouFeed(c *gin.Context) {
 
 		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems})
 		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+		boosted := int64(0)
+		for _, item := range pageItems {
+			if item.ScoreBreakdown.Preference > 0 {
+				boosted++
+			}
+		}
+		recordPreferenceServes(db, "default", boosted, int64(len(items)))
 		return
 	}
 
@@ -261,17 +269,22 @@ func GetForYouFeed(c *gin.Context) {
 		}
 	}
 
-	// Determine if there's a next page
+	// Keep the cursor boundary chronological even when preferences reorder the
+	// returned page. That makes the cursor stable while allowing a deliberately
+	// bounded preference boost within the current chronological window.
 	items = spaceSiblingChapters(items)
 	var nextCursor *string
 	hasMore := len(items) > pagination.Limit
+	var cursorItem *models.ContentItem
 	if hasMore {
+		boundary := items[pagination.Limit-1]
+		cursorItem = &boundary
 		items = items[:pagination.Limit] // trim to limit
 	}
 
 	// Get last item for cursor
-	if len(items) > 0 && hasMore {
-		lastItem := items[len(items)-1]
+	if cursorItem != nil {
+		lastItem := *cursorItem
 		var ts time.Time
 		if lastItem.PublishedAt != nil {
 			ts = *lastItem.PublishedAt
@@ -281,6 +294,8 @@ func GetForYouFeed(c *gin.Context) {
 		cursor := utils.EncodeCursor(ts, lastItem.PublicID)
 		nextCursor = &cursor
 	}
+
+	items, boosted := applyChronologicalPreferenceOrder(db, "default", userIDStr, items)
 
 	// Get interaction status if session/user provided
 	likedMap := make(map[uuid.UUID]bool)
@@ -300,6 +315,7 @@ func GetForYouFeed(c *gin.Context) {
 		Items:  responseItems,
 	})
 	recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+	recordPreferenceServes(db, "default", int64(boosted), int64(len(items)))
 }
 
 // recordForYouServe fires the Ranking/Intelligence serve-side telemetry
@@ -376,7 +392,7 @@ func GetNewsFeed(c *gin.Context) {
 		return seenIDs
 	}
 	slides, nextCursor := serveStoryNewsFeed(
-		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen,
+		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr,
 	)
 
 	c.JSON(http.StatusOK, StoryNewsResponse{

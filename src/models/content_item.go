@@ -154,10 +154,10 @@ type ContentItem struct {
 
 	// Tags & AI
 	TopicTags pq.StringArray `gorm:"type:text[]" json:"topic_tags,omitempty"`
-	// TopicID is the first-class topic this article is classified into
+	// StoryID is the first-class topic this article is classified into
 	// (Enrichment LLM label + embedding centroid). NULL until classified.
 	// Distinct from the legacy free-form TopicTags above.
-	TopicID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_topic_id" json:"topic_id,omitempty"`
+	StoryID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_story_id" json:"story_id,omitempty"`
 	// Embedding is the Qwen/Qwen3-Embedding-0.6B dense text vector (1024-dim),
 	// populated by Enrichment-Service. Multilingual — strong on Arabic + English.
 	// (Replaced BGE-M3; semantic similarity is dense cosine only.)
