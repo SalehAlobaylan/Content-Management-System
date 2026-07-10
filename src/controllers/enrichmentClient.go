@@ -660,6 +660,75 @@ func generateChaptersViaEnrichment(
 	return decoded.Chapters, nil
 }
 
+// ─── Bounded bilingual translation (Preferences Autopilot advisor) ──
+//
+// translateViaEnrichment is the ONLY LLM path the Preferences Autopilot uses
+// (plan §15). It fills a missing/sluggish AR or EN topic label as DISPLAY PREFILL
+// — never an approval input by itself. The scorer caps calls per run; failure
+// degrades to slug-derived labels flagged needs_label.
+
+func translateViaEnrichment(text, targetLanguage string) (string, error) {
+	baseURL := enrichmentBaseURL()
+	if baseURL == "" {
+		return "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+	}
+	token := enrichmentServiceToken()
+	if token == "" {
+		return "", fmt.Errorf("enrichment service token is not configured")
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", fmt.Errorf("empty text")
+	}
+	if targetLanguage == "" {
+		targetLanguage = "en"
+	}
+
+	payload, err := json.Marshal(map[string]interface{}{"text": text, "target_language": targetLanguage})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/translate", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("enrichment translate status %d: %s", resp.StatusCode, string(body))
+	}
+	var r struct {
+		TranslatedText string `json:"translated_text"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(r.TranslatedText) == "" {
+		return "", fmt.Errorf("enrichment returned empty translation")
+	}
+	return strings.TrimSpace(r.TranslatedText), nil
+}
+
+// hasArabicScript reports whether s contains any Arabic-range code point — used to
+// classify a topic label's language without an LLM round trip.
+func hasArabicScript(s string) bool {
+	for _, r := range s {
+		if (r >= 0x0600 && r <= 0x06FF) || (r >= 0x0750 && r <= 0x077F) ||
+			(r >= 0x08A0 && r <= 0x08FF) || (r >= 0xFB50 && r <= 0xFDFF) ||
+			(r >= 0xFE70 && r <= 0xFEFF) {
+			return true
+		}
+	}
+	return false
+}
+
 // embedQueryViaEnrichment embeds a single text synchronously and returns the
 // 1024-dim L2-normalized dense vector (Qwen). Unlike triggerEmbedding it does
 // NOT persist anything — used for on-the-fly relevance scoring of candidates.

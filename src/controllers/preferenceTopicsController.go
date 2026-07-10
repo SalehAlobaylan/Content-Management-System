@@ -3,7 +3,6 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
-	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"math"
@@ -17,7 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/pgvector/pgvector-go"
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -119,7 +117,6 @@ const prefSettingsCacheTTL = 30 * time.Second
 var (
 	prefSettingsCache   = map[string]cachedPrefSettings{}
 	prefSettingsCacheMu sync.RWMutex
-	catalogRemaps       sync.Map
 )
 
 // loadPreferenceSettingsCached is the feed-path loader — cheap and DB-free on the
@@ -309,6 +306,7 @@ func AdminCreateTopic(c *gin.Context) {
 	topic := models.Topic{
 		TenantID: principal.TenantID, Slug: slug, LabelAR: ar, LabelEN: en,
 		CategorySlug: strings.TrimSpace(req.CategorySlug), Active: active, Featured: featured, CreatedFrom: "manual",
+		NeedsRemap: true,
 	}
 	if emb, err := embedQueryViaEnrichment(en + " " + ar); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
@@ -318,7 +316,6 @@ func AdminCreateTopic(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Failed to create topic: " + err.Error(), Code: "CREATE_FAILED"})
 		return
 	}
-	scheduleCatalogRemap(db, principal.TenantID)
 	c.JSON(http.StatusCreated, gin.H{"data": topic})
 }
 
@@ -358,22 +355,24 @@ func AdminUpdateTopic(c *gin.Context) {
 	if req.Featured != nil {
 		updates["featured"] = *req.Featured
 	}
+	if _, changesMapping := updates["slug"]; changesMapping {
+		updates["needs_remap"] = true
+	}
+	if _, changesMapping := updates["label_ar"]; changesMapping {
+		updates["needs_remap"] = true
+	}
+	if _, changesMapping := updates["label_en"]; changesMapping {
+		updates["needs_remap"] = true
+	}
+	if _, changesMapping := updates["category_slug"]; changesMapping {
+		updates["needs_remap"] = true
+	}
+	if _, changesMapping := updates["active"]; changesMapping {
+		updates["needs_remap"] = true
+	}
 	if err := db.Model(&models.Topic{}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).Updates(updates).Error; err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Failed to update topic: " + err.Error(), Code: "UPDATE_FAILED"})
 		return
-	}
-	// Keep mappings consistent with the edit: an active topic is re-mapped against
-	// the corpus (category/label edits change how it should surface); a deactivated
-	// topic has its mapping rows purged so it stops contributing to affinity.
-	var saved models.Topic
-	if err := db.Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&saved).Error; err == nil {
-		if saved.Active {
-			scheduleCatalogRemap(db, principal.TenantID)
-		} else {
-			db.Where("topic_id = ?", saved.PublicID).Delete(&models.ContentItemTopic{})
-			db.Where("topic_id = ?", saved.PublicID).Delete(&models.StoryTopic{})
-			refreshTopicMemberCounts(db, principal.TenantID)
-		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Topic updated"})
 }
@@ -406,6 +405,35 @@ func topicProposalByID(db *gorm.DB, tenant string, id string) (models.TopicPropo
 	return p, true, nil
 }
 
+// approveTopicProposalCore performs the shared approve transaction: upsert the
+// topic on (tenant, slug), mark the proposal approved, and reload by slug so
+// PublicID is populated even when the upsert resolved to an existing row. Both
+// the human handler and the autopilot's earned auto-approve tier call this —
+// keeping ONE canonical write path. The bounded dirty sweep performs the remap
+// (NeedsRemap must be true on the passed topic).
+func approveTopicProposalCore(db *gorm.DB, tenantID string, p models.TopicProposal, topic models.Topic, resolvedBy string) (models.Topic, error) {
+	now := time.Now()
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "slug"}},
+			DoUpdates: clause.AssignmentColumns([]string{"label_ar", "label_en", "category_slug", "active", "featured", "needs_remap"}),
+		}).Create(&topic).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.TopicProposal{}).Where("id = ?", p.ID).Updates(map[string]interface{}{
+			"status": "approved", "resolved_by": resolvedBy, "resolved_at": now,
+		}).Error
+	})
+	if err != nil {
+		return topic, err
+	}
+	var saved models.Topic
+	if err := db.Where("tenant_id = ? AND slug = ?", tenantID, topic.Slug).First(&saved).Error; err == nil {
+		return saved, nil
+	}
+	return topic, nil
+}
+
 // AdminApproveTopicProposal handles POST /admin/topics/proposals/:id/approve.
 func AdminApproveTopicProposal(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
@@ -425,33 +453,15 @@ func AdminApproveTopicProposal(c *gin.Context) {
 	if req.Featured != nil {
 		featured = *req.Featured
 	}
-	topic := models.Topic{TenantID: principal.TenantID, Slug: slug, LabelAR: ar, LabelEN: en, CategorySlug: topicFirstNonEmpty(req.CategorySlug, p.SuggestedCategory), Featured: featured, Active: true, CreatedFrom: "mined"}
+	topic := models.Topic{TenantID: principal.TenantID, Slug: slug, LabelAR: ar, LabelEN: en, CategorySlug: topicFirstNonEmpty(req.CategorySlug, p.SuggestedCategory), Featured: featured, Active: true, CreatedFrom: "mined", NeedsRemap: true}
 	if emb, err := embedQueryViaEnrichment(en + " " + ar); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
 		topic.Centroid = &vec
 	}
-	now := time.Now()
-	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "slug"}},
-			DoUpdates: clause.AssignmentColumns([]string{"label_ar", "label_en", "category_slug", "active", "featured"}),
-		}).Create(&topic).Error; err != nil {
-			return err
-		}
-		return tx.Model(&models.TopicProposal{}).Where("id = ?", p.ID).Updates(map[string]interface{}{
-			"status": "approved", "resolved_by": principal.UserID, "resolved_at": now,
-		}).Error
-	})
+	topic, err = approveTopicProposalCore(db, principal.TenantID, p, topic, principal.UserID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Approval failed: " + err.Error(), Code: "APPROVE_FAILED"})
 		return
-	}
-	// Reload by (tenant, slug) so PublicID is populated even when the upsert
-	// resolved to an existing row, then map the topic against the whole corpus.
-	var saved models.Topic
-	if err := db.Where("tenant_id = ? AND slug = ?", principal.TenantID, slug).First(&saved).Error; err == nil {
-		scheduleCatalogRemap(db, principal.TenantID)
-		topic = saved
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Proposal approved", "data": topic})
 }
@@ -505,12 +515,6 @@ func AdminMergeTopicProposal(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Proposal merged"})
 }
 
-type minedCandidate struct {
-	Slug        string
-	MemberCount int64
-	Samples     []string
-}
-
 // AdminMineTopics handles POST /admin/topics/mine.
 func AdminMineTopics(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
@@ -526,74 +530,9 @@ func AdminMineTopics(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"created": created})
 }
 
-func mineTopicProposals(db *gorm.DB, tenantID string) (int, error) {
-	ensureDefaultTopicCategories(db, tenantID)
-	type row struct {
-		Slug        string
-		MemberCount int64
-		Samples     datatypes.JSON
-	}
-	var rows []row
-	if err := db.Raw(`
-		SELECT lower(trim(tag)) AS slug, COUNT(*) AS member_count,
-		       COALESCE(jsonb_agg(title) FILTER (WHERE title IS NOT NULL), '[]'::jsonb) AS samples
-		FROM content_items, unnest(topic_tags) AS tag
-		WHERE tenant_id = ? AND status = ? AND trim(tag) <> ''
-		GROUP BY 1 HAVING COUNT(*) >= ?
-		ORDER BY COUNT(*) DESC LIMIT 100
-	`, tenantID, models.ContentStatusReady, topicMineMinMembers).Scan(&rows).Error; err != nil {
-		return 0, err
-	}
-	// Normalize candidate slugs once, then resolve existence with two IN-list
-	// queries instead of two COUNT round trips per candidate.
-	normalized := make([]string, 0, len(rows))
-	candidateSlugs := make([]string, 0, len(rows))
-	seen := map[string]bool{}
-	for _, r := range rows {
-		slug := normalizedTopicSlug(r.Slug)
-		if len([]rune(slug)) < 2 {
-			normalized = append(normalized, "")
-			continue
-		}
-		normalized = append(normalized, slug)
-		if !seen[slug] {
-			seen[slug] = true
-			candidateSlugs = append(candidateSlugs, slug)
-		}
-	}
-	taken := map[string]bool{}
-	if len(candidateSlugs) > 0 {
-		var existingTopics []string
-		db.Model(&models.Topic{}).Where("tenant_id = ? AND slug IN ?", tenantID, candidateSlugs).Pluck("slug", &existingTopics)
-		for _, s := range existingTopics {
-			taken[s] = true
-		}
-		var existingProposals []string
-		db.Model(&models.TopicProposal{}).Where("tenant_id = ? AND suggested_slug IN ? AND status IN ?", tenantID, candidateSlugs, []string{"pending", "rejected"}).Pluck("suggested_slug", &existingProposals)
-		for _, s := range existingProposals {
-			taken[s] = true
-		}
-	}
-
-	created := 0
-	for i, r := range rows {
-		slug := normalized[i]
-		if slug == "" || taken[slug] {
-			continue
-		}
-		taken[slug] = true // guard against duplicate candidate rows in one run
-		evidence, _ := json.Marshal(map[string]interface{}{"member_count": r.MemberCount, "sample_titles": json.RawMessage(r.Samples)})
-		p := models.TopicProposal{
-			TenantID: tenantID, SuggestedSlug: slug, SuggestedLabelEN: strings.ReplaceAll(slug, "-", " "),
-			SuggestedLabelAR: strings.ReplaceAll(slug, "-", " "), SuggestedCategory: "general",
-			Evidence: datatypes.JSON(evidence),
-		}
-		if err := db.Create(&p).Error; err == nil {
-			created++
-		}
-	}
-	return created, nil
-}
+// mineTopicProposals + the capped variant now live in
+// preferenceMappingMaintenance.go so the Autopilot can share the new-proposal cap
+// and richer demand/sample evidence.
 
 // AdminRemapTopics handles POST /admin/topics/remap.
 func AdminRemapTopics(c *gin.Context) {
@@ -745,14 +684,17 @@ func remapCatalogTopics(db *gorm.DB, tenantID string, full bool) (int, int, erro
 			break
 		}
 	}
-	refreshTopicMemberCounts(db, tenantID)
+	if err := refreshTopicMemberCounts(db, tenantID); err != nil {
+		return mappedItems, mappedStories, err
+	}
 	return mappedItems, mappedStories, nil
 }
 
-func refreshTopicMemberCounts(db *gorm.DB, tenantID string) {
-	_ = db.Exec(`
+func refreshTopicMemberCounts(db *gorm.DB, tenantID string) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`
 		UPDATE topics t
-		SET member_count = COALESCE(counts.member_count, 0), updated_at = now()
+		SET member_count = COALESCE(counts.member_count, 0)
 		FROM (
 			SELECT cit.topic_id, COUNT(*)::integer AS member_count
 			FROM content_item_topics cit
@@ -761,15 +703,18 @@ func refreshTopicMemberCounts(db *gorm.DB, tenantID string) {
 			GROUP BY cit.topic_id
 		) counts
 		WHERE t.tenant_id = ? AND t.public_id = counts.topic_id
-	`, tenantID, tenantID).Error
-	_ = db.Exec(`
-		UPDATE topics t SET member_count = 0, updated_at = now()
+	`, tenantID, tenantID).Error; err != nil {
+			return err
+		}
+		return tx.Exec(`
+		UPDATE topics t SET member_count = 0
 		WHERE t.tenant_id = ? AND NOT EXISTS (
 			SELECT 1 FROM content_item_topics cit
 			JOIN content_items ci ON ci.public_id = cit.content_item_id
 			WHERE cit.topic_id = t.public_id AND ci.tenant_id = ?
 		)
 	`, tenantID, tenantID).Error
+	})
 }
 
 func hydrateMissingTopicCentroids(db *gorm.DB, tenantID string) {
@@ -785,17 +730,6 @@ func hydrateMissingTopicCentroids(db *gorm.DB, tenantID string) {
 		vec := pgvector.NewVector(emb)
 		_ = db.Model(&models.Topic{}).Where("tenant_id = ? AND public_id = ?", tenantID, topic.PublicID).Update("centroid", vec).Error
 	}
-}
-
-func scheduleCatalogRemap(db *gorm.DB, tenantID string) {
-	if _, loaded := catalogRemaps.LoadOrStore(tenantID, struct{}{}); loaded {
-		return
-	}
-	go func() {
-		defer catalogRemaps.Delete(tenantID)
-		hydrateMissingTopicCentroids(db, tenantID)
-		_, _, _ = remapCatalogTopics(db, tenantID, true)
-	}()
 }
 
 // remapSingleTopic maps ONE topic against already-mapped corpus rows, so a topic
@@ -1094,7 +1028,7 @@ func recomputeUserAffinityCfg(db *gorm.DB, uid uuid.UUID, tenantID string, cfg m
 		JOIN content_item_topics cit ON cit.content_item_id = ui.content_item_id
 		JOIN content_items ci ON ci.public_id = ui.content_item_id
 		JOIN topics t ON t.public_id = cit.topic_id
-		WHERE ui.user_id = ? AND ui.created_at > ? AND ci.tenant_id = ? AND t.tenant_id = ?
+		WHERE ui.user_id = ? AND ui.created_at > ? AND ci.tenant_id = ? AND t.tenant_id = ? AND t.active = true
 	`, uid, cutoff, tenantID, tenantID).Scan(&signals).Error; err != nil {
 		return err
 	}
@@ -1195,42 +1129,11 @@ func recordPreferenceRecompute(db *gorm.DB, tenantID string, d time.Duration) {
 	}).Create(&stat).Error
 }
 
-// StartTopicsHeartbeat keeps the catalog mappings and derived affinities warm.
-// It is CMS-owned SQL + stored embeddings only: no queues, no Aggregation.
-func StartTopicsHeartbeat(db *gorm.DB) {
-	go func() {
-		ticker := time.NewTicker(15 * time.Minute)
-		defer ticker.Stop()
-		lastMine := time.Time{}
-		lastRecompute := time.Now().Add(-time.Hour)
-		run := func() {
-			tenantID := "default"
-			ensureDefaultTopicCategories(db, tenantID)
-			hydrateMissingTopicCentroids(db, tenantID)
-			_, _, _ = remapCatalogTopics(db, tenantID, false)
-			if time.Since(lastMine) > 24*time.Hour {
-				_, _ = mineTopicProposals(db, tenantID)
-				lastMine = time.Now()
-			}
-			var users []uuid.UUID
-			db.Model(&models.UserInteraction{}).
-				Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
-				Where("user_interactions.user_id IS NOT NULL AND user_interactions.created_at > ? AND content_items.tenant_id = ?", lastRecompute, tenantID).
-				Distinct("user_id").
-				Limit(500).
-				Pluck("user_id", &users)
-			cfg := loadPreferenceSettings(db, tenantID) // once per tick, not per user
-			for _, uid := range users {
-				_ = recomputeUserAffinityCfg(db, uid, tenantID, cfg)
-			}
-			lastRecompute = time.Now()
-		}
-		run()
-		for range ticker.C {
-			run()
-		}
-	}()
-}
+// The catalog-maintenance heartbeat (formerly StartTopicsHeartbeat) is now owned
+// by the Preferences Autopilot scheduler: its incumbent body lives in
+// runPreferenceBaseline (preferenceAutopilotRunner.go) and is driven by
+// StartPreferenceAutopilotHeartbeat (preferenceAutopilotScheduler.go). Disabled
+// tenants get exactly today's behavior; enabled tenants get the ledgered runner.
 
 // GetPreferenceSettings handles GET /admin/preferences/settings.
 func GetPreferenceSettings(c *gin.Context) {

@@ -38,8 +38,14 @@ type Topic struct {
 	Active       bool             `gorm:"not null;default:true" json:"active"`
 	Featured     bool             `gorm:"not null;default:false" json:"featured"`
 	CreatedFrom  string           `gorm:"type:text;not null;default:'mined'" json:"created_from"`
-	CreatedAt    time.Time        `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt    time.Time        `gorm:"autoUpdateTime" json:"updated_at"`
+	// NeedsRemap is the explicit dirty-state boundary the Preferences Autopilot
+	// consumes (plan §0.1.2). Human label/category/activation/approval changes set
+	// it; the autopilot's dirty sweep clears it only after a successful limited
+	// remap. Derived member-count/centroid writes use UpdateColumn and MUST NOT set
+	// it, or routine maintenance would create an endless sweep loop.
+	NeedsRemap bool      `gorm:"not null;default:false;index:idx_topics_needs_remap" json:"needs_remap"`
+	CreatedAt  time.Time `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt  time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
 
 func (Topic) TableName() string { return "topics" }
@@ -56,7 +62,24 @@ type TopicProposal struct {
 	MergedInto        *uuid.UUID     `gorm:"type:uuid" json:"merged_into,omitempty"`
 	ResolvedBy        string         `gorm:"type:text" json:"resolved_by,omitempty"`
 	ResolvedAt        *time.Time     `json:"resolved_at,omitempty"`
-	CreatedAt         time.Time      `gorm:"autoCreateTime" json:"created_at"`
+
+	// Preferences Autopilot advisor columns (plan §11). Scored state lives on the
+	// proposal so the Console queue can sort by it directly. Confidence + flags are
+	// deterministic; the cached embedding + input hash keep Enrichment calls bounded
+	// and let the scorer skip already-embedded, unchanged proposals.
+	Confidence         *float64         `gorm:"type:double precision" json:"confidence,omitempty"`
+	AutopilotFlags     datatypes.JSON   `gorm:"type:jsonb" json:"autopilot_flags,omitempty"`
+	Embedding          *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
+	EmbeddingInputHash string           `gorm:"type:varchar(64)" json:"-"`
+	EmbeddedAt         *time.Time       `gorm:"type:timestamp" json:"embedded_at,omitempty"`
+	EnrichedAt         *time.Time       `gorm:"type:timestamp" json:"enriched_at,omitempty"`
+	// Frozen prediction for the trust ladder (§15): recorded before human
+	// resolution, compared on resolution. V1 records evidence only.
+	PredictedVerdict  string     `gorm:"type:varchar(24)" json:"predicted_verdict,omitempty"`
+	PredictedAt       *time.Time `gorm:"type:timestamp" json:"predicted_at,omitempty"`
+	PredictionVersion string     `gorm:"type:varchar(24)" json:"prediction_version,omitempty"`
+
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 }
 
 func (TopicProposal) TableName() string { return "topic_proposals" }

@@ -150,6 +150,11 @@ func main() {
 			&models.UserCategoryAffinity{},
 			&models.PreferenceSettings{},
 			&models.PreferenceStat{},
+			// Preferences Autopilot (stage 7) — bounded catalog-maintenance + proposal advisor
+			&models.PreferenceAutopilotPolicy{},
+			&models.PreferenceAutopilotRun{},
+			&models.PreferenceAutopilotAction{},
+			&models.PreferenceAffinityRecomputeQueue{},
 			// Feeds Finding — auto source discovery (profiles + suggestions + config)
 			&models.DiscoveryProfile{},
 			&models.SourceSuggestion{},
@@ -255,7 +260,10 @@ func main() {
 	// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
 	// precompute News snapshot when done. Runs in the background.
 	controllers.StartClassificationBackfill(db)
-	controllers.StartTopicsHeartbeat(db)
+	// Preferences Autopilot scheduler (stage 7) — REPLACES the bare topics
+	// heartbeat. Disabled tenants get the incumbent catalog maintenance exactly;
+	// enabled tenants get the bounded, ledgered runner with a health verdict.
+	controllers.StartPreferenceAutopilotHeartbeat(db)
 	// Precompute missing topics.related_ids (stories predating the write-time
 	// related feature) so feed reads never fall back to per-slide centroid kNN.
 	controllers.StartRelatedBackfill(db)
