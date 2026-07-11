@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,7 @@ const (
 
 var (
 	feedIntegrityMu         sync.Mutex
-	feedIntegrityRunning    bool
+	feedIntegrityRunning    = map[string]bool{}
 	feedIntegrityCapability = newFeedIntegrityCapability()
 )
 
@@ -96,8 +97,10 @@ var feedIntegrityChecks = []feedIntegrityCheck{
 	{"edge_news_empty", "News page is empty despite active stories", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "critical"},
 	{"edge_news_shape", "News slide has an invalid shape", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
 	{"edge_news_dup", "News cursor walk repeats a story", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
+	{"edge_news_cache_stale", "News served a snapshot beyond its stale ceiling", "edge", "news", models.FeedIntegrityAxisConsumer, "news-circulation", "major"},
 	{"probe_url_dead", "Primary playback URL is unavailable", "probe", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
 	{"probe_hls_manifest", "HLS manifest is invalid", "probe", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
+	{"checker_unhealthy", "Feed Integrity checker repeatedly failed", "checker", "platform", models.FeedIntegrityAxisReadiness, "system-health", "major"},
 }
 
 func feedIntegrityCheckCatalog() []feedIntegrityCheck {
@@ -137,18 +140,18 @@ func loadFeedIntegrityPolicy(db *gorm.DB, tenant string) models.FeedIntegrityPol
 	return policy
 }
 
-func feedIntegrityTryStart() bool {
+func feedIntegrityTryStart(tenant string) bool {
 	feedIntegrityMu.Lock()
 	defer feedIntegrityMu.Unlock()
-	if feedIntegrityRunning {
+	if feedIntegrityRunning[tenant] {
 		return false
 	}
-	feedIntegrityRunning = true
+	feedIntegrityRunning[tenant] = true
 	return true
 }
-func feedIntegrityFinish() {
+func feedIntegrityFinish(tenant string) {
 	feedIntegrityMu.Lock()
-	feedIntegrityRunning = false
+	delete(feedIntegrityRunning, tenant)
 	feedIntegrityMu.Unlock()
 }
 
@@ -184,10 +187,10 @@ type integrityResult struct {
 }
 
 func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) (models.FeedIntegrityRun, error) {
-	if !feedIntegrityTryStart() {
+	if !feedIntegrityTryStart(tenant) {
 		return models.FeedIntegrityRun{}, fmt.Errorf("feed integrity run already running")
 	}
-	defer feedIntegrityFinish()
+	defer feedIntegrityFinish(tenant)
 	ctx, cancel := context.WithTimeout(context.Background(), feedIntegrityMaxRun)
 	defer cancel()
 	unlock, ok := withFeedIntegrityLock(ctx, db, tenant)
@@ -210,25 +213,28 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 
 	findings := make([]models.FeedIntegrityFinding, 0)
 	var findingsMu sync.Mutex
-	results := map[string]*integrityResult{"foryou": {Feed: "foryou", Variant: "default", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}, "news": {Feed: "news", Variant: "today", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}}
+	results := map[string]*integrityResult{"foryou": {Feed: "foryou", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}, "news": {Feed: "news", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}}
+	laneResults := map[string]map[string]int{"inventory": {"executed": 1}, "edge": {"executed": 1}, "probe": {"executed": 0}}
 	add := func(key, lane, feed, variant, axis, severity, status, targetType, target string, candidates int, evidence interface{}) {
 		findingsMu.Lock()
 		defer findingsMu.Unlock()
 		raw, _ := json.Marshal(evidence)
-		findings = append(findings, models.FeedIntegrityFinding{RunID: run.ID, TenantID: tenant, Lane: lane, CheckKey: key, Feed: feed, Variant: variant, Axis: axis, Severity: severity, Status: status, TargetType: targetType, TargetRef: target, CandidateCount: candidates, Evidence: datatypes.JSON(raw)})
-		res := results[feed]
-		if res == nil {
-			return
+		findings = append(findings, models.FeedIntegrityFinding{RunID: run.ID, TenantID: tenant, Lane: lane, CheckKey: key, Feed: feed, Variant: variant, Axis: axis, Severity: severity, Status: status, TargetType: targetType, TargetRef: target, CandidateCount: candidates, AffectedCount: 1, SampleCount: candidates, Evidence: datatypes.JSON(raw)})
+		variantKey := feed + ":" + variant
+		if results[variantKey] == nil {
+			results[variantKey] = &integrityResult{Feed: feed, Variant: variant, ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}
 		}
-		res.Checked += candidates
-		if status == "violation" {
-			res.Violations++
-			if axis == models.FeedIntegrityAxisConsumer {
-				res.ConsumerScore -= scorePenalty(severity)
-				res.ConsumerVerdict = worsenIntegrityVerdict(res.ConsumerVerdict, severity)
-			} else {
-				res.ReadinessScore -= scorePenalty(severity)
-				res.ReadinessVerdict = worsenIntegrityVerdict(res.ReadinessVerdict, severity)
+		for _, res := range []*integrityResult{results[feed], results[variantKey]} {
+			res.Checked += candidates
+			if status == "violation" {
+				res.Violations++
+				if axis == models.FeedIntegrityAxisConsumer {
+					res.ConsumerScore -= scorePenalty(severity)
+					res.ConsumerVerdict = worsenIntegrityVerdict(res.ConsumerVerdict, severity)
+				} else {
+					res.ReadinessScore -= scorePenalty(severity)
+					res.ReadinessVerdict = worsenIntegrityVerdict(res.ReadinessVerdict, severity)
+				}
 			}
 		}
 	}
@@ -236,6 +242,7 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 	runFeedIntegrityInventory(db, tenant, add)
 	probeURLs := runFeedIntegrityEdge(ctx, db, policy, tier, add)
 	if tier == models.FeedIntegrityTierDeep {
+		laneResults["probe"]["executed"] = 1
 		runFeedIntegrityProbes(ctx, policy, probeURLs, add)
 	}
 	for _, r := range results {
@@ -252,11 +259,15 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 		}
 	}
 	updateFeedIntegrityEpisodes(db, tenant, policy, run, findings)
+	updateFeedIntegrityCheckerEpisode(db, tenant, run, findings)
 	feedJSON, _ := json.Marshal(results)
-	counts := map[string]int{"findings": len(findings), "violations": 0}
+	laneJSON, _ := json.Marshal(laneResults)
+	counts := map[string]int{"findings": len(findings), "violations": 0, "check_errors": 0}
 	for _, f := range findings {
 		if f.Status == "violation" {
 			counts["violations"]++
+		} else if f.Status == "check_error" {
+			counts["check_errors"]++
 		}
 	}
 	countsJSON, _ := json.Marshal(counts)
@@ -265,19 +276,62 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 		headline = "watching"
 	}
 	status := models.FeedIntegrityRunCompleted
-	if run.Error != "" {
+	if run.Error != "" || counts["check_errors"] > 0 {
 		status = models.FeedIntegrityRunPartial
 	}
 	finished := time.Now().UTC()
-	run.Status, run.Headline, run.FinishedAt, run.FeedResults, run.Counts = status, headline, &finished, datatypes.JSON(feedJSON), datatypes.JSON(countsJSON)
+	run.Status, run.Headline, run.FinishedAt, run.FeedResults, run.Counts, run.LaneResults = status, headline, &finished, datatypes.JSON(feedJSON), datatypes.JSON(countsJSON), datatypes.JSON(laneJSON)
 	run.Summary = fmt.Sprintf("%s CMS edge checks: %d violation(s) across %d finding(s)", tier, counts["violations"], len(findings))
-	_ = db.Model(&models.FeedIntegrityRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{"status": run.Status, "headline": run.Headline, "finished_at": finished, "feed_results": run.FeedResults, "counts": run.Counts, "summary": run.Summary, "error": run.Error, "updated_at": finished}).Error
+	_ = db.Model(&models.FeedIntegrityRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{"status": run.Status, "headline": run.Headline, "finished_at": finished, "feed_results": run.FeedResults, "counts": run.Counts, "lane_results": run.LaneResults, "summary": run.Summary, "error": run.Error, "updated_at": finished}).Error
 	if tier == models.FeedIntegrityTierDeep {
 		_ = db.Model(&models.FeedIntegrityPolicy{}).Where("id = ?", policy.ID).Updates(map[string]interface{}{"last_deep_run_at": finished, "last_light_run_at": finished, "updated_at": finished}).Error
 	} else {
 		_ = db.Model(&models.FeedIntegrityPolicy{}).Where("id = ?", policy.ID).Updates(map[string]interface{}{"last_light_run_at": finished, "updated_at": finished}).Error
 	}
+	_ = evaluateFeedIntegrityAutopilot(db, run.ID)
 	return run, nil
+}
+
+func updateFeedIntegrityCheckerEpisode(db *gorm.DB, tenant string, run models.FeedIntegrityRun, findings []models.FeedIntegrityFinding) {
+	hasError := false
+	for _, finding := range findings {
+		if finding.Status == "check_error" {
+			hasError = true
+			break
+		}
+	}
+	if !hasError {
+		now := time.Now().UTC()
+		var ep models.FeedIntegrityEpisode
+		if db.Where("tenant_id=? AND check_key=? AND scope=? AND status IN ?", tenant, "checker_unhealthy", "checker", []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).First(&ep).Error == nil {
+			if ep.Status == models.FeedIntegrityEpisodeOpen {
+				_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeRecovering, "recovering_since": now, "clean_streak": 1, "violation_streak": 0}).Error
+			} else if ep.CleanStreak+1 >= loadFeedIntegrityPolicy(db, tenant).ResolveRuns {
+				_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeResolved, "resolved_at": now, "clean_streak": ep.CleanStreak + 1}).Error
+			} else {
+				_ = db.Model(&ep).Update("clean_streak", ep.CleanStreak+1).Error
+			}
+		}
+		return
+	}
+	var previous models.FeedIntegrityRun
+	if eligibleRunQuery(db, tenant, "edge").Where("started_at < ?", run.StartedAt).Order("started_at DESC").First(&previous).Error != nil {
+		return
+	}
+	var previousErrors int64
+	db.Model(&models.FeedIntegrityFinding{}).Where("run_id=? AND status='check_error'", previous.ID).Count(&previousErrors)
+	if previousErrors == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	var ep models.FeedIntegrityEpisode
+	err := db.Where("tenant_id=? AND check_key=? AND scope=? AND status IN ?", tenant, "checker_unhealthy", "checker", []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).First(&ep).Error
+	if err == nil {
+		_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeOpen, "last_seen_at": now, "violation_streak": ep.ViolationStreak + 1, "clean_streak": 0, "recovering_since": nil}).Error
+		return
+	}
+	ep = models.FeedIntegrityEpisode{TenantID: tenant, CheckKey: "checker_unhealthy", Axis: models.FeedIntegrityAxisReadiness, Feed: "platform", Variant: "cms-edge", Scope: "checker", Status: models.FeedIntegrityEpisodeOpen, Severity: "major", Summary: feedIntegritySummary("checker_unhealthy"), FirstDetectedAt: now, LastSeenAt: now, ViolationStreak: 2}
+	_ = db.Create(&ep).Error
 }
 
 func scorePenalty(severity string) float64 {
@@ -379,7 +433,14 @@ func runFeedIntegrityInventory(db *gorm.DB, tenant string, add integrityAdd) {
 	var snaps []models.NewsSnapshot
 	db.Where("tenant_id = ?", tenant).Find(&snaps)
 	for _, snap := range snaps {
-		if time.Since(snap.BuiltAt) > newsSnapshotMaxStale {
+		// Rebuild debt = the cached row is dirty (new content landed, awaiting a
+		// rebuild) OR it has aged past the max-stale ceiling. Dirty must count:
+		// a dirty snapshot is exactly what the edge lane can observe served to a
+		// consumer, and the Safe Auto refresh gate requires BOTH signals to
+		// agree on the same window. Keying inventory only on age would leave the
+		// dual-evidence gate permanently unsatisfiable for the common
+		// dirty-but-recent case.
+		if snap.Dirty || time.Since(snap.BuiltAt) > newsSnapshotMaxStale {
 			add("inv_news_cache_rebuild_debt", "inventory", "news", snap.Window, models.FeedIntegrityAxisReadiness, "minor", "violation", "snapshot", snap.Window, 1, map[string]interface{}{"age_seconds": int(time.Since(snap.BuiltAt).Seconds()), "dirty": snap.Dirty})
 		}
 	}
@@ -475,6 +536,46 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 				urls = append(urls, item.PlaybackURL)
 			}
 		}
+		cursor := payload.Cursor
+		for page := 1; page < policy.EdgePagesPerFeed && cursor != nil && *cursor != ""; page++ {
+			nextReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, feedIntegritySelfURL()+path+"&cursor="+url.QueryEscape(*cursor), nil)
+			nextReq.Header.Set(feedIntegritySyntheticHdr, feedIntegrityCapability)
+			nextResp, nextErr := client.Do(nextReq)
+			if nextErr != nil || nextResp.StatusCode != http.StatusOK {
+				add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr), "status": httpStatus(nextResp)})
+				if nextResp != nil {
+					nextResp.Body.Close()
+				}
+				break
+			}
+			var next struct {
+				Cursor *string `json:"cursor"`
+				Items  []struct {
+					ID          string `json:"id"`
+					DurationSec int    `json:"duration_sec"`
+					PlaybackURL string `json:"playback_url"`
+				} `json:"items"`
+			}
+			nextErr = json.NewDecoder(io.LimitReader(nextResp.Body, 2<<20)).Decode(&next)
+			nextResp.Body.Close()
+			if nextErr != nil {
+				add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
+				break
+			}
+			for _, item := range next.Items {
+				if seen[item.ID] {
+					add("edge_fy_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1})
+				}
+				seen[item.ID] = true
+				if item.DurationSec < forYouMinDurationSec || item.DurationSec > forYouHardMaxDurationSec {
+					add("edge_fy_bounds_served", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1, "duration_sec": item.DurationSec})
+				}
+				if item.PlaybackURL != "" {
+					urls = append(urls, item.PlaybackURL)
+				}
+			}
+			cursor = next.Cursor
+		}
 	}
 	newsVariants := []string{"today"}
 	if tier == models.FeedIntegrityTierDeep {
@@ -494,7 +595,13 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			}
 			continue
 		}
+		serveSource := resp.Header.Get("X-Wahb-Feed-Source")
+		snapshotAgeMS, _ := strconv.ParseInt(resp.Header.Get("X-Wahb-Snapshot-Age-Ms"), 10, 64)
+		snapshotWindow := resp.Header.Get("X-Wahb-Snapshot-Window")
+		snapshotBuiltAt := resp.Header.Get("X-Wahb-Snapshot-Built-At")
+		snapshotDirty := resp.Header.Get("X-Wahb-Snapshot-Dirty") == "true"
 		var payload struct {
+			Cursor *string `json:"cursor"`
 			Slides []struct {
 				Featured struct {
 					StoryID string            `json:"story_id"`
@@ -514,9 +621,20 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		if policy.NewsLatencyBudgetMS > 0 && elapsed > time.Duration(policy.NewsLatencyBudgetMS)*time.Millisecond {
 			add("edge_news_latency", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, 1, map[string]interface{}{"latency_ms": elapsed.Milliseconds(), "budget_ms": policy.NewsLatencyBudgetMS})
 		}
+		// Consumer-facing News staleness. The serving path only returns
+		// Source="cache" when age <= newsSnapshotMaxStale (past that it
+		// assembles live), so a pure `age > maxStale` test on a cache response
+		// is unreachable. The real consumer damage is a DIRTY snapshot still
+		// being served from cache — new content exists but the stale page is
+		// shipped while a rebuild is pending — which IS served within the
+		// max-stale window. Keep the age branch as a belt-and-suspenders guard
+		// for any future serving-path change.
+		if serveSource == "cache" && (snapshotDirty || snapshotAgeMS > newsSnapshotMaxStale.Milliseconds()) {
+			add("edge_news_cache_stale", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "snapshot", window, 1, map[string]interface{}{"source": serveSource, "age_ms": snapshotAgeMS, "window": snapshotWindow, "built_at": snapshotBuiltAt, "dirty": snapshotDirty})
+		}
 		if len(payload.Slides) == 0 {
 			var active int64
-			db.Model(&models.Story{}).Where("tenant_id = ? AND last_member_at IS NOT NULL AND last_member_at > ?", feedIntegrityTenant, time.Now().Add(-7*24*time.Hour)).Count(&active)
+			db.Model(&models.Story{}).Where("tenant_id = ? AND last_member_at IS NOT NULL AND last_member_at > ?", policy.TenantID, time.Now().Add(-7*24*time.Hour)).Count(&active)
 			sev := "critical"
 			if active < int64(policy.ExpectedMinNewsSlides) {
 				sev = "info"
@@ -532,6 +650,47 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			if slide.Featured.StoryID == "" || (slide.Featured.Title == "" && slide.Featured.Label == "") || len(slide.Featured.Members) == 0 || len(slide.Related) > 3 {
 				add("edge_news_shape", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, nil)
 			}
+		}
+		cursor := payload.Cursor
+		for page := 1; page < policy.EdgePagesPerFeed && cursor != nil && *cursor != ""; page++ {
+			nextReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, feedIntegritySelfURL()+"/api/v1/feed/news?limit=10&window="+window+"&cursor="+url.QueryEscape(*cursor), nil)
+			nextReq.Header.Set(feedIntegritySyntheticHdr, feedIntegrityCapability)
+			nextResp, nextErr := client.Do(nextReq)
+			if nextErr != nil || nextResp.StatusCode != http.StatusOK {
+				add("edge_news_http", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr), "status": httpStatus(nextResp)})
+				if nextResp != nil {
+					nextResp.Body.Close()
+				}
+				break
+			}
+			var next struct {
+				Cursor *string `json:"cursor"`
+				Slides []struct {
+					Featured struct {
+						StoryID string            `json:"story_id"`
+						Title   string            `json:"title"`
+						Label   string            `json:"label"`
+						Members []json.RawMessage `json:"members"`
+					} `json:"featured"`
+					Related []json.RawMessage `json:"related"`
+				} `json:"slides"`
+			}
+			nextErr = json.NewDecoder(io.LimitReader(nextResp.Body, 2<<20)).Decode(&next)
+			nextResp.Body.Close()
+			if nextErr != nil {
+				add("edge_news_http", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
+				break
+			}
+			for _, slide := range next.Slides {
+				if seen[slide.Featured.StoryID] {
+					add("edge_news_dup", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, map[string]interface{}{"page": page + 1})
+				}
+				seen[slide.Featured.StoryID] = true
+				if slide.Featured.StoryID == "" || (slide.Featured.Title == "" && slide.Featured.Label == "") || len(slide.Featured.Members) == 0 || len(slide.Related) > 3 {
+					add("edge_news_shape", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, map[string]interface{}{"page": page + 1})
+				}
+			}
+			cursor = next.Cursor
 		}
 	}
 	return urls
@@ -597,7 +756,7 @@ func probeIntegrityURL(ctx context.Context, raw string, timeout time.Duration) e
 	if err := validateIntegrityURL(ctx, raw); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	client := newIntegrityHTTPClient(timeout)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodHead, raw, nil)
 	resp, err := client.Do(req)
 	if err == nil && resp != nil {
@@ -644,11 +803,49 @@ func validateIntegrityURL(ctx context.Context, raw string) error {
 	return nil
 }
 
+func newIntegrityHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 15 * time.Second}
+	transport := &http.Transport{
+		Proxy:                 nil,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          4,
+		MaxIdleConnsPerHost:   2,
+		IdleConnTimeout:       15 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid_target")
+			}
+			ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("dns_failed")
+			}
+			for _, ip := range ips {
+				if !integrityPrivateIP(ip) {
+					return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				}
+			}
+			return nil, fmt.Errorf("private_target")
+		},
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too_many_redirects")
+			}
+			return validateIntegrityURL(req.Context(), req.URL.String())
+		},
+	}
+}
+
 func probeIntegrityHLS(ctx context.Context, raw string, timeout time.Duration) error {
 	if err := validateIntegrityURL(ctx, raw); err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: timeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	client := newIntegrityHTTPClient(timeout)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -665,6 +862,47 @@ func probeIntegrityHLS(ctx context.Context, raw string, timeout time.Duration) e
 	text := string(body)
 	if !strings.Contains(text, "#EXTM3U") || (!strings.Contains(text, "#EXT-X-STREAM-INF") && !strings.Contains(text, "#EXTINF")) {
 		return fmt.Errorf("invalid_hls_manifest")
+	}
+	base, _ := url.Parse(raw)
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		child, err := url.Parse(line)
+		if err != nil {
+			return fmt.Errorf("invalid_hls_child")
+		}
+		childURL := base.ResolveReference(child).String()
+		if strings.Contains(strings.ToLower(child.Path), ".m3u8") {
+			return probeIntegrityHLSChild(ctx, childURL, timeout)
+		}
+		return probeIntegrityURL(ctx, childURL, timeout)
+	}
+	return fmt.Errorf("hls_has_no_child")
+}
+
+func probeIntegrityHLSChild(ctx context.Context, raw string, timeout time.Duration) error {
+	if err := validateIntegrityURL(ctx, raw); err != nil {
+		return err
+	}
+	client := newIntegrityHTTPClient(timeout)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("http_%d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return err
+	}
+	text := string(body)
+	if !strings.Contains(text, "#EXTM3U") || !strings.Contains(text, "#EXTINF") {
+		return fmt.Errorf("invalid_hls_child_manifest")
 	}
 	return nil
 }
@@ -686,16 +924,24 @@ func updateFeedIntegrityEpisodes(db *gorm.DB, tenant string, policy models.FeedI
 		if f.Status != "violation" {
 			continue
 		}
-		active[f.CheckKey+"|"+f.Feed+"|"+f.Variant] = f
+		active[f.CheckKey+"|"+f.Feed+"|"+f.Variant+"|"+feedIntegrityScope(f)] = f
 	}
+	openedByClass := map[string]int{}
+	overflowByIdentity := map[string][]models.FeedIntegrityFinding{}
+	aggregateActive := map[string]bool{}
 	for _, f := range active {
 		if isFeedIntegritySuppressed(db, tenant, f, now) {
 			continue
 		}
 		var ep models.FeedIntegrityEpisode
-		err := db.Where("tenant_id=? AND check_key=? AND feed=? AND variant=? AND status IN ?", tenant, f.CheckKey, f.Feed, f.Variant, []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).First(&ep).Error
+		scope := feedIntegrityScope(f)
+		err := db.Where("tenant_id=? AND check_key=? AND feed=? AND variant=? AND scope=? AND status IN ?", tenant, f.CheckKey, f.Feed, f.Variant, scope, []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).First(&ep).Error
 		if err == nil {
-			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeOpen, "last_seen_at": now, "severity": f.Severity, "recovering_since": nil}).Error
+			flaps := ep.FlapCount24h
+			if ep.Status == models.FeedIntegrityEpisodeRecovering && ep.RecoveringSince != nil && now.Sub(*ep.RecoveringSince) <= 24*time.Hour {
+				flaps++
+			}
+			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeOpen, "last_seen_at": now, "severity": f.Severity, "recovering_since": nil, "violation_streak": ep.ViolationStreak + 1, "clean_streak": 0, "flap_count_24h": flaps}).Error
 			continue
 		}
 		// Confirm across CONSECUTIVE eligible runs, not any-two-runs-ever: each
@@ -704,22 +950,65 @@ func updateFeedIntegrityEpisodes(db *gorm.DB, tenant string, policy models.FeedI
 		if !feedIntegrityConfirmed(db, tenant, policy, run, f) {
 			continue
 		}
-		ep = models.FeedIntegrityEpisode{TenantID: tenant, CheckKey: f.CheckKey, Axis: f.Axis, Feed: f.Feed, Variant: f.Variant, Scope: "feed", Status: models.FeedIntegrityEpisodeOpen, Severity: f.Severity, Summary: feedIntegritySummary(f.CheckKey), Evidence: f.Evidence, FirstDetectedAt: now, LastSeenAt: now}
+		var recentClosed int64
+		db.Model(&models.FeedIntegrityEpisode{}).Where("tenant_id=? AND check_key=? AND feed=? AND variant=? AND scope=? AND status=? AND updated_at > ?", tenant, f.CheckKey, f.Feed, f.Variant, scope, models.FeedIntegrityEpisodeClosed, now.Add(-time.Duration(policy.AutopilotCooldownMinutes)*time.Minute)).Count(&recentClosed)
+		if recentClosed > 0 {
+			continue
+		}
+		if openedByClass[f.CheckKey] >= 20 {
+			overflowKey := f.CheckKey + "|" + f.Feed + "|" + f.Variant
+			overflowByIdentity[overflowKey] = append(overflowByIdentity[overflowKey], f)
+			continue
+		}
+		ep = models.FeedIntegrityEpisode{TenantID: tenant, CheckKey: f.CheckKey, Axis: f.Axis, Feed: f.Feed, Variant: f.Variant, Scope: scope, Status: models.FeedIntegrityEpisodeOpen, Severity: f.Severity, Summary: feedIntegritySummary(f.CheckKey), Evidence: f.Evidence, FirstDetectedAt: now, LastSeenAt: now, ViolationStreak: policy.ConfirmRuns}
 		_ = db.Create(&ep).Error
+		openedByClass[f.CheckKey]++
+	}
+	for _, overflow := range overflowByIdentity {
+		if len(overflow) == 0 {
+			continue
+		}
+		f := overflow[0]
+		scope := "aggregate:" + f.CheckKey + ":" + f.Feed + ":" + f.Variant
+		key := f.CheckKey + "|" + f.Feed + "|" + f.Variant + "|" + scope
+		aggregateActive[key] = true
+		examples := make([]string, 0, minIntegrity(len(overflow), 5))
+		for _, row := range overflow {
+			if len(examples) == 5 {
+				break
+			}
+			if row.TargetRef != "" {
+				examples = append(examples, row.TargetRef)
+			}
+		}
+		evidence, _ := json.Marshal(gin.H{"affected_count": len(overflow), "sample_count": len(overflow), "examples": examples, "overflow": true})
+		var aggregate models.FeedIntegrityEpisode
+		if db.Where("tenant_id=? AND check_key=? AND feed=? AND variant=? AND scope=? AND status IN ?", tenant, f.CheckKey, f.Feed, f.Variant, scope, []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).First(&aggregate).Error == nil {
+			_ = db.Model(&aggregate).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeOpen, "severity": f.Severity, "last_seen_at": now, "evidence": datatypes.JSON(evidence), "affected_trend": datatypes.JSON(evidence), "recovering_since": nil, "clean_streak": 0, "updated_at": now}).Error
+			continue
+		}
+		aggregate = models.FeedIntegrityEpisode{TenantID: tenant, CheckKey: f.CheckKey, Axis: f.Axis, Feed: f.Feed, Variant: f.Variant, Scope: scope, Status: models.FeedIntegrityEpisodeOpen, Severity: f.Severity, Summary: fmt.Sprintf("%d additional %s violations beyond the per-run episode cap", len(overflow), feedIntegritySummary(f.CheckKey)), Evidence: datatypes.JSON(evidence), AffectedTrend: datatypes.JSON(evidence), FirstDetectedAt: now, LastSeenAt: now, ViolationStreak: policy.ConfirmRuns}
+		_ = db.Create(&aggregate).Error
 	}
 	var open []models.FeedIntegrityEpisode
 	db.Where("tenant_id=? AND status IN ?", tenant, []string{models.FeedIntegrityEpisodeOpen, models.FeedIntegrityEpisodeRecovering}).Find(&open)
 	for _, ep := range open {
-		if _, ok := active[ep.CheckKey+"|"+ep.Feed+"|"+ep.Variant]; ok {
+		identity := ep.CheckKey + "|" + ep.Feed + "|" + ep.Variant + "|" + ep.Scope
+		if _, ok := active[identity]; ok {
+			continue
+		}
+		if aggregateActive[identity] {
 			continue
 		}
 		if ep.Status == models.FeedIntegrityEpisodeOpen {
-			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeRecovering, "recovering_since": now}).Error
+			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeRecovering, "recovering_since": now, "clean_streak": 1, "violation_streak": 0}).Error
 		} else if ep.RecoveringSince != nil && feedIntegrityCleanRunsSince(db, tenant, ep, *ep.RecoveringSince) >= int64(policy.ResolveRuns) {
 			// resolve_runs is a count of clean eligible runs, not wall-clock
 			// minutes — the previous `ResolveRuns * time.Minute` resolved an
 			// episode on the very next run regardless of how many clean runs.
-			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeResolved, "resolved_at": now}).Error
+			_ = db.Model(&ep).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeResolved, "resolved_at": now, "clean_streak": policy.ResolveRuns}).Error
+		} else if ep.Status == models.FeedIntegrityEpisodeRecovering {
+			_ = db.Model(&ep).Update("clean_streak", feedIntegrityCleanRunsSince(db, tenant, ep, *ep.RecoveringSince)).Error
 		}
 	}
 }
@@ -792,7 +1081,7 @@ func feedIntegrityCleanRunsSince(db *gorm.DB, tenant string, ep models.FeedInteg
 }
 func isFeedIntegritySuppressed(db *gorm.DB, tenant string, f models.FeedIntegrityFinding, now time.Time) bool {
 	var n int64
-	db.Model(&models.FeedIntegritySuppression{}).Where("tenant_id=? AND check_key=? AND starts_at <= ? AND expires_at > ? AND revoked_at IS NULL", tenant, f.CheckKey, now, now).Where("feed='' OR feed IS NULL OR feed=?", f.Feed).Where("variant='' OR variant IS NULL OR variant=?", f.Variant).Count(&n)
+	db.Model(&models.FeedIntegritySuppression{}).Where("tenant_id=? AND check_key=? AND starts_at <= ? AND expires_at > ? AND revoked_at IS NULL", tenant, f.CheckKey, now, now).Where("feed='' OR feed IS NULL OR feed=?", f.Feed).Where("variant='' OR variant IS NULL OR variant=?", f.Variant).Where("scope='' OR scope IS NULL OR scope=?", feedIntegrityScope(f)).Count(&n)
 	return n > 0
 }
 
@@ -988,8 +1277,10 @@ func CloseFeedIntegrityEpisode(c *gin.Context) {
 		Notes       string `json:"notes"`
 	}
 	_ = c.ShouldBindJSON(&req)
-	if req.ReasonClass == "" {
-		req.ReasonClass = "resolved_manually"
+	allowedReasons := map[string]bool{"resolved": true, "false_positive": true, "expected": true, "duplicate": true}
+	if !allowedReasons[req.ReasonClass] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reason_class must be resolved, false_positive, expected, or duplicate"})
+		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var ep models.FeedIntegrityEpisode
@@ -1084,13 +1375,36 @@ func StartFeedIntegrityHeartbeat(db *gorm.DB) {
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
+		runFeedIntegrityDue(db)
 		for range ticker.C {
 			runFeedIntegrityDue(db)
 		}
 	}()
 }
 func runFeedIntegrityDue(db *gorm.DB) {
-	policy := loadFeedIntegrityPolicy(db, feedIntegrityTenant)
+	evaluatePendingFeedIntegrityRuns(db)
+	processFeedIntegrityActions(db)
+	sweepFeedIntegrityRetention(db)
+	var policies []models.FeedIntegrityPolicy
+	if err := db.Where("scheduled_enabled = TRUE").Order("tenant_id ASC").Limit(100).Find(&policies).Error; err != nil {
+		return
+	}
+	sem := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	for _, policy := range policies {
+		policy := policy
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			runFeedIntegrityTenantDue(db, policy)
+		}()
+	}
+	wg.Wait()
+}
+
+func runFeedIntegrityTenantDue(db *gorm.DB, policy models.FeedIntegrityPolicy) {
 	now := time.Now().UTC()
 	if !policy.ScheduledEnabled || (policy.PausedUntil != nil && policy.PausedUntil.After(now)) {
 		return
@@ -1104,5 +1418,5 @@ func runFeedIntegrityDue(db *gorm.DB) {
 	if tier == "" {
 		return
 	}
-	_, _ = runFeedIntegrity(db, feedIntegrityTenant, feedIntegrityRunOptions{Trigger: "scheduled", CreatedBy: "automation", Tier: tier})
+	_, _ = runFeedIntegrity(db, policy.TenantID, feedIntegrityRunOptions{Trigger: "scheduled", CreatedBy: "automation", Tier: tier})
 }

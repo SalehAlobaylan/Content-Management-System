@@ -315,6 +315,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/feed-integrity/checks/:key/suppress", perm("feed", "manage"), controllers.CreateFeedIntegritySuppression)
 	adminGroup.DELETE("/feed-integrity/suppressions/:id", perm("feed", "manage"), controllers.DeleteFeedIntegritySuppression)
 	adminGroup.GET("/feed-integrity/checks", perm("feed", "read"), controllers.GetFeedIntegrityChecks)
+	adminGroup.GET("/feed-integrity/autopilot/status", perm("feed", "read"), controllers.GetFeedIntegrityAutopilotStatus)
+	adminGroup.PUT("/feed-integrity/autopilot/policy", perm("feed", "manage"), controllers.UpdateFeedIntegrityAutopilotPolicy)
+	adminGroup.POST("/feed-integrity/autopilot/run", perm("feed", "manage"), controllers.RunFeedIntegrityAutopilotNow)
+	adminGroup.POST("/feed-integrity/autopilot/pause", perm("feed", "manage"), controllers.PauseFeedIntegrityAutopilot)
+	adminGroup.GET("/feed-integrity/autopilot/actions", perm("feed", "read"), controllers.ListFeedIntegrityAutopilotActions)
+	adminGroup.GET("/feed-integrity/autopilot/actions/:id", perm("feed", "read"), controllers.GetFeedIntegrityAutopilotAction)
+	adminGroup.POST("/feed-integrity/autopilot/actions/:id/approve", perm("feed", "manage"), controllers.ApproveFeedIntegrityAutopilotAction)
+	adminGroup.POST("/feed-integrity/autopilot/actions/:id/reject", perm("feed", "manage"), controllers.RejectFeedIntegrityAutopilotAction)
+	adminGroup.POST("/feed-integrity/autopilot/actions/:class/reset-breaker", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
 
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).

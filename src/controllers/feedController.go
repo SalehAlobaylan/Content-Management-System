@@ -403,6 +403,9 @@ func GetNewsFeed(c *gin.Context) {
 	if isFeedIntegritySynthetic(c) {
 		c.Header("X-Wahb-Feed-Source", serveMeta.Source)
 		c.Header("X-Wahb-Snapshot-Age-Ms", strconv.FormatInt(serveMeta.SnapshotAge.Milliseconds(), 10))
+		c.Header("X-Wahb-Snapshot-Window", serveMeta.Window)
+		c.Header("X-Wahb-Snapshot-Built-At", serveMeta.SnapshotBuiltAt.UTC().Format(time.RFC3339Nano))
+		c.Header("X-Wahb-Snapshot-Dirty", strconv.FormatBool(serveMeta.SnapshotDirty))
 	}
 
 	c.JSON(http.StatusOK, StoryNewsResponse{

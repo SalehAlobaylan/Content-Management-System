@@ -1198,8 +1198,11 @@ func serveNewsSnapshot(db *gorm.DB, tenantID string, circ circulationContext, la
 //   - NewsFeedMode="cached_only" → emergency escape hatch, cache always
 //     (admin-disable switch for the live path).
 type newsServeMeta struct {
-	Source      string
-	SnapshotAge time.Duration
+	Source          string
+	SnapshotAge     time.Duration
+	Window          string
+	SnapshotBuiltAt time.Time
+	SnapshotDirty   bool
 }
 
 func serveStoryNewsFeed(
@@ -1216,9 +1219,10 @@ func serveStoryNewsFeed(
 	if config.NewsFeedMode == "cached_only" {
 		slides, cursor := serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
 		_, builtAt, _, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
-		meta := newsServeMeta{Source: "cache"}
+		meta := newsServeMeta{Source: "cache", Window: circ.Window.Name}
 		if ok {
 			meta.SnapshotAge = time.Since(builtAt)
+			meta.SnapshotBuiltAt = builtAt
 		}
 		return slides, cursor, meta
 	}
@@ -1227,7 +1231,7 @@ func serveStoryNewsFeed(
 			db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
 		)
 		startSnapshotRebuild(db, tenantID, circ.Window.Name)
-		return slides, nextCursor, newsServeMeta{Source: "live"}
+		return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}
 	}
 
 	// Live mode (default; legacy "precompute"/"on_demand" values fold in here).
@@ -1261,7 +1265,7 @@ func serveStoryNewsFeed(
 			if cursorCovered {
 				slides, nextCursor := paginateStorySlides(all, lastTimestamp, lastID, slideLimit, waitSeen())
 				if len(slides) > 0 {
-					return slides, nextCursor, newsServeMeta{Source: "cache", SnapshotAge: age}
+					return slides, nextCursor, newsServeMeta{Source: "cache", SnapshotAge: age, Window: circ.Window.Name, SnapshotBuiltAt: builtAt, SnapshotDirty: dirty}
 				}
 			}
 		}
@@ -1273,7 +1277,7 @@ func serveStoryNewsFeed(
 		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
 	)
 	startSnapshotRebuild(db, tenantID, circ.Window.Name)
-	return slides, nextCursor, newsServeMeta{Source: "live"}
+	return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}
 }
 
 // ─── Write-time related-story computation ──────────────────────────────────
