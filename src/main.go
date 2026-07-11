@@ -286,6 +286,8 @@ func main() {
 	controllers.StartMediaStudioAutopilotHeartbeat(db)
 	// System Health / Incident Autopilot — CMS-owned probes + incident ledger.
 	controllers.StartSystemHealthAutopilotHeartbeat(db)
+	// Feed Integrity base system — deterministic CMS-edge verification, not an Autopilot.
+	controllers.StartFeedIntegrityHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

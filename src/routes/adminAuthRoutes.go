@@ -300,6 +300,22 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/system/autopilot/runs", perm("aggregation", "read"), controllers.ListSystemAutopilotRuns)
 	adminGroup.GET("/system/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetSystemAutopilotRun)
 
+	// Feed Integrity / Experience QA System — deterministic CMS-edge checks only.
+	adminGroup.GET("/feed-integrity/status", perm("feed", "read"), controllers.GetFeedIntegrityStatus)
+	adminGroup.GET("/feed-integrity/policy", perm("feed", "read"), controllers.GetFeedIntegrityPolicy)
+	adminGroup.PUT("/feed-integrity/policy", perm("feed", "manage"), controllers.UpdateFeedIntegrityPolicy)
+	adminGroup.POST("/feed-integrity/run", perm("feed", "manage"), controllers.RunFeedIntegrityNow)
+	adminGroup.POST("/feed-integrity/schedule/pause", perm("feed", "manage"), controllers.PauseFeedIntegritySchedule)
+	adminGroup.GET("/feed-integrity/runs", perm("feed", "read"), controllers.ListFeedIntegrityRuns)
+	adminGroup.GET("/feed-integrity/runs/:id", perm("feed", "read"), controllers.GetFeedIntegrityRun)
+	adminGroup.GET("/feed-integrity/findings", perm("feed", "read"), controllers.ListFeedIntegrityFindings)
+	adminGroup.GET("/feed-integrity/episodes", perm("feed", "read"), controllers.ListFeedIntegrityEpisodes)
+	adminGroup.GET("/feed-integrity/episodes/:id", perm("feed", "read"), controllers.GetFeedIntegrityEpisode)
+	adminGroup.POST("/feed-integrity/episodes/:id/close", perm("feed", "manage"), controllers.CloseFeedIntegrityEpisode)
+	adminGroup.POST("/feed-integrity/checks/:key/suppress", perm("feed", "manage"), controllers.CreateFeedIntegritySuppression)
+	adminGroup.DELETE("/feed-integrity/suppressions/:id", perm("feed", "manage"), controllers.DeleteFeedIntegritySuppression)
+	adminGroup.GET("/feed-integrity/checks", perm("feed", "read"), controllers.GetFeedIntegrityChecks)
+
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).
 	// Re-encoding old content moved to the Storage system as

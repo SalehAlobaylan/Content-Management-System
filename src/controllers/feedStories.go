@@ -1197,6 +1197,11 @@ func serveNewsSnapshot(db *gorm.DB, tenantID string, circ circulationContext, la
 //     refresh the cache in the background for the next reader;
 //   - NewsFeedMode="cached_only" → emergency escape hatch, cache always
 //     (admin-disable switch for the live path).
+type newsServeMeta struct {
+	Source      string
+	SnapshotAge time.Duration
+}
+
 func serveStoryNewsFeed(
 	db *gorm.DB,
 	tenantID string,
@@ -1207,16 +1212,22 @@ func serveStoryNewsFeed(
 	slideLimit int,
 	waitSeen func() []uuid.UUID,
 	userIDStr string,
-) ([]StorySlide, *string) {
+) ([]StorySlide, *string, newsServeMeta) {
 	if config.NewsFeedMode == "cached_only" {
-		return serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
+		slides, cursor := serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
+		_, builtAt, _, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
+		meta := newsServeMeta{Source: "cache"}
+		if ok {
+			meta.SnapshotAge = time.Since(builtAt)
+		}
+		return slides, cursor, meta
 	}
 	if shouldPersonalizeNews(db, tenantID, userIDStr) {
 		slides, nextCursor := assembleStoryNewsFeed(
 			db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
 		)
 		startSnapshotRebuild(db, tenantID, circ.Window.Name)
-		return slides, nextCursor
+		return slides, nextCursor, newsServeMeta{Source: "live"}
 	}
 
 	// Live mode (default; legacy "precompute"/"on_demand" values fold in here).
@@ -1250,7 +1261,7 @@ func serveStoryNewsFeed(
 			if cursorCovered {
 				slides, nextCursor := paginateStorySlides(all, lastTimestamp, lastID, slideLimit, waitSeen())
 				if len(slides) > 0 {
-					return slides, nextCursor
+					return slides, nextCursor, newsServeMeta{Source: "cache", SnapshotAge: age}
 				}
 			}
 		}
@@ -1262,7 +1273,7 @@ func serveStoryNewsFeed(
 		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
 	)
 	startSnapshotRebuild(db, tenantID, circ.Window.Name)
-	return slides, nextCursor
+	return slides, nextCursor, newsServeMeta{Source: "live"}
 }
 
 // ─── Write-time related-story computation ──────────────────────────────────

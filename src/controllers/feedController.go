@@ -214,14 +214,18 @@ func GetForYouFeed(c *gin.Context) {
 		}
 
 		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems})
-		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+		if !isFeedIntegritySynthetic(c) {
+			recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+		}
 		boosted := int64(0)
 		for _, item := range pageItems {
 			if item.ScoreBreakdown.Preference > 0 {
 				boosted++
 			}
 		}
-		recordPreferenceServes(db, "default", boosted, int64(len(items)))
+		if !isFeedIntegritySynthetic(c) {
+			recordPreferenceServes(db, "default", boosted, int64(len(items)))
+		}
 		return
 	}
 
@@ -314,8 +318,10 @@ func GetForYouFeed(c *gin.Context) {
 		Cursor: nextCursor,
 		Items:  responseItems,
 	})
-	recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
-	recordPreferenceServes(db, "default", int64(boosted), int64(len(items)))
+	if !isFeedIntegritySynthetic(c) {
+		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+		recordPreferenceServes(db, "default", int64(boosted), int64(len(items)))
+	}
 }
 
 // recordForYouServe fires the Ranking/Intelligence serve-side telemetry
@@ -391,9 +397,13 @@ func GetNewsFeed(c *gin.Context) {
 		<-seenDone
 		return seenIDs
 	}
-	slides, nextCursor := serveStoryNewsFeed(
+	slides, nextCursor, serveMeta := serveStoryNewsFeed(
 		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr,
 	)
+	if isFeedIntegritySynthetic(c) {
+		c.Header("X-Wahb-Feed-Source", serveMeta.Source)
+		c.Header("X-Wahb-Snapshot-Age-Ms", strconv.FormatInt(serveMeta.SnapshotAge.Milliseconds(), 10))
+	}
 
 	c.JSON(http.StatusOK, StoryNewsResponse{
 		Cursor: nextCursor,
