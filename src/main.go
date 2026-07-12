@@ -222,6 +222,14 @@ func main() {
 			&models.EmbeddingCampaign{},
 			&models.EmbeddingCampaignAction{},
 			&models.EmbeddingCampaignException{},
+			// AI Spend & Economics Governor (stage 11) — ledger and policy.
+			&models.AISpendEvent{},
+			&models.AIPriceBook{},
+			&models.AISpendRollup{},
+			&models.AISpendPolicy{},
+			&models.AISpendBudget{},
+			&models.AISpendRun{},
+			&models.AISpendEpisode{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
@@ -303,6 +311,7 @@ func main() {
 	// Embedding & Model Lifecycle (stage 10) — vector-space audit scheduler.
 	// Observation only; disabled by default until an admin enables it.
 	controllers.StartEmbeddingLifecycleHeartbeat(db)
+	controllers.StartAISpendGovernorHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

@@ -351,6 +351,19 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/embedding-lifecycle/exceptions/:id/retry", perm("content", "write"), controllers.RetryEmbeddingException)
 	adminGroup.POST("/embedding-lifecycle/exceptions/:id/waive", utils.RequireAdminRole("admin"), controllers.WaiveEmbeddingException)
 
+	// AI Spend & Economics Governor (stage 11).
+	adminGroup.GET("/ai-spend/status", perm("content", "read"), controllers.GetAISpendStatus)
+	adminGroup.GET("/ai-spend/policy", perm("content", "read"), controllers.GetAISpendPolicy)
+	adminGroup.PUT("/ai-spend/policy", perm("content", "write"), controllers.UpdateAISpendPolicy)
+	adminGroup.GET("/ai-spend/rollups", perm("content", "read"), controllers.ListAISpendRollups)
+	adminGroup.GET("/ai-spend/events", perm("content", "read"), controllers.ListAISpendEvents)
+	adminGroup.GET("/ai-spend/runs", perm("content", "read"), controllers.ListAISpendRuns)
+	adminGroup.GET("/ai-spend/price-book", perm("content", "read"), controllers.ListAIPriceBook)
+	adminGroup.POST("/ai-spend/price-book", perm("content", "write"), controllers.CreateAIPriceBook)
+	adminGroup.GET("/ai-spend/budgets", perm("content", "read"), controllers.ListAISpendBudgets)
+	adminGroup.PUT("/ai-spend/budgets", perm("content", "write"), controllers.UpsertAISpendBudget)
+	adminGroup.POST("/ai-spend/run", perm("content", "write"), controllers.RunAISpendGovernorNow)
+
 	// Real User Experience (RUX) — browser-observed reliability cockpit. Reuses
 	// the `feed` permission resource (consumer-edge experience, same family).
 	adminGroup.GET("/experience/status", perm("feed", "read"), controllers.GetExperienceStatus)

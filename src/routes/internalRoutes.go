@@ -72,6 +72,11 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 
 	internal.POST("/transcripts", controllers.InternalCreateTranscript)
 
+	// AI Spend Governor — metering is service-to-service only; policy remains
+	// behind the admin surface.
+	internal.POST("/ai-spend/events", controllers.InternalIngestAISpendEvents)
+	internal.GET("/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
+
 	// Storage management — used by Aggregation's storage worker
 	internal.GET("/storage/policies", controllers.InternalListStoragePolicies)
 	internal.GET("/storage/candidates", controllers.InternalListStorageCandidates)
