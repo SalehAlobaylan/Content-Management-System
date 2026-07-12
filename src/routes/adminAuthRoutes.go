@@ -323,7 +323,23 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/feed-integrity/autopilot/actions/:id", perm("feed", "read"), controllers.GetFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/approve", perm("feed", "manage"), controllers.ApproveFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/reject", perm("feed", "manage"), controllers.RejectFeedIntegrityAutopilotAction)
-	adminGroup.POST("/feed-integrity/autopilot/actions/:class/reset-breaker", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
+	adminGroup.POST("/feed-integrity/autopilot/actions/breakers/:class/reset", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
+
+	// Real User Experience (RUX) — browser-observed reliability cockpit. Reuses
+	// the `feed` permission resource (consumer-edge experience, same family).
+	adminGroup.GET("/experience/status", perm("feed", "read"), controllers.GetExperienceStatus)
+	adminGroup.GET("/experience/policy", perm("feed", "read"), controllers.GetExperiencePolicy)
+	adminGroup.PUT("/experience/policy", perm("feed", "manage"), controllers.UpdateExperiencePolicy)
+	adminGroup.POST("/experience/run", perm("feed", "manage"), controllers.RunExperienceNow)
+	adminGroup.POST("/experience/pause", perm("feed", "manage"), controllers.PauseExperienceSchedule)
+	adminGroup.GET("/experience/runs", perm("feed", "read"), controllers.ListExperienceRuns)
+	adminGroup.GET("/experience/metrics", perm("feed", "read"), controllers.GetExperienceMetrics)
+	adminGroup.GET("/experience/incidents", perm("feed", "read"), controllers.ListExperienceIncidents)
+	adminGroup.POST("/experience/incidents/:id/close", perm("feed", "manage"), controllers.CloseExperienceIncident)
+	adminGroup.GET("/experience/actions", perm("feed", "read"), controllers.ListExperienceActions)
+	adminGroup.GET("/experience/suppressions", perm("feed", "read"), controllers.ListExperienceSuppressions)
+	adminGroup.POST("/experience/suppressions", perm("feed", "manage"), controllers.CreateExperienceSuppression)
+	adminGroup.DELETE("/experience/suppressions/:id", perm("feed", "manage"), controllers.RevokeExperienceSuppression)
 
 	// Quality / Ingest configuration. Phase 7: this is now a pure config
 	// surface (Profiles + Resolve preview + a one-shot Probe diagnostic).

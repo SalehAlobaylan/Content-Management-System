@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -28,19 +29,25 @@ type migrationFile struct {
 	Path    string
 }
 
+var timestampedMigrationName = regexp.MustCompile(`^\d{14}_.+\.sql$`)
+
 func main() {
 	var (
 		applyAll = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
 		status   = flag.Bool("status", false, "print migration ledger status without applying files")
+		baseline = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
 		dir      = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
 
-	if *status && (*applyAll || flag.NArg() > 0) {
-		log.Fatal("--status cannot be combined with --all or explicit migration files")
+	if *status && (*applyAll || *baseline != "" || flag.NArg() > 0) {
+		log.Fatal("--status cannot be combined with --all, --baseline-through, or explicit migration files")
 	}
-	if !*status && !*applyAll && flag.NArg() == 0 {
-		log.Fatal("no migrations selected. Use --status, --all, or pass explicit migration filenames")
+	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
+		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
+	}
+	if !*status && !*applyAll && *baseline == "" && flag.NArg() == 0 {
+		log.Fatal("no migrations selected. Use --status, --all, --baseline-through, or pass explicit migration filenames")
 	}
 
 	db, err := utils.ConnectDB()
@@ -64,6 +71,12 @@ func main() {
 
 	if *status {
 		printStatus(files, applied)
+		return
+	}
+	if *baseline != "" {
+		if err := baselineThrough(db, files, applied, *baseline); err != nil {
+			log.Fatalf("baseline migrations: %v", err)
+		}
 		return
 	}
 
@@ -96,7 +109,7 @@ func listMigrationFiles(dir string) ([]migrationFile, error) {
 
 	files := make([]migrationFile, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+		if entry.IsDir() || !timestampedMigrationName.MatchString(entry.Name()) {
 			continue
 		}
 		files = append(files, migrationFile{
@@ -108,6 +121,41 @@ func listMigrationFiles(dir string) ([]migrationFile, error) {
 		return files[i].Version < files[j].Version
 	})
 	return files, nil
+}
+
+func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]time.Time, through string) error {
+	through = strings.TrimSuffix(through, ".sql")
+	matched := false
+	selected := make([]migrationFile, 0)
+	for _, file := range files {
+		version := strings.TrimSuffix(file.Version, ".sql")
+		if version > through {
+			break
+		}
+		selected = append(selected, file)
+		if version == through {
+			matched = true
+		}
+	}
+	if !matched {
+		return fmt.Errorf("baseline version %q not found in migrations/", through)
+	}
+
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, file := range selected {
+			if _, ok := applied[file.Version]; ok {
+				continue
+			}
+			if err := tx.Exec(
+				"INSERT INTO cms_schema_migrations (version, applied_at) VALUES (?, now()) ON CONFLICT (version) DO NOTHING",
+				file.Version,
+			).Error; err != nil {
+				return err
+			}
+			log.Printf("Baselined %s", file.Version)
+		}
+		return nil
+	})
 }
 
 func appliedVersions(db *gorm.DB) (map[string]time.Time, error) {

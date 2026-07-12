@@ -35,16 +35,17 @@ go build ./...
 docker build -t wahb-cms .
 ```
 
-In `development` the server can auto-migrate the schema on boot with GORM `AutoMigrate`. `./start.sh` defaults CMS to `AUTO_MIGRATE=false` so the full local stack does not spend minutes introspecting a remote Supabase database. GORM AutoMigrate also does not execute SQL files from `migrations/`.
+In `development` the server can auto-migrate the schema on boot with GORM `AutoMigrate`, but the supported `./start.sh` flow keeps that disabled. When `AUTO_SQL_MIGRATE=true`, the launcher runs `go run ./cmd/migrate --all` before CMS, applying only pending timestamped SQL migrations recorded in `cms_schema_migrations`. The default is `false`.
 
-Apply canonical CMS SQL migrations explicitly:
+Inspect or apply canonical CMS SQL migrations explicitly:
 
 ```bash
 go run ./cmd/migrate --status
+go run ./cmd/migrate --all
 go run ./cmd/migrate 20260627000000_media_atomization.sql 20260627010000_media_atomization_operations.sql 20260627020000_media_atomization_manual_controls.sql 20260627030000_media_atomization_unique_index_repair.sql
 ```
 
-Use `go run ./cmd/migrate --all` only when the target database has a reliable `cms_schema_migrations` ledger or is a fresh database. Production never auto-migrates.
+For an existing pre-ledger database, establish the historical boundary once with `--baseline-through <timestamped-file.sql>` before using `--all`. Set `AUTO_SQL_MIGRATE=true` only for a startup where pending migrations should be applied, then return it to `false`.
 
 ### Go API docs (terminal)
 
@@ -78,7 +79,8 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `ENRICHMENT_BASE_URL` | no | http://localhost:5050 | On-demand embed/translate/rerank/news-slide |
 | `ENRICHMENT_SERVICE_TOKEN` | no | falls back to `CMS_SERVICE_TOKEN` | Auth for Enrichment calls |
 | `REDIS_URL` | no | redis://localhost:6379 | Declared; caching is future-use |
-| `AUTO_MIGRATE` | no | (unset = migrate in dev) | Set `false` to skip GORM AutoMigrate on boot. *(Not in `.env.example`.)* |
+| `AUTO_SQL_MIGRATE` | no | false | Set `true` to apply pending tracked SQL migrations before CMS starts |
+| `AUTO_MIGRATE` | no | false in `./start.sh` | Legacy GORM AutoMigrate; keep disabled when using tracked SQL migrations |
 
 ## Authentication
 

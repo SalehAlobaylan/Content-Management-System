@@ -65,6 +65,8 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupContentRoutes(v1, db)
 	routes.SetupTranscriptRoutes(v1, db)
 	routes.SetupPreferenceRoutes(v1, db)
+	// Real User Experience — public RUX telemetry ingest (BFF-token guarded)
+	routes.SetupExperienceRoutes(v1, db)
 
 	// Internal service-to-service routes
 	routes.SetupInternalRoutes(router, db)
@@ -288,6 +290,9 @@ func main() {
 	controllers.StartSystemHealthAutopilotHeartbeat(db)
 	// Feed Integrity base system — deterministic CMS-edge verification, not an Autopilot.
 	controllers.StartFeedIntegrityHeartbeat(db)
+	// Real User Experience — Observe scheduler: rolls up closed telemetry buckets
+	// and evaluates deterministic surface verdicts for tenants that enabled it.
+	controllers.StartExperienceHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)
