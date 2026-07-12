@@ -92,6 +92,7 @@ var feedIntegrityChecks = []feedIntegrityCheck{
 	{"edge_fy_playback_fields", "Served For You item has invalid playback fields", "edge", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
 	{"edge_fy_status_served", "Served For You item is archived", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_fy_dup", "For You cursor walk repeats an item", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_fy_family_dup", "For You cursor walk serves two members of one redundancy family", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_news_http", "News CMS endpoint is unavailable", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "critical"},
 	{"edge_news_latency", "News page exceeded its latency budget", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_news_empty", "News page is empty despite active stories", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "critical"},
@@ -509,11 +510,18 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			add("edge_fy_empty", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, sev, "violation", "page", variant, int(count), nil)
 		}
 		seen := map[string]bool{}
+		seenFamilies := map[uint]string{}
 		for _, item := range payload.Items {
 			if seen[item.ID] {
 				add("edge_fy_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
 			}
 			seen[item.ID] = true
+			if familyID := activeRedundancyFamilyForContent(db, item.ID); familyID != 0 {
+				if prior := seenFamilies[familyID]; prior != "" && prior != item.ID {
+					add("edge_fy_family_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior})
+				}
+				seenFamilies[familyID] = item.ID
+			}
 			// A present playback URL is the contract; playback_type is advisory
 			// and legitimately empty for legacy MP4-fallback units (media_url
 			// only, no explicit type). Do not require playback_type here — that
@@ -567,6 +575,12 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 					add("edge_fy_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1})
 				}
 				seen[item.ID] = true
+				if familyID := activeRedundancyFamilyForContent(db, item.ID); familyID != 0 {
+					if prior := seenFamilies[familyID]; prior != "" && prior != item.ID {
+						add("edge_fy_family_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior, "page": page + 1})
+					}
+					seenFamilies[familyID] = item.ID
+				}
 				if item.DurationSec < forYouMinDurationSec || item.DurationSec > forYouHardMaxDurationSec {
 					add("edge_fy_bounds_served", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1, "duration_sec": item.DurationSec})
 				}
@@ -701,6 +715,15 @@ func httpStatus(resp *http.Response) int {
 		return 0
 	}
 	return resp.StatusCode
+}
+
+func activeRedundancyFamilyForContent(db *gorm.DB, contentID string) uint {
+	var familyID uint
+	if contentID == "" {
+		return 0
+	}
+	db.Table("redundancy_family_members m").Joins("JOIN redundancy_families f ON f.id = m.family_id").Where("m.content_item_id = ? AND m.ended_at IS NULL AND f.status = ?", contentID, "active").Limit(1).Pluck("m.family_id", &familyID)
+	return familyID
 }
 func safeIntegrityError(err error) string {
 	if err == nil {

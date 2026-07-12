@@ -118,6 +118,7 @@ func GetForYouFeed(c *gin.Context) {
 		if len(allItems) < 200 {
 			baseQuery.Session(&gorm.Session{}).Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allItems)
 		}
+		allItems = excludeCollapsedRedundancyMembers(db, "default", allItems)
 
 		// Score items
 		contentIDs := extractPublicIDs(allItems)
@@ -260,6 +261,7 @@ func GetForYouFeed(c *gin.Context) {
 		})
 		return
 	}
+	items = excludeCollapsedRedundancyMembers(db, "default", items)
 	if config.ShowWatchedWhenUnseenExhausted && len(items) == 0 && len(seenIDs) > 0 && !hasCursor(pagination) {
 		query = forYouEligibleMediaQuery(db, atomizedFeedSchema).
 			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
@@ -271,6 +273,7 @@ func GetForYouFeed(c *gin.Context) {
 			})
 			return
 		}
+		items = excludeCollapsedRedundancyMembers(db, "default", items)
 	}
 
 	// Keep the cursor boundary chronological even when preferences reorder the
@@ -322,6 +325,39 @@ func GetForYouFeed(c *gin.Context) {
 		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
 		recordPreferenceServes(db, "default", int64(boosted), int64(len(items)))
 	}
+}
+
+// excludeCollapsedRedundancyMembers is deliberately an inventory filter, not
+// cursor/session state: once a human confirms a family, only its canonical
+// member may enter For You until the family is dissolved or collapse is off.
+func excludeCollapsedRedundancyMembers(db *gorm.DB, tenantID string, items []models.ContentItem) []models.ContentItem {
+	if len(items) == 0 {
+		return items
+	}
+	var policy models.RedundancyPolicy
+	if db.Where("tenant_id = ?", tenantID).First(&policy).Error != nil || !policy.Enabled || !policy.CollapseEnabled {
+		return items
+	}
+	ids := extractPublicIDs(items)
+	var hidden []uuid.UUID
+	db.Table("redundancy_family_members m").
+		Joins("JOIN redundancy_families f ON f.id = m.family_id").
+		Where("m.tenant_id = ? AND m.role = ? AND m.ended_at IS NULL AND f.status = ? AND m.content_item_id IN ?", tenantID, "redundant", "active", ids).
+		Pluck("m.content_item_id", &hidden)
+	if len(hidden) == 0 {
+		return items
+	}
+	hiddenSet := make(map[uuid.UUID]struct{}, len(hidden))
+	for _, id := range hidden {
+		hiddenSet[id] = struct{}{}
+	}
+	filtered := items[:0]
+	for _, item := range items {
+		if _, ok := hiddenSet[item.PublicID]; !ok {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 // recordForYouServe fires the Ranking/Intelligence serve-side telemetry

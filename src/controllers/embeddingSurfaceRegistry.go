@@ -92,7 +92,7 @@ var embeddingSurfaceRegistry = []EmbeddingSurface{
 		TenantCol: "tenant_id", Dim: 1024, Kind: SurfaceKindItem, Owner: OwnerEnrichment,
 		IDCol:        "public_id",
 		Recipe:       spaceid.RecipeContentText,
-		ConsumerKeys: []string{"knn_dense", "related_dense", "story_classify", "discovery_dense"},
+		ConsumerKeys: []string{"knn_dense", "related_dense", "story_classify", "discovery_dense", "redundancy_dense"},
 	},
 	{
 		Key: "content_image", Label: "Content image embeddings", Space: EmbeddingSpaceImage,
@@ -101,7 +101,7 @@ var embeddingSurfaceRegistry = []EmbeddingSurface{
 		TenantCol: "tenant_id", Dim: 512, Kind: SurfaceKindItem, Owner: OwnerMedia,
 		IDCol:        "public_id",
 		Recipe:       spaceid.RecipeContentImage,
-		ConsumerKeys: []string{}, // no live image-similarity consumer yet
+		ConsumerKeys: []string{"redundancy_image"},
 	},
 	{
 		Key: "story_centroid", Label: "Story centroids", Space: EmbeddingSpaceText,

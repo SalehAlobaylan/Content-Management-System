@@ -30,6 +30,7 @@ var knownSemanticConsumers = map[string][]string{
 	"internalDiscoveryController.go": {"discovery_dense"},
 	"internalContentController.go":   {"knn_dense", "related_dense"},
 	"intelligenceController.go":      {"related_dense"},
+	"redundancyHygieneController.go": {"redundancy_dense", "redundancy_image"},
 }
 
 // semanticExemptFiles use `<=>` only in comments or as pure string/literal

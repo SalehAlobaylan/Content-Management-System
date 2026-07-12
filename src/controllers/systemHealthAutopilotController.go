@@ -121,6 +121,7 @@ var systemSiblingAutopilots = []systemSiblingAutopilot{
 	{Key: "news_circulation", Label: "News Circulation", Table: "news_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, DefaultDisabled: true},
 	{Key: "media_circulation", Label: "Media Circulation", Table: "media_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, DefaultDisabled: true},
 	{Key: "media_studio", Label: "Media Studio", Table: "media_studio_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "media", "enrichment"}, DefaultDisabled: true},
+	{Key: "redundancy", Label: "Redundancy Hygiene", Table: "redundancy_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "aggregation"}, DefaultDisabled: true},
 }
 
 func tryStartSystemAutopilotRun() bool {

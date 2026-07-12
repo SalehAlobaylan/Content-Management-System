@@ -35,6 +35,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal.GET("/intel/candidates", controllers.InternalListCandidates)
 
 	internal.GET("/content-items", controllers.InternalListContentItems)
+	internal.POST("/redundancy/precheck", controllers.InternalRedundancyPrecheck)
 	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
 	internal.GET("/atomization/candidates", controllers.InternalListAtomizationCandidates)
 	internal.POST("/atomization/repair-leaks", controllers.InternalRepairMediaAtomizationLeaks)

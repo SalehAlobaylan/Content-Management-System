@@ -186,6 +186,14 @@ func main() {
 			&models.MediaCirculationOverride{},
 			&models.MediaCirculationRun{},
 			&models.MediaCirculationAction{},
+			&models.RedundancyPolicy{},
+			&models.RedundancyRun{},
+			&models.RedundancyPair{},
+			&models.RedundancyPairEvaluation{},
+			&models.RedundancyFamily{},
+			&models.RedundancyFamilyMember{},
+			&models.RedundancyAction{},
+			&models.RedundancyFingerprint{},
 			// Enrichment Coverage Autopilot — scheduled gap-filling supervisor
 			&models.EnrichmentAutopilotPolicy{},
 			&models.EnrichmentAutopilotRun{},
@@ -296,6 +304,7 @@ func main() {
 	// runs for tenants whose autopilot interval has elapsed; Observe tenants
 	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
 	controllers.StartMediaCirculationAutopilotHeartbeat(db)
+	controllers.StartRedundancyHygieneHeartbeat(db)
 	controllers.StartEnrichmentAutopilotHeartbeat(db)
 	controllers.StartPipelineAutopilotHeartbeat(db)
 	// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
