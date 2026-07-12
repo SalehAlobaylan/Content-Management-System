@@ -22,6 +22,24 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// /me only needs a valid principal (any authenticated user may read their own access).
 	adminGroup.GET("/me", controllers.AdminMe)
 
+	// Operations Command Center is intentionally admin-only: it aggregates
+	// deployment-wide state and can write bounded pause fields across systems.
+	adminGroup.GET("/ops/status", utils.RequireAdminRole("admin"), controllers.GetOpsStatus)
+	adminGroup.GET("/ops/fleet", utils.RequireAdminRole("admin"), controllers.GetOpsFleet)
+	adminGroup.GET("/ops/attention", utils.RequireAdminRole("admin"), controllers.ListOpsAttention)
+	adminGroup.POST("/ops/attention/ack", utils.RequireAdminRole("admin"), controllers.AckOpsAttention)
+	adminGroup.POST("/ops/attention/snooze", utils.RequireAdminRole("admin"), controllers.SnoozeOpsAttention)
+	adminGroup.POST("/ops/attention/clear", utils.RequireAdminRole("admin"), controllers.ClearOpsAttentionState)
+	adminGroup.DELETE("/ops/attention/state", utils.RequireAdminRole("admin"), controllers.ClearOpsAttentionState)
+	adminGroup.GET("/ops/calendar", utils.RequireAdminRole("admin"), controllers.GetOpsCalendar)
+	adminGroup.GET("/ops/briefing", utils.RequireAdminRole("admin"), controllers.GetOpsBriefing)
+	adminGroup.POST("/ops/briefing/seen", utils.RequireAdminRole("admin"), controllers.MarkOpsBriefingSeen)
+	adminGroup.GET("/ops/commands", utils.RequireAdminRole("admin"), controllers.ListOpsCommands)
+	adminGroup.GET("/ops/commands/:id", utils.RequireAdminRole("admin"), controllers.GetOpsCommand)
+	adminGroup.POST("/ops/commands/pause-member", utils.RequireAdminRole("admin"), controllers.PauseOpsMember)
+	adminGroup.POST("/ops/commands/pause-all", utils.RequireAdminRole("admin"), controllers.PauseOpsFleet)
+	adminGroup.POST("/ops/commands/resume", utils.RequireAdminRole("admin"), controllers.ResumeOpsCommand)
+
 	adminGroup.GET("/sources", perm("source", "read"), controllers.ListContentSources)
 	adminGroup.POST("/sources", perm("source", "write"), controllers.CreateContentSource)
 	adminGroup.POST("/sources/bulk", perm("source", "write"), controllers.BulkCreateContentSources)

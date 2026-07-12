@@ -238,6 +238,11 @@ func main() {
 			&models.AISpendBudget{},
 			&models.AISpendRun{},
 			&models.AISpendEpisode{},
+			// Operations Command Center
+			&models.OpsAttentionState{},
+			&models.OpsBriefingCursor{},
+			&models.OpsFleetCommand{},
+			&models.OpsFleetCommandAction{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
