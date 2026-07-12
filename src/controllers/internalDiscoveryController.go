@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"encoding/json"
 	"net/http"
@@ -34,8 +35,8 @@ type suggestionCandidate struct {
 }
 
 type internalSourceSuggestionsRequest struct {
-	TenantID   string              `json:"tenant_id"`
-	ProfileID  string              `json:"profile_id"` // discovery profile public id (optional)
+	TenantID   string                `json:"tenant_id"`
+	ProfileID  string                `json:"profile_id"` // discovery profile public id (optional)
 	Candidates []suggestionCandidate `json:"candidates"`
 }
 
@@ -198,8 +199,8 @@ func scoreSuggestionRows(db *gorm.DB, tenantID string, profileID *uint, rows []m
 		if len(titles) == 0 {
 			continue
 		}
-		vecs, err := embedBatchViaEnrichment(titles)
-		if err != nil || len(vecs) == 0 {
+		vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles)
+		if err != nil || len(vecs) == 0 || profile.EmbeddingSpaceID == nil || sampleSpaceID != *profile.EmbeddingSpaceID {
 			continue
 		}
 		// Mean of the per-item cosines vs the profile. Averaging over ALL recent
@@ -254,7 +255,11 @@ func meanVector(vecs [][]float32) []float32 {
 // ensureProfileEmbedding returns the profile's cached embedding, computing and
 // persisting it on first use. Returns (vec, true) on success.
 func ensureProfileEmbedding(db *gorm.DB, profile *models.DiscoveryProfile) ([]float32, bool) {
-	if profile.Embedding != nil {
+	expectedProducer := ""
+	if _, _, producer := textSurfaceStamp(spaceid.RecipeDiscoveryProfile); producer != nil {
+		expectedProducer = *producer
+	}
+	if profile.Embedding != nil && expectedProducer != "" && profile.EmbeddingProducerID != nil && *profile.EmbeddingProducerID == expectedProducer {
 		if s := profile.Embedding.Slice(); len(s) > 0 {
 			return s, true
 		}
@@ -263,23 +268,33 @@ func ensureProfileEmbedding(db *gorm.DB, profile *models.DiscoveryProfile) ([]fl
 	if text == "" {
 		return nil, false
 	}
-	vec, err := embedQueryViaEnrichment(text)
+	vec, observedSpace, err := embedQueryViaEnrichmentWithSpace(text)
 	if err != nil || len(vec) == 0 {
 		return nil, false
 	}
 	pv := pgvector.NewVector(vec)
 	profile.Embedding = &pv
-	_ = db.Model(&models.DiscoveryProfile{}).Where("id = ?", profile.ID).Update("embedding", &pv).Error
+	upd := map[string]interface{}{"embedding": &pv}
+	// Stamp vector-space provenance (stage 10); NULL when text space unresolved.
+	if model, producer, ok := textStampForObservedSpace(spaceid.RecipeDiscoveryProfile, observedSpace); ok {
+		upd["embedding_model"], upd["embedding_space_id"], upd["embedding_producer_id"] = model, observedSpace, producer
+		profile.EmbeddingModel, profile.EmbeddingSpaceID, profile.EmbeddingProducerID = &model, &observedSpace, &producer
+	}
+	_ = db.Model(&models.DiscoveryProfile{}).Where("id = ?", profile.ID).Updates(upd).Error
 	return vec, true
 }
 
 // noveltyFactor returns dupPenalty when the candidate sample is near-identical
 // to existing ingested content (a mirror/aggregator), else 1.0.
 func noveltyFactor(db *gorm.DB, tenantID string, vec []float32, dupThreshold, dupPenalty float64) float64 {
+	spaceID := currentTextSpaceIDForSimilarity()
+	if spaceID == "" {
+		return 1.0
+	}
 	lit := utils.PgvectorToLiteral(vec)
 	var row struct{ Sim float64 }
 	err := db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND embedding IS NOT NULL", tenantID).
+		Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ?", tenantID, spaceID).
 		Select("1 - (embedding <=> '" + lit + "') AS sim").
 		Order("embedding <=> '" + lit + "'").
 		Limit(1).Scan(&row).Error

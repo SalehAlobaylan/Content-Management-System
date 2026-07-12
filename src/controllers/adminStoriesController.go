@@ -861,7 +861,7 @@ func DigestTopicsBatch(c *gin.Context) {
 // closest to a topic's centroid — the LLM names the cluster from these.
 func topicRepresentativeTexts(db *gorm.DB, tenant string, t models.Story) []string {
 	order := "created_at DESC"
-	if t.Embedding != nil {
+	if t.Embedding != nil && t.EmbeddingSpaceID != nil {
 		lit := utils.PgvectorToLiteral(t.Embedding.Slice())
 		order = "embedding <=> '" + lit + "'"
 	}
@@ -871,9 +871,13 @@ func topicRepresentativeTexts(db *gorm.DB, tenant string, t models.Story) []stri
 		Excerpt *string
 	}
 	var rows []snip
-	db.Model(&models.ContentItem{}).
+	q := db.Model(&models.ContentItem{}).
 		Select("title, excerpt").
-		Where("tenant_id = ? AND story_id = ?", tenant, t.PublicID).
+		Where("tenant_id = ? AND story_id = ?", tenant, t.PublicID)
+	if t.Embedding != nil && t.EmbeddingSpaceID != nil {
+		q = q.Where("embedding_space_id = ?", *t.EmbeddingSpaceID)
+	}
+	q.
 		Order(order).
 		Limit(5).
 		Scan(&rows)

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -167,7 +168,7 @@ func limitedMapSweep(db *gorm.DB, tenantID string, itemCap, storyCap int, itemCu
 		if itemCap > 0 {
 			var items []models.ContentItem
 			if err := tx.Select("id, public_id, embedding").
-				Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND id > ?", tenantID, models.ContentStatusReady, itemCursor).
+				Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, models.ContentStatusReady, currentTextSpaceIDForSimilarity(), itemCursor).
 				Where("NOT EXISTS (SELECT 1 FROM content_item_topics cit WHERE cit.content_item_id = content_items.public_id)").
 				Order("id ASC").Limit(itemCap).Find(&items).Error; err != nil {
 				return err
@@ -196,7 +197,7 @@ func limitedMapSweep(db *gorm.DB, tenantID string, itemCap, storyCap int, itemCu
 		if storyCap > 0 {
 			var stories []models.Story
 			if err := tx.Select("id, public_id, embedding").
-				Where("tenant_id = ? AND embedding IS NOT NULL AND id > ?", tenantID, storyCursor).
+				Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, currentTextSpaceIDForSimilarity(), storyCursor).
 				Where("NOT EXISTS (SELECT 1 FROM story_topics st WHERE st.story_id = stories.public_id)").
 				Order("id ASC").Limit(storyCap).Find(&stories).Error; err != nil {
 				return err
@@ -316,7 +317,7 @@ func reevaluateCorpusPage(db *gorm.DB, tenantID string, topics []topicVector, it
 	if itemCap > 0 {
 		var items []models.ContentItem
 		if err := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND id > ?", tenantID, models.ContentStatusReady, itemCursor).
+			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, models.ContentStatusReady, currentTextSpaceIDForSimilarity(), itemCursor).
 			Order("id ASC").Limit(itemCap).Find(&items).Error; err != nil {
 			return false, false, err
 		}
@@ -336,7 +337,7 @@ func reevaluateCorpusPage(db *gorm.DB, tenantID string, topics []topicVector, it
 	if storyCap > 0 {
 		var stories []models.Story
 		if err := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND embedding IS NOT NULL AND id > ?", tenantID, storyCursor).
+			Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, currentTextSpaceIDForSimilarity(), storyCursor).
 			Order("id ASC").Limit(storyCap).Find(&stories).Error; err != nil {
 			return false, false, err
 		}
@@ -374,14 +375,18 @@ func refreshNullCentroidsBounded(db *gorm.DB, tenantID string, limitN int) (int,
 	}
 	recovered, failed := 0, 0
 	for _, topic := range topics {
-		emb, err := embedQueryViaEnrichment(topic.LabelEN + " " + topic.LabelAR)
+		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN + " " + topic.LabelAR)
 		if err != nil || len(emb) != 1024 {
 			failed++
 			continue
 		}
 		vec := pgvector.NewVector(emb)
+		updates := map[string]interface{}{"centroid": vec, "needs_remap": true}
+		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
+			updates["centroid_model"], updates["centroid_space_id"], updates["centroid_producer_id"] = model, observedSpace, producer
+		}
 		if err := db.Model(&models.Topic{}).Where("tenant_id = ? AND public_id = ?", tenantID, topic.PublicID).
-			Updates(map[string]interface{}{"centroid": vec, "needs_remap": true}).Error; err == nil {
+			Updates(updates).Error; err == nil {
 			recovered++
 		} else {
 			failed++

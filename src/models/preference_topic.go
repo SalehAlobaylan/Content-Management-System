@@ -34,10 +34,15 @@ type Topic struct {
 	LabelEN      string           `gorm:"type:text;not null" json:"label_en"`
 	CategorySlug string           `gorm:"type:text;index:idx_topics_category" json:"category_slug,omitempty"`
 	Centroid     *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
-	MemberCount  int              `gorm:"type:integer;not null;default:0" json:"member_count"`
-	Active       bool             `gorm:"not null;default:true" json:"active"`
-	Featured     bool             `gorm:"not null;default:false" json:"featured"`
-	CreatedFrom  string           `gorm:"type:text;not null;default:'mined'" json:"created_from"`
+	// Vector-space provenance for the topic centroid (stage 10). Stamped by the
+	// Preferences owner refresh adapter; NULL for legacy label-seed centroids.
+	CentroidModel      *string `gorm:"type:varchar(80);column:centroid_model" json:"-"`
+	CentroidSpaceID    *string `gorm:"type:char(64);column:centroid_space_id" json:"-"`
+	CentroidProducerID *string `gorm:"type:char(64);column:centroid_producer_id" json:"-"`
+	MemberCount        int     `gorm:"type:integer;not null;default:0" json:"member_count"`
+	Active             bool    `gorm:"not null;default:true" json:"active"`
+	Featured           bool    `gorm:"not null;default:false" json:"featured"`
+	CreatedFrom        string  `gorm:"type:text;not null;default:'mined'" json:"created_from"`
 	// NeedsRemap is the explicit dirty-state boundary the Preferences Autopilot
 	// consumes (plan §0.1.2). Human label/category/activation/approval changes set
 	// it; the autopilot's dirty sweep clears it only after a successful limited
@@ -67,12 +72,17 @@ type TopicProposal struct {
 	// proposal so the Console queue can sort by it directly. Confidence + flags are
 	// deterministic; the cached embedding + input hash keep Enrichment calls bounded
 	// and let the scorer skip already-embedded, unchanged proposals.
-	Confidence         *float64         `gorm:"type:double precision" json:"confidence,omitempty"`
-	AutopilotFlags     datatypes.JSON   `gorm:"type:jsonb" json:"autopilot_flags,omitempty"`
-	Embedding          *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
-	EmbeddingInputHash string           `gorm:"type:varchar(64)" json:"-"`
-	EmbeddedAt         *time.Time       `gorm:"type:timestamp" json:"embedded_at,omitempty"`
-	EnrichedAt         *time.Time       `gorm:"type:timestamp" json:"enriched_at,omitempty"`
+	Confidence     *float64         `gorm:"type:double precision" json:"confidence,omitempty"`
+	AutopilotFlags datatypes.JSON   `gorm:"type:jsonb" json:"autopilot_flags,omitempty"`
+	Embedding      *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
+	// Vector-space provenance for the proposal seed embedding (stage 10). The
+	// input hash tracks TEXT changes; these track MODEL/recipe changes.
+	EmbeddingModel      *string    `gorm:"type:varchar(80);column:embedding_model" json:"-"`
+	EmbeddingSpaceID    *string    `gorm:"type:char(64);column:embedding_space_id" json:"-"`
+	EmbeddingProducerID *string    `gorm:"type:char(64);column:embedding_producer_id" json:"-"`
+	EmbeddingInputHash  string     `gorm:"type:varchar(64)" json:"-"`
+	EmbeddedAt          *time.Time `gorm:"type:timestamp" json:"embedded_at,omitempty"`
+	EnrichedAt          *time.Time `gorm:"type:timestamp" json:"enriched_at,omitempty"`
 	// Frozen prediction for the trust ladder (§15): recorded before human
 	// resolution, compared on resolution. V1 records evidence only.
 	PredictedVerdict  string     `gorm:"type:varchar(24)" json:"predicted_verdict,omitempty"`

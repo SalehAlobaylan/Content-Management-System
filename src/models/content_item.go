@@ -172,11 +172,24 @@ type ContentItem struct {
 	// reconcile sweep treats it as missing so it gets re-embedded. This is the
 	// guard against silently mixing embedding spaces across model migrations.
 	EmbeddingModel *string `gorm:"type:varchar(80)" json:"-"`
+	// EmbeddingSpaceID / EmbeddingProducerID are the immutable vector-space
+	// identities stamped by the Embedding & Model Lifecycle System (stage 10).
+	// SpaceID answers "may this be compared?" (basis hash); ProducerID answers
+	// "must this surface be recomputed?" (recipe hash). NULL = unstamped legacy
+	// vector — excluded from semantic comparison by the comparability guards and
+	// treated as campaign debt. Never inferred from a non-NULL vector.
+	EmbeddingSpaceID    *string `gorm:"type:char(64);column:embedding_space_id" json:"-"`
+	EmbeddingProducerID *string `gorm:"type:char(64);column:embedding_producer_id" json:"-"`
 	// ImageEmbedding is a CLIP-ViT-B-32 image vector (512-dim), populated by
 	// Media-Service when content has a hero image or video thumbnail.
 	// Independent from Embedding (text, 1024-dim) — both can coexist.
 	ImageEmbedding *pgvector.Vector `gorm:"type:vector(512)" json:"-"`
-	Metadata       datatypes.JSON   `gorm:"type:jsonb" json:"metadata,omitempty"`
+	// Image embedding provenance — mirror of the text identities above for the
+	// CLIP space. NULL for legacy image vectors (unstamped debt).
+	ImageEmbeddingModel      *string        `gorm:"type:varchar(80);column:image_embedding_model" json:"-"`
+	ImageEmbeddingSpaceID    *string        `gorm:"type:char(64);column:image_embedding_space_id" json:"-"`
+	ImageEmbeddingProducerID *string        `gorm:"type:char(64);column:image_embedding_producer_id" json:"-"`
+	Metadata                 datatypes.JSON `gorm:"type:jsonb" json:"metadata,omitempty"`
 
 	// Transcript link (optional)
 	TranscriptID *uuid.UUID `gorm:"type:uuid" json:"transcript_id,omitempty"`

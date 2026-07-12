@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/hex"
@@ -107,6 +108,13 @@ type internalUpdateEmbeddingRequest struct {
 	// for back-compat — when absent the row's embedding_model is cleared, which
 	// flags the vector for re-embedding by the reconcile sweep.
 	Model string `json:"model"`
+	// SpaceID / ProducerID are the immutable vector-space identities (stage 10).
+	// SpaceID = "may this be compared?"; ProducerID = "must this surface be
+	// recomputed?". When absent both are cleared so the row is visibly unstamped
+	// debt rather than silently inheriting a stale identity. The comparability
+	// guards exclude NULL-space rows from similarity.
+	SpaceID    string `json:"space_id"`
+	ProducerID string `json:"producer_id"`
 }
 
 // bgeM3SparseDim is BGE-M3's vocabulary size — the dimension of its sparse
@@ -119,6 +127,11 @@ const textEmbeddingDim = 1024
 
 type internalUpdateImageEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
+	// Vector-space provenance for the CLIP space (stage 10), mirroring the text
+	// write-back. Media supplies these on write-back; absent ⇒ cleared.
+	Model      string `json:"model"`
+	SpaceID    string `json:"space_id"`
+	ProducerID string `json:"producer_id"`
 }
 
 type internalLinkTranscriptRequest struct {
@@ -533,6 +546,15 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		return
 	}
 
+	// Write fence (stage 10 §7): while a text campaign is running, every write
+	// must carry the target identity. A write stamped with a different (old)
+	// producer — a rolling old model instance overwriting a migrated row — is
+	// rejected as writer_regression; a missing stamp is rejected too.
+	if reason, blocked := fenceEmbeddingWrite(db, EmbeddingSpaceText, spaceid.RecipeContentText, req.SpaceID, req.ProducerID); blocked {
+		c.JSON(http.StatusConflict, gin.H{"error": reason, "code": "writer_regression"})
+		return
+	}
+
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
@@ -545,12 +567,11 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	// Provenance follows the write: set when the caller names its model, cleared
 	// otherwise so a provenance-less overwrite is visibly suspect (and gets
 	// re-embedded by the reconcile sweep) instead of silently inheriting the
-	// previous model name.
-	if m := strings.TrimSpace(req.Model); m != "" {
-		item.EmbeddingModel = &m
-	} else {
-		item.EmbeddingModel = nil
-	}
+	// previous model name. SpaceID/ProducerID follow the same all-or-cleared
+	// rule so a legacy writer never leaves a half-stamped, uncomparable row.
+	item.EmbeddingModel = stampOrNil(req.Model)
+	item.EmbeddingSpaceID = stampOrNil(req.SpaceID)
+	item.EmbeddingProducerID = stampOrNil(req.ProducerID)
 
 	// Sparse output is optional (Slice A populates it). Convert BGE-M3's
 	// {token_id_string: weight} map to pgvector.SparseVector if supplied.
@@ -613,6 +634,12 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		return
 	}
 
+	// Write fence (stage 10 §7) for the image space.
+	if reason, blocked := fenceEmbeddingWrite(db, EmbeddingSpaceImage, spaceid.RecipeContentImage, req.SpaceID, req.ProducerID); blocked {
+		c.JSON(http.StatusConflict, gin.H{"error": reason, "code": "writer_regression"})
+		return
+	}
+
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
@@ -621,6 +648,9 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 
 	vec := pgvector.NewVector(req.Embedding)
 	item.ImageEmbedding = &vec
+	item.ImageEmbeddingModel = stampOrNil(req.Model)
+	item.ImageEmbeddingSpaceID = stampOrNil(req.SpaceID)
+	item.ImageEmbeddingProducerID = stampOrNil(req.ProducerID)
 
 	if err := db.Save(&item).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update image embedding"})
@@ -647,6 +677,7 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 
 type internalKNNDenseRequest struct {
 	Embedding  []float32 `json:"embedding"`
+	SpaceID    string    `json:"space_id"`
 	Types      []string  `json:"types"`       // optional — when empty, no type filter
 	K          int       `json:"k"`           // required, >0
 	ExcludeIDs []string  `json:"exclude_ids"` // optional public_ids to skip
@@ -676,8 +707,9 @@ type internalKNNResponse struct {
 }
 
 type internalEmbeddingsResponse struct {
-	Embedding       []float32          `json:"embedding"`        // 1024 dense, null if missing
-	EmbeddingSparse map[string]float32 `json:"embedding_sparse"` // BGE-M3 sparse, null if missing
+	Embedding        []float32          `json:"embedding"` // 1024 dense, null if missing
+	EmbeddingSpaceID string             `json:"embedding_space_id,omitempty"`
+	EmbeddingSparse  map[string]float32 `json:"embedding_sparse"` // BGE-M3 sparse, null if missing
 }
 
 // InternalGetContentEmbeddings handles GET /internal/content-items/:id/embeddings.
@@ -694,7 +726,7 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", id).
-		Select("embedding", "embedding_sparse").
+		Select("embedding", "embedding_sparse", "embedding_space_id").
 		First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
@@ -703,6 +735,9 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 	resp := internalEmbeddingsResponse{}
 	if item.Embedding != nil {
 		resp.Embedding = item.Embedding.Slice()
+		if item.EmbeddingSpaceID != nil {
+			resp.EmbeddingSpaceID = *item.EmbeddingSpaceID
+		}
 	}
 	if item.EmbeddingSparse != nil {
 		// Convert pgvector.SparseVector → BGE-M3 wire format {token_id_str: weight}.
@@ -739,9 +774,13 @@ func InternalKNNDense(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "k must be in [1, 200]"})
 		return
 	}
+	if strings.TrimSpace(req.SpaceID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "space_id is required for dense kNN"})
+		return
+	}
 
 	hits := runKNNQuery(db, "embedding", utils.PgvectorToLiteral(req.Embedding),
-		req.Types, req.K, req.ExcludeIDs)
+		req.SpaceID, req.Types, req.K, req.ExcludeIDs)
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
@@ -782,7 +821,7 @@ func InternalKNNSparse(c *gin.Context) {
 	}
 	sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
 
-	hits := runKNNQuery(db, "embedding_sparse", sparse.String(),
+	hits := runKNNQuery(db, "embedding_sparse", sparse.String(), "",
 		req.Types, req.K, req.ExcludeIDs)
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
@@ -957,10 +996,13 @@ func InternalListMissingEmbedding(c *gin.Context) {
 // operator works on both vector and sparsevec when the matching ops class
 // is on the index. The RRF fusion in Enrichment only uses RANK, not raw
 // scores, so cross-mode score scales don't need to match.
-func runKNNQuery(db *gorm.DB, column, vecLiteral string, types []string, k int, excludeIDs []string) []internalKNNHit {
+func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string, k int, excludeIDs []string) []internalKNNHit {
 	q := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).
 		Where(column + " IS NOT NULL")
+	if column == "embedding" {
+		q = q.Where("embedding_space_id = ?", spaceID)
+	}
 
 	if len(types) > 0 {
 		q = q.Where("type IN ?", types)

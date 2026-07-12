@@ -128,7 +128,7 @@ func computePreferenceSnapshot(db *gorm.DB, tenantID string, policy models.Prefe
 		"public_id", "story_topics", "story_id")
 
 	db.Model(&models.ContentItem{}).
-		Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL", tenantID, models.ContentStatusReady).
+		Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND embedding_space_id = ?", tenantID, models.ContentStatusReady, currentTextSpaceIDForSimilarity()).
 		Where("NOT EXISTS (SELECT 1 FROM content_item_topics cit WHERE cit.content_item_id = content_items.public_id)").
 		Count(&snap.UnmappedBacklog)
 

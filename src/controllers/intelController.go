@@ -791,7 +791,8 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 		relevance := 0.0
 		novelty := 1.0
 		if len(titles) > 0 {
-			if vecs, err := embedBatchViaEnrichment(titles); err == nil && len(vecs) > 0 {
+			if vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles); err == nil && len(vecs) > 0 &&
+				profile.EmbeddingSpaceID != nil && sampleSpaceID == *profile.EmbeddingSpaceID {
 				var sum float64
 				n := 0
 				for _, v := range vecs {

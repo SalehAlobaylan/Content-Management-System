@@ -215,6 +215,13 @@ func main() {
 			&models.QualityProfile{},
 			// Audit log — admin actions executed from Platform-Console
 			&models.AuditLog{},
+			// Embedding & Model Lifecycle System (stage 10) — audit persistence
+			&models.EmbeddingLifecyclePolicy{},
+			&models.EmbeddingLifecycleRun{},
+			&models.EmbeddingLifecycleFinding{},
+			&models.EmbeddingCampaign{},
+			&models.EmbeddingCampaignAction{},
+			&models.EmbeddingCampaignException{},
 		); err != nil {
 			log.Fatalf("Failed to migrate database: %v", err)
 		}
@@ -293,6 +300,9 @@ func main() {
 	// Real User Experience — Observe scheduler: rolls up closed telemetry buckets
 	// and evaluates deterministic surface verdicts for tenants that enabled it.
 	controllers.StartExperienceHeartbeat(db)
+	// Embedding & Model Lifecycle (stage 10) — vector-space audit scheduler.
+	// Observation only; disabled by default until an admin enables it.
+	controllers.StartEmbeddingLifecycleHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

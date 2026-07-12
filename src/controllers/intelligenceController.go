@@ -554,7 +554,7 @@ func GetSimilarContent(c *gin.Context) {
 		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Content not found", Code: "NOT_FOUND"})
 		return
 	}
-	if refItem.Embedding == nil {
+	if refItem.Embedding == nil || refItem.EmbeddingSpaceID == nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Content has no embedding", Code: "NO_EMBEDDING"})
 		return
 	}
@@ -564,10 +564,11 @@ func GetSimilarContent(c *gin.Context) {
 		SELECT public_id::text AS id, title, type,
 			1 - (embedding <=> (SELECT embedding FROM content_items WHERE public_id = ? AND tenant_id = ?)) AS similarity
 		FROM content_items
-		WHERE tenant_id = ? AND status = ? AND embedding IS NOT NULL AND public_id != ?
+		WHERE tenant_id = ? AND status = ? AND embedding IS NOT NULL
+		  AND embedding_space_id = ? AND public_id != ?
 		ORDER BY embedding <=> (SELECT embedding FROM content_items WHERE public_id = ? AND tenant_id = ?)
 		LIMIT ?
-	`, contentID, principal.TenantID, principal.TenantID, models.ContentStatusReady, contentID, contentID, principal.TenantID, limit).Scan(&results)
+	`, contentID, principal.TenantID, principal.TenantID, models.ContentStatusReady, *refItem.EmbeddingSpaceID, contentID, contentID, principal.TenantID, limit).Scan(&results)
 
 	c.JSON(http.StatusOK, results)
 }

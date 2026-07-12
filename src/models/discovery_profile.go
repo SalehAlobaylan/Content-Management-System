@@ -35,6 +35,11 @@ type DiscoveryProfile struct {
 	// Embedding is the cached Qwen vector of (name + description + keywords),
 	// used to score candidate relevance. Cleared on profile edit to recompute.
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
+	// Vector-space provenance (stage 10). Edit clears the vector; a MODEL change
+	// does not, so these identities are what the lifecycle campaign keys on.
+	EmbeddingModel      *string `gorm:"type:varchar(80);column:embedding_model" json:"-"`
+	EmbeddingSpaceID    *string `gorm:"type:char(64);column:embedding_space_id" json:"-"`
+	EmbeddingProducerID *string `gorm:"type:char(64);column:embedding_producer_id" json:"-"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`

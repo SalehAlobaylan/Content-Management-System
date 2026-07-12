@@ -19,6 +19,11 @@ type Story struct {
 
 	Label     string           `gorm:"type:text;not null;uniqueIndex:idx_stories_tenant_label,priority:2" json:"label"`
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
+	// Vector-space provenance for the story centroid (stage 10). Stamped by the
+	// News owner rebuild adapter; NULL for legacy running-mean centroids.
+	EmbeddingModel      *string `gorm:"type:varchar(80);column:embedding_model" json:"-"`
+	EmbeddingSpaceID    *string `gorm:"type:char(64);column:embedding_space_id" json:"-"`
+	EmbeddingProducerID *string `gorm:"type:char(64);column:embedding_producer_id" json:"-"`
 
 	ArticleCount int `gorm:"default:0" json:"article_count"`
 

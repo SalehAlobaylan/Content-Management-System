@@ -851,20 +851,24 @@ func relatedCandidateIDs(db *gorm.DB, tenantID string, topic models.Story, story
 // Self-contained — fetches the one centroid it needs (the bulk topic load
 // deliberately skips centroids; see topicMetaColumns).
 func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) []uuid.UUID {
-	var lit string
+	var anchor struct {
+		Embedding string
+		SpaceID   string
+	}
 	db.Model(&models.Story{}).
-		Where("public_id = ? AND embedding IS NOT NULL", storyID).
-		Pluck("embedding::text", &lit)
-	if lit == "" {
+		Select("embedding::text AS embedding, embedding_space_id AS space_id").
+		Where("public_id = ? AND embedding IS NOT NULL AND embedding_space_id IS NOT NULL", storyID).
+		Scan(&anchor)
+	if anchor.Embedding == "" || anchor.SpaceID == "" {
 		return nil
 	}
 	relatedFloor := time.Now().AddDate(0, 0, -storyRelatedWindowDays)
 	var relIDs []uuid.UUID
 	db.Model(&models.Story{}).
-		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND article_count > 0", tenantID, storyID).
+		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND embedding_space_id = ? AND article_count > 0", tenantID, storyID, anchor.SpaceID).
 		Where("last_member_at IS NULL OR last_member_at > ?", relatedFloor).
-		Where("embedding <=> '"+lit+"' <= ?", 1-storyRelatedMinSimilarity).
-		Order("embedding <=> '"+lit+"'").
+		Where("embedding <=> '"+anchor.Embedding+"' <= ?", 1-storyRelatedMinSimilarity).
+		Order("embedding <=> '"+anchor.Embedding+"'").
 		Limit(limit).
 		Pluck("public_id", &relIDs)
 	return relIDs

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"fmt"
 	"hash/fnv"
@@ -308,9 +309,12 @@ func AdminCreateTopic(c *gin.Context) {
 		CategorySlug: strings.TrimSpace(req.CategorySlug), Active: active, Featured: featured, CreatedFrom: "manual",
 		NeedsRemap: true,
 	}
-	if emb, err := embedQueryViaEnrichment(en + " " + ar); err == nil && len(emb) == 1024 {
+	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en + " " + ar); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
 		topic.Centroid = &vec
+		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
+			topic.CentroidModel, topic.CentroidSpaceID, topic.CentroidProducerID = &model, &observedSpace, &producer
+		}
 	}
 	if err := db.Create(&topic).Error; err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Failed to create topic: " + err.Error(), Code: "CREATE_FAILED"})
@@ -454,9 +458,12 @@ func AdminApproveTopicProposal(c *gin.Context) {
 		featured = *req.Featured
 	}
 	topic := models.Topic{TenantID: principal.TenantID, Slug: slug, LabelAR: ar, LabelEN: en, CategorySlug: topicFirstNonEmpty(req.CategorySlug, p.SuggestedCategory), Featured: featured, Active: true, CreatedFrom: "mined", NeedsRemap: true}
-	if emb, err := embedQueryViaEnrichment(en + " " + ar); err == nil && len(emb) == 1024 {
+	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en + " " + ar); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
 		topic.Centroid = &vec
+		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
+			topic.CentroidModel, topic.CentroidSpaceID, topic.CentroidProducerID = &model, &observedSpace, &producer
+		}
 	}
 	topic, err = approveTopicProposalCore(db, principal.TenantID, p, topic, principal.UserID)
 	if err != nil {
@@ -556,8 +563,12 @@ type topicVector struct {
 }
 
 func activeTopicVectors(db *gorm.DB, tenantID string) ([]topicVector, error) {
+	spaceID := currentTextSpaceIDForSimilarity()
+	if spaceID == "" {
+		return nil, nil
+	}
 	var topics []models.Topic
-	if err := db.Where("tenant_id = ? AND active = ? AND centroid IS NOT NULL", tenantID, true).Find(&topics).Error; err != nil {
+	if err := db.Where("tenant_id = ? AND active = ? AND centroid IS NOT NULL AND centroid_space_id = ?", tenantID, true, spaceID).Find(&topics).Error; err != nil {
 		return nil, err
 	}
 	out := make([]topicVector, 0, len(topics))
@@ -615,7 +626,7 @@ func remapCatalogTopics(db *gorm.DB, tenantID string, full bool) (int, int, erro
 	for {
 		var items []models.ContentItem
 		q := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND id > ?", tenantID, models.ContentStatusReady, lastItemID)
+			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, models.ContentStatusReady, currentTextSpaceIDForSimilarity(), lastItemID)
 		if !full {
 			q = q.Where("NOT EXISTS (SELECT 1 FROM content_item_topics cit WHERE cit.content_item_id = content_items.public_id)")
 		}
@@ -652,7 +663,7 @@ func remapCatalogTopics(db *gorm.DB, tenantID string, full bool) (int, int, erro
 	for {
 		var stories []models.Story
 		q := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND embedding IS NOT NULL AND id > ?", tenantID, lastStoryID)
+			Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, currentTextSpaceIDForSimilarity(), lastStoryID)
 		if !full {
 			q = q.Where("NOT EXISTS (SELECT 1 FROM story_topics st WHERE st.story_id = stories.public_id)")
 		}
@@ -723,12 +734,16 @@ func hydrateMissingTopicCentroids(db *gorm.DB, tenantID string) {
 		return
 	}
 	for _, topic := range topics {
-		emb, err := embedQueryViaEnrichment(topic.LabelEN + " " + topic.LabelAR)
+		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN + " " + topic.LabelAR)
 		if err != nil || len(emb) != 1024 {
 			continue
 		}
 		vec := pgvector.NewVector(emb)
-		_ = db.Model(&models.Topic{}).Where("tenant_id = ? AND public_id = ?", tenantID, topic.PublicID).Update("centroid", vec).Error
+		updates := map[string]interface{}{"centroid": vec}
+		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
+			updates["centroid_model"], updates["centroid_space_id"], updates["centroid_producer_id"] = model, observedSpace, producer
+		}
+		_ = db.Model(&models.Topic{}).Where("tenant_id = ? AND public_id = ?", tenantID, topic.PublicID).Updates(updates).Error
 	}
 }
 
@@ -756,7 +771,7 @@ func remapSingleTopic(db *gorm.DB, tenantID string, topic models.Topic) {
 	for {
 		var items []models.ContentItem
 		if err := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND id > ?", tenantID, models.ContentStatusReady, lastItemID).
+			Where("tenant_id = ? AND status = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, models.ContentStatusReady, currentTextSpaceIDForSimilarity(), lastItemID).
 			Where("EXISTS (SELECT 1 FROM content_item_topics cit WHERE cit.content_item_id = content_items.public_id)").
 			Order("id ASC").Limit(remapCatalogBatchSize).Find(&items).Error; err != nil || len(items) == 0 {
 			break
@@ -783,7 +798,7 @@ func remapSingleTopic(db *gorm.DB, tenantID string, topic models.Topic) {
 	for {
 		var stories []models.Story
 		if err := db.Select("id, public_id, embedding").
-			Where("tenant_id = ? AND embedding IS NOT NULL AND id > ?", tenantID, lastStoryID).
+			Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND id > ?", tenantID, currentTextSpaceIDForSimilarity(), lastStoryID).
 			Where("EXISTS (SELECT 1 FROM story_topics st WHERE st.story_id = stories.public_id)").
 			Order("id ASC").Limit(remapCatalogBatchSize).Find(&stories).Error; err != nil || len(stories) == 0 {
 			break

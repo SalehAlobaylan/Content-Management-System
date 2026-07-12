@@ -733,22 +733,30 @@ func hasArabicScript(s string) bool {
 // 1024-dim L2-normalized dense vector (Qwen). Unlike triggerEmbedding it does
 // NOT persist anything — used for on-the-fly relevance scoring of candidates.
 func embedQueryViaEnrichment(text string) ([]float32, error) {
+	vec, _, err := embedQueryViaEnrichmentWithSpace(text)
+	return vec, err
+}
+
+// embedQueryViaEnrichmentWithSpace returns the vector and the exact space_id
+// reported by the inference call. Lifecycle owner adapters compare this with
+// their frozen campaign target before stamping, closing a model-swap race.
+func embedQueryViaEnrichmentWithSpace(text string) ([]float32, string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
-		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
+		return nil, "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
 	}
 	token := enrichmentServiceToken()
 	if token == "" {
-		return nil, fmt.Errorf("enrichment service token is not configured")
+		return nil, "", fmt.Errorf("enrichment service token is not configured")
 	}
 
 	payload, err := json.Marshal(map[string]interface{}{"text": text})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/embed/query", bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -756,45 +764,51 @@ func embedQueryViaEnrichment(text string) ([]float32, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("enrichment embed/query status %d: %s", resp.StatusCode, string(body))
+		return nil, "", fmt.Errorf("enrichment embed/query status %d: %s", resp.StatusCode, string(body))
 	}
 	var r struct {
 		Embedding []float32 `json:"embedding"`
+		SpaceID   string    `json:"space_id"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(r.Embedding) == 0 {
-		return nil, fmt.Errorf("enrichment returned empty embedding")
+		return nil, "", fmt.Errorf("enrichment returned empty embedding")
 	}
-	return r.Embedding, nil
+	return r.Embedding, r.SpaceID, nil
 }
 
 // embedBatchViaEnrichment embeds multiple texts in one call and returns their
 // vectors (no persistence — content_ids omitted). Used to score a candidate's
 // sample items individually for sharper topic discrimination.
 func embedBatchViaEnrichment(texts []string) ([][]float32, error) {
+	vectors, _, err := embedBatchViaEnrichmentWithSpace(texts)
+	return vectors, err
+}
+
+func embedBatchViaEnrichmentWithSpace(texts []string) ([][]float32, string, error) {
 	if len(texts) == 0 {
-		return nil, fmt.Errorf("no texts")
+		return nil, "", fmt.Errorf("no texts")
 	}
 	baseURL := enrichmentBaseURL()
 	token := enrichmentServiceToken()
 	if baseURL == "" || token == "" {
-		return nil, fmt.Errorf("enrichment not configured")
+		return nil, "", fmt.Errorf("enrichment not configured")
 	}
 	payload, err := json.Marshal(map[string]interface{}{"texts": texts})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/embed", bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -802,23 +816,24 @@ func embedBatchViaEnrichment(texts []string) ([][]float32, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("enrichment embed status %d: %s", resp.StatusCode, string(body))
+		return nil, "", fmt.Errorf("enrichment embed status %d: %s", resp.StatusCode, string(body))
 	}
 	var r struct {
 		Embeddings [][]float32 `json:"embeddings"`
+		SpaceID    string      `json:"space_id"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(r.Embeddings) == 0 {
-		return nil, fmt.Errorf("empty embeddings")
+		return nil, "", fmt.Errorf("empty embeddings")
 	}
-	return r.Embeddings, nil
+	return r.Embeddings, r.SpaceID, nil
 }
 
 // triggerEmbedding sends an embedding request to the Enrichment-Service.

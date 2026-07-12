@@ -117,6 +117,7 @@ type systemSiblingAutopilot struct {
 var systemSiblingAutopilots = []systemSiblingAutopilot{
 	{Key: "pipeline", Label: "Pipeline Repair", Table: "pipeline_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation"}},
 	{Key: "enrichment", Label: "Enrichment Coverage", Table: "enrichment_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation", "enrichment", "media"}},
+	{Key: "embedding_lifecycle", Label: "Embedding Lifecycle", Table: "embedding_lifecycle_policies", PauseColumn: "campaigns_paused_until", Dependencies: []string{"cms", "enrichment", "media"}},
 	{Key: "news_circulation", Label: "News Circulation", Table: "news_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, DefaultDisabled: true},
 	{Key: "media_circulation", Label: "Media Circulation", Table: "media_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, DefaultDisabled: true},
 	{Key: "media_studio", Label: "Media Studio", Table: "media_studio_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "media", "enrichment"}, DefaultDisabled: true},
@@ -1287,6 +1288,8 @@ func ensureSystemSiblingPolicyRow(db *gorm.DB, sibling systemSiblingAutopilot) {
 	case "enrichment":
 		policy := models.DefaultEnrichmentAutopilotPolicy(defaultCirculationTenant)
 		_ = db.Where("tenant_id = ?", defaultCirculationTenant).FirstOrCreate(&policy).Error
+	case "embedding_lifecycle":
+		_, _ = getOrCreateEmbeddingPolicy(db)
 	case "news_circulation":
 		policy := models.DefaultNewsCirculationPolicy(defaultCirculationTenant)
 		_ = db.Where("tenant_id = ?", defaultCirculationTenant).FirstOrCreate(&policy).Error

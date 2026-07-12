@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"errors"
 	"log"
@@ -42,6 +43,13 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	if item.Embedding == nil {
 		return
 	}
+	// Unknown-space vectors are debt, never classification inputs. During a
+	// target-space campaign, hold new classification until active story
+	// centroids have crossed to the same space; otherwise the partial catalog
+	// would create duplicate migration-window stories.
+	if item.EmbeddingSpaceID == nil || strings.TrimSpace(*item.EmbeddingSpaceID) == "" || holdStoryClassification(db, item.TenantID, *item.EmbeddingSpaceID) {
+		return
+	}
 	emb := item.Embedding.Slice()
 	if len(emb) == 0 {
 		return
@@ -62,7 +70,7 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	var nearest nearestRow
 	_ = db.Model(&models.Story{}).
 		Select("public_id, (embedding <=> '"+lit+"') AS distance").
-		Where("tenant_id = ? AND embedding IS NOT NULL", item.TenantID).
+		Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ?", item.TenantID, *item.EmbeddingSpaceID).
 		Where("last_member_at IS NULL OR last_member_at BETWEEN ? AND ?", windowStart, windowEnd).
 		Order("embedding <=> '" + lit + "'").
 		Limit(1).
@@ -104,6 +112,11 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 			Labeled:      labeled, // false = placeholder awaiting label-batch
 			LastMemberAt: &itemT,
 		}
+		topic.EmbeddingModel = item.EmbeddingModel
+		topic.EmbeddingSpaceID = item.EmbeddingSpaceID
+		if producer := spaceid.ProducerID(*item.EmbeddingSpaceID, spaceid.RecipeStoryCentroid); producer != "" {
+			topic.EmbeddingProducerID = &producer
+		}
 		if createErr := db.Create(&topic).Error; createErr != nil {
 			// Lost a create race on the unique (tenant,label) — fetch the winner.
 			if refetch := db.Where("tenant_id = ? AND label = ?", item.TenantID, label).
@@ -114,8 +127,27 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	} else if findErr != nil {
 		return
 	}
+	if topic.EmbeddingSpaceID == nil || *topic.EmbeddingSpaceID != *item.EmbeddingSpaceID {
+		return
+	}
 
 	assignTopicToItem(db, &item, topic.PublicID, emb)
+}
+
+func holdStoryClassification(db *gorm.DB, tenantID, itemSpaceID string) bool {
+	var c models.EmbeddingCampaign
+	if err := db.Where("space = ? AND state IN ?", EmbeddingSpaceText,
+		[]string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying}).First(&c).Error; err != nil || c.TargetSpaceID != itemSpaceID {
+		return false
+	}
+	activeFloor := time.Now().AddDate(0, 0, -storyActivityWindowDays)
+	var pending int64
+	db.Model(&models.Story{}).
+		Where("tenant_id = ? AND embedding IS NOT NULL", tenantID).
+		Where("last_member_at IS NULL OR last_member_at > ?", activeFloor).
+		Where("embedding_space_id IS NULL OR embedding_space_id <> ?", itemSpaceID).
+		Count(&pending)
+	return pending > 0
 }
 
 // assignTopicToItem points an article at a topic and folds its embedding into
@@ -145,8 +177,11 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 			newCentroid := runningMean(centroid, topic.ArticleCount, emb)
 			vec := pgvector.NewVector(newCentroid)
 			updates := map[string]interface{}{
-				"embedding":     &vec,
-				"article_count": topic.ArticleCount + 1,
+				"embedding":             &vec,
+				"embedding_model":       item.EmbeddingModel,
+				"embedding_space_id":    item.EmbeddingSpaceID,
+				"embedding_producer_id": spaceid.ProducerID(*item.EmbeddingSpaceID, spaceid.RecipeStoryCentroid),
+				"article_count":         topic.ArticleCount + 1,
 			}
 			// Advance the story's activity time when this member is newer —
 			// keeps the activity window tracking real event time.

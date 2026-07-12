@@ -325,6 +325,32 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/reject", perm("feed", "manage"), controllers.RejectFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/breakers/:class/reset", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
 
+	// Embedding & Model Lifecycle System (stage 10) — vector-space custodian.
+	// Reads under content:read, policy/manual-audit under content:write, privileged
+	// mutations (campaign start/abort, overrides — Slice 3) gated by admin role.
+	adminGroup.GET("/embedding-lifecycle/status", perm("content", "read"), controllers.GetEmbeddingLifecycleStatus)
+	adminGroup.GET("/embedding-lifecycle/policy", perm("content", "read"), controllers.GetEmbeddingLifecyclePolicy)
+	adminGroup.PUT("/embedding-lifecycle/policy", perm("content", "write"), controllers.UpdateEmbeddingLifecyclePolicy)
+	adminGroup.POST("/embedding-lifecycle/run", perm("content", "write"), controllers.RunEmbeddingLifecycleNow)
+	adminGroup.GET("/embedding-lifecycle/runs", perm("content", "read"), controllers.ListEmbeddingLifecycleRuns)
+	adminGroup.GET("/embedding-lifecycle/runs/:id", perm("content", "read"), controllers.GetEmbeddingLifecycleRun)
+	adminGroup.GET("/embedding-lifecycle/findings", perm("content", "read"), controllers.ListEmbeddingLifecycleFindings)
+	adminGroup.GET("/embedding-lifecycle/surfaces", perm("content", "read"), controllers.GetEmbeddingLifecycleSurfaces)
+	adminGroup.GET("/embedding-lifecycle/actions", perm("content", "read"), controllers.ListEmbeddingCampaignActions)
+	// Campaigns — reads under content:read; creation is content:write; the
+	// mutating lifecycle (start/abort) + waivers require admin role (§10).
+	adminGroup.POST("/embedding-lifecycle/campaigns/preview", perm("content", "read"), controllers.PreviewEmbeddingCampaign)
+	adminGroup.GET("/embedding-lifecycle/campaigns", perm("content", "read"), controllers.ListEmbeddingCampaigns)
+	adminGroup.GET("/embedding-lifecycle/campaigns/:id", perm("content", "read"), controllers.GetEmbeddingCampaign)
+	adminGroup.GET("/embedding-lifecycle/campaigns/:id/exceptions", perm("content", "read"), controllers.ListEmbeddingCampaignExceptions)
+	adminGroup.POST("/embedding-lifecycle/campaigns", perm("content", "write"), controllers.CreateEmbeddingCampaign)
+	adminGroup.POST("/embedding-lifecycle/campaigns/:id/start", utils.RequireAdminRole("admin"), controllers.StartEmbeddingCampaign)
+	adminGroup.POST("/embedding-lifecycle/campaigns/:id/pause", perm("content", "write"), controllers.PauseEmbeddingCampaign)
+	adminGroup.POST("/embedding-lifecycle/campaigns/:id/resume", perm("content", "write"), controllers.ResumeEmbeddingCampaign)
+	adminGroup.POST("/embedding-lifecycle/campaigns/:id/abort", utils.RequireAdminRole("admin"), controllers.AbortEmbeddingCampaign)
+	adminGroup.POST("/embedding-lifecycle/exceptions/:id/retry", perm("content", "write"), controllers.RetryEmbeddingException)
+	adminGroup.POST("/embedding-lifecycle/exceptions/:id/waive", utils.RequireAdminRole("admin"), controllers.WaiveEmbeddingException)
+
 	// Real User Experience (RUX) — browser-observed reliability cockpit. Reuses
 	// the `feed` permission resource (consumer-edge experience, same family).
 	adminGroup.GET("/experience/status", perm("feed", "read"), controllers.GetExperienceStatus)

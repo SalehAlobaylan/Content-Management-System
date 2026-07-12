@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/spaceid"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -284,23 +285,34 @@ func (s *proposalScorer) fillLabels(p *models.TopicProposal) (string, string, bo
 // same unchanged proposals on every scheduled run (§0.1.8).
 func (s *proposalScorer) ensureEmbedding(p *models.TopicProposal, ar, en string) ([]float32, bool) {
 	hash := hashProposalEmbeddingInput(p.SuggestedSlug, ar, en, p.SuggestedCategory)
-	if p.Embedding != nil && p.EmbeddingInputHash == hash {
+	expectedProducer := ""
+	if _, _, producer := textSurfaceStamp(spaceid.RecipeTopicProposal); producer != nil {
+		expectedProducer = *producer
+	}
+	if p.Embedding != nil && p.EmbeddingInputHash == hash && expectedProducer != "" &&
+		p.EmbeddingProducerID != nil && *p.EmbeddingProducerID == expectedProducer {
 		return p.Embedding.Slice(), true
 	}
 	if s.embedCalls >= s.policy.MaxEmbeddingCalls {
 		return nil, false
 	}
 	text := strings.TrimSpace(en + " " + ar + " " + strings.ReplaceAll(p.SuggestedSlug, "-", " "))
-	emb, err := embedQueryViaEnrichment(text)
+	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text)
 	s.embedCalls++
 	if err != nil || len(emb) != 1024 {
 		return nil, false
 	}
 	vec := pgvector.NewVector(emb)
 	now := time.Now()
-	_ = s.db.Model(&models.TopicProposal{}).Where("id = ?", p.ID).Updates(map[string]interface{}{
+	upd := map[string]interface{}{
 		"embedding": vec, "embedding_input_hash": hash, "embedded_at": now,
-	}).Error
+	}
+	// Stamp vector-space provenance (stage 10) so new proposal seeds carry
+	// identity; left NULL (unstamped debt) when the text space is unresolved.
+	if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicProposal, observedSpace); ok {
+		upd["embedding_model"], upd["embedding_space_id"], upd["embedding_producer_id"] = model, observedSpace, producer
+	}
+	_ = s.db.Model(&models.TopicProposal{}).Where("id = ?", p.ID).Updates(upd).Error
 	return emb, true
 }
 
