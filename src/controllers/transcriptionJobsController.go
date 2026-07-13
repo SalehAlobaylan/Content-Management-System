@@ -251,6 +251,16 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 	return job, nil
 }
 
+// sttSkipKind classifies guard skips so consumers never need to parse the
+// human-readable reason that is shown in the ledger and Console.
+type sttSkipKind string
+
+const (
+	sttSkipNone   sttSkipKind = ""
+	sttSkipBudget sttSkipKind = "budget"
+	sttSkipGuard  sttSkipKind = "guard"
+)
+
 func latestTranscriptQuality(db *gorm.DB, contentID uuid.UUID) *models.TranscriptQuality {
 	var q models.TranscriptQuality
 	if err := db.Where("content_item_id = ?", contentID).First(&q).Error; err != nil {
@@ -259,51 +269,62 @@ func latestTranscriptQuality(db *gorm.DB, contentID uuid.UUID) *models.Transcrip
 	return &q
 }
 
-func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, triggerSource string, force bool) (models.TranscriptionJob, bool, string, error) {
+// evaluateSTTAdmission answers whether an unforced trigger would be accepted
+// without creating a job. Observe mode uses this same decision as the live path.
+func evaluateSTTAdmission(db *gorm.DB, item *models.ContentItem, triggerSource string) (bool, string) {
 	cfg := getOrCreateTranscriptionConfig(db, item.TenantID)
 	state := ""
 	if item.CaptionState != nil {
 		state = *item.CaptionState
 	}
-
 	if triggerSource == "" {
 		triggerSource = models.TranscriptionTriggerManual
 	}
+	if item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "" {
+		return false, "no media_url available"
+	}
+	if state == models.CaptionStateYouTubeHuman {
+		return false, "human caption present (no STT needed)"
+	}
+	qualityDriven := triggerSource == models.TranscriptionTriggerAutoQuality || triggerSource == models.TranscriptionTriggerStudioAutopilot
+	if state == models.CaptionStateSTTDone {
+		q := latestTranscriptQuality(db, item.PublicID)
+		if q == nil || q.Status != models.TranscriptQualityAutoRepair || !cfg.AutoRepairEnabled {
+			return false, "already upgraded by STT"
+		}
+	}
+	if state == models.CaptionStateYouTubeAuto && !cfg.AutoSttEnabled && !qualityDriven {
+		return false, "auto-STT disabled (manual trigger required)"
+	}
+	if (state == "" || state == models.CaptionStateNone) && !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual && triggerSource != models.TranscriptionTriggerAutoQuality {
+		return false, "auto-STT disabled (manual trigger required)"
+	}
+	if estimate := estimateSTTCostUSD(item.DurationSec); cfg.MonthlyBudgetCapUsd > 0 && cfg.MonthlySpendUsd+cfg.MonthlyReservedUsd+estimate > cfg.MonthlyBudgetCapUsd {
+		return false, "monthly STT budget cap reached"
+	}
+	return true, ""
+}
 
+func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, triggerSource string, force bool) (models.TranscriptionJob, bool, string, sttSkipKind, error) {
+	if triggerSource == "" {
+		triggerSource = models.TranscriptionTriggerManual
+	}
 	if item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "" {
 		job := createSkippedTranscriptionJob(db, item, triggerSource, "no media_url available")
-		return job, false, job.SkipReason, nil
+		return job, false, job.SkipReason, sttSkipGuard, nil
 	}
-
 	if !force {
-		if state == models.CaptionStateYouTubeHuman {
-			job := createSkippedTranscriptionJob(db, item, triggerSource, "human caption present (no STT needed)")
-			return job, false, job.SkipReason, nil
-		}
-		// Quality-driven re-runs: auto_quality (internal quality loop) and
-		// studio_autopilot (stage 6 — same predicate, attributed). Both pass the
-		// same gates; the studio trigger keeps its own attribution (H9/S12).
-		qualityDriven := triggerSource == models.TranscriptionTriggerAutoQuality ||
-			triggerSource == models.TranscriptionTriggerStudioAutopilot
-		if state == models.CaptionStateSTTDone {
-			q := latestTranscriptQuality(db, item.PublicID)
-			if q == nil || q.Status != models.TranscriptQualityAutoRepair || !cfg.AutoRepairEnabled {
-				job := createSkippedTranscriptionJob(db, item, triggerSource, "already upgraded by STT")
-				return job, false, job.SkipReason, nil
+		admit, reason := evaluateSTTAdmission(db, item, triggerSource)
+		if !admit {
+			job := createSkippedTranscriptionJob(db, item, triggerSource, reason)
+			kind := sttSkipGuard
+			if reason == "monthly STT budget cap reached" {
+				kind = sttSkipBudget
 			}
-			if !qualityDriven {
-				triggerSource = models.TranscriptionTriggerAutoQuality
-			}
+			return job, false, job.SkipReason, kind, nil
 		}
-		if state == models.CaptionStateYouTubeAuto && !cfg.AutoSttEnabled && !qualityDriven {
-			job := createSkippedTranscriptionJob(db, item, triggerSource, "auto-STT disabled (manual trigger required)")
-			return job, false, job.SkipReason, nil
-		}
-		if state == "" || state == models.CaptionStateNone {
-			if !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual && triggerSource != models.TranscriptionTriggerAutoQuality {
-				job := createSkippedTranscriptionJob(db, item, triggerSource, "auto-STT disabled (manual trigger required)")
-				return job, false, job.SkipReason, nil
-			}
+		if item.CaptionState != nil && *item.CaptionState == models.CaptionStateSTTDone && triggerSource != models.TranscriptionTriggerAutoQuality && triggerSource != models.TranscriptionTriggerStudioAutopilot {
+			triggerSource = models.TranscriptionTriggerAutoQuality
 		}
 	}
 
@@ -311,11 +332,11 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 	if err != nil {
 		if errors.Is(err, errTranscriptionBudgetCapReached) {
 			job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
-			return job, false, job.SkipReason, nil
+			return job, false, job.SkipReason, sttSkipBudget, nil
 		}
-		return job, false, "", err
+		return job, false, "", sttSkipNone, err
 	}
-	return job, true, "", nil
+	return job, true, "", sttSkipNone, nil
 }
 
 func checksumTranscriptText(text string, segments datatypes.JSON) string {
@@ -658,7 +679,7 @@ func CreateTranscriptionJob(c *gin.Context) {
 	if trigger == "" {
 		trigger = models.TranscriptionTriggerManual
 	}
-	job, triggered, reason, err := createTranscriptionJobForItem(db, &item, trigger, req.Force)
+	job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, trigger, req.Force)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create transcription job", Code: "CREATE_FAILED"})
 		return
@@ -1011,7 +1032,7 @@ func dispatchTranscriptionBatch(db *gorm.DB, batchID uuid.UUID) {
 			if err := tx.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
 				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": "content item not found"}).Error
 			}
-			job, triggered, reason, err := createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerBulkManual, batch.Force)
+			job, triggered, reason, _, err := createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerBulkManual, batch.Force)
 			if err != nil {
 				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": err.Error()}).Error
 			}
@@ -1285,7 +1306,7 @@ func BulkCreateTranscriptionJobs(c *gin.Context) {
 			results = append(results, gin.H{"content_id": rawID, "status": "failed", "error": "not found"})
 			continue
 		}
-		job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerBulkManual, req.Force)
+		job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerBulkManual, req.Force)
 		if err != nil {
 			failed++
 			results = append(results, gin.H{"content_id": rawID, "status": "failed", "error": err.Error()})
@@ -1481,7 +1502,7 @@ func RepairTranscriptionQualitySweep(c *gin.Context) {
 			resp.Results = append(resp.Results, map[string]any{"content_id": contentID, "status": "skipped", "reason": reason})
 			continue
 		}
-		job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false)
+		job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false)
 		if err != nil {
 			resp.Failed++
 			resp.Reasons[err.Error()]++

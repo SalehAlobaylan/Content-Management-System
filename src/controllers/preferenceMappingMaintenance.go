@@ -313,7 +313,10 @@ func sweepDirtyTopics(db *gorm.DB, tenantID string, maxDirty, itemCap, storyCap 
 }
 
 func reevaluateCorpusPage(db *gorm.DB, tenantID string, topics []topicVector, itemCap, storyCap int, itemCursor, storyCursor uint, res *dirtySweepResult) (bool, bool, error) {
-	itemsDone, storiesDone := itemCap <= 0, storyCap <= 0
+	// A zero cap means this surface is disabled, not reconciled. Returning false
+	// preserves needs_remap until every required surface has actually reached its
+	// tail under an enabled bounded pass.
+	itemsDone, storiesDone := false, false
 	if itemCap > 0 {
 		var items []models.ContentItem
 		if err := db.Select("id, public_id, embedding").
@@ -411,7 +414,7 @@ func mineTopicProposals(db *gorm.DB, tenantID string) (int, error) {
 // member count / titles so the autopilot scorer can compute review priority.
 func mineTopicProposalsCapped(db *gorm.DB, tenantID string, limitN int) (int, error) {
 	if limitN <= 0 {
-		limitN = 25
+		return 0, nil
 	}
 	ensureDefaultTopicCategories(db, tenantID)
 	type row struct {
@@ -424,15 +427,23 @@ func mineTopicProposalsCapped(db *gorm.DB, tenantID string, limitN int) (int, er
 	}
 	var rows []row
 	if err := db.Raw(`
-		SELECT lower(trim(tag)) AS slug,
+		WITH tagged AS (
+			SELECT lower(trim(tag)) AS slug, public_id, title, impression_count,
+			       last_served_at, created_at
+			FROM content_items, unnest(topic_tags) AS tag
+			WHERE tenant_id = ? AND status = ? AND trim(tag) <> ''
+		), ranked AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY slug ORDER BY created_at DESC, public_id) AS sample_rank
+			FROM tagged
+		)
+		SELECT slug,
 		       COUNT(*) AS member_count,
 		       COALESCE(SUM(impression_count), 0) AS impression_count,
 		       COUNT(*) FILTER (WHERE last_served_at IS NOT NULL) AS served_members,
-		       COALESCE(jsonb_agg(title) FILTER (WHERE title IS NOT NULL), '[]'::jsonb) AS samples,
-		       COALESCE(jsonb_agg(public_id), '[]'::jsonb) AS sample_ids
-		FROM content_items, unnest(topic_tags) AS tag
-		WHERE tenant_id = ? AND status = ? AND trim(tag) <> ''
-		GROUP BY 1 HAVING COUNT(*) >= ?
+		       COALESCE(jsonb_agg(title ORDER BY created_at DESC, public_id) FILTER (WHERE sample_rank <= 5 AND title IS NOT NULL), '[]'::jsonb) AS samples,
+		       COALESCE(jsonb_agg(public_id ORDER BY created_at DESC, public_id) FILTER (WHERE sample_rank <= 5), '[]'::jsonb) AS sample_ids
+		FROM ranked
+		GROUP BY slug HAVING COUNT(*) >= ?
 		ORDER BY COUNT(*) DESC LIMIT 100
 	`, tenantID, models.ContentStatusReady, topicMineMinMembers).Scan(&rows).Error; err != nil {
 		return 0, err

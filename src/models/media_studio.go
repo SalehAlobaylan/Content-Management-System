@@ -92,6 +92,7 @@ const (
 	StudioGuardMultiCode        = "multi_code"
 	StudioGuardInvalidDuration  = "invalid_duration"
 	StudioGuardUpstreamDisabled = "upstream_disabled"
+	StudioGuardParentContext    = "parent_context"
 	StudioGuardRecentlyEdited   = "recently_edited"
 	StudioGuardOverride         = "override"
 	StudioGuardJobInFlight      = "job_in_flight"

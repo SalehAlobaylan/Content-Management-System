@@ -22,10 +22,12 @@ import (
 )
 
 const (
-	topicMappingThreshold = 0.55
-	topicMappingTopK      = 3
-	topicMineMinMembers   = 5
-	affinityK             = 3.0
+	topicMappingThreshold          = 0.55
+	topicMappingTopK               = 3
+	topicMineMinMembers            = 5
+	affinityK                      = 3.0
+	maxPreferenceMutationBodyBytes = 16 * 1024
+	maxDeclaredTopicCount          = 100
 )
 
 var slugCleaner = regexp.MustCompile(`[^\p{L}\p{N}]+`)
@@ -65,6 +67,28 @@ type replaceDeclaredTopicsRequest struct {
 	TopicIDs []string `json:"topic_ids"`
 }
 
+type preferenceSettingDomain struct {
+	Min float64
+	Max float64
+}
+
+// Preference controls are product policy, not deployment tuning. Zero disables
+// a weight/discount/prior; half-life stays strictly positive so decay math is
+// always defined. Keep this table aligned with the Console and migration.
+var preferenceSettingDomains = map[string]preferenceSettingDomain{
+	"w_foryou":             {Min: 0, Max: 1},
+	"w_news":               {Min: 0, Max: 1},
+	"weight_complete":      {Min: 0, Max: 5},
+	"weight_bookmark":      {Min: 0, Max: 5},
+	"weight_share":         {Min: 0, Max: 5},
+	"weight_like":          {Min: 0, Max: 5},
+	"weight_comment":       {Min: 0, Max: 5},
+	"weight_view":          {Min: 0, Max: 5},
+	"decay_half_life_days": {Min: 0.25, Max: 365},
+	"declared_prior":       {Min: 0, Max: 5},
+	"category_discount":    {Min: 0, Max: 1},
+}
+
 func defaultPreferenceSettings(tenantID string) models.PreferenceSettings {
 	return models.PreferenceSettings{
 		TenantID:          tenantID,
@@ -92,16 +116,21 @@ func loadPreferenceSettings(db *gorm.DB, tenantID string) models.PreferenceSetti
 			}).Create(&cfg).Error
 		}
 	}
-	if cfg.DecayHalfLifeDays <= 0 {
+	if !validPreferenceSettingValue("decay_half_life_days", cfg.DecayHalfLifeDays) {
 		cfg.DecayHalfLifeDays = 30
 	}
-	if cfg.DeclaredPrior <= 0 {
+	if !validPreferenceSettingValue("declared_prior", cfg.DeclaredPrior) {
 		cfg.DeclaredPrior = 3
 	}
-	if cfg.CategoryDiscount <= 0 {
+	if !validPreferenceSettingValue("category_discount", cfg.CategoryDiscount) {
 		cfg.CategoryDiscount = 0.5
 	}
 	return cfg
+}
+
+func validPreferenceSettingValue(key string, value float64) bool {
+	domain, ok := preferenceSettingDomains[key]
+	return ok && !math.IsNaN(value) && !math.IsInf(value, 0) && value >= domain.Min && value <= domain.Max
 }
 
 // Per-tenant settings cache. The feed hot path reads settings on every
@@ -924,9 +953,22 @@ func PutPreferenceTopics(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
+	if c.Request.ContentLength > maxPreferenceMutationBodyBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, utils.HTTPError{Code: http.StatusRequestEntityTooLarge, Message: "Preference request body is too large"})
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPreferenceMutationBodyBytes)
 	var req replaceDeclaredTopicsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid request"})
+		return
+	}
+	rawUnique := make(map[string]struct{}, len(req.TopicIDs))
+	for _, raw := range req.TopicIDs {
+		rawUnique[raw] = struct{}{}
+	}
+	if len(rawUnique) > maxDeclaredTopicCount {
+		c.JSON(http.StatusUnprocessableEntity, utils.HTTPError{Code: http.StatusUnprocessableEntity, Message: "Too many declared topics"})
 		return
 	}
 	ids := make([]uuid.UUID, 0, len(req.TopicIDs))
@@ -951,7 +993,14 @@ func PutPreferenceTopics(c *gin.Context) {
 		}
 	}
 	err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("tenant_id = ? AND user_id = ? AND state = ?", "default", uid, "declared").Delete(&models.UserTopicPref{}).Error; err != nil {
+		// The picker intentionally excludes inactive/de-featured catalog topics.
+		// Preserve existing hidden declarations while replacing only declarations
+		// that were visible in the current picker; otherwise a catalog change can
+		// make the consumer editor permanently unsavable.
+		visibleTopicIDs := tx.Model(&models.Topic{}).
+			Select("public_id").Where("tenant_id = ? AND active = ? AND featured = ?", "default", true, true)
+		if err := tx.Where("tenant_id = ? AND user_id = ? AND state = ? AND topic_id IN (?)", "default", uid, "declared", visibleTopicIDs).
+			Delete(&models.UserTopicPref{}).Error; err != nil {
 			return err
 		}
 		for _, id := range ids {
@@ -969,9 +1018,7 @@ func PutPreferenceTopics(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to save preferences"})
 		return
 	}
-	_ = recomputeUserAffinity(db, uid, "default")
-	resp, _ := buildPreferenceResponse(db, "default", uid)
-	c.JSON(http.StatusOK, resp)
+	respondPreferenceMutation(c, db, uid, "default")
 }
 
 // MutePreferenceTopic handles POST /api/v1/preferences/topics/:id/mute.
@@ -1003,16 +1050,44 @@ func setPreferenceMute(c *gin.Context, muted bool) {
 	}
 	if muted {
 		p := models.UserTopicPref{TenantID: "default", UserID: uid, TopicID: tid, State: "muted"}
-		_ = db.Clauses(clause.OnConflict{
+		if err := db.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "user_id"}, {Name: "topic_id"}},
 			DoUpdates: clause.Assignments(map[string]interface{}{"state": "muted", "updated_at": time.Now()}),
-		}).Create(&p).Error
+		}).Create(&p).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to save mute preference"})
+			return
+		}
 	} else {
-		_ = db.Where("tenant_id = ? AND user_id = ? AND topic_id = ? AND state = ?", "default", uid, tid, "muted").Delete(&models.UserTopicPref{}).Error
+		if err := db.Where("tenant_id = ? AND user_id = ? AND topic_id = ? AND state = ?", "default", uid, tid, "muted").Delete(&models.UserTopicPref{}).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to remove mute preference"})
+			return
+		}
 	}
-	_ = recomputeUserAffinity(db, uid, "default")
-	resp, _ := buildPreferenceResponse(db, "default", uid)
-	c.JSON(http.StatusOK, resp)
+	respondPreferenceMutation(c, db, uid, "default")
+}
+
+// respondPreferenceMutation keeps the user-owned preference write durable even
+// when derived affinities need a retry. A successful preference mutation must
+// never be reported as if the feed cache were already refreshed.
+func respondPreferenceMutation(c *gin.Context, db *gorm.DB, uid uuid.UUID, tenantID string) {
+	status := http.StatusOK
+	queued := false
+	if err := recomputeUserAffinity(db, uid, tenantID); err != nil {
+		if enqueueErr := enqueueAffinityRecompute(db, tenantID, uid, models.PreferenceRecomputeReasonFailed); enqueueErr != nil {
+			c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Preference saved, but feed recomputation could not be queued"})
+			return
+		}
+		status, queued = http.StatusAccepted, true
+	}
+	resp, err := buildPreferenceResponse(db, tenantID, uid)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Preference saved, but the authoritative response could not be loaded"})
+		return
+	}
+	if queued {
+		resp["recompute_status"] = "queued"
+	}
+	c.JSON(status, resp)
 }
 
 // affinityDecayHorizons bounds how far back the interaction scan reaches, in
@@ -1029,15 +1104,16 @@ func recomputeUserAffinity(db *gorm.DB, uid uuid.UUID, tenantID string) error {
 // heartbeat) load them once instead of once per user.
 func recomputeUserAffinityCfg(db *gorm.DB, uid uuid.UUID, tenantID string, cfg models.PreferenceSettings) error {
 	start := time.Now()
-	cutoff := time.Now().AddDate(0, 0, -int(cfg.DecayHalfLifeDays*affinityDecayHorizons))
-	type signalRow struct {
-		TopicID   uuid.UUID
-		MapScore  float64
-		Type      models.InteractionType
-		CreatedAt time.Time
-	}
-	var signals []signalRow
-	if err := db.Raw(`
+	err := db.Transaction(func(tx *gorm.DB) error {
+		cutoff := time.Now().AddDate(0, 0, -int(cfg.DecayHalfLifeDays*affinityDecayHorizons))
+		type signalRow struct {
+			TopicID   uuid.UUID
+			MapScore  float64
+			Type      models.InteractionType
+			CreatedAt time.Time
+		}
+		var signals []signalRow
+		if err := tx.Raw(`
 		SELECT cit.topic_id, cit.score AS map_score, ui.type, ui.created_at
 		FROM user_interactions ui
 		JOIN content_item_topics cit ON cit.content_item_id = ui.content_item_id
@@ -1045,87 +1121,102 @@ func recomputeUserAffinityCfg(db *gorm.DB, uid uuid.UUID, tenantID string, cfg m
 		JOIN topics t ON t.public_id = cit.topic_id
 		WHERE ui.user_id = ? AND ui.created_at > ? AND ci.tenant_id = ? AND t.tenant_id = ? AND t.active = true
 	`, uid, cutoff, tenantID, tenantID).Scan(&signals).Error; err != nil {
-		return err
-	}
-	raw := map[uuid.UUID]float64{}
-	for _, s := range signals {
-		raw[s.TopicID] += interactionWeight(s.Type, cfg) * s.MapScore * decayMultiplier(s.CreatedAt, cfg)
-	}
-	var prefs []models.UserTopicPref
-	db.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Find(&prefs)
-	muted := map[uuid.UUID]bool{}
-	declared := map[uuid.UUID]bool{}
-	for _, p := range prefs {
-		if p.State == "muted" {
-			muted[p.TopicID] = true
-			delete(raw, p.TopicID)
-			continue
-		}
-		if p.State == "declared" {
-			declared[p.TopicID] = true
-			raw[p.TopicID] += cfg.DeclaredPrior
-		}
-	}
-	if err := db.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Delete(&models.UserTopicAffinity{}).Error; err != nil {
-		return err
-	}
-	affRows := make([]models.UserTopicAffinity, 0, len(raw))
-	for tid, v := range raw {
-		if muted[tid] || v <= 0 {
-			continue
-		}
-		affRows = append(affRows, models.UserTopicAffinity{TenantID: tenantID, UserID: uid, TopicID: tid, Score: v / (v + affinityK), Declared: declared[tid]})
-	}
-	if len(affRows) > 0 {
-		if err := db.Create(&affRows).Error; err != nil {
 			return err
 		}
-	}
-
-	categoryRaw := map[string]float64{}
-	if len(raw) > 0 {
-		ids := make([]uuid.UUID, 0, len(raw))
-		for tid := range raw {
-			ids = append(ids, tid)
+		raw := map[uuid.UUID]float64{}
+		for _, s := range signals {
+			raw[s.TopicID] += interactionWeight(s.Type, cfg) * s.MapScore * decayMultiplier(s.CreatedAt, cfg)
 		}
-		var topics []models.Topic
-		db.Where("tenant_id = ? AND public_id IN ?", tenantID, ids).Find(&topics)
-		for _, t := range topics {
-			if t.CategorySlug == "" || muted[t.PublicID] {
+		var prefs []models.UserTopicPref
+		if err := tx.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Find(&prefs).Error; err != nil {
+			return err
+		}
+		muted := map[uuid.UUID]bool{}
+		declared := map[uuid.UUID]bool{}
+		for _, p := range prefs {
+			if p.State == "muted" {
+				muted[p.TopicID] = true
+				delete(raw, p.TopicID)
 				continue
 			}
-			v := raw[t.PublicID] * cfg.CategoryDiscount
-			if v > categoryRaw[t.CategorySlug] {
-				categoryRaw[t.CategorySlug] = v
+			if p.State == "declared" {
+				declared[p.TopicID] = true
+				raw[p.TopicID] += cfg.DeclaredPrior
 			}
 		}
-	}
-	type storyCatSignal struct {
-		Category  string
-		Type      models.InteractionType
-		CreatedAt time.Time
-	}
-	var catSignals []storyCatSignal
-	db.Raw(`
+
+		categoryRaw := map[string]float64{}
+		if len(raw) > 0 {
+			ids := make([]uuid.UUID, 0, len(raw))
+			for tid := range raw {
+				ids = append(ids, tid)
+			}
+			var topics []models.Topic
+			if err := tx.Where("tenant_id = ? AND public_id IN ?", tenantID, ids).Find(&topics).Error; err != nil {
+				return err
+			}
+			for _, t := range topics {
+				if t.CategorySlug == "" || muted[t.PublicID] {
+					continue
+				}
+				v := raw[t.PublicID] * cfg.CategoryDiscount
+				if v > categoryRaw[t.CategorySlug] {
+					categoryRaw[t.CategorySlug] = v
+				}
+			}
+		}
+		type storyCatSignal struct {
+			Category  string
+			Type      models.InteractionType
+			CreatedAt time.Time
+		}
+		var catSignals []storyCatSignal
+		if err := tx.Raw(`
 		SELECT s.category, ui.type, ui.created_at
 		FROM user_interactions ui
 		JOIN content_items ci ON ci.public_id = ui.content_item_id
 		JOIN stories s ON s.public_id = ci.story_id
 		WHERE ui.user_id = ? AND ui.created_at > ? AND ci.tenant_id = ? AND s.tenant_id = ? AND s.category IS NOT NULL AND s.category <> ''
-	`, uid, cutoff, tenantID, tenantID).Scan(&catSignals)
-	for _, s := range catSignals {
-		categoryRaw[s.Category] += interactionWeight(s.Type, cfg) * cfg.CategoryDiscount * decayMultiplier(s.CreatedAt, cfg)
-	}
-	_ = db.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Delete(&models.UserCategoryAffinity{}).Error
-	catRows := make([]models.UserCategoryAffinity, 0, len(categoryRaw))
-	for cat, v := range categoryRaw {
-		if v <= 0 {
-			continue
+	`, uid, cutoff, tenantID, tenantID).Scan(&catSignals).Error; err != nil {
+			return err
 		}
-		catRows = append(catRows, models.UserCategoryAffinity{TenantID: tenantID, UserID: uid, CategorySlug: cat, Score: v / (v + affinityK)})
-	}
-	if len(catRows) > 0 {
-		_ = db.Create(&catRows).Error
+		for _, s := range catSignals {
+			categoryRaw[s.Category] += interactionWeight(s.Type, cfg) * cfg.CategoryDiscount * decayMultiplier(s.CreatedAt, cfg)
+		}
+
+		affRows := make([]models.UserTopicAffinity, 0, len(raw))
+		for tid, v := range raw {
+			if muted[tid] || v <= 0 {
+				continue
+			}
+			affRows = append(affRows, models.UserTopicAffinity{TenantID: tenantID, UserID: uid, TopicID: tid, Score: v / (v + affinityK), Declared: declared[tid]})
+		}
+		catRows := make([]models.UserCategoryAffinity, 0, len(categoryRaw))
+		for cat, v := range categoryRaw {
+			if v > 0 {
+				catRows = append(catRows, models.UserCategoryAffinity{TenantID: tenantID, UserID: uid, CategorySlug: cat, Score: v / (v + affinityK)})
+			}
+		}
+		if err := tx.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Delete(&models.UserTopicAffinity{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("tenant_id = ? AND user_id = ?", tenantID, uid).Delete(&models.UserCategoryAffinity{}).Error; err != nil {
+			return err
+		}
+		if len(affRows) > 0 {
+			if err := tx.Create(&affRows).Error; err != nil {
+				return err
+			}
+		}
+		if len(catRows) > 0 {
+			if err := tx.Create(&catRows).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	recordPreferenceRecompute(db, tenantID, time.Since(start))
 	return nil
@@ -1174,23 +1265,18 @@ func UpdatePreferenceSettings(c *gin.Context) {
 		return
 	}
 	delete(patch, "tenant_id")
-	allowed := map[string]bool{
-		"foryou_enabled": true, "news_enabled": true, "w_foryou": true, "w_news": true,
-		"weight_complete": true, "weight_bookmark": true, "weight_share": true,
-		"weight_like": true, "weight_comment": true, "weight_view": true,
-		"decay_half_life_days": true, "declared_prior": true, "category_discount": true,
-	}
 	for key, value := range patch {
-		if !allowed[key] {
-			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Unsupported setting: " + key, Code: "INVALID_SETTING"})
-			return
-		}
-		if key != "foryou_enabled" && key != "news_enabled" {
-			n, ok := value.(float64)
-			if !ok || n < 0 || n > 10 {
-				c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Setting values must be between 0 and 10", Code: "INVALID_SETTING_VALUE"})
+		if key == "foryou_enabled" || key == "news_enabled" {
+			if _, ok := value.(bool); !ok {
+				c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Boolean setting required: " + key, Code: "INVALID_SETTING_VALUE"})
 				return
 			}
+			continue
+		}
+		n, ok := value.(float64)
+		if !ok || !validPreferenceSettingValue(key, n) {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid value for setting: " + key, Code: "INVALID_SETTING_VALUE"})
+			return
 		}
 	}
 	if err := db.Model(&cfg).Updates(patch).Error; err != nil {

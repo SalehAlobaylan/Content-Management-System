@@ -68,9 +68,14 @@ func InternalCreateTranscript(c *gin.Context) {
 		source = *req.Source
 	}
 	var previousTranscriptID *uuid.UUID
+	var previousQuality *models.TranscriptQuality
 	if haveItem && strings.HasPrefix(source, "stt_") && item.TranscriptID != nil {
 		idCopy := *item.TranscriptID
 		previousTranscriptID = &idCopy
+		var quality models.TranscriptQuality
+		if db.Where("tenant_id = ? AND content_item_id = ? AND transcript_id = ?", item.TenantID, item.PublicID, idCopy).First(&quality).Error == nil {
+			previousQuality = &quality
+		}
 	}
 
 	transcript := models.Transcript{
@@ -184,13 +189,16 @@ func InternalCreateTranscript(c *gin.Context) {
 			if transcriptionJob != nil {
 				wasTerminal := terminalTranscriptionStatus(transcriptionJob.Status) && transcriptionJob.CompletedAt != nil
 				updateTranscriptionJobFromRequest(db, transcriptionJob, jobReq)
-				if err := db.Save(transcriptionJob).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
-					actual := transcriptionJob.ActualCostUsd
-					if actual == 0 {
-						actual = transcriptionJob.EstimatedCostUsd
+				if err := db.Save(transcriptionJob).Error; err == nil {
+					if !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
+						actual := transcriptionJob.ActualCostUsd
+						if actual == 0 {
+							actual = transcriptionJob.EstimatedCostUsd
+						}
+						settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
+						updateBatchItemForJob(db, transcriptionJob)
+						maybeEmitStudioReatomizeAfterCompletion(db, transcriptionJob, &item, previousTranscriptID, previousQuality, quality)
 					}
-					settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
-					updateBatchItemForJob(db, transcriptionJob)
 				}
 			}
 		}
@@ -213,7 +221,7 @@ func InternalCreateTranscript(c *gin.Context) {
 			}()
 		}
 		if !strings.HasPrefix(source, "stt_") && quality.Status == models.TranscriptQualityAutoRepair {
-			if job, triggered, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false); err == nil && triggered {
+			if job, triggered, _, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerAutoQuality, false); err == nil && triggered {
 				itemCopy := item
 				jobID := job.PublicID.String()
 				go func() {
@@ -229,6 +237,32 @@ func InternalCreateTranscript(c *gin.Context) {
 		ID:        transcript.PublicID.String(),
 		CreatedAt: transcript.CreatedAt.UTC().Format(time.RFC3339),
 	})
+}
+
+// maybeEmitStudioReatomizeAfterCompletion is deliberately completion-side: an
+// accepted STT job is not evidence of an improved transcript. A recommendation
+// is emitted only once a Studio-attributed job writes a new transcript that
+// resolves the exact prior auto_repair observation. The lead's own idempotency
+// gate remains authoritative for duplicate callbacks.
+func maybeEmitStudioReatomizeAfterCompletion(db *gorm.DB, job *models.TranscriptionJob, item *models.ContentItem, previousTranscriptID *uuid.UUID, previousQuality *models.TranscriptQuality, quality models.TranscriptQuality) {
+	if job == nil || item == nil || previousTranscriptID == nil || previousQuality == nil {
+		return
+	}
+	if job.TriggerSource != models.TranscriptionTriggerStudioAutopilot || job.Status != models.TranscriptionJobStatusSucceeded {
+		return
+	}
+	if previousQuality.Status != models.TranscriptQualityAutoRepair || quality.Status != models.TranscriptQualityOK || quality.TranscriptID == *previousTranscriptID {
+		return
+	}
+	recommendation := emitReatomizeRecommendation(db, item.TenantID, item)
+	if recommendation == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]string{
+		"transcription_job_id": job.PublicID.String(), "previous_transcript_id": previousTranscriptID.String(),
+		"transcript_id": quality.TranscriptID.String(), "recommendation_id": recommendation.PublicID.String(),
+	})
+	_ = db.Create(&models.AuditLog{TenantID: item.TenantID, UserEmail: models.StudioAuditPrincipal, Action: "media_studio.transcript_reatomize_recommended", TargetService: "cms", TargetResource: item.PublicID.String(), Status: "success", Payload: datatypes.JSON(payload)}).Error
 }
 
 func ptrString(s string) *string {

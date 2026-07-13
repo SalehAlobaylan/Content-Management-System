@@ -160,18 +160,12 @@ func runMediaStudioAutopilot(db *gorm.DB, tenantID string, opts studioAutopilotR
 		return models.MediaStudioRun{}, nil, err
 	}
 
-	// Upstream auto-publish gate (S14): resolved once per run from the tenant
-	// atomization policy. Per-episode/source precedence is honoured per case if
-	// needed; the tenant value is the safe default.
-	upstreamAutoPublish := tenantAutoPublishHighConfidence(db, tenantID)
-
 	rn := &studioRunner{
-		db:                  db,
-		run:                 run,
-		tenantID:            tenantID,
-		policy:              policy,
-		observe:             observe,
-		upstreamAutoPublish: upstreamAutoPublish,
+		db:       db,
+		run:      run,
+		tenantID: tenantID,
+		policy:   policy,
+		observe:  observe,
 	}
 
 	rn.processChapterCases()
@@ -198,29 +192,16 @@ func touchStudioLastRun(db *gorm.DB, tenantID string, at time.Time) {
 		Update("last_run_at", at).Error
 }
 
-// tenantAutoPublishHighConfidence reads the tenant atomization policy's
-// AutoPublishHighConfidence flag (S14). Defaults true when no policy row exists
-// (matches the atomization policy default).
-func tenantAutoPublishHighConfidence(db *gorm.DB, tenantID string) bool {
-	var policy models.MediaAtomizationPolicy
-	if err := db.Where("tenant_id = ?", tenantID).First(&policy).Error; err != nil {
-		return true
-	}
-	return policy.AutoPublishHighConfidence
-}
-
 // ---------------------------------------------------------------
 // Runner state + case processing
 // ---------------------------------------------------------------
 
 type studioRunner struct {
-	db                  *gorm.DB
-	run                 *models.MediaStudioRun
-	tenantID            string
-	policy              models.MediaStudioAutopilotPolicy
-	observe             bool
-	upstreamAutoPublish bool
-
+	db          *gorm.DB
+	run         *models.MediaStudioRun
+	tenantID    string
+	policy      models.MediaStudioAutopilotPolicy
+	observe     bool
 	clears      int
 	publishes   int
 	rejects     int
@@ -404,8 +385,13 @@ func (r *studioRunner) emitAutoReject(base studioActionInput, ch *models.Chapter
 		recordStudioAction(r.db, r.run, base)
 		return
 	}
-	out, revErr := applyAtomizedChapterReview(r.db, r.tenantID, ch.PublicID, false,
-		chapterReviewActor{UserID: "", Email: models.StudioAuditPrincipal}, true)
+	out, revErr := applyAtomizedChapterReviewWithOptions(r.db, r.tenantID, ch.PublicID, false,
+		chapterReviewActor{UserID: "", Email: models.StudioAuditPrincipal}, chapterReviewApplyOptions{
+			RequireNeedsReview:        true,
+			ExpectedChildID:           ch.ChildContentItemID,
+			ExpectedReviewCodes:       []string{models.StudioReviewCodeShortUnmergeable},
+			RequireNoBlockingOverride: true,
+		})
 	r.finalizeApply(&base, out, revErr, false)
 }
 
@@ -413,8 +399,19 @@ func (r *studioRunner) emitAutoPublishCandidate(base studioActionInput, ch *mode
 	base.Verdict = models.StudioVerdictAutoPublishMechanical
 	base.ToolName = "chapter.publish"
 
-	// Upstream auto-publish disabled → approval tier (S14).
-	if !r.upstreamAutoPublish {
+	// Publication authority follows the chapter's parent, not a tenant-wide
+	// snapshot. A missing parent is held for a human; a valid parent is resolved
+	// through the canonical tenant → source → episode policy resolver.
+	upstreamAutoPublish, parentResolved := studioParentAutoPublishPolicy(r.db, r.tenantID, child)
+	if !parentResolved {
+		base.Status = models.StudioActionStatusApprovalRequired
+		base.Guardrail = models.StudioGuardParentContext
+		base.Reason = "Chapter parent context is unavailable; publish requires human approval."
+		r.approvalCnt++
+		recordStudioAction(r.db, r.run, base)
+		return
+	}
+	if !upstreamAutoPublish {
 		base.Status = models.StudioActionStatusApprovalRequired
 		base.Guardrail = models.StudioGuardUpstreamDisabled
 		base.Reason = "Upstream auto-publish is disabled; publish requires human approval."
@@ -444,8 +441,16 @@ func (r *studioRunner) emitAutoPublishCandidate(base studioActionInput, ch *mode
 		recordStudioAction(r.db, r.run, base)
 		return
 	}
-	out, revErr := applyAtomizedChapterReview(r.db, r.tenantID, ch.PublicID, true,
-		chapterReviewActor{UserID: "", Email: models.StudioAuditPrincipal}, true)
+	out, revErr := applyAtomizedChapterReviewWithOptions(r.db, r.tenantID, ch.PublicID, true,
+		chapterReviewActor{UserID: "", Email: models.StudioAuditPrincipal}, chapterReviewApplyOptions{
+			RequireNeedsReview:        true,
+			RequireParentAutoPublish:  true,
+			ExpectedChildID:           ch.ChildContentItemID,
+			ExpectedReviewCodes:       []string{models.StudioReviewCodeMergedShort},
+			RequireMergeProvenance:    true,
+			RequireNoSponsor:          true,
+			RequireNoBlockingOverride: true,
+		})
 	r.finalizeApply(&base, out, revErr, true)
 }
 
@@ -470,12 +475,48 @@ func (r *studioRunner) finalizeApply(base *studioActionInput, out *chapterReview
 		base.Status = models.StudioActionStatusSkipped
 		base.Guardrail = models.StudioGuardInvalidDuration
 		base.Reason = revErr.message
+	case revErr.code == chapterReviewErrMultiCode:
+		base.Status = models.StudioActionStatusSkipped
+		base.Guardrail = models.StudioGuardMultiCode
+		base.Reason = revErr.message
+	case revErr.code == chapterReviewErrOverride:
+		base.Status = models.StudioActionStatusSkipped
+		base.Guardrail = models.StudioGuardOverride
+		base.Reason = revErr.message
+	case revErr.code == chapterReviewErrEditorialReason:
+		base.Status = models.StudioActionStatusSkipped
+		base.Guardrail = models.StudioGuardEditorialReason
+		base.Reason = revErr.message
+	case revErr.code == chapterReviewErrUpstreamDisabled:
+		base.Status = models.StudioActionStatusApprovalRequired
+		base.Guardrail = models.StudioGuardUpstreamDisabled
+		base.Reason = revErr.message
+		r.approvalCnt++
+	case revErr.code == chapterReviewErrParentContext:
+		base.Status = models.StudioActionStatusApprovalRequired
+		base.Guardrail = models.StudioGuardParentContext
+		base.Reason = revErr.message
+		r.approvalCnt++
 	default:
 		base.Status = models.StudioActionStatusError
 		base.Err = revErr.message
 		r.errorCount++
 	}
 	recordStudioAction(r.db, r.run, *base)
+}
+
+// studioParentAutoPublishPolicy resolves the publication flag from the parent
+// item. The parent carries the source and episode context used by the canonical
+// resolver; looking at the child would silently bypass source-level controls.
+func studioParentAutoPublishPolicy(db *gorm.DB, tenantID string, child *models.ContentItem) (bool, bool) {
+	if child == nil || child.ID == 0 || child.ParentContentItemID == nil {
+		return false, false
+	}
+	var parent models.ContentItem
+	if err := db.Where("public_id = ? AND tenant_id = ?", *child.ParentContentItemID, tenantID).First(&parent).Error; err != nil {
+		return false, false
+	}
+	return atomizationPolicyForItem(db, &parent).AutoPublishHighConfidence, true
 }
 
 func (r *studioRunner) emitProposalTier(base studioActionInput, ch *models.Chapter, child *models.ContentItem, single bool) {
@@ -692,13 +733,16 @@ func (r *studioRunner) processTranscriptCases() {
 		Order("computed_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&qualities).Error
 
 	for i := range qualities {
-		r.classifyTranscriptCase(qualities[i].ContentItemID)
+		r.classifyTranscriptCase(qualities[i])
 	}
 }
 
-func (r *studioRunner) classifyTranscriptCase(contentItemID uuid.UUID) {
+// classifyTranscriptCase carries the exact quality observation into admission;
+// a quality row is not merely a content-id hint because transcription may have
+// been replaced or repaired between collection and action.
+func (r *studioRunner) classifyTranscriptCase(observed models.TranscriptQuality) {
 	var item models.ContentItem
-	if err := r.db.Where("public_id = ? AND tenant_id = ?", contentItemID, r.tenantID).First(&item).Error; err != nil {
+	if err := r.db.Where("public_id = ? AND tenant_id = ?", observed.ContentItemID, r.tenantID).First(&item).Error; err != nil {
 		return
 	}
 	cid := item.PublicID
@@ -706,6 +750,24 @@ func (r *studioRunner) classifyTranscriptCase(contentItemID uuid.UUID) {
 		UnitType:      models.StudioUnitTranscriptCase,
 		ContentItemID: &cid,
 		ToolName:      "transcript.rerun_stt",
+	}
+	if observed.Status != models.TranscriptQualityAutoRepair || item.TranscriptID == nil || *item.TranscriptID != observed.TranscriptID {
+		base.Verdict = models.StudioVerdictRerunSTT
+		base.Status = r.skipStatus()
+		base.Guardrail = models.StudioGuardStaleness
+		base.Reason = "Transcript quality observation is stale; skipping STT admission."
+		recordStudioAction(r.db, r.run, base)
+		return
+	}
+	var currentQuality models.TranscriptQuality
+	if err := r.db.Where("public_id = ? AND tenant_id = ? AND content_item_id = ? AND transcript_id = ? AND status = ?",
+		observed.PublicID, r.tenantID, observed.ContentItemID, observed.TranscriptID, models.TranscriptQualityAutoRepair).First(&currentQuality).Error; err != nil {
+		base.Verdict = models.StudioVerdictRerunSTT
+		base.Status = r.skipStatus()
+		base.Guardrail = models.StudioGuardStaleness
+		base.Reason = "Transcript quality observation changed; skipping STT admission."
+		recordStudioAction(r.db, r.run, base)
+		return
 	}
 
 	// In-flight job → blocked (S12 belt-and-suspenders).
@@ -742,11 +804,8 @@ func (r *studioRunner) classifyTranscriptCase(contentItemID uuid.UUID) {
 		base.Status = models.StudioActionStatusSuccess
 		base.STTImpact = 1
 		r.sttRuns++
-		base.Reason = "Re-ran STT on auto_repair transcript."
+		base.Reason = "Re-ran STT on auto_repair transcript; re-atomization remains pending verified completion."
 		recordStudioAction(r.db, r.run, base)
-		// After a transcript improves on an atomization-eligible parent, ask the
-		// LEAD to reconsider re-atomization (H1: Studio never atomizes).
-		r.maybeEmitReatomize(&item)
 		return
 	case isSTTSkipped(err):
 		base.Status = models.StudioActionStatusSkipped
@@ -803,21 +862,7 @@ func (r *studioRunner) maybeEmitReatomize(item *models.ContentItem) {
 // ---------------------------------------------------------------
 
 func (r *studioRunner) hasBlockingOverride(child *models.ContentItem) bool {
-	if child == nil || child.ID == 0 {
-		return false
-	}
-	subjects := []uuid.UUID{child.PublicID}
-	if child.ParentContentItemID != nil {
-		subjects = append(subjects, *child.ParentContentItemID)
-	}
-	var count int64
-	_ = r.db.Model(&models.MediaCirculationOverride{}).
-		Where("tenant_id = ? AND subject_id IN ? AND override_type IN ? AND (expires_at IS NULL OR expires_at > ?)",
-			r.tenantID, subjects,
-			[]string{models.MediaCirculationOverrideEditorialHold, models.MediaCirculationOverrideNoAtomize},
-			time.Now().UTC()).
-		Count(&count).Error
-	return count > 0
+	return hasStudioBlockingOverride(r.db, r.tenantID, child)
 }
 
 func (r *studioRunner) recentlyEdited(child *models.ContentItem) bool {

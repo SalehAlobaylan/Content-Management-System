@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,7 +12,8 @@ import (
 // Sanitize clamps every knob into range and fills zero-values with the grilled
 // defaults (interval 180, stuck 4h, cooldown 60, source ceiling 100, cap 3).
 func TestSanitizePipelineAutopilotPolicy(t *testing.T) {
-	// Zero-value policy → grilled defaults.
+	// Zero-value policy retains legal zero knobs; concrete defaults come from the
+	// model constructor so an explicit API 0 is never silently re-enabled.
 	def := sanitizePipelineAutopilotPolicy(models.PipelineAutopilotPolicy{})
 	if def.TenantID != defaultCirculationTenant {
 		t.Fatalf("empty tenant should default to %q, got %q", defaultCirculationTenant, def.TenantID)
@@ -21,7 +24,6 @@ func TestSanitizePipelineAutopilotPolicy(t *testing.T) {
 	checks := map[string]struct{ got, want int }{
 		"interval":        {def.IntervalMinutes, 180},
 		"processingStuck": {def.ProcessingStuckHours, 4},
-		"cooldown":        {def.RecoveryCooldownMinutes, 60},
 		"sourceCeiling":   {def.PerSourceDailyRetries, 100},
 		"maxAttempts":     {def.MaxAttempts, 3},
 		"trustOutcomes":   {def.TrustMinOutcomes, 20},
@@ -31,6 +33,13 @@ func TestSanitizePipelineAutopilotPolicy(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("default %s = %d, want %d", name, c.got, c.want)
 		}
+	}
+	if def.PendingAgeFloorMinutes != 0 || def.RecoveryCooldownMinutes != 0 {
+		t.Fatalf("legal zero knobs must remain zero, got age=%d cooldown=%d", def.PendingAgeFloorMinutes, def.RecoveryCooldownMinutes)
+	}
+	defaults := models.DefaultPipelineAutopilotPolicy("default")
+	if defaults.PendingAgeFloorMinutes != 30 || defaults.RecoveryCooldownMinutes != 60 {
+		t.Fatalf("model defaults changed: %+v", defaults)
 	}
 
 	// Out-of-range values clamp to bounds; an unknown mode falls back to observe.
@@ -60,6 +69,61 @@ func TestSanitizePipelineAutopilotPolicy(t *testing.T) {
 	if wild.ElevatedMode != "" {
 		t.Errorf("unknown elevated mode should clear, got %q", wild.ElevatedMode)
 	}
+}
+
+func pipelineControllerSource(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile("pipelineAutopilotController.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func pipelineFunctionBody(t *testing.T, source, name string) string {
+	t.Helper()
+	start := strings.Index(source, "func "+name+"(")
+	if start < 0 {
+		t.Fatalf("missing %s", name)
+	}
+	end := strings.Index(source[start+1:], "\nfunc ")
+	if end < 0 {
+		return source[start:]
+	}
+	return source[start : start+1+end]
+}
+
+func TestPipelineRecoveryTransitionProbeOrdering(t *testing.T) {
+	body := pipelineFunctionBody(t, pipelineControllerSource(t), "runPipelineAutopilot")
+	probe, create := strings.Index(body, "lastPipelineRunHadHealthFailure(db, tenantID)"), strings.Index(body, "db.Create(&run)")
+	if probe < 0 || create < 0 || probe >= create {
+		t.Fatal("recovery probe must precede current run creation")
+	}
+}
+
+func TestPipelineTrustResetWindowing(t *testing.T) {
+	body := pipelineFunctionBody(t, pipelineControllerSource(t), "computePipelineTrust")
+	if !strings.Contains(body, "TrustResetAt") || !strings.Contains(body, "started_at > ?") {
+		t.Fatal("trust reset watermark must window the trust query")
+	}
+}
+
+func TestPipelineAttemptStateErrorSemantics(t *testing.T) {
+	source := pipelineControllerSource(t)
+	attempts := pipelineFunctionBody(t, source, "pipelineAttemptStates")
+	selection := pipelineFunctionBody(t, source, "(r *pipelineAutopilotRunner) selectCandidates")
+	if !strings.Contains(attempts, "status = 'error'") || !strings.Contains(selection, "st.Errors >=") {
+		t.Fatal("errors must drive attempt state and exhaustion")
+	}
+}
+
+func TestPipelineHeartbeatPanicContainment(t *testing.T) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("panic escaped: %v", rec)
+		}
+	}()
+	withPipelineAutopilotRecovery("tenant-x", func() { panic("boom") })
 }
 
 // Trust lanes self-seed in probation, earn trusted, and demote only past the

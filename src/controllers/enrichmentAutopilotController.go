@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -33,6 +34,8 @@ const (
 	// attempts before a high failure rate can DEMOTE it — one early flake must
 	// not park a whole artifact class.
 	enrichmentTrustDemotionFloor = 10
+	// Trust is recent execution history, not a permanent verdict on a class.
+	enrichmentTrustWindowDays = 14
 	// enrichmentBackfillCatchupMultiplier scales the item caps in the one elevated
 	// preset (code default, not env — Config Discipline).
 	enrichmentBackfillCatchupMultiplier = 5
@@ -84,6 +87,12 @@ func finishEnrichmentAutopilotRun(tenantID string) {
 	delete(enrichmentAutopilotRunInFlight, tenantID)
 }
 
+func enrichmentAutopilotAnyRunInFlight() bool {
+	enrichmentAutopilotRunMu.Lock()
+	defer enrichmentAutopilotRunMu.Unlock()
+	return len(enrichmentAutopilotRunInFlight) > 0
+}
+
 // ----------------------------------------------------------------
 // Policy load + sanitize (mirrors the media/news clamp pattern)
 // ----------------------------------------------------------------
@@ -106,11 +115,11 @@ func sanitizeEnrichmentAutopilotPolicy(p models.EnrichmentAutopilotPolicy) model
 	p.IntervalMinutes = clampIntOrDefault(p.IntervalMinutes, 15, 1440, 360)
 	p.MaxItemsPerRun = clampIntOrDefault(p.MaxItemsPerRun, 10, 2000, 200)
 	p.MaxItemsPerClass = clampIntOrDefault(p.MaxItemsPerClass, 5, 1000, 100)
-	p.MaxTranscriptsPerRun = clampIntOrDefault(p.MaxTranscriptsPerRun, 0, 500, 10)
+	p.MaxTranscriptsPerRun = clampInt(p.MaxTranscriptsPerRun, 0, 500)
 	p.MaxQueueDepth = clampIntOrDefault(p.MaxQueueDepth, 1, 10000, 100)
 	p.FailureBreakerPct = clampIntOrDefault(p.FailureBreakerPct, 1, 100, 30)
 	p.StallWindowRuns = clampIntOrDefault(p.StallWindowRuns, 1, 20, 2)
-	p.AgeFloorMinutes = clampIntOrDefault(p.AgeFloorMinutes, 0, 1440, 10)
+	p.AgeFloorMinutes = clampInt(p.AgeFloorMinutes, 0, 1440)
 	p.TrustMinAttempts = clampIntOrDefault(p.TrustMinAttempts, 1, 10000, 50)
 	p.TrustMaxFailurePct = clampIntOrDefault(p.TrustMaxFailurePct, 1, 100, 15)
 	if p.ElevatedMode != "" && p.ElevatedMode != models.EnrichmentAutopilotElevatedBackfillCatchup {
@@ -173,7 +182,7 @@ func computeEnrichmentTrust(db *gorm.DB, tenantID string, policy models.Enrichme
 		Select(`artifact,
 			COUNT(*) FILTER (WHERE status IN ('success','error')) AS attempts,
 			COUNT(*) FILTER (WHERE status = 'error') AS failures`).
-		Where("tenant_id = ?", tenantID).
+		Where("tenant_id = ? AND created_at >= ?", tenantID, time.Now().AddDate(0, 0, -enrichmentTrustWindowDays)).
 		Group("artifact").
 		Scan(&rows).Error
 	seen := map[string]bool{}
@@ -233,6 +242,10 @@ func embeddingDrainingOverWindow(db *gorm.DB, tenantID string, currentMissing in
 }
 
 func missingEmbeddingFromSnapshot(raw []byte) (int64, bool) {
+	return classMissingFromSnapshot(raw, models.EnrichmentArtifactEmbedding)
+}
+
+func classMissingFromSnapshot(raw []byte, artifact string) (int64, bool) {
 	if len(raw) == 0 {
 		return 0, false
 	}
@@ -240,7 +253,52 @@ func missingEmbeddingFromSnapshot(raw []byte) (int64, bool) {
 	if err := json.Unmarshal(raw, &stats); err != nil {
 		return 0, false
 	}
-	return stats.MissingEmbedding, true
+	switch artifact {
+	case models.EnrichmentArtifactTranscript:
+		return stats.MissingTranscriptActionable, true
+	case models.EnrichmentArtifactEmbedding:
+		return stats.MissingEmbedding, true
+	case models.EnrichmentArtifactImage:
+		return stats.MissingImageEmbedding, true
+	default:
+		return 0, false
+	}
+}
+
+// classStuckOverWindow identifies a non-draining class only when it has actually
+// been attempted in the same history window; intentionally gated classes are not stuck.
+func classStuckOverWindow(db *gorm.DB, tenantID, artifact string, currentMissing int64, window int) bool {
+	var runs []models.EnrichmentAutopilotRun
+	_ = db.Where("tenant_id = ? AND status IN ?", tenantID, []string{models.EnrichmentAutopilotRunStatusCompleted, models.EnrichmentAutopilotRunStatusPartial}).
+		Order("started_at DESC").Limit(window).Find(&runs).Error
+	if len(runs) < window {
+		return false
+	}
+	oldest, ok := classMissingFromSnapshot(runs[len(runs)-1].StatsAfter, artifact)
+	if !ok || currentMissing < oldest {
+		return false
+	}
+	ids := make([]uint, 0, len(runs))
+	for _, run := range runs {
+		ids = append(ids, run.ID)
+	}
+	var attempts int64
+	_ = db.Model(&models.EnrichmentAutopilotAction{}).Where("run_id IN ? AND artifact = ? AND status IN ?", ids, artifact,
+		[]string{models.EnrichmentAutopilotActionStatusSuccess, models.EnrichmentAutopilotActionStatusError, models.EnrichmentAutopilotActionStatusWouldTrigger}).Count(&attempts).Error
+	return attempts > 0
+}
+
+func missingForArtifact(stats enrichmentStatsResponse, artifact string) int64 {
+	switch artifact {
+	case models.EnrichmentArtifactTranscript:
+		return stats.MissingTranscriptActionable
+	case models.EnrichmentArtifactEmbedding:
+		return stats.MissingEmbedding
+	case models.EnrichmentArtifactImage:
+		return stats.MissingImageEmbedding
+	default:
+		return 0
+	}
 }
 
 // ----------------------------------------------------------------
@@ -265,6 +323,7 @@ type enrichmentAutopilotRunner struct {
 
 	budgetCapped bool
 	breakerFired bool
+	serviceGated bool
 }
 
 func (r *enrichmentAutopilotRunner) writeAction(a models.EnrichmentAutopilotAction) {
@@ -400,6 +459,21 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 	}
 	summary := fmt.Sprintf("%s %d (+%d already present), skipped %d, errors %d",
 		verb, runner.success, runner.acked, runner.skipped, runner.errored)
+	stuck := []string{}
+	for _, artifact := range enrichmentManagedArtifacts {
+		if classStuckOverWindow(db, tenantID, artifact, missingForArtifact(statsAfter, artifact), policy.StallWindowRuns) {
+			status := models.EnrichmentAutopilotActionStatusSkipped
+			if observe {
+				status = models.EnrichmentAutopilotActionStatusWouldSkip
+			}
+			runner.writeAction(models.EnrichmentAutopilotAction{Artifact: artifact, Status: status, Guardrail: models.EnrichmentAutopilotGuardEscalateStuck,
+				Reason: fmt.Sprintf("%s gaps remain at %d across %d runs despite attempted automation; human attention required.", artifact, missingForArtifact(statsAfter, artifact), policy.StallWindowRuns)})
+			stuck = append(stuck, artifact)
+		}
+	}
+	if len(stuck) > 0 {
+		summary += " · escalated: " + strings.Join(stuck, ", ")
+	}
 	errText := ""
 	if status == models.EnrichmentAutopilotRunStatusFailed {
 		errText = "all executed autopilot triggers failed"
@@ -429,6 +503,7 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enrichmentTrustStat, serviceDown map[string]error, queueDepth int, statsBefore enrichmentStatsResponse) {
 	// Service gate.
 	if err := serviceDown[enrichmentArtifactService(artifact)]; err != nil {
+		r.serviceGated = true
 		r.classBlock(artifact, models.EnrichmentAutopilotGuardServiceDown,
 			fmt.Sprintf("%s service unreachable: %v", enrichmentArtifactService(artifact), err))
 		return
@@ -456,7 +531,21 @@ func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enri
 		}
 	}
 
-	// Select gap candidates for this class (age floor applied in SQL).
+	if artifact == models.EnrichmentArtifactTranscript {
+		var excluded int64
+		_ = buildMissingQuery(r.db, artifact, "VIDEO,PODCAST", "READY").Where("duration_sec > 2400").Count(&excluded).Error
+		if excluded > 0 {
+			status := models.EnrichmentAutopilotActionStatusSkipped
+			if r.observe {
+				status = models.EnrichmentAutopilotActionStatusWouldSkip
+			}
+			r.skipped++
+			r.writeAction(models.EnrichmentAutopilotAction{Artifact: artifact, Status: status, Guardrail: models.EnrichmentAutopilotGuardCirculationScope,
+				Reason: fmt.Sprintf("%d parents >40m excluded — atomization/circulation owns their transcripts.", excluded)})
+		}
+	}
+
+	// Select gap candidates for this class (age floor and circulation scope in SQL).
 	items := r.selectClassCandidates(artifact)
 	for i := range items {
 		if r.breakerFired {
@@ -467,20 +556,28 @@ func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enri
 				fmt.Sprintf("Run item cap (%d) reached.", r.policy.MaxItemsPerRun))
 			return
 		}
+		if bulkEnrichRunning() {
+			r.classBlock(artifact, models.EnrichmentAutopilotGuardBulkInFlight,
+				"A manual bulk run started — autopilot yields the lane (manual pre-empts).")
+			return
+		}
 		r.dispatchItem(&items[i], artifact)
 		r.maybeTripBreaker()
 	}
 }
 
 // selectClassCandidates loads the gap items for one artifact class under the
-// per-class cap. Transcript scope excludes >40m parents in the loop (circulation
-// autopilot's domain), so they are still selected here for ledger visibility.
+// per-class cap. Transcript selection excludes circulation-scope parents; the
+// in-loop check remains an invariant belt against accidental query drift.
 func (r *enrichmentAutopilotRunner) selectClassCandidates(artifact string) []models.ContentItem {
 	contentType := ""
 	if artifact == models.EnrichmentArtifactTranscript {
 		contentType = "VIDEO,PODCAST"
 	}
 	query := buildMissingQuery(r.db, artifact, contentType, "READY")
+	if artifact == models.EnrichmentArtifactTranscript {
+		query = query.Where("(duration_sec IS NULL OR duration_sec <= 2400)")
+	}
 	if r.policy.AgeFloorMinutes > 0 {
 		floor := time.Now().Add(-time.Duration(r.policy.AgeFloorMinutes) * time.Minute)
 		query = query.Where("created_at < ?", floor)
@@ -495,11 +592,15 @@ func (r *enrichmentAutopilotRunner) selectClassCandidates(artifact string) []mod
 func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artifact string) {
 	startedAt := time.Now()
 
-	// Transcript circulation scope: >40m parents belong to the Media Circulation
-	// Autopilot's transcript lane (G8). Provably untouched here.
+	// Invariant belt: selection already excludes >40m circulation-scope parents.
 	if artifact == models.EnrichmentArtifactTranscript && item.DurationSec != nil && *item.DurationSec > 2400 {
 		r.itemSkip(item, artifact, models.EnrichmentAutopilotGuardCirculationScope,
 			fmt.Sprintf("Parent is %ds (>40m) — atomization/circulation owns its transcript.", *item.DurationSec))
+		return
+	}
+	// A queued/running STT job has already committed the spend; never double bill.
+	if artifact == models.EnrichmentArtifactTranscript && hasActiveTranscriptionJob(r.db, item.PublicID) {
+		r.itemSkip(item, artifact, models.EnrichmentAutopilotGuardAlreadyPresent, "An STT job for this item is already queued/running.")
 		return
 	}
 	// Transcript dedicated per-run cap (each is a billable Deepgram call).
@@ -511,8 +612,27 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 
 	id := item.PublicID
 
-	// Observe: prove selection + gates without any side effect.
+	// Observe proves the same read-only guards as Safe Auto without triggering.
 	if r.observe {
+		if artifact == models.EnrichmentArtifactTranscript {
+			if admit, reason := evaluateSTTAdmission(r.db, item, models.TranscriptionTriggerEnrichmentAutopilot); !admit {
+				guardrail := models.EnrichmentAutopilotGuardAlreadyPresent
+				if reason == "monthly STT budget cap reached" {
+					guardrail = models.EnrichmentAutopilotGuardBudget
+					r.budgetCapped = true
+				}
+				r.itemSkip(item, artifact, guardrail, reason)
+				return
+			}
+		}
+		if artifact == models.EnrichmentArtifactEmbedding && item.Embedding != nil {
+			r.itemSkip(item, artifact, models.EnrichmentAutopilotGuardAlreadyPresent, "already exists")
+			return
+		}
+		if artifact == models.EnrichmentArtifactImage && item.ImageEmbedding != nil {
+			r.itemSkip(item, artifact, models.EnrichmentAutopilotGuardAlreadyPresent, "already exists")
+			return
+		}
 		r.usedTotal++
 		if artifact == models.EnrichmentArtifactTranscript {
 			r.transcriptUsed++
@@ -571,7 +691,7 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 	case artifactOutcomeSkipped:
 		r.skipped++
 		action.Status = models.EnrichmentAutopilotActionStatusSkipped
-		if strings.Contains(strings.ToLower(o.Reason), "budget") {
+		if o.SkipKind == string(sttSkipBudget) {
 			action.Guardrail = models.EnrichmentAutopilotGuardBudget
 			r.budgetCapped = true
 		} else {
@@ -608,10 +728,10 @@ func (r *enrichmentAutopilotRunner) maybeTripBreaker() {
 }
 
 func (r *enrichmentAutopilotRunner) computeHeadline(statsAfter enrichmentStatsResponse) string {
-	if r.breakerFired || (r.attempts >= 10 && float64(r.failures)*100/float64(r.attempts) > float64(r.policy.FailureBreakerPct)) {
+	if r.serviceGated || r.breakerFired || (r.attempts >= 10 && float64(r.failures)*100/float64(r.attempts) > float64(r.policy.FailureBreakerPct)) {
 		return models.EnrichmentAutopilotHeadlineDegraded
 	}
-	gaps := statsAfter.MissingTranscript + statsAfter.MissingEmbedding + statsAfter.MissingImageEmbedding
+	gaps := statsAfter.MissingTranscriptActionable + statsAfter.MissingEmbedding + statsAfter.MissingImageEmbedding
 	if gaps == 0 {
 		return models.EnrichmentAutopilotHeadlineFullyEnriched
 	}
@@ -675,7 +795,33 @@ type enrichmentAutopilotStatusBlock struct {
 	LastRun           *models.EnrichmentAutopilotRun   `json:"last_run,omitempty"`
 	Trust             []enrichmentTrustStat            `json:"trust"`
 	RecommendedAction string                           `json:"recommended_action,omitempty"`
+	Attention         []enrichmentAttentionItem        `json:"attention"`
 	Policy            models.EnrichmentAutopilotPolicy `json:"policy"`
+}
+
+type enrichmentAttentionItem struct {
+	Kind     string `json:"kind"`
+	Artifact string `json:"artifact,omitempty"`
+	Message  string `json:"message"`
+	Target   string `json:"target"`
+}
+
+func attentionTargetFor(artifact, lastGuardrail string) string {
+	if artifact == models.EnrichmentArtifactTranscript {
+		return "media_studio"
+	}
+	if (artifact == models.EnrichmentArtifactEmbedding || artifact == models.EnrichmentArtifactImage) && lastGuardrail == models.EnrichmentAutopilotGuardQueueDepth {
+		return "pipeline"
+	}
+	return "missing_panel"
+}
+
+func lastGuardrailForArtifact(db *gorm.DB, tenantID, artifact string) string {
+	var action models.EnrichmentAutopilotAction
+	if err := db.Where("tenant_id = ? AND artifact = ?", tenantID, artifact).Order("created_at DESC, id DESC").First(&action).Error; err != nil {
+		return ""
+	}
+	return action.Guardrail
 }
 
 func buildEnrichmentAutopilotStatus(db *gorm.DB, tenantID string, policy models.EnrichmentAutopilotPolicy) enrichmentAutopilotStatusBlock {
@@ -689,6 +835,7 @@ func buildEnrichmentAutopilotStatus(db *gorm.DB, tenantID string, policy models.
 		PausedUntil:     policy.PausedUntil,
 		LastRunAt:       policy.LastRunAt,
 		Trust:           []enrichmentTrustStat{},
+		Attention:       []enrichmentAttentionItem{},
 		Policy:          policy,
 	}
 	switch {
@@ -727,6 +874,21 @@ func buildEnrichmentAutopilotStatus(db *gorm.DB, tenantID string, policy models.
 			trusted = append(trusted, a)
 		}
 	}
+	stats, _ := computeEnrichmentStats(db)
+	for _, a := range enrichmentManagedArtifacts {
+		if classStuckOverWindow(db, tenantID, a, missingForArtifact(stats, a), policy.StallWindowRuns) {
+			block.Attention = append(block.Attention, enrichmentAttentionItem{Kind: "stuck_class", Artifact: a,
+				Message: fmt.Sprintf("%s coverage is not draining despite attempted automation.", a), Target: attentionTargetFor(a, lastGuardrailForArtifact(db, tenantID, a))})
+		}
+	}
+	if block.LastRun != nil && block.LastRun.Headline == models.EnrichmentAutopilotHeadlineBudgetCapped {
+		block.Attention = append(block.Attention, enrichmentAttentionItem{Kind: "budget_capped", Message: "STT budget is capped; review transcription configuration.", Target: "transcription_config"})
+	}
+	for _, a := range artifacts {
+		if trust[a].State == models.EnrichmentTrustStateDemoted {
+			block.Attention = append(block.Attention, enrichmentAttentionItem{Kind: "demoted_class", Artifact: a, Message: fmt.Sprintf("%s is held after failures; use manual triggers or reset trust.", a), Target: "missing_panel"})
+		}
+	}
 
 	switch {
 	case !policy.Enabled:
@@ -760,9 +922,20 @@ func StartEnrichmentAutopilotHeartbeat(db *gorm.DB) {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			runEnrichmentAutopilotDue(db)
+			withEnrichmentAutopilotRecovery("heartbeat", func() { runEnrichmentAutopilotDue(db) })
 		}
 	}()
+}
+
+// withEnrichmentAutopilotRecovery prevents one malformed row or downstream edge
+// case from permanently killing the heartbeat goroutine.
+func withEnrichmentAutopilotRecovery(tenantID string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("enrichment autopilot: recovered panic for tenant %s: %v", tenantID, rec)
+		}
+	}()
+	fn()
 }
 
 func runEnrichmentAutopilotDue(db *gorm.DB) {
@@ -780,19 +953,21 @@ func runEnrichmentAutopilotDue(db *gorm.DB) {
 			now.Sub(*raw.LastRunAt) < time.Duration(policy.IntervalMinutes)*time.Minute {
 			continue
 		}
-		run, _, err := runEnrichmentAutopilot(db, policy.TenantID, enrichmentAutopilotRunOptions{
-			Trigger:   "scheduled",
-			CreatedBy: "automation",
-		})
-		if errors.Is(err, errEnrichmentAutopilotAlreadyRunning) || errors.Is(err, errEnrichmentAutopilotBusy) {
-			continue
-		}
-		payload := map[string]interface{}{"status": run.Status, "summary": run.Summary, "headline": run.Headline}
-		if err != nil {
-			payload["error"] = err.Error()
-		}
-		writeCirculationAuditSystem(db, policy.TenantID, "enrichment.autopilot.scheduled", policy.TenantID, payload)
+		policyCopy := policy
+		withEnrichmentAutopilotRecovery(policy.TenantID, func() { runEnrichmentAutopilotForTenantSafely(db, policyCopy) })
 	}
+}
+
+func runEnrichmentAutopilotForTenantSafely(db *gorm.DB, policy models.EnrichmentAutopilotPolicy) {
+	run, _, err := runEnrichmentAutopilot(db, policy.TenantID, enrichmentAutopilotRunOptions{Trigger: "scheduled", CreatedBy: "automation"})
+	if errors.Is(err, errEnrichmentAutopilotAlreadyRunning) || errors.Is(err, errEnrichmentAutopilotBusy) {
+		return
+	}
+	payload := map[string]interface{}{"status": run.Status, "summary": run.Summary, "headline": run.Headline}
+	if err != nil {
+		payload["error"] = err.Error()
+	}
+	writeCirculationAuditSystem(db, policy.TenantID, "enrichment.autopilot.scheduled", policy.TenantID, payload)
 }
 
 // ----------------------------------------------------------------
@@ -945,9 +1120,11 @@ func PauseEnrichmentAutopilot(c *gin.Context) {
 		t := time.Now().Add(time.Duration(minutes) * time.Minute)
 		until = &t
 	}
-	if err := db.Model(&models.EnrichmentAutopilotPolicy{}).
+	ensureEnrichmentAutopilotPolicyRow(db, principal.TenantID)
+	res := db.Model(&models.EnrichmentAutopilotPolicy{}).
 		Where("tenant_id = ?", principal.TenantID).
-		Updates(map[string]interface{}{"paused_until": until, "updated_at": time.Now()}).Error; err != nil {
+		Updates(map[string]interface{}{"paused_until": until, "updated_at": time.Now()})
+	if res.Error != nil || res.RowsAffected == 0 {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update pause state", Code: "SAVE_FAILED"})
 		return
 	}
@@ -999,8 +1176,9 @@ func ElevateEnrichmentAutopilot(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Unknown elevated mode: " + req.Mode, Code: "INVALID_MODE"})
 		return
 	}
-	if err := db.Model(&models.EnrichmentAutopilotPolicy{}).
-		Where("tenant_id = ?", principal.TenantID).Updates(updates).Error; err != nil {
+	ensureEnrichmentAutopilotPolicyRow(db, principal.TenantID)
+	res := db.Model(&models.EnrichmentAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).Updates(updates)
+	if res.Error != nil || res.RowsAffected == 0 {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update elevated mode", Code: "SAVE_FAILED"})
 		return
 	}
@@ -1008,6 +1186,47 @@ func ElevateEnrichmentAutopilot(c *gin.Context) {
 		"mode": req.Mode, "until": until,
 	})
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"mode": req.Mode, "until": until}})
+}
+
+// ensureEnrichmentAutopilotPolicyRow makes pause/elevate meaningful even before
+// settings have been saved. The default is inert: disabled Observe mode.
+func ensureEnrichmentAutopilotPolicyRow(db *gorm.DB, tenantID string) {
+	p := models.DefaultEnrichmentAutopilotPolicy(tenantID)
+	_ = db.Where("tenant_id = ?", tenantID).FirstOrCreate(&p).Error
+}
+
+func isManagedEnrichmentArtifact(artifact string) bool {
+	for _, managed := range enrichmentManagedArtifacts {
+		if artifact == managed {
+			return true
+		}
+	}
+	return false
+}
+
+// POST /admin/enrichment/autopilot/trust/reset
+func ResetEnrichmentAutopilotTrust(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		Artifact string `json:"artifact"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || !isManagedEnrichmentArtifact(req.Artifact) {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "A managed artifact is required", Code: "INVALID_ARTIFACT"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	res := db.Model(&models.EnrichmentAutopilotAction{}).
+		Where("tenant_id = ? AND artifact = ? AND status = ?", principal.TenantID, req.Artifact, models.EnrichmentAutopilotActionStatusError).
+		Updates(map[string]interface{}{"status": models.EnrichmentAutopilotActionStatusErrorAcknowledged, "updated_at": time.Now()})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to reset trust", Code: "SAVE_FAILED"})
+		return
+	}
+	writeCirculationAudit(db, principal, "enrichment.autopilot.trust_reset", principal.TenantID, map[string]interface{}{"artifact": req.Artifact, "rows": res.RowsAffected})
+	c.JSON(http.StatusOK, gin.H{"data": buildEnrichmentAutopilotStatus(db, principal.TenantID, loadEnrichmentAutopilotPolicy(db, principal.TenantID))})
 }
 
 // GET /admin/enrichment/autopilot/runs

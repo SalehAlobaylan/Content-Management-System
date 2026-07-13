@@ -151,11 +151,11 @@ func sanitizePipelineAutopilotPolicy(p models.PipelineAutopilotPolicy) models.Pi
 	p.MaxBatchesPerRun = clampIntOrDefault(p.MaxBatchesPerRun, 1, 100, 4)
 	p.MaxAttempts = clampIntOrDefault(p.MaxAttempts, 1, 20, 3)
 	p.RetryBackoffHours = clampIntOrDefault(p.RetryBackoffHours, 1, 168, 12)
-	p.PendingAgeFloorMinutes = clampIntOrDefault(p.PendingAgeFloorMinutes, 0, 1440, 30)
+	p.PendingAgeFloorMinutes = clampInt(p.PendingAgeFloorMinutes, 0, 1440)
 	p.ProcessingStuckHours = clampIntOrDefault(p.ProcessingStuckHours, 1, 24, 4)
 	p.MaxQueueDepth = clampIntOrDefault(p.MaxQueueDepth, 1, 10000, 100)
 	p.PerSourceDailyRetries = clampIntOrDefault(p.PerSourceDailyRetries, 1, 10000, 100)
-	p.RecoveryCooldownMinutes = clampIntOrDefault(p.RecoveryCooldownMinutes, 0, 1440, 60)
+	p.RecoveryCooldownMinutes = clampInt(p.RecoveryCooldownMinutes, 0, 1440)
 	p.TrustMinOutcomes = clampIntOrDefault(p.TrustMinOutcomes, 1, 10000, 20)
 	p.TrustMinSuccessPct = clampIntOrDefault(p.TrustMinSuccessPct, 1, 100, 40)
 	if p.ElevatedMode != "" && p.ElevatedMode != models.PipelineAutopilotElevatedBacklogDrain {
@@ -209,13 +209,17 @@ func computePipelineTrust(db *gorm.DB, tenantID string, policy models.PipelineAu
 		Failed    int64
 	}
 	var rows []row
-	_ = db.Model(&models.PipelineAutopilotAction{}).
+	// Trust resets only confidence history; item attempts/backoff stay lifetime scoped.
+	query := db.Model(&models.PipelineAutopilotAction{}).
 		Select(`lane,
 			COUNT(*) FILTER (WHERE outcome IN ('recovered','failed_again','unresolved')) AS outcomes,
 			COUNT(*) FILTER (WHERE outcome = 'recovered') AS recovered,
 			COUNT(*) FILTER (WHERE outcome IN ('failed_again','unresolved')) AS failed`).
-		Where("tenant_id = ? AND status = ?", tenantID, models.PipelineAutopilotActionStatusSuccess).
-		Group("lane").Scan(&rows).Error
+		Where("tenant_id = ? AND status = ?", tenantID, models.PipelineAutopilotActionStatusSuccess)
+	if policy.TrustResetAt != nil {
+		query = query.Where("started_at > ?", *policy.TrustResetAt)
+	}
+	_ = query.Group("lane").Scan(&rows).Error
 	for _, r := range rows {
 		stat := pipelineTrustStat{Lane: r.Lane, Outcomes: r.Outcomes, Recovered: r.Recovered, Failed: r.Failed}
 		if r.Outcomes > 0 {
@@ -279,12 +283,6 @@ func runPipelineAutopilot(db *gorm.DB, tenantID string, opts pipelineAutopilotRu
 		}
 		return failPipelineAutopilotRun(db, &run, "Aggregation precondition failed: "+queueErr.Error(), errorClass)
 	}
-	healthBefore := buildPipelineHealthSnapshot(db, tenantID, queues)
-	run.HealthBefore = marshalAutopilotJSON(healthBefore)
-	if err := db.Create(&run).Error; err != nil {
-		return run, nil, err
-	}
-
 	// Recovery cooldown (G8): last_health_ok_at marks the most recent down→up
 	// recovery transition — stamped ONLY when the previous run aborted on a health
 	// failure, never on ordinary healthy runs or the very first run. The cooldown
@@ -300,6 +298,11 @@ func runPipelineAutopilot(db *gorm.DB, tenantID string, opts pipelineAutopilotRu
 			Updates(map[string]interface{}{"last_health_ok_at": t, "updated_at": t}).Error
 	}
 	cooldownActive := pipelineCooldownActive(healthOKAt, execPolicy.RecoveryCooldownMinutes, now)
+	healthBefore := buildPipelineHealthSnapshot(db, tenantID, queues)
+	run.HealthBefore = marshalAutopilotJSON(healthBefore)
+	if err := db.Create(&run).Error; err != nil {
+		return run, nil, err
+	}
 
 	resolvePipelineOutcomes(db, tenantID, now)
 	runner := &pipelineAutopilotRunner{
@@ -521,6 +524,10 @@ func (r *pipelineAutopilotRunner) selectCandidates() []pipelineCandidate {
 			if st.Attempts >= int64(r.policy.MaxAttempts) {
 				continue
 			}
+			// Enqueue errors can be transient, so they get twice the retry budget.
+			if st.Errors >= int64(2*r.policy.MaxAttempts) {
+				continue
+			}
 			if st.LastAttempt != nil && now.Sub(*st.LastAttempt) < backoff {
 				continue
 			}
@@ -538,6 +545,7 @@ func (r *pipelineAutopilotRunner) selectCandidates() []pipelineCandidate {
 
 type pipelineAttemptState struct {
 	Attempts    int64
+	Errors      int64
 	LastAttempt *time.Time
 }
 
@@ -553,15 +561,20 @@ func pipelineAttemptStates(db *gorm.DB, tenantID string, ids []uuid.UUID) map[uu
 	type row struct {
 		ContentItemID uuid.UUID
 		Attempts      int64
+		Errors        int64
 		LastAttempt   *time.Time
 	}
 	var rows []row
 	_ = db.Model(&models.PipelineAutopilotAction{}).
-		Select("content_item_id, COUNT(*) AS attempts, MAX(started_at) AS last_attempt").
-		Where("tenant_id = ? AND status = ? AND content_item_id IN ?", tenantID, models.PipelineAutopilotActionStatusSuccess, ids).
+		Select(`content_item_id,
+			COUNT(*) FILTER (WHERE status = 'success') AS attempts,
+			COUNT(*) FILTER (WHERE status = 'error') AS errors,
+			MAX(started_at) AS last_attempt`).
+		Where("tenant_id = ? AND status IN ? AND content_item_id IN ?", tenantID,
+			[]string{models.PipelineAutopilotActionStatusSuccess, models.PipelineAutopilotActionStatusError}, ids).
 		Group("content_item_id").Scan(&rows).Error
 	for _, r := range rows {
-		out[r.ContentItemID] = pipelineAttemptState{Attempts: r.Attempts, LastAttempt: r.LastAttempt}
+		out[r.ContentItemID] = pipelineAttemptState{Attempts: r.Attempts, Errors: r.Errors, LastAttempt: r.LastAttempt}
 	}
 	return out
 }
@@ -572,9 +585,13 @@ func pipelineAttemptStates(db *gorm.DB, tenantID string, ids []uuid.UUID) map[uu
 // N+1 scan. limit<=0 returns just the count.
 func pipelineExhaustedFailed(db *gorm.DB, tenantID string, maxAttempts, limit int) ([]string, int64) {
 	base := func() *gorm.DB {
+		// Error rows count at half weight: 3 successes or 6 enqueue errors exhaust.
 		sub := db.Model(&models.PipelineAutopilotAction{}).
-			Select("content_item_id, COUNT(*) AS c").
-			Where("tenant_id = ? AND status = ?", tenantID, models.PipelineAutopilotActionStatusSuccess).
+			Select(`content_item_id,
+					(COUNT(*) FILTER (WHERE status = 'success'))
+					+ (COUNT(*) FILTER (WHERE status = 'error')) / 2 AS c`).
+			Where("tenant_id = ? AND status IN ?", tenantID,
+				[]string{models.PipelineAutopilotActionStatusSuccess, models.PipelineAutopilotActionStatusError}).
 			Group("content_item_id")
 		return db.Table("content_items AS ci").
 			Joins("JOIN (?) AS a ON a.content_item_id = ci.public_id", sub).
@@ -917,6 +934,8 @@ func touchPipelineAutopilotLastRun(db *gorm.DB, tenantID string, at time.Time) {
 		Updates(map[string]interface{}{"last_run_at": at, "updated_at": at}).Error
 }
 
+// lastPipelineRunHadHealthFailure must be called before creating the current
+// run, so the newest persisted row is still the previous run.
 func lastPipelineRunHadHealthFailure(db *gorm.DB, tenantID string) bool {
 	var run models.PipelineAutopilotRun
 	if err := db.Where("tenant_id = ?", tenantID).Order("started_at DESC").First(&run).Error; err != nil {
@@ -1000,9 +1019,18 @@ func StartPipelineAutopilotHeartbeat(db *gorm.DB) {
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			runPipelineAutopilotDue(db)
+			withPipelineAutopilotRecovery("heartbeat", func() { runPipelineAutopilotDue(db) })
 		}
 	}()
+}
+
+func withPipelineAutopilotRecovery(tenantID string, fn func()) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			fmt.Printf("pipeline autopilot heartbeat recovered panic for tenant %s: %v\n", tenantID, rec)
+		}
+	}()
+	fn()
 }
 
 func runPipelineAutopilotDue(db *gorm.DB) {
@@ -1173,9 +1201,14 @@ func PausePipelineAutopilot(c *gin.Context) {
 		t := time.Now().Add(time.Duration(minutes) * time.Minute)
 		until = &t
 	}
-	if err := db.Model(&models.PipelineAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).
-		Updates(map[string]interface{}{"paused_until": until, "updated_at": time.Now()}).Error; err != nil {
+	res := db.Model(&models.PipelineAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).
+		Updates(map[string]interface{}{"paused_until": until, "updated_at": time.Now()})
+	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update pause state", Code: "SAVE_FAILED"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "No autopilot policy exists for this tenant yet — save settings first.", Code: "NO_POLICY"})
 		return
 	}
 	action := "pipeline.autopilot.pause"
@@ -1225,12 +1258,39 @@ func ElevatePipelineAutopilot(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Unknown elevated mode: " + req.Mode, Code: "INVALID_MODE"})
 		return
 	}
-	if err := db.Model(&models.PipelineAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).Updates(updates).Error; err != nil {
+	res := db.Model(&models.PipelineAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).Updates(updates)
+	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update elevated mode", Code: "SAVE_FAILED"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "No autopilot policy exists for this tenant yet — save settings first.", Code: "NO_POLICY"})
 		return
 	}
 	writeCirculationAudit(db, principal, "pipeline.autopilot.elevate", principal.TenantID, map[string]interface{}{"mode": req.Mode, "until": until})
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"mode": req.Mode, "until": until}})
+}
+
+// POST /admin/pipeline/autopilot/trust/reset
+func ResetPipelineAutopilotTrust(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	now := time.Now()
+	res := db.Model(&models.PipelineAutopilotPolicy{}).Where("tenant_id = ?", principal.TenantID).
+		Updates(map[string]interface{}{"trust_reset_at": now, "updated_at": now})
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to reset trust", Code: "SAVE_FAILED"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "No autopilot policy exists for this tenant yet — save settings first.", Code: "NO_POLICY"})
+		return
+	}
+	writeCirculationAudit(db, principal, "pipeline.autopilot.trust_reset", principal.TenantID, map[string]interface{}{"trust_reset_at": now})
+	c.JSON(http.StatusOK, gin.H{"data": buildPipelineAutopilotStatus(db, principal.TenantID, loadPipelineAutopilotPolicy(db, principal.TenantID))})
 }
 
 func ListPipelineAutopilotRuns(c *gin.Context) {

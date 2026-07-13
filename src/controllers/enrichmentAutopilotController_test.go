@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -84,11 +85,17 @@ func TestEnrichmentHeadline(t *testing.T) {
 	if r := (&enrichmentAutopilotRunner{policy: policy}).computeHeadline(backlog); r != models.EnrichmentAutopilotHeadlineBacklog {
 		t.Fatalf("gaps → %q, want backlog", r)
 	}
-	if r := (&enrichmentAutopilotRunner{policy: policy, budgetCapped: true}).computeHeadline(enrichmentStatsResponse{MissingTranscript: 4}); r != models.EnrichmentAutopilotHeadlineBudgetCapped {
+	if r := (&enrichmentAutopilotRunner{policy: policy, budgetCapped: true}).computeHeadline(enrichmentStatsResponse{MissingTranscript: 4, MissingTranscriptActionable: 4}); r != models.EnrichmentAutopilotHeadlineBudgetCapped {
 		t.Fatalf("budget skip → %q, want budget_capped", r)
 	}
 	if r := (&enrichmentAutopilotRunner{policy: policy, breakerFired: true}).computeHeadline(backlog); r != models.EnrichmentAutopilotHeadlineDegraded {
 		t.Fatalf("breaker → %q, want degraded", r)
+	}
+	if r := (&enrichmentAutopilotRunner{policy: policy, serviceGated: true}).computeHeadline(backlog); r != models.EnrichmentAutopilotHeadlineDegraded {
+		t.Fatalf("service gate → %q, want degraded", r)
+	}
+	if r := (&enrichmentAutopilotRunner{policy: policy}).computeHeadline(enrichmentStatsResponse{MissingTranscript: 40}); r != models.EnrichmentAutopilotHeadlineFullyEnriched {
+		t.Fatalf("long parents only → %q, want fully_enriched", r)
 	}
 }
 
@@ -130,6 +137,16 @@ func TestSanitizeEnrichmentAutopilotPolicy(t *testing.T) {
 	if got.ElevatedMode != "" {
 		t.Fatalf("unknown elevated mode should be cleared, got %q", got.ElevatedMode)
 	}
+	zero := sanitizeEnrichmentAutopilotPolicy(models.DefaultEnrichmentAutopilotPolicy("default"))
+	zero.MaxTranscriptsPerRun, zero.AgeFloorMinutes = 0, 0
+	zero = sanitizeEnrichmentAutopilotPolicy(zero)
+	if zero.MaxTranscriptsPerRun != 0 || zero.AgeFloorMinutes != 0 {
+		t.Fatalf("legal zero knobs must remain zero: %+v", zero)
+	}
+	zero.MaxTranscriptsPerRun = 501
+	if got := sanitizeEnrichmentAutopilotPolicy(zero).MaxTranscriptsPerRun; got != 500 {
+		t.Fatalf("transcript cap = %d, want 500", got)
+	}
 }
 
 func TestMissingEmbeddingFromSnapshot(t *testing.T) {
@@ -140,6 +157,96 @@ func TestMissingEmbeddingFromSnapshot(t *testing.T) {
 	}
 	if _, ok := missingEmbeddingFromSnapshot(nil); ok {
 		t.Fatalf("nil snapshot should report not-ok")
+	}
+}
+
+func TestClassMissingFromSnapshot(t *testing.T) {
+	raw, _ := json.Marshal(enrichmentStatsResponse{MissingTranscriptActionable: 2, MissingEmbedding: 3, MissingImageEmbedding: 4})
+	for artifact, want := range map[string]int64{models.EnrichmentArtifactTranscript: 2, models.EnrichmentArtifactEmbedding: 3, models.EnrichmentArtifactImage: 4} {
+		if got, ok := classMissingFromSnapshot(raw, artifact); !ok || got != want {
+			t.Fatalf("%s = %d ok=%v, want %d", artifact, got, ok, want)
+		}
+	}
+	if _, ok := classMissingFromSnapshot(raw, "sparse"); ok {
+		t.Fatal("sparse must not map to a class snapshot field")
+	}
+}
+
+func TestAttentionTarget(t *testing.T) {
+	if got := attentionTargetFor(models.EnrichmentArtifactTranscript, ""); got != "media_studio" {
+		t.Fatalf("transcript target = %q", got)
+	}
+	if got := attentionTargetFor(models.EnrichmentArtifactEmbedding, models.EnrichmentAutopilotGuardQueueDepth); got != "pipeline" {
+		t.Fatalf("queue target = %q", got)
+	}
+	if got := attentionTargetFor(models.EnrichmentArtifactImage, ""); got != "missing_panel" {
+		t.Fatalf("image target = %q", got)
+	}
+}
+
+func TestInFlightSTTGuardrailConstant(t *testing.T) {
+	if models.EnrichmentAutopilotGuardAlreadyPresent != "already_present" {
+		t.Fatalf("guardrail = %q", models.EnrichmentAutopilotGuardAlreadyPresent)
+	}
+}
+
+func TestBulkLane(t *testing.T) {
+	if !tryStartEnrichmentAutopilotRun("bulk-lane-test") {
+		t.Fatal("fresh tenant should acquire")
+	}
+	if !enrichmentAutopilotAnyRunInFlight() {
+		t.Fatal("autopilot must mark lane busy")
+	}
+	finishEnrichmentAutopilotRun("bulk-lane-test")
+	bulkMu.Lock()
+	bulkState.Running = true
+	bulkMu.Unlock()
+	if !bulkLaneBusy() {
+		t.Fatal("manual run must mark lane busy")
+	}
+	bulkMu.Lock()
+	bulkState.Running = false
+	bulkMu.Unlock()
+}
+
+func TestManagedArtifact(t *testing.T) {
+	for _, artifact := range []string{models.EnrichmentArtifactTranscript, models.EnrichmentArtifactEmbedding, models.EnrichmentArtifactImage} {
+		if !isManagedEnrichmentArtifact(artifact) {
+			t.Fatalf("%s should be managed", artifact)
+		}
+	}
+	for _, artifact := range []string{"sparse", "", "banana"} {
+		if isManagedEnrichmentArtifact(artifact) {
+			t.Fatalf("%s should not be managed", artifact)
+		}
+	}
+}
+
+func TestEnsuredPolicyRowIsInert(t *testing.T) {
+	p := models.DefaultEnrichmentAutopilotPolicy("t")
+	if p.Enabled || p.Mode != models.EnrichmentAutopilotModeObserve {
+		t.Fatalf("default must be disabled observe: %+v", p)
+	}
+}
+
+func TestHeartbeatPanicContainment(t *testing.T) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("panic escaped: %v", rec)
+		}
+	}()
+	withEnrichmentAutopilotRecovery("tenant-x", func() { panic("boom") })
+}
+
+func TestSTTSkipKindClassification(t *testing.T) {
+	if got := sttSkipKindOf(&sttSkippedError{reason: "monthly STT budget cap reached", kind: sttSkipBudget}); got != sttSkipBudget {
+		t.Fatalf("budget = %q", got)
+	}
+	if got := sttSkipKindOf(&sttSkippedError{reason: "guard", kind: sttSkipGuard}); got != sttSkipGuard {
+		t.Fatalf("guard = %q", got)
+	}
+	if got := sttSkipKindOf(errors.New("boom")); got != sttSkipNone {
+		t.Fatalf("non-skip = %q", got)
 	}
 }
 

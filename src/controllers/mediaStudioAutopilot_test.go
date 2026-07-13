@@ -1,10 +1,44 @@
 package controllers
 
 import (
+	"encoding/json"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"content-management-system/src/models"
 )
+
+func TestStudioRunnerDoesNotEmitReatomizeAtSTTAdmission(t *testing.T) {
+	data, err := os.ReadFile("mediaStudioAutopilotRunner.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "r.maybeEmitReatomize(&item)") {
+		t.Fatal("STT admission must not emit a re-atomization recommendation before verified completion")
+	}
+}
+
+func TestStudioAutopilotPolicyPatchPreservesOmittedFields(t *testing.T) {
+	policy := models.DefaultMediaStudioAutopilotPolicy("default")
+	policy.MaxSTTPerRun = 0
+	policy.PausedUntil = func() *time.Time { t := time.Now().Add(time.Hour); return &t }()
+	mode := models.StudioAutopilotModeSafeAuto
+	if err := (mediaStudioAutopilotPolicyPatch{AutopilotMode: &mode}).applyTo(&policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.MaxSTTPerRun != 0 || policy.PausedUntil == nil {
+		t.Fatalf("omitted fields changed: stt=%d paused=%v", policy.MaxSTTPerRun, policy.PausedUntil)
+	}
+	null := json.RawMessage("null")
+	if err := (mediaStudioAutopilotPolicyPatch{PausedUntil: &null}).applyTo(&policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.PausedUntil != nil {
+		t.Fatal("explicit null must clear paused_until")
+	}
+}
 
 // ----------------------------------------------------------------
 // Slice 1 — review-reason code derivation (S4/S5)
@@ -26,7 +60,7 @@ func TestDeriveStudioReviewCodes_SingleConstants(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			primary, codes := deriveStudioReviewCodes(strptr(tc.reason), nil, nil, false, 0.82)
+			primary, codes := deriveStudioReviewCodes(strptr(tc.reason), false, nil, false, 0.82)
 			if primary == nil || *primary != tc.want {
 				t.Fatalf("primary: got %v want %s", primary, tc.want)
 			}
@@ -38,7 +72,7 @@ func TestDeriveStudioReviewCodes_SingleConstants(t *testing.T) {
 }
 
 func TestDeriveStudioReviewCodes_SponsorAndLowConfidence(t *testing.T) {
-	primary, codes := deriveStudioReviewCodes(nil, nil, fptr(0.5), true, 0.82)
+	primary, codes := deriveStudioReviewCodes(nil, false, fptr(0.5), true, 0.82)
 	// sponsor_intro outranks low_confidence (S5 precedence).
 	if primary == nil || *primary != models.StudioReviewCodeSponsorIntro {
 		t.Fatalf("primary: got %v want sponsor_intro", primary)
@@ -48,20 +82,34 @@ func TestDeriveStudioReviewCodes_SponsorAndLowConfidence(t *testing.T) {
 	}
 }
 
-func TestDeriveStudioReviewCodes_MergedShortSuppressesLowConfidence(t *testing.T) {
-	// A merged-short chapter is coded merged_short, not low_confidence, even at
-	// low confidence — so it can be a single-code auto-publish candidate.
-	primary, codes := deriveStudioReviewCodes(nil, strptr("merged_short_chapter"), fptr(0.5), false, 0.82)
-	if primary == nil || *primary != models.StudioReviewCodeMergedShort {
-		t.Fatalf("primary: got %v want merged_short", primary)
+func TestDeriveStudioReviewCodes_MergedShortRequiresDeterministicProvenance(t *testing.T) {
+	// LLM-authored prose cannot authorize merged_short.
+	primary, codes := deriveStudioReviewCodes(nil, false, fptr(0.5), false, 0.82)
+	if primary == nil || *primary != models.StudioReviewCodeLowConfidence || len(codes) != 1 {
+		t.Fatalf("unproven merge must remain low confidence: primary=%v codes=%v", primary, codes)
 	}
-	if len(codes) != 1 {
-		t.Fatalf("expected single merged_short code, got %v", codes)
+	primary, codes = deriveStudioReviewCodes(nil, true, fptr(0.5), false, 0.82)
+	if primary == nil || *primary != models.StudioReviewCodeLowConfidence || len(codes) != 2 {
+		t.Fatalf("low-confidence merge must be multi-code approval-only: primary=%v codes=%v", primary, codes)
+	}
+	primary, codes = deriveStudioReviewCodes(nil, true, fptr(0.95), false, 0.82)
+	if primary == nil || *primary != models.StudioReviewCodeMergedShort || len(codes) != 1 {
+		t.Fatalf("high-confidence deterministic merge should be sole merged_short: primary=%v codes=%v", primary, codes)
+	}
+}
+
+func TestApplyStudioReviewCodesRejectsUnprovenEmittedMerge(t *testing.T) {
+	confidence := 0.95
+	chapter := models.Chapter{Confidence: &confidence, MergedShortProvenance: false}
+	emittedPrimary := models.StudioReviewCodeMergedShort
+	applyStudioReviewCodes(&chapter, &emittedPrimary, []string{models.StudioReviewCodeMergedShort}, 0.82)
+	if chapter.NeedsReviewCode != nil || len(chapter.NeedsReviewCodes) != 0 {
+		t.Fatalf("unproven emitted merge must not authorize review code: %+v", chapter)
 	}
 }
 
 func TestDeriveStudioReviewCodes_Unclassified(t *testing.T) {
-	primary, codes := deriveStudioReviewCodes(strptr("some free text a human wrote"), nil, nil, false, 0.82)
+	primary, codes := deriveStudioReviewCodes(strptr("some free text a human wrote"), false, nil, false, 0.82)
 	if primary != nil || codes != nil {
 		t.Fatalf("unmatched text must be unclassified, got primary=%v codes=%v", primary, codes)
 	}
@@ -75,6 +123,15 @@ func TestStudioReviewPrimaryCode_Precedence(t *testing.T) {
 	})
 	if got != models.StudioReviewCodeSponsorIntro {
 		t.Fatalf("precedence: got %s want sponsor_intro", got)
+	}
+}
+
+func TestSameStudioReviewCodeSet(t *testing.T) {
+	if !sameStudioReviewCodeSet([]string{models.StudioReviewCodeMergedShort}, []string{models.StudioReviewCodeMergedShort}) {
+		t.Fatal("matching single-code set rejected")
+	}
+	if sameStudioReviewCodeSet([]string{models.StudioReviewCodeMergedShort, models.StudioReviewCodeLowConfidence}, []string{models.StudioReviewCodeMergedShort}) {
+		t.Fatal("new second review code must invalidate mechanical clearance")
 	}
 }
 

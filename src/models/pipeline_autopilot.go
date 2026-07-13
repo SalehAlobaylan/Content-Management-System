@@ -96,6 +96,7 @@ type PipelineAutopilotPolicy struct {
 	ElevatedUntil  *time.Time `gorm:"type:timestamp" json:"elevated_until,omitempty"`
 	LastRunAt      *time.Time `gorm:"type:timestamp" json:"last_run_at,omitempty"`
 	LastHealthOKAt *time.Time `gorm:"type:timestamp" json:"last_health_ok_at,omitempty"`
+	TrustResetAt   *time.Time `gorm:"type:timestamp" json:"trust_reset_at,omitempty"`
 
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`

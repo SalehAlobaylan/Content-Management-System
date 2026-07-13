@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -586,16 +587,17 @@ func InternalGetAtomizationInput(c *gin.Context) {
 }
 
 type atomizationChapterRequest struct {
-	Title                string   `json:"title"`
-	Summary              *string  `json:"summary"`
-	StartMs              int      `json:"start_ms"`
-	EndMs                int      `json:"end_ms"`
-	Confidence           *float64 `json:"confidence"`
-	ContextLabel         *string  `json:"context_label"`
-	BoundaryReason       *string  `json:"boundary_reason"`
-	StandaloneScore      *float64 `json:"standalone_score"`
-	ContainsSponsorIntro bool     `json:"contains_sponsor_intro"`
-	NeedsReviewReason    *string  `json:"needs_review_reason"`
+	Title                 string   `json:"title"`
+	Summary               *string  `json:"summary"`
+	StartMs               int      `json:"start_ms"`
+	EndMs                 int      `json:"end_ms"`
+	Confidence            *float64 `json:"confidence"`
+	ContextLabel          *string  `json:"context_label"`
+	BoundaryReason        *string  `json:"boundary_reason"`
+	MergedShortProvenance bool     `json:"merged_short_provenance"`
+	StandaloneScore       *float64 `json:"standalone_score"`
+	ContainsSponsorIntro  bool     `json:"contains_sponsor_intro"`
+	NeedsReviewReason     *string  `json:"needs_review_reason"`
 	// Stage 6 (S4/S5): Aggregation emits the review-reason code(s) it used. When
 	// absent (older Aggregation, manual paths) CMS derives them from the fields.
 	NeedsReviewCode     *string                  `json:"needs_review_code"`
@@ -652,7 +654,7 @@ func InternalSaveAtomizationPlan(c *gin.Context) {
 // emits (substring, so joined multi-reason strings resolve to every code), plus
 // structural signals (sponsor flag, merged-short boundary, low confidence). The
 // same rules run in the migration backfill so live and historical rows agree.
-func deriveStudioReviewCodes(reason *string, boundaryReason *string, confidence *float64, containsSponsor bool, highConfThreshold float64) (*string, []string) {
+func deriveStudioReviewCodes(reason *string, mergedShortProvenance bool, confidence *float64, containsSponsor bool, highConfThreshold float64) (*string, []string) {
 	codes := make([]string, 0, 3)
 	add := func(code string) { codes = append(codes, code) }
 
@@ -666,15 +668,10 @@ func deriveStudioReviewCodes(reason *string, boundaryReason *string, confidence 
 	if strings.Contains(r, "planner returned no usable chapters") {
 		add(models.StudioReviewCodePlannerFallback)
 	}
-	br := ""
-	if boundaryReason != nil {
-		br = *boundaryReason
-	}
-	mergedShort := strings.Contains(br, "merged_short_chapter")
-	if confidence != nil && *confidence < highConfThreshold && !mergedShort {
+	if confidence != nil && *confidence < highConfThreshold {
 		add(models.StudioReviewCodeLowConfidence)
 	}
-	if mergedShort {
+	if mergedShortProvenance {
 		add(models.StudioReviewCodeMergedShort)
 	}
 	if strings.Contains(r, "cannot merge without exceeding hard max") {
@@ -693,23 +690,38 @@ func deriveStudioReviewCodes(reason *string, boundaryReason *string, confidence 
 	return &primary, codes
 }
 
-// applyStudioReviewCodes writes review codes onto a chapter row, preferring the
-// Aggregation-emitted set (authoritative for new rows) and falling back to
-// CMS-side derivation from the persisted fields.
+// applyStudioReviewCodes accepts emitted taxonomy only as evidence, then unions
+// it with CMS-derivable facts. Structural merge authority is fail-closed: an
+// emitted merged_short without deterministic provenance is discarded.
 func applyStudioReviewCodes(ch *models.Chapter, emittedPrimary *string, emittedCodes []string, highConfThreshold float64) {
-	if len(emittedCodes) > 0 {
-		ch.NeedsReviewCodes = emittedCodes
-		if emittedPrimary != nil && strings.TrimSpace(*emittedPrimary) != "" {
-			ch.NeedsReviewCode = emittedPrimary
-		} else {
-			p := models.StudioReviewPrimaryCode(emittedCodes)
-			ch.NeedsReviewCode = &p
+	_, derived := deriveStudioReviewCodes(ch.NeedsReviewReason, ch.MergedShortProvenance, ch.Confidence, ch.ContainsSponsorIntro, highConfThreshold)
+	known := map[string]bool{
+		models.StudioReviewCodeSponsorIntro: true, models.StudioReviewCodePlannerFallback: true,
+		models.StudioReviewCodeLowConfidence: true, models.StudioReviewCodeMergedShort: true,
+		models.StudioReviewCodeBelowMin: true, models.StudioReviewCodeAboveHardMax: true,
+		models.StudioReviewCodeShortUnmergeable: true,
+	}
+	seen := map[string]bool{}
+	codes := make([]string, 0, len(derived)+len(emittedCodes))
+	add := func(code string) {
+		if !known[code] || (code == models.StudioReviewCodeMergedShort && !ch.MergedShortProvenance) || seen[code] {
+			return
 		}
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	for _, code := range derived {
+		add(code)
+	}
+	for _, code := range emittedCodes {
+		add(strings.TrimSpace(code))
+	}
+	if len(codes) == 0 {
+		ch.NeedsReviewCode, ch.NeedsReviewCodes = nil, nil
 		return
 	}
-	primary, codes := deriveStudioReviewCodes(ch.NeedsReviewReason, ch.BoundaryReason, ch.Confidence, ch.ContainsSponsorIntro, highConfThreshold)
-	ch.NeedsReviewCode = primary
-	ch.NeedsReviewCodes = codes
+	primary := models.StudioReviewPrimaryCode(codes)
+	ch.NeedsReviewCode, ch.NeedsReviewCodes = &primary, codes
 }
 
 func chaptersFromAtomizationRequest(tenantID string, transcriptID uuid.UUID, chapters []atomizationChapterRequest, policy atomizationPolicy) []models.Chapter {
@@ -743,7 +755,8 @@ func chaptersFromAtomizationRequest(tenantID string, transcriptID uuid.UUID, cha
 			StartMs: ch.StartMs, EndMs: &end, Source: models.ChapterSourceDerived,
 			Status: status, Confidence: ch.Confidence, ContextLabel: ch.ContextLabel,
 			BoundaryReason: ch.BoundaryReason, StandaloneScore: ch.StandaloneScore,
-			ContainsSponsorIntro: ch.ContainsSponsorIntro, NeedsReviewReason: needsReviewReason,
+			MergedShortProvenance: ch.MergedShortProvenance,
+			ContainsSponsorIntro:  ch.ContainsSponsorIntro, NeedsReviewReason: needsReviewReason,
 			DurationBucket: &bucket,
 		}
 		applyStudioReviewCodes(&row, ch.NeedsReviewCode, ch.NeedsReviewCodes, policy.HighConfidenceThreshold)
@@ -2676,6 +2689,7 @@ func getMediaAtomizationSchemaInfo(db *gorm.DB) mediaAtomizationSchemaInfo {
 			"confidence",
 			"context_label",
 			"boundary_reason",
+			"merged_short_provenance",
 			"standalone_score",
 			"contains_sponsor_intro",
 			"needs_review_reason",
@@ -3100,9 +3114,28 @@ func updateAtomizedChapterReview(c *gin.Context, approve bool) {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid chapter id"})
 		return
 	}
-	// Human path: act on any current review state (requireNeedsReview=false).
-	res, reviewErr := applyAtomizedChapterReview(db, principal.TenantID, chapterID, approve,
-		chapterReviewActor{UserID: principal.UserID, Email: principal.Email}, false)
+	var req struct {
+		ProposalActionID *string `json:"proposal_action_id"`
+	}
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid request"})
+			return
+		}
+	}
+	options := chapterReviewApplyOptions{ProposalActor: principal.Email, ResolveProposal: true}
+	if req.ProposalActionID != nil && strings.TrimSpace(*req.ProposalActionID) != "" {
+		proposalID, err := uuid.Parse(strings.TrimSpace(*req.ProposalActionID))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid proposal action id"})
+			return
+		}
+		options.ProposalActionID = &proposalID
+	}
+	// Human path retains editorial authority; proposal outcome bookkeeping shares
+	// its transaction without imposing any Safe Auto requirements.
+	res, reviewErr := applyAtomizedChapterReviewWithOptions(db, principal.TenantID, chapterID, approve,
+		chapterReviewActor{UserID: principal.UserID, Email: principal.Email}, options)
 	if reviewErr != nil {
 		c.JSON(reviewErr.httpStatus, utils.HTTPError{Code: reviewErr.httpStatus, Message: reviewErr.message})
 		return
@@ -3127,21 +3160,43 @@ type chapterReviewOutcome struct {
 	Child   models.ContentItem
 }
 
+// chapterReviewApplyOptions contains requirements unique to an automated
+// clearance. Human decisions deliberately use the zero value so editorial
+// authority is unchanged.
+type chapterReviewApplyOptions struct {
+	RequireNeedsReview        bool
+	RequireParentAutoPublish  bool
+	ExpectedChildID           *uuid.UUID
+	ExpectedReviewCodes       []string
+	RequireMergeProvenance    bool
+	RequireNoSponsor          bool
+	RequireNoBlockingOverride bool
+	ProposalActionID          *uuid.UUID
+	ProposalActor             string
+	ResolveProposal           bool
+}
+
 // chapterReviewError carries an HTTP status for the human endpoint and a stable
 // machine code for the autopilot runner to map onto its skip taxonomy.
 type chapterReviewError struct {
 	httpStatus int
-	code       string // not_found | no_child | invalid_duration | stale | save_failed
+	code       string // not_found | no_child | invalid_duration | stale | multi_code | override | editorial_reason | save_failed
 	message    string
 }
 
 // Machine codes for chapterReviewError.code.
 const (
-	chapterReviewErrNotFound        = "not_found"
-	chapterReviewErrNoChild         = "no_child"
-	chapterReviewErrInvalidDuration = "invalid_duration"
-	chapterReviewErrStale           = "stale"
-	chapterReviewErrSaveFailed      = "save_failed"
+	chapterReviewErrNotFound         = "not_found"
+	chapterReviewErrNoChild          = "no_child"
+	chapterReviewErrInvalidDuration  = "invalid_duration"
+	chapterReviewErrStale            = "stale"
+	chapterReviewErrMultiCode        = "multi_code"
+	chapterReviewErrOverride         = "override"
+	chapterReviewErrEditorialReason  = "editorial_reason"
+	chapterReviewErrParentContext    = "parent_context"
+	chapterReviewErrUpstreamDisabled = "upstream_disabled"
+	chapterReviewErrProposalNotFound = "proposal_not_found"
+	chapterReviewErrSaveFailed       = "save_failed"
 )
 
 // applyAtomizedChapterReview is the single choke point both the human endpoint
@@ -3150,6 +3205,12 @@ const (
 // conditional update — if the row is no longer `needs_review` the call returns a
 // `stale` error and nothing is written (S6 concurrency correctness).
 func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUID, approve bool, actor chapterReviewActor, requireNeedsReview bool) (*chapterReviewOutcome, *chapterReviewError) {
+	return applyAtomizedChapterReviewWithOptions(db, tenantID, chapterID, approve, actor, chapterReviewApplyOptions{
+		RequireNeedsReview: requireNeedsReview,
+	})
+}
+
+func applyAtomizedChapterReviewWithOptions(db *gorm.DB, tenantID string, chapterID uuid.UUID, approve bool, actor chapterReviewActor, opts chapterReviewApplyOptions) (*chapterReviewOutcome, *chapterReviewError) {
 	var chapter models.Chapter
 	if err := db.Where("public_id = ? AND tenant_id = ?", chapterID, tenantID).First(&chapter).Error; err != nil {
 		return nil, &chapterReviewError{http.StatusNotFound, chapterReviewErrNotFound, "Chapter not found"}
@@ -3178,7 +3239,73 @@ func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUI
 		newChapterStatus = chapterStatusPublished
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if requireNeedsReview {
+		// Re-read and lock both rows in the same transaction as the mutation. The
+		// preliminary reads above provide useful 404s; these are the authoritative
+		// values for any automation decision.
+		var lockedChapter models.Chapter
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ?", chapterID, tenantID).First(&lockedChapter).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errChapterReviewStale
+			}
+			return err
+		}
+		if lockedChapter.ChildContentItemID == nil {
+			return errChapterReviewStale
+		}
+		var lockedChild models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ?", *lockedChapter.ChildContentItemID, tenantID).First(&lockedChild).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errChapterReviewStale
+			}
+			return err
+		}
+		chapter, child = lockedChapter, lockedChild
+		if opts.ExpectedChildID != nil && child.PublicID != *opts.ExpectedChildID {
+			return errChapterReviewStale
+		}
+		if child.Status == models.ContentStatusArchived {
+			return errChapterReviewStale
+		}
+		if approve && (child.DurationSec == nil || *child.DurationSec < forYouMinDurationSec || *child.DurationSec > forYouHardMaxDurationSec) {
+			return errChapterReviewInvalidDuration
+		}
+		if !approve && len(opts.ExpectedReviewCodes) > 0 && (child.DurationSec == nil || *child.DurationSec >= forYouMinDurationSec) {
+			return errChapterReviewInvalidDuration
+		}
+		if len(opts.ExpectedReviewCodes) > 0 && !sameStudioReviewCodeSet(chapter.NeedsReviewCodes, opts.ExpectedReviewCodes) {
+			if len(chapter.NeedsReviewCodes) > 1 {
+				return errChapterReviewMultiCode
+			}
+			return errChapterReviewEditorialReason
+		}
+		if opts.RequireMergeProvenance && !chapter.MergedShortProvenance {
+			return errChapterReviewEditorialReason
+		}
+		if opts.RequireNoSponsor && chapter.ContainsSponsorIntro {
+			return errChapterReviewEditorialReason
+		}
+		if opts.RequireNoBlockingOverride && hasStudioBlockingOverride(tx, tenantID, &child) {
+			return errChapterReviewOverride
+		}
+		if opts.RequireParentAutoPublish && approve {
+			if child.ParentContentItemID == nil {
+				return errChapterReviewParentContext
+			}
+			var parent models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("public_id = ? AND tenant_id = ?", *child.ParentContentItemID, tenantID).First(&parent).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errChapterReviewParentContext
+				}
+				return err
+			}
+			if !atomizationPolicyForItem(tx, &parent).AutoPublishHighConfidence {
+				return errChapterReviewUpstreamDisabled
+			}
+		}
+		if opts.RequireNeedsReview {
 			// Guarded conditional update (S6): only act if still in review.
 			res := tx.Model(&models.Chapter{}).
 				Where("public_id = ? AND tenant_id = ? AND status = ?", chapterID, tenantID, chapterStatusReview).
@@ -3196,6 +3323,9 @@ func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUI
 				return err
 			}
 		}
+		if err := resolveStudioProposalOutcome(tx, tenantID, chapter.PublicID, approve, opts); err != nil {
+			return err
+		}
 		if approve {
 			child.Status = models.ContentStatusReady
 			child.FeedVisibility = feedVisibilityVisible
@@ -3212,6 +3342,27 @@ func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUI
 		if errors.Is(err, errChapterReviewStale) {
 			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrStale, "Chapter is no longer awaiting review"}
 		}
+		if errors.Is(err, errChapterReviewInvalidDuration) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrInvalidDuration, "Chapter duration changed outside feed bounds"}
+		}
+		if errors.Is(err, errChapterReviewMultiCode) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrMultiCode, "Chapter review codes changed to a multi-code case"}
+		}
+		if errors.Is(err, errChapterReviewOverride) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrOverride, "An editorial override now blocks automatic clearance"}
+		}
+		if errors.Is(err, errChapterReviewEditorialReason) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrEditorialReason, "Chapter review facts no longer match the mechanical clearance"}
+		}
+		if errors.Is(err, errChapterReviewParentContext) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrParentContext, "Chapter parent context is unavailable for automatic publication"}
+		}
+		if errors.Is(err, errChapterReviewUpstreamDisabled) {
+			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrUpstreamDisabled, "Automatic publication is disabled by the parent atomization policy"}
+		}
+		if errors.Is(err, errChapterReviewProposalNotFound) {
+			return nil, &chapterReviewError{http.StatusBadRequest, chapterReviewErrProposalNotFound, "Proposal action is not available for this chapter"}
+		}
 		return nil, &chapterReviewError{http.StatusInternalServerError, chapterReviewErrSaveFailed, "Failed to update chapter review state"}
 	}
 
@@ -3224,6 +3375,94 @@ func applyAtomizedChapterReview(db *gorm.DB, tenantID string, chapterID uuid.UUI
 }
 
 var errChapterReviewStale = errors.New("chapter no longer awaiting review")
+var errChapterReviewInvalidDuration = errors.New("chapter duration outside feed bounds")
+var errChapterReviewMultiCode = errors.New("chapter has multiple review codes")
+var errChapterReviewOverride = errors.New("chapter has a blocking override")
+var errChapterReviewEditorialReason = errors.New("chapter review facts are editorial")
+var errChapterReviewParentContext = errors.New("chapter parent context is unavailable")
+var errChapterReviewUpstreamDisabled = errors.New("chapter parent policy disables automatic publication")
+var errChapterReviewProposalNotFound = errors.New("studio proposal not found")
+
+func sameStudioReviewCodeSet(actual []string, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	seen := make(map[string]int, len(expected))
+	for _, code := range expected {
+		seen[code]++
+	}
+	for _, code := range actual {
+		if seen[code] == 0 {
+			return false
+		}
+		seen[code]--
+	}
+	return true
+}
+
+func hasStudioBlockingOverride(db *gorm.DB, tenantID string, child *models.ContentItem) bool {
+	if child == nil || child.ID == 0 {
+		return false
+	}
+	subjects := []uuid.UUID{child.PublicID}
+	if child.ParentContentItemID != nil {
+		subjects = append(subjects, *child.ParentContentItemID)
+	}
+	var count int64
+	_ = db.Model(&models.MediaCirculationOverride{}).
+		Where("tenant_id = ? AND subject_id IN ? AND override_type IN ? AND (expires_at IS NULL OR expires_at > ?)",
+			tenantID, subjects,
+			[]string{models.MediaCirculationOverrideEditorialHold, models.MediaCirculationOverrideNoAtomize},
+			time.Now().UTC()).
+		Count(&count).Error
+	return count > 0
+}
+
+// resolveStudioProposalOutcome records the human's decision in the same
+// transaction as the existing chapter mutation. A supplied action id is
+// tenant/chapter scoped; without one the latest unresolved proposal is used.
+func resolveStudioProposalOutcome(tx *gorm.DB, tenantID string, chapterID uuid.UUID, approve bool, opts chapterReviewApplyOptions) error {
+	if !opts.ResolveProposal {
+		return nil
+	}
+	query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("tenant_id = ? AND chapter_id = ? AND proposal IS NOT NULL AND proposal <> 'null'::jsonb", tenantID, chapterID)
+	if opts.ProposalActionID != nil {
+		query = query.Where("public_id = ?", *opts.ProposalActionID)
+	} else {
+		query = query.Where("COALESCE(human_outcome, '') = ''")
+	}
+	var action models.MediaStudioAction
+	err := query.Order("created_at DESC, id DESC").First(&action).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if opts.ProposalActionID != nil {
+			return errChapterReviewProposalNotFound
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if action.HumanOutcome != "" {
+		return nil // replay-safe: preserve the original human outcome/actor/time
+	}
+	var proposal studioProposal
+	if err := json.Unmarshal(action.Proposal, &proposal); err != nil || (proposal.Proposal != "publish" && proposal.Proposal != "reject") {
+		return errChapterReviewProposalNotFound
+	}
+	want := "reject"
+	if approve {
+		want = "publish"
+	}
+	outcome := "overridden"
+	if proposal.Proposal == want {
+		outcome = "accepted"
+	}
+	now := time.Now().UTC()
+	return tx.Model(&action).Updates(map[string]interface{}{
+		"human_outcome": outcome, "human_outcome_by": opts.ProposalActor, "human_outcome_at": now,
+	}).Error
+}
 
 func writeAtomizedChapterReviewAudit(db *gorm.DB, tenantID string, actor chapterReviewActor, action string, chapter models.Chapter, child models.ContentItem) {
 	payload := map[string]interface{}{

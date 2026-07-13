@@ -125,7 +125,7 @@ func GetForYouFeed(c *gin.Context) {
 		flagMap := LoadContentFlags(db, "default", contentIDs)
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
-		scored = applyPreferenceFeedHook(db, "default", userIDStr, scored)
+		scored, preferenceEligible := applyPreferenceFeedHook(db, "default", userIDStr, scored)
 		scored = applyIntelligenceFeedHooks(db, "default", scored)
 		scored = spaceScoredSiblingChapters(scored)
 		unfilteredScored := append([]ScoredItem(nil), scored...)
@@ -225,7 +225,7 @@ func GetForYouFeed(c *gin.Context) {
 			}
 		}
 		if !isFeedIntegritySynthetic(c) {
-			recordPreferenceServes(db, "default", boosted, int64(len(items)))
+			recordPreferenceServes(db, "default", preferenceEligible, boosted, int64(len(items)))
 		}
 		return
 	}
@@ -302,7 +302,7 @@ func GetForYouFeed(c *gin.Context) {
 		nextCursor = &cursor
 	}
 
-	items, boosted := applyChronologicalPreferenceOrder(db, "default", userIDStr, items)
+	items, boosted, preferenceEligible := applyChronologicalPreferenceOrder(db, "default", userIDStr, items)
 
 	// Get interaction status if session/user provided
 	likedMap := make(map[uuid.UUID]bool)
@@ -323,7 +323,7 @@ func GetForYouFeed(c *gin.Context) {
 	})
 	if !isFeedIntegritySynthetic(c) {
 		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
-		recordPreferenceServes(db, "default", int64(boosted), int64(len(items)))
+		recordPreferenceServes(db, "default", preferenceEligible, int64(boosted), int64(len(items)))
 	}
 }
 

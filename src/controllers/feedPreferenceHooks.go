@@ -10,21 +10,24 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, scored []ScoredItem) []ScoredItem {
+func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, scored []ScoredItem) ([]ScoredItem, bool) {
 	if len(scored) < 2 || userIDStr == "" {
-		return scored
+		return scored, false
 	}
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		return scored
+		return scored, false
 	}
 	cfg := loadPreferenceSettingsCached(db, tenantID)
 	if !cfg.ForYouEnabled {
-		return scored
+		return scored, false
 	}
-	topicAff, categoryAff := loadUserAffinityMaps(db, tenantID, userID)
+	// From here the authenticated, enabled hook ran. It may legitimately find no
+	// affinities or matches, but it is an eligible personalization observation.
+	eligible := true
+	topicAff, categoryAff, mutedTopics := loadUserAffinityMaps(db, tenantID, userID)
 	if len(topicAff) == 0 && len(categoryAff) == 0 {
-		return scored
+		return scored, eligible
 	}
 	ids := make([]uuid.UUID, 0, len(scored))
 	for _, s := range scored {
@@ -44,6 +47,9 @@ func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, sco
 		Scan(&rows)
 	byItem := map[uuid.UUID]float64{}
 	for _, r := range rows {
+		if mutedTopics[r.TopicID] {
+			continue
+		}
 		a := topicAff[r.TopicID]
 		if r.CategorySlug != "" && categoryAff[r.CategorySlug] > a {
 			a = categoryAff[r.CategorySlug]
@@ -71,22 +77,23 @@ func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, sco
 		sort.SliceStable(scored, func(i, j int) bool { return scored[i].FinalScore > scored[j].FinalScore })
 		scored = applyDiversityPenalty(scored)
 	}
-	return scored
+	return scored, eligible
 }
 
 // applyChronologicalPreferenceOrder keeps the default feed chronological at
 // page granularity, while allowing affinities to move a matching item a small
 // number of positions inside that page. The cursor remains tied to the
 // chronological boundary selected before this function runs.
-func applyChronologicalPreferenceOrder(db *gorm.DB, tenantID, userIDStr string, items []models.ContentItem) ([]models.ContentItem, int) {
+func applyChronologicalPreferenceOrder(db *gorm.DB, tenantID, userIDStr string, items []models.ContentItem) ([]models.ContentItem, int, bool) {
 	if len(items) < 2 {
-		return items, 0
+		return items, 0, false
 	}
 	scored := make([]ScoredItem, len(items))
 	for i, item := range items {
 		scored[i] = ScoredItem{Item: item, FinalScore: float64(len(items) - i)}
 	}
-	scored = applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
+	var eligible bool
+	scored, eligible = applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
 	boosted := 0
 	for i, s := range scored {
 		items[i] = s.Item
@@ -94,10 +101,10 @@ func applyChronologicalPreferenceOrder(db *gorm.DB, tenantID, userIDStr string, 
 			boosted++
 		}
 	}
-	return items, boosted
+	return items, boosted, eligible
 }
 
-func loadUserAffinityMaps(db *gorm.DB, tenantID string, userID uuid.UUID) (map[uuid.UUID]float64, map[string]float64) {
+func loadUserAffinityMaps(db *gorm.DB, tenantID string, userID uuid.UUID) (map[uuid.UUID]float64, map[string]float64, map[uuid.UUID]bool) {
 	var rows []models.UserTopicAffinity
 	db.Where("tenant_id = ? AND user_id = ? AND score > 0", tenantID, userID).Find(&rows)
 	topicAff := make(map[uuid.UUID]float64, len(rows))
@@ -110,11 +117,17 @@ func loadUserAffinityMaps(db *gorm.DB, tenantID string, userID uuid.UUID) (map[u
 	for _, r := range cats {
 		categoryAff[r.CategorySlug] = r.Score
 	}
-	return topicAff, categoryAff
+	var prefs []models.UserTopicPref
+	db.Where("tenant_id = ? AND user_id = ? AND state = ?", tenantID, userID, "muted").Find(&prefs)
+	mutedTopics := make(map[uuid.UUID]bool, len(prefs))
+	for _, p := range prefs {
+		mutedTopics[p.TopicID] = true
+	}
+	return topicAff, categoryAff, mutedTopics
 }
 
-func recordPreferenceServes(db *gorm.DB, tenantID string, boosted, total int64) {
-	if total <= 0 {
+func recordPreferenceServes(db *gorm.DB, tenantID string, eligible bool, boosted, total int64) {
+	if !eligible || total <= 0 {
 		return
 	}
 	day := time.Now().UTC().Truncate(24 * time.Hour)
@@ -139,17 +152,18 @@ func shouldPersonalizeNews(db *gorm.DB, tenantID string, userIDStr string) bool 
 	return loadPreferenceSettingsCached(db, tenantID).NewsEnabled
 }
 
-func applyNewsPreferenceBoost(db *gorm.DB, tenantID string, userIDStr string, order []*storyAgg, storyIDs []uuid.UUID) []*storyAgg {
+func applyNewsPreferenceBoost(db *gorm.DB, tenantID string, userIDStr string, order []*storyAgg, storyIDs []uuid.UUID) ([]*storyAgg, bool) {
 	if len(order) < 2 || !shouldPersonalizeNews(db, tenantID, userIDStr) {
-		return order
+		return order, false
 	}
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
-		return order
+		return order, false
 	}
-	topicAff, categoryAff := loadUserAffinityMaps(db, tenantID, userID)
+	eligible := true
+	topicAff, categoryAff, mutedTopics := loadUserAffinityMaps(db, tenantID, userID)
 	if len(topicAff) == 0 && len(categoryAff) == 0 {
-		return order
+		return order, eligible
 	}
 	cfg := loadPreferenceSettingsCached(db, tenantID)
 	affByStory := make(map[uuid.UUID]float64, len(order))
@@ -167,6 +181,9 @@ func applyNewsPreferenceBoost(db *gorm.DB, tenantID string, userIDStr string, or
 		Where("st.story_id IN ? AND topics.tenant_id = ?", storyIDs, tenantID).
 		Scan(&topicRows)
 	for _, r := range topicRows {
+		if mutedTopics[r.TopicID] {
+			continue
+		}
 		a := topicAff[r.TopicID]
 		if r.CategorySlug != "" && categoryAff[r.CategorySlug] > a {
 			a = categoryAff[r.CategorySlug]
@@ -200,7 +217,7 @@ func applyNewsPreferenceBoost(db *gorm.DB, tenantID string, userIDStr string, or
 		a.score *= 1 + cfg.WNews*aff
 		a.preferenceBoosted = true
 	}
-	return order
+	return order, eligible
 }
 
 func reorderRelatedByPreference(db *gorm.DB, tenantID string, userIDStr string, related []StorySummary) []StorySummary {
@@ -211,7 +228,7 @@ func reorderRelatedByPreference(db *gorm.DB, tenantID string, userIDStr string, 
 	if err != nil {
 		return related
 	}
-	topicAff, categoryAff := loadUserAffinityMaps(db, tenantID, userID)
+	topicAff, categoryAff, mutedTopics := loadUserAffinityMaps(db, tenantID, userID)
 	if len(topicAff) == 0 && len(categoryAff) == 0 {
 		return related
 	}
@@ -233,6 +250,9 @@ func reorderRelatedByPreference(db *gorm.DB, tenantID string, userIDStr string, 
 		Scan(&rows)
 	aff := map[uuid.UUID]float64{}
 	for _, r := range rows {
+		if mutedTopics[r.TopicID] {
+			continue
+		}
 		a := topicAff[r.TopicID]
 		if r.CategorySlug != "" && categoryAff[r.CategorySlug] > a {
 			a = categoryAff[r.CategorySlug]

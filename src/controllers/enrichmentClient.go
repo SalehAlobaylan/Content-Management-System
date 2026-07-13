@@ -130,12 +130,12 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, tri
 			trigger = models.TranscriptionTriggerManual
 		}
 	}
-	job, triggered, reason, err := createTranscriptionJobForItem(db, item, trigger, force)
+	job, triggered, reason, kind, err := createTranscriptionJobForItem(db, item, trigger, force)
 	if err != nil {
 		return "", err
 	}
 	if !triggered {
-		return "", &sttSkippedError{reason: reason}
+		return "", &sttSkippedError{reason: reason, kind: kind}
 	}
 	jobID := job.PublicID.String()
 	if err := submitTranscriptionJobToMedia(db, item, jobID); err != nil {

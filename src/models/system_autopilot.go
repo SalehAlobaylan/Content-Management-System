@@ -88,15 +88,16 @@ func (SystemAutopilotPolicy) TableName() string {
 
 func DefaultSystemAutopilotPolicy() SystemAutopilotPolicy {
 	return SystemAutopilotPolicy{
-		Scope:                  "platform",
-		Enabled:                false,
-		Mode:                   SystemAutopilotModeObserve,
-		IntervalMinutes:        10,
-		ConfirmProbes:          2,
-		ResolveProbes:          3,
-		FlapCycles24h:          3,
-		ContainmentTTLMinutes:  60,
-		ContainmentDisabledFor: datatypes.JSON([]byte(`["news_circulation","media_circulation","media_studio"]`)),
+		Scope:                 "platform",
+		Enabled:               false,
+		Mode:                  SystemAutopilotModeObserve,
+		IntervalMinutes:       10,
+		ConfirmProbes:         2,
+		ResolveProbes:         3,
+		FlapCycles24h:         3,
+		ContainmentTTLMinutes: 60,
+		// G1: only Pipeline and Enrichment are containment-enabled by default.
+		ContainmentDisabledFor: datatypes.JSON([]byte(`["embedding_lifecycle","media_circulation","media_studio","news_circulation","redundancy"]`)),
 	}
 }
 

@@ -395,6 +395,30 @@ func ListPreferenceAutopilotActions(c *gin.Context) {
 // Recompute-queue ops + cursor reset
 // ----------------------------------------------------------------
 
+// GetPreferenceRecomputeQueueSummary exposes queue health to feed:read without
+// leaking stable user identifiers or raw internal failure text.
+func GetPreferenceRecomputeQueueSummary(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	type summary struct {
+		Total       int64      `json:"total"`
+		OldestAt    *time.Time `json:"oldest_at,omitempty"`
+		MaxAttempts int        `json:"max_attempts"`
+		Errored     int64      `json:"errored"`
+	}
+	var result summary
+	if err := db.Model(&models.PreferenceAffinityRecomputeQueue{}).
+		Select("COUNT(*) AS total, MIN(updated_at) AS oldest_at, COALESCE(MAX(attempts), 0) AS max_attempts, COUNT(*) FILTER (WHERE last_error <> '') AS errored").
+		Where("tenant_id = ?", principal.TenantID).Scan(&result).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to summarize queue", Code: "QUERY_FAILED"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": result})
+}
+
 // ListPreferenceRecomputeQueue handles GET /admin/preferences/autopilot/recompute-queue.
 func ListPreferenceRecomputeQueue(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)

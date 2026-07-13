@@ -52,6 +52,9 @@ const (
 	EnrichmentAutopilotActionStatusApprovalRequired = "approval_required"
 	EnrichmentAutopilotActionStatusWouldTrigger     = "would_trigger"
 	EnrichmentAutopilotActionStatusWouldSkip        = "would_skip"
+	// ErrorAcknowledged preserves the audit row while excluding a human-reviewed
+	// failure from the trust window.
+	EnrichmentAutopilotActionStatusErrorAcknowledged = "error_acknowledged"
 
 	// Guardrail / skip-reason taxonomy (plan §12) — the fixed vocabulary recorded
 	// on every skipped/blocked action so the ledger explains itself.
@@ -66,6 +69,8 @@ const (
 	EnrichmentAutopilotGuardRunCap            = "run_cap"
 	EnrichmentAutopilotGuardBreakerTripped    = "breaker_tripped"
 	EnrichmentAutopilotGuardAlreadyPresent    = "already_present"
+	EnrichmentAutopilotGuardBulkInFlight      = "bulk_in_flight"
+	EnrichmentAutopilotGuardEscalateStuck     = "escalate_stuck"
 
 	// Trust states (plan §8, enrichment adaptation). Media seeds trust from a
 	// persisted human decision history; enrichment has none (bulk runs were

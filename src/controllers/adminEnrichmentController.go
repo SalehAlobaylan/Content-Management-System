@@ -32,16 +32,17 @@ func cleanForEmbedding(text string) string {
 // ── Response types ──────────────────────────────────────────
 
 type enrichmentStatsResponse struct {
-	TotalMedia            int64 `json:"total_media"`
-	WithTranscript        int64 `json:"with_transcript"`
-	MissingTranscript     int64 `json:"missing_transcript"`
-	WithEmbedding         int64 `json:"with_embedding"`
-	MissingEmbedding      int64 `json:"missing_embedding"`
-	WithSparse            int64 `json:"with_sparse"`
-	MissingSparse         int64 `json:"missing_sparse"`
-	WithImageEmbedding    int64 `json:"with_image_embedding"`
-	MissingImageEmbedding int64 `json:"missing_image_embedding"`
-	TotalReady            int64 `json:"total_ready"`
+	TotalMedia                  int64 `json:"total_media"`
+	WithTranscript              int64 `json:"with_transcript"`
+	MissingTranscript           int64 `json:"missing_transcript"`
+	MissingTranscriptActionable int64 `json:"missing_transcript_actionable"`
+	WithEmbedding               int64 `json:"with_embedding"`
+	MissingEmbedding            int64 `json:"missing_embedding"`
+	WithSparse                  int64 `json:"with_sparse"`
+	MissingSparse               int64 `json:"missing_sparse"`
+	WithImageEmbedding          int64 `json:"with_image_embedding"`
+	MissingImageEmbedding       int64 `json:"missing_image_embedding"`
+	TotalReady                  int64 `json:"total_ready"`
 }
 
 type missingEnrichmentCountsResponse struct {
@@ -118,7 +119,8 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 		SELECT
 			COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST')) as total_media,
 			COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NOT NULL) as with_transcript,
-			COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NULL AND status = 'READY') as missing_transcript,
+				COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NULL AND status = 'READY') as missing_transcript,
+				COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NULL AND status = 'READY' AND (duration_sec IS NULL OR duration_sec <= 2400)) as missing_transcript_actionable,
 			COUNT(*) FILTER (WHERE embedding IS NOT NULL) as with_embedding,
 			COUNT(*) FILTER (WHERE embedding IS NULL AND status = 'READY') as missing_embedding,
 			COUNT(*) FILTER (WHERE embedding_sparse IS NOT NULL) as with_sparse,
@@ -134,6 +136,7 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 		&stats.TotalMedia,
 		&stats.WithTranscript,
 		&stats.MissingTranscript,
+		&stats.MissingTranscriptActionable,
 		&stats.WithEmbedding,
 		&stats.MissingEmbedding,
 		&stats.WithSparse,
@@ -514,6 +517,7 @@ type artifactOutcome struct {
 	Status   string // artifactOutcome* constant
 	Reason   string
 	JobID    string // transcript only, when a job was created
+	SkipKind string // transcript only, when a typed guard declined it
 }
 
 // triggerItemArtifactsTraced runs the requested enrichment passes for one item
@@ -541,6 +545,7 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 			} else if jobID, err := triggerTranscription(item, db, force, triggerSource); err != nil {
 				if isSTTSkipped(err) {
 					o.Status, o.Reason = artifactOutcomeSkipped, err.Error()
+					o.SkipKind = string(sttSkipKindOf(err))
 				} else {
 					o.Status, o.Reason = artifactOutcomeError, err.Error()
 				}
@@ -669,6 +674,10 @@ func TriggerAllEnrichment(c *gin.Context) {
 		limit = bulkMaxItems
 	}
 
+	if enrichmentAutopilotAnyRunInFlight() {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "an autopilot run is in flight; retry shortly"})
+		return
+	}
 	bulkMu.Lock()
 	if bulkState.Running {
 		bulkMu.Unlock()
@@ -757,4 +766,8 @@ func bulkEnrichRunning() bool {
 	bulkMu.Lock()
 	defer bulkMu.Unlock()
 	return bulkState.Running
+}
+
+func bulkLaneBusy() bool {
+	return bulkEnrichRunning() || enrichmentAutopilotAnyRunInFlight()
 }

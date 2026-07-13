@@ -74,8 +74,18 @@ func runPreferenceAutopilotDue(db *gorm.DB) {
 		if !tryStartPreferenceAutopilotRun(policy.TenantID) {
 			continue
 		}
-		_ = runPreferenceBaseline(db, policy.TenantID, policy)
-		touchPreferenceAutopilotLastRun(db, policy.TenantID, time.Now())
+		releaseLock, acquired := tryAcquirePreferenceAutopilotLock(db, policy.TenantID)
+		if !acquired {
+			finishPreferenceAutopilotRun(policy.TenantID)
+			continue
+		}
+		err := runPreferenceBaseline(db, policy.TenantID, policy)
+		releaseLock()
+		if err == nil {
+			touchPreferenceAutopilotLastRun(db, policy.TenantID, time.Now())
+		} else {
+			writeCirculationAuditSystem(db, policy.TenantID, "preferences.autopilot.baseline_error", policy.TenantID, map[string]interface{}{"error": err.Error()})
+		}
 		finishPreferenceAutopilotRun(policy.TenantID)
 	}
 }

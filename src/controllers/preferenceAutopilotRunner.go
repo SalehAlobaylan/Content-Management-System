@@ -2,8 +2,10 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +45,32 @@ func finishPreferenceAutopilotRun(tenantID string) {
 	preferenceAutopilotRunMu.Lock()
 	defer preferenceAutopilotRunMu.Unlock()
 	delete(preferenceAutopilotRunInFlight, tenantID)
+}
+
+// tryAcquirePreferenceAutopilotLock holds a PostgreSQL session advisory lock
+// for one tenant's complete maintenance pass. The connection owns the lock, so
+// a crashed replica or lost connection releases it automatically.
+func tryAcquirePreferenceAutopilotLock(db *gorm.DB, tenantID string) (func(), bool) {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return func() {}, false
+	}
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return func() {}, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("preferences-autopilot/v1/" + tenantID))
+	key := int64(h.Sum64())
+	var acquired bool
+	if err := conn.QueryRowContext(context.Background(), "SELECT pg_try_advisory_lock($1)", key).Scan(&acquired); err != nil || !acquired {
+		_ = conn.Close()
+		return func() {}, false
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
+		_ = conn.Close()
+	}, true
 }
 
 // ----------------------------------------------------------------
@@ -153,12 +181,14 @@ func computePreferenceSnapshot(db *gorm.DB, tenantID string, policy models.Prefe
 		Boosted int64
 		Total   int64
 	}
-	db.Model(&models.PreferenceStat{}).
+	serveQueryErr := db.Model(&models.PreferenceStat{}).
 		Select("COALESCE(SUM(boosted_serves),0) AS boosted, COALESCE(SUM(total_serves),0) AS total").
 		Where("tenant_id = ? AND day >= ?", tenantID, weekAgo).Scan(&serveAgg)
 	snap.BoostedServes = serveAgg.Boosted
 	snap.TotalServes = serveAgg.Total
-	if serveAgg.Total > 0 {
+	if serveQueryErr.Error != nil {
+		snap.BoostSanity = "unknown"
+	} else if serveAgg.Total > 0 {
 		snap.BoostSanity = "ok"
 	} else {
 		snap.BoostSanity = "unknown"
@@ -321,6 +351,11 @@ func runPreferenceAutopilot(db *gorm.DB, tenantID string, opts preferenceAutopil
 		return models.PreferenceAutopilotRun{}, errPreferenceAutopilotAlreadyRunning
 	}
 	defer finishPreferenceAutopilotRun(tenantID)
+	releaseLock, acquired := tryAcquirePreferenceAutopilotLock(db, tenantID)
+	if !acquired {
+		return models.PreferenceAutopilotRun{}, errPreferenceAutopilotAlreadyRunning
+	}
+	defer releaseLock()
 
 	policy := loadPreferenceAutopilotPolicy(db, tenantID)
 	if !policy.Enabled {
@@ -742,6 +777,12 @@ func (r *preferenceAutopilotRunner) recomputeRecentlyActive(cfg models.Preferenc
 // ceiling (§9).
 func (r *preferenceAutopilotRunner) actionMine(snap preferenceSnapshot) {
 	started := time.Now()
+	if r.policy.MaxMinedProposals <= 0 {
+		r.writeAction(models.PreferenceActionMine, models.PreferenceSubjectAggregate, "",
+			models.PreferenceActionStatusSkipped, models.PreferenceGuardRunCap,
+			"Mining is disabled because the per-run proposal cap is zero.", started)
+		return
+	}
 	if r.policy.LastMineAt != nil && time.Since(*r.policy.LastMineAt) < 24*time.Hour {
 		return // daily cadence
 	}

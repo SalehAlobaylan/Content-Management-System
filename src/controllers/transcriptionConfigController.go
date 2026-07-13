@@ -20,7 +20,10 @@ const sttEstimatedCostPerHourUsd = 0.26
 // sttSkippedError signals the guard declined to run STT for a NON-failure reason
 // (already upgraded, human caption present, auto-STT disabled, over budget).
 // Callers surface these as "skipped" results, not errors.
-type sttSkippedError struct{ reason string }
+type sttSkippedError struct {
+	reason string
+	kind   sttSkipKind
+}
 
 func (e *sttSkippedError) Error() string { return e.reason }
 
@@ -28,6 +31,14 @@ func (e *sttSkippedError) Error() string { return e.reason }
 func isSTTSkipped(err error) bool {
 	var s *sttSkippedError
 	return errors.As(err, &s)
+}
+
+func sttSkipKindOf(err error) sttSkipKind {
+	var s *sttSkippedError
+	if errors.As(err, &s) {
+		return s.kind
+	}
+	return sttSkipNone
 }
 
 // getOrCreateTranscriptionConfig loads the tenant's STT config, creating a
@@ -161,7 +172,7 @@ func InternalRequestSTT(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&req) // body optional
 
-	job, triggered, reason, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerIngestAuto, req.Force)
+	job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerIngestAuto, req.Force)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"triggered": false, "error": err.Error()})
 		return

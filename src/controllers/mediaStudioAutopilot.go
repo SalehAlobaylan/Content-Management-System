@@ -2,7 +2,9 @@ package controllers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -71,6 +73,89 @@ func GetMediaStudioAutopilotPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": loadEffectiveMediaStudioAutopilotPolicy(db, principal.TenantID)})
 }
 
+type mediaStudioAutopilotPolicyPatch struct {
+	AutopilotEnabled      *bool            `json:"autopilot_enabled"`
+	AutopilotMode         *string          `json:"autopilot_mode"`
+	ObserveProposals      *bool            `json:"observe_proposals"`
+	IntervalMinutes       *int             `json:"interval_minutes"`
+	ChainDebounceMinutes  *int             `json:"chain_debounce_minutes"`
+	MaxClearsPerRun       *int             `json:"max_clears_per_run"`
+	MaxPublishesPerRun    *int             `json:"max_publishes_per_run"`
+	MaxRejectsPerRun      *int             `json:"max_rejects_per_run"`
+	MaxSTTPerRun          *int             `json:"max_stt_per_run"`
+	MaxProposalsPerRun    *int             `json:"max_proposals_per_run"`
+	AgedThresholdDays     *int             `json:"aged_threshold_days"`
+	DirtyWorkbenchMinutes *int             `json:"dirty_workbench_minutes"`
+	TrustMinDecisions     *int             `json:"trust_min_decisions"`
+	TrustMinApprovePct    *int             `json:"trust_min_approve_pct"`
+	TrustMaxReversalPct   *int             `json:"trust_max_reversal_pct"`
+	PausedUntil           *json.RawMessage `json:"paused_until"`
+}
+
+func (p mediaStudioAutopilotPolicyPatch) applyTo(policy *models.MediaStudioAutopilotPolicy) error {
+	if p.AutopilotEnabled != nil {
+		policy.AutopilotEnabled = *p.AutopilotEnabled
+	}
+	if p.AutopilotMode != nil {
+		policy.AutopilotMode = *p.AutopilotMode
+	}
+	if p.ObserveProposals != nil {
+		policy.ObserveProposals = *p.ObserveProposals
+	}
+	if p.IntervalMinutes != nil {
+		policy.IntervalMinutes = *p.IntervalMinutes
+	}
+	if p.ChainDebounceMinutes != nil {
+		policy.ChainDebounceMinutes = *p.ChainDebounceMinutes
+	}
+	if p.MaxClearsPerRun != nil {
+		policy.MaxClearsPerRun = *p.MaxClearsPerRun
+	}
+	if p.MaxPublishesPerRun != nil {
+		policy.MaxPublishesPerRun = *p.MaxPublishesPerRun
+	}
+	if p.MaxRejectsPerRun != nil {
+		policy.MaxRejectsPerRun = *p.MaxRejectsPerRun
+	}
+	if p.MaxSTTPerRun != nil {
+		policy.MaxSTTPerRun = *p.MaxSTTPerRun
+	}
+	if p.MaxProposalsPerRun != nil {
+		policy.MaxProposalsPerRun = *p.MaxProposalsPerRun
+	}
+	if p.AgedThresholdDays != nil {
+		policy.AgedThresholdDays = *p.AgedThresholdDays
+	}
+	if p.DirtyWorkbenchMinutes != nil {
+		policy.DirtyWorkbenchMinutes = *p.DirtyWorkbenchMinutes
+	}
+	if p.TrustMinDecisions != nil {
+		policy.TrustMinDecisions = *p.TrustMinDecisions
+	}
+	if p.TrustMinApprovePct != nil {
+		policy.TrustMinApprovePct = *p.TrustMinApprovePct
+	}
+	if p.TrustMaxReversalPct != nil {
+		policy.TrustMaxReversalPct = *p.TrustMaxReversalPct
+	}
+	if p.PausedUntil != nil {
+		if string(*p.PausedUntil) == "null" {
+			policy.PausedUntil = nil
+		} else {
+			var raw string
+			if err := json.Unmarshal(*p.PausedUntil, &raw); err != nil {
+				return fmt.Errorf("paused_until must be RFC3339 or null")
+			}
+			until, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				return fmt.Errorf("paused_until must be RFC3339 or null")
+			}
+			policy.PausedUntil = &until
+		}
+	}
+	return nil
+}
+
 func UpdateMediaStudioAutopilotPolicy(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -78,13 +163,17 @@ func UpdateMediaStudioAutopilotPolicy(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 
-	var req models.MediaStudioAutopilotPolicy
+	var req mediaStudioAutopilotPolicyPatch
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}
-	req.TenantID = principal.TenantID
-	req = sanitizeMediaStudioAutopilotPolicy(req)
+	policy := loadEffectiveMediaStudioAutopilotPolicy(db, principal.TenantID)
+	if err := req.applyTo(&policy); err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: err.Error(), Code: "INVALID_REQUEST"})
+		return
+	}
+	policy = sanitizeMediaStudioAutopilotPolicy(policy)
 	if err := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "tenant_id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
@@ -95,15 +184,15 @@ func UpdateMediaStudioAutopilotPolicy(c *gin.Context) {
 			"trust_min_decisions", "trust_min_approve_pct", "trust_max_reversal_pct",
 			"paused_until", "updated_at",
 		}),
-	}).Create(&req).Error; err != nil {
+	}).Create(&policy).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to save policy", Code: "SAVE_FAILED"})
 		return
 	}
 	writeStudioAutopilotAudit(db, principal, "media_studio.autopilot.policy.update", principal.TenantID, map[string]interface{}{
-		"enabled": req.AutopilotEnabled,
-		"mode":    req.AutopilotMode,
+		"enabled": policy.AutopilotEnabled,
+		"mode":    policy.AutopilotMode,
 	})
-	c.JSON(http.StatusOK, gin.H{"data": req})
+	c.JSON(http.StatusOK, gin.H{"data": policy})
 }
 
 // GetMediaStudioAutopilotStatus is the cockpit read-model (§10/§13): policy,
@@ -133,13 +222,14 @@ func GetMediaStudioAutopilotStatus(c *gin.Context) {
 		computeStudioReasonCodeTrust(db, tenantID, models.StudioReviewCodeMergedShort, policy),
 	}
 
-	// Pending proposals: approval-tier actions carrying a proposal in the last run.
+	// Pending proposals are durable across runs. A newer proposal for the same
+	// open chapter supersedes the older draft in the inbox, but neither row is
+	// deleted from the audit-grade ledger.
 	var pendingProposals int64
-	if hasLast {
-		_ = db.Model(&models.MediaStudioAction{}).
-			Where("run_id = ? AND status = ? AND proposal IS NOT NULL", lastRun.ID, models.StudioActionStatusApprovalRequired).
-			Count(&pendingProposals).Error
-	}
+	_ = db.Model(&models.MediaStudioAction{}).
+		Where("tenant_id = ? AND unit_type = ? AND status = ? AND proposal IS NOT NULL AND proposal <> 'null'::jsonb AND COALESCE(human_outcome, '') = ''",
+			tenantID, models.StudioUnitChapterReview, models.StudioActionStatusApprovalRequired).
+		Count(&pendingProposals).Error
 
 	// Lead relationship (H4): chain is idle when the lead autopilot is off.
 	var leadPolicy models.MediaCirculationPolicy
@@ -163,6 +253,67 @@ func GetMediaStudioAutopilotStatus(c *gin.Context) {
 		resp["last_run"] = lastRun
 	}
 	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+// ListMediaStudioAutopilotProposals returns one latest unresolved draft for
+// each currently-open chapter. Ranking is confidence descending then oldest
+// case, so an older run remains actionable until a human resolves it.
+func ListMediaStudioAutopilotProposals(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	policy := loadEffectiveMediaStudioAutopilotPolicy(db, principal.TenantID)
+	limit := boundedLimit(c.Query("limit"), 50, 200)
+	var actions []models.MediaStudioAction
+	if err := db.Where("tenant_id = ? AND unit_type = ? AND status = ? AND chapter_id IS NOT NULL AND proposal IS NOT NULL AND proposal <> 'null'::jsonb AND COALESCE(human_outcome, '') = ''",
+		principal.TenantID, models.StudioUnitChapterReview, models.StudioActionStatusApprovalRequired).
+		Order("chapter_id ASC, created_at DESC, id DESC").Find(&actions).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to load Studio proposals", Code: "QUERY_FAILED"})
+		return
+	}
+	now := time.Now().UTC()
+	seen := map[uuid.UUID]bool{}
+	items := make([]gin.H, 0, limit)
+	for _, action := range actions {
+		if action.ChapterID == nil || seen[*action.ChapterID] {
+			continue
+		}
+		var chapter models.Chapter
+		if err := db.Where("public_id = ? AND tenant_id = ? AND status = ?", *action.ChapterID, principal.TenantID, chapterStatusReview).First(&chapter).Error; err != nil {
+			continue // stale cases do not belong in the unresolved human inbox
+		}
+		seen[*action.ChapterID] = true
+		proposal := studioProposal{}
+		if err := json.Unmarshal(action.Proposal, &proposal); err != nil || (proposal.Proposal != "publish" && proposal.Proposal != "reject") {
+			continue
+		}
+		var child models.ContentItem
+		if chapter.ChildContentItemID != nil {
+			_ = db.Where("public_id = ? AND tenant_id = ?", *chapter.ChildContentItemID, principal.TenantID).First(&child).Error
+		}
+		age := now.Sub(chapter.CreatedAt)
+		items = append(items, gin.H{
+			"action_id": action.PublicID.String(), "chapter_id": chapter.PublicID.String(), "content_item_id": uuidPtrString(chapter.ChildContentItemID),
+			"title": chapter.Title, "summary": chapter.Summary, "review_code": chapter.NeedsReviewCode, "review_reason": chapter.NeedsReviewReason,
+			"proposal": proposal.Proposal, "confidence": proposal.Confidence, "rationale": proposal.Rationale, "checked": proposal.Checked,
+			"age_hours": age.Hours(), "aged": age >= time.Duration(policy.AgedThresholdDays)*24*time.Hour,
+			"created_at": chapter.CreatedAt, "duration_sec": child.DurationSec,
+		})
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		left, lok := items[i]["confidence"].(float64)
+		right, rok := items[j]["confidence"].(float64)
+		if lok && rok && left != right {
+			return left > right
+		}
+		return items[i]["created_at"].(time.Time).Before(items[j]["created_at"].(time.Time))
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items}})
 }
 
 // GetMediaStudioAutopilotInsights returns visualization-ready rollups: per-run

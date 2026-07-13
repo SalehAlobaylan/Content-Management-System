@@ -3,6 +3,9 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -19,7 +22,7 @@ func TestDefaultSystemAutopilotPolicyMatchesPlanDefaults(t *testing.T) {
 		t.Fatalf("unexpected cadence defaults: interval=%d confirm=%d resolve=%d", p.IntervalMinutes, p.ConfirmProbes, p.ResolveProbes)
 	}
 	disabled := containmentDisabledSet(p)
-	for _, key := range []string{"news_circulation", "media_circulation", "media_studio"} {
+	for _, key := range []string{"embedding_lifecycle", "news_circulation", "media_circulation", "media_studio", "redundancy"} {
 		if !disabled[key] {
 			t.Fatalf("%s should be opted out by default", key)
 		}
@@ -28,6 +31,61 @@ func TestDefaultSystemAutopilotPolicyMatchesPlanDefaults(t *testing.T) {
 		if disabled[key] {
 			t.Fatalf("%s should be containment-enabled by default", key)
 		}
+	}
+}
+
+func TestContainmentDisabledSetHonorsPersistedOptIn(t *testing.T) {
+	p := models.DefaultSystemAutopilotPolicy()
+	p.ContainmentDisabledFor = []byte(`[]`)
+	if containmentDisabledSet(p)["media_studio"] {
+		t.Fatal("removing a persisted opt-out must genuinely opt in the sibling")
+	}
+}
+
+func TestSystemContainmentLedgerScopesOwnershipToSiblingTenant(t *testing.T) {
+	ledger := systemContainmentLedger{Version: 2, Siblings: map[string]map[string]systemContainmentLedgerEntry{
+		"pipeline": {
+			"tenant-a": {WrittenUntil: "2026-07-13T12:00:00Z", Outcome: "paused"},
+			"tenant-b": {Outcome: "skipped", Reason: "human_pause"},
+		},
+	}}
+	raw := marshalAutopilotJSON(ledger)
+	got, legacy := readSystemContainmentLedger(raw)
+	if legacy {
+		t.Fatal("v2 containment ledger must not be treated as legacy")
+	}
+	if entry, ok := containmentEntry(got, "pipeline", "tenant-a"); !ok || entry.WrittenUntil == "" {
+		t.Fatalf("missing tenant-a ownership: %+v", got)
+	}
+	if entry, ok := containmentEntry(got, "pipeline", "tenant-b"); !ok || entry.Reason != "human_pause" || entry.WrittenUntil != "" {
+		t.Fatalf("tenant-b human pause must remain unowned: %+v", got)
+	}
+}
+
+func TestSystemContainmentLegacyLedgerNeverAuthorizesResume(t *testing.T) {
+	_, legacy := readSystemContainmentLedger([]byte(`{"pipeline":"2026-07-13T12:00:00Z"}`))
+	if !legacy {
+		t.Fatal("v1 sibling-wide containment must be treated as legacy")
+	}
+}
+
+func TestSystemContainmentCompareAndSetQueriesAreTenantExact(t *testing.T) {
+	sibling, ok := systemSiblingByKey("pipeline")
+	if !ok {
+		t.Fatal("pipeline sibling missing")
+	}
+	pause := systemPauseCompareAndSetSQL(sibling, "= ?")
+	resume := systemResumeCompareAndSetSQL(sibling)
+	for _, query := range []string{pause, resume} {
+		if !strings.Contains(query, "tenant_id = ?") {
+			t.Fatalf("containment query must scope to one tenant: %s", query)
+		}
+		if strings.Contains(query, "<=") || strings.Contains(query, ">=") {
+			t.Fatalf("containment query must use exact ownership, not a tolerance: %s", query)
+		}
+	}
+	if !strings.Contains(resume, "paused_until = ?") {
+		t.Fatalf("resume must compare the exact written timestamp: %s", resume)
 	}
 }
 
@@ -112,6 +170,56 @@ func TestSystemRootCauseHintAndTimeline(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0]["transition"] != "opened" || entries[0]["verdict"] != models.SystemVerdictWorkerStalled {
 		t.Fatalf("unexpected timeline: %+v", entries)
+	}
+}
+
+func TestSystemDependencyHealthyStringUsesExactEnums(t *testing.T) {
+	for _, value := range []string{"connected", "reachable", "configured", "ready", "ok", "true"} {
+		if !systemDependencyHealthyString(value) {
+			t.Fatalf("%q should be healthy", value)
+		}
+	}
+	for _, value := range []string{"disconnected", "unreachable", "circuit_open", "not_ready", "", "unknown"} {
+		if systemDependencyHealthyString(value) {
+			t.Fatalf("%q must not be healthy", value)
+		}
+	}
+}
+
+func TestSystemHTTPProbeRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(strings.Repeat("x", systemProbeBodyLimit+1)))
+	}))
+	defer server.Close()
+	probe := systemHTTPProbe(server.URL, false)
+	if probe.Error == "" || !strings.Contains(probe.Error, "exceeds") {
+		t.Fatalf("oversized response must be rejected, got %+v", probe)
+	}
+}
+
+func TestSystemCorrelationOnlyCollapsesDeclaredSharedRoots(t *testing.T) {
+	got := correlateSystemAnomalies([]systemAnomaly{
+		{Key: "aggregation:queue_backlog", Service: "aggregation", Verdict: models.SystemVerdictQueueBacklog},
+		{Key: "media:worker_stalled", Service: "media", Verdict: models.SystemVerdictWorkerStalled},
+		{Key: "iam:service_down", Service: "iam", Verdict: models.SystemVerdictServiceDown},
+	})
+	if len(got) != 2 {
+		t.Fatalf("got %d incidents, want redis correlation plus independent IAM", len(got))
+	}
+	if got[0].Service != "iam" || got[1].Service != "redis" {
+		t.Fatalf("unexpected correlations: %+v", got)
+	}
+}
+
+func TestSystemEpisodeObservablyHealthyRequiresEveryCorrelatedMember(t *testing.T) {
+	ep := models.SystemIncidentEpisode{RootService: "redis"}
+	snapshot := systemHealthSnapshot{Services: []systemProbeResult{{Name: "aggregation", Status: "healthy"}, {Name: "media", Status: "unknown"}}}
+	if systemEpisodeObservablyHealthy(ep, snapshot) {
+		t.Fatal("unknown member must not advance correlated recovery")
+	}
+	snapshot.Services[1].Status = "healthy"
+	if !systemEpisodeObservablyHealthy(ep, snapshot) {
+		t.Fatal("all healthy members must allow recovery")
 	}
 }
 

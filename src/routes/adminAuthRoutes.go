@@ -129,7 +129,10 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Cockpit deep logging + ops (insights rollups, cross-run ledger, queue/cursor management)
 	adminGroup.GET("/preferences/autopilot/insights", perm("feed", "read"), controllers.GetPreferenceAutopilotInsights)
 	adminGroup.GET("/preferences/autopilot/actions", perm("feed", "read"), controllers.ListPreferenceAutopilotActions)
-	adminGroup.GET("/preferences/autopilot/recompute-queue", perm("feed", "read"), controllers.ListPreferenceRecomputeQueue)
+	// Read-only operators get aggregate queue health only. User-level repair
+	// rows and their errors require feed:manage.
+	adminGroup.GET("/preferences/autopilot/recompute-queue/summary", perm("feed", "read"), controllers.GetPreferenceRecomputeQueueSummary)
+	adminGroup.GET("/preferences/autopilot/recompute-queue", perm("feed", "manage"), controllers.ListPreferenceRecomputeQueue)
 	adminGroup.POST("/preferences/autopilot/recompute-queue/requeue", perm("feed", "manage"), controllers.RequeuePreferenceRecompute)
 	adminGroup.DELETE("/preferences/autopilot/recompute-queue/:user_id", perm("feed", "manage"), controllers.DeletePreferenceRecomputeRow)
 	adminGroup.POST("/preferences/autopilot/cursors/reset", perm("feed", "manage"), controllers.ResetPreferenceCursors)
@@ -238,6 +241,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.PUT("/enrichment/autopilot/policy", perm("content", "write"), controllers.UpdateEnrichmentAutopilotPolicy)
 	adminGroup.POST("/enrichment/autopilot/run", perm("content", "write"), controllers.RunEnrichmentAutopilotNow)
 	adminGroup.POST("/enrichment/autopilot/pause", perm("content", "write"), controllers.PauseEnrichmentAutopilot)
+	adminGroup.POST("/enrichment/autopilot/trust/reset", perm("content", "write"), controllers.ResetEnrichmentAutopilotTrust)
 	adminGroup.POST("/enrichment/autopilot/elevate", perm("content", "write"), controllers.ElevateEnrichmentAutopilot)
 	adminGroup.GET("/enrichment/autopilot/runs", perm("content", "read"), controllers.ListEnrichmentAutopilotRuns)
 	adminGroup.GET("/enrichment/autopilot/runs/:id", perm("content", "read"), controllers.GetEnrichmentAutopilotRun)
@@ -248,6 +252,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.PUT("/pipeline/autopilot/policy", perm("content", "write"), controllers.UpdatePipelineAutopilotPolicy)
 	adminGroup.POST("/pipeline/autopilot/run", perm("content", "write"), controllers.RunPipelineAutopilotNow)
 	adminGroup.POST("/pipeline/autopilot/pause", perm("content", "write"), controllers.PausePipelineAutopilot)
+	adminGroup.POST("/pipeline/autopilot/trust/reset", perm("content", "write"), controllers.ResetPipelineAutopilotTrust)
 	adminGroup.POST("/pipeline/autopilot/elevate", perm("content", "write"), controllers.ElevatePipelineAutopilot)
 	adminGroup.GET("/pipeline/autopilot/runs", perm("content", "read"), controllers.ListPipelineAutopilotRuns)
 	adminGroup.GET("/pipeline/autopilot/runs/:id", perm("content", "read"), controllers.GetPipelineAutopilotRun)
@@ -321,18 +326,21 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/media/studio/autopilot/run", perm("aggregation", "manage"), controllers.RunMediaStudioAutopilotNow)
 	adminGroup.GET("/media/studio/autopilot/runs", perm("aggregation", "read"), controllers.ListMediaStudioAutopilotRuns)
 	adminGroup.GET("/media/studio/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotRun)
+	adminGroup.GET("/media/studio/autopilot/proposals", perm("aggregation", "read"), controllers.ListMediaStudioAutopilotProposals)
 	adminGroup.POST("/media/studio/autopilot/pause", perm("aggregation", "manage"), controllers.PauseMediaStudioAutopilot)
 
 	// System Health / Incident Autopilot — platform probes, incident ledger, bounded containment.
-	adminGroup.GET("/system/autopilot/status", perm("aggregation", "read"), controllers.GetSystemAutopilotStatus)
-	adminGroup.GET("/system/autopilot/policy", perm("aggregation", "read"), controllers.GetSystemAutopilotPolicy)
-	adminGroup.PUT("/system/autopilot/policy", perm("aggregation", "manage"), controllers.UpdateSystemAutopilotPolicy)
-	adminGroup.POST("/system/autopilot/run", perm("aggregation", "manage"), controllers.RunSystemAutopilotNow)
-	adminGroup.POST("/system/autopilot/pause", perm("aggregation", "manage"), controllers.PauseSystemAutopilotContainment)
-	adminGroup.GET("/system/autopilot/episodes", perm("aggregation", "read"), controllers.ListSystemIncidentEpisodes)
-	adminGroup.GET("/system/autopilot/episodes/:id", perm("aggregation", "read"), controllers.GetSystemIncidentEpisode)
-	adminGroup.POST("/system/autopilot/episodes/:id/close", perm("aggregation", "manage"), controllers.CloseSystemIncidentEpisode)
-	adminGroup.GET("/system/autopilot/runs", perm("aggregation", "read"), controllers.ListSystemAutopilotRuns)
+	// System Health can pause or resume automation across services, so it has the
+	// same deployment-wide admin-role boundary as Operations Command Center.
+	adminGroup.GET("/system/autopilot/status", utils.RequireAdminRole("admin"), controllers.GetSystemAutopilotStatus)
+	adminGroup.GET("/system/autopilot/policy", utils.RequireAdminRole("admin"), controllers.GetSystemAutopilotPolicy)
+	adminGroup.PUT("/system/autopilot/policy", utils.RequireAdminRole("admin"), controllers.UpdateSystemAutopilotPolicy)
+	adminGroup.POST("/system/autopilot/run", utils.RequireAdminRole("admin"), controllers.RunSystemAutopilotNow)
+	adminGroup.POST("/system/autopilot/pause", utils.RequireAdminRole("admin"), controllers.PauseSystemAutopilotContainment)
+	adminGroup.GET("/system/autopilot/episodes", utils.RequireAdminRole("admin"), controllers.ListSystemIncidentEpisodes)
+	adminGroup.GET("/system/autopilot/episodes/:id", utils.RequireAdminRole("admin"), controllers.GetSystemIncidentEpisode)
+	adminGroup.POST("/system/autopilot/episodes/:id/close", utils.RequireAdminRole("admin"), controllers.CloseSystemIncidentEpisode)
+	adminGroup.GET("/system/autopilot/runs", utils.RequireAdminRole("admin"), controllers.ListSystemAutopilotRuns)
 	adminGroup.GET("/system/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetSystemAutopilotRun)
 
 	// Feed Integrity / Experience QA System — deterministic CMS-edge checks only.

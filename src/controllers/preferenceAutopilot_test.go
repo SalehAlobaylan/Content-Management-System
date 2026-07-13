@@ -15,6 +15,30 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestPreferenceZeroCapsRemainDisabled(t *testing.T) {
+	created, err := mineTopicProposalsCapped(nil, "default", 0)
+	if err != nil || created != 0 {
+		t.Fatalf("zero mining cap = (%d, %v), want no-op", created, err)
+	}
+	itemsDone, storiesDone, err := reevaluateCorpusPage(nil, "default", nil, 0, 0, 0, 0, &dirtySweepResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if itemsDone || storiesDone {
+		t.Fatalf("disabled surfaces must remain incomplete: items=%t stories=%t", itemsDone, storiesDone)
+	}
+}
+
+func TestPreferenceAnonymousHookAvoidsSettingsAndTelemetry(t *testing.T) {
+	items := []ScoredItem{{FinalScore: 2}, {FinalScore: 1}}
+	got, eligible := applyPreferenceFeedHook(nil, "default", "", items)
+	if eligible || len(got) != len(items) {
+		t.Fatalf("anonymous hook must return before preference access: eligible=%t items=%d", eligible, len(got))
+	}
+	// A false eligibility flag is intentionally a no-op even without a DB.
+	recordPreferenceServes(nil, "default", false, 0, 2)
+}
+
 // Policy sanitize clamps every knob into range and forces a valid mode.
 func TestSanitizePreferenceAutopilotPolicy(t *testing.T) {
 	p := models.PreferenceAutopilotPolicy{

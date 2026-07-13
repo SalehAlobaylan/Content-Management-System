@@ -286,7 +286,7 @@ func assembleStoryNewsFeed(
 	for _, a := range order {
 		storyIDsForOverrides = append(storyIDsForOverrides, a.storyID)
 	}
-	order = applyNewsPreferenceBoost(db, tenantID, userIDStr, order, storyIDsForOverrides)
+	order, preferenceEligible := applyNewsPreferenceBoost(db, tenantID, userIDStr, order, storyIDsForOverrides)
 	overrides := activeStoryOverrides(db, tenantID, storyIDsForOverrides, now)
 	filteredByOverride := order[:0]
 	for _, a := range order {
@@ -566,7 +566,7 @@ func assembleStoryNewsFeed(
 			boosted++
 		}
 	}
-	recordPreferenceServes(db, tenantID, boosted, int64(len(page)))
+	recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(page)))
 
 	return slides, nextCursor
 }
