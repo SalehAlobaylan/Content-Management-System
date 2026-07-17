@@ -560,8 +560,7 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
 			} else if text := buildEmbeddingText(item); text == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no text content available"
-			} else if err := triggerEmbedding(text, id, true); err != nil {
-				// extract_sparse=true → populates dense + sparse together.
+			} else if err := triggerEmbedding(text, id); err != nil {
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
 				o.Status = artifactOutcomeTriggered
@@ -572,13 +571,8 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 			o := artifactOutcome{Artifact: "sparse"}
 			if item.EmbeddingSparse != nil {
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
-			} else if text := buildEmbeddingText(item); text == "" {
-				o.Status, o.Reason = artifactOutcomeError, "no text content available"
-			} else if err := triggerEmbedding(text, id, true); err != nil {
-				// Re-embed with sparse on — re-writes dense too (harmless, same value).
-				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
-				o.Status = artifactOutcomeTriggered
+				o.Status, o.Reason = artifactOutcomeSkipped, "legacy sparse embeddings are no longer generated"
 			}
 			out = append(out, o)
 

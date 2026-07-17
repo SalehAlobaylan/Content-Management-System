@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -37,9 +38,10 @@ const (
 )
 
 var (
-	feedIntegrityMu         sync.Mutex
-	feedIntegrityRunning    = map[string]bool{}
-	feedIntegrityCapability = newFeedIntegrityCapability()
+	feedIntegrityMu                   sync.Mutex
+	feedIntegrityRunning              = map[string]bool{}
+	feedIntegrityCapability           = newFeedIntegrityCapability()
+	errFeedIntegrityTenantUnavailable = errors.New("feed integrity is currently available only for the default public tenant")
 )
 
 func newFeedIntegrityCapability() string {
@@ -188,6 +190,12 @@ type integrityResult struct {
 }
 
 func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) (models.FeedIntegrityRun, error) {
+	// Edge probes exercise V1 public routes, whose tenant contract is default
+	// only. Refuse another tenant rather than mixing its inventory with default
+	// consumer evidence.
+	if tenant != feedIntegrityTenant {
+		return models.FeedIntegrityRun{}, errFeedIntegrityTenantUnavailable
+	}
 	if !feedIntegrityTryStart(tenant) {
 		return models.FeedIntegrityRun{}, fmt.Errorf("feed integrity run already running")
 	}
@@ -289,7 +297,9 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 	} else {
 		_ = db.Model(&models.FeedIntegrityPolicy{}).Where("id = ?", policy.ID).Updates(map[string]interface{}{"last_light_run_at": finished, "updated_at": finished}).Error
 	}
-	_ = evaluateFeedIntegrityAutopilot(db, run.ID)
+	if run.Status == models.FeedIntegrityRunCompleted {
+		_ = evaluateFeedIntegrityAutopilot(db, run.ID)
+	}
 	return run, nil
 }
 
@@ -502,7 +512,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		}
 		if len(payload.Items) == 0 {
 			var count int64
-			forYouEligibleMediaQuery(db, supportsAtomizedForYouSchema(db)).Count(&count)
+			forYouEligibleMediaQuery(db, policy.TenantID, supportsAtomizedForYouSchema(db)).Count(&count)
 			sev := "critical"
 			if count < int64(policy.ExpectedMinForYouUnits) {
 				sev = "info"
@@ -1138,6 +1148,71 @@ func GetFeedIntegrityPolicy(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	c.JSON(http.StatusOK, gin.H{"data": loadFeedIntegrityPolicy(db, principal.TenantID)})
 }
+
+type feedIntegrityPolicyPatch struct {
+	ScheduledEnabled     *bool `json:"scheduled_enabled"`
+	LightIntervalMinutes *int  `json:"light_interval_minutes"`
+	DeepIntervalHours    *int  `json:"deep_interval_hours"`
+	ConfirmRuns          *int  `json:"confirm_runs"`
+	ResolveRuns          *int  `json:"resolve_runs"`
+	EdgePagesPerFeed     *int  `json:"edge_pages_per_feed"`
+	ProbeURLBudget       *int  `json:"probe_url_budget"`
+	ProbeConcurrency     *int  `json:"probe_concurrency"`
+	ProbeTimeoutMS       *int  `json:"probe_timeout_ms"`
+	ForYouLatencyMS      *int  `json:"foryou_latency_budget_ms"`
+	NewsLatencyMS        *int  `json:"news_latency_budget_ms"`
+	ExpectedForYou       *int  `json:"expected_min_foryou_units"`
+	ExpectedNews         *int  `json:"expected_min_news_slides"`
+}
+
+func (p feedIntegrityPolicyPatch) updates() (map[string]interface{}, error) {
+	updates := map[string]interface{}{}
+	bounded := func(name string, value *int, min, max int) error {
+		if value == nil {
+			return nil
+		}
+		if *value < min || *value > max {
+			return fmt.Errorf("%s must be between %d and %d", name, min, max)
+		}
+		updates[name] = *value
+		return nil
+	}
+	if p.ScheduledEnabled != nil {
+		updates["scheduled_enabled"] = *p.ScheduledEnabled
+	}
+	for _, rule := range []struct {
+		name     string
+		value    *int
+		min, max int
+	}{
+		{"light_interval_minutes", p.LightIntervalMinutes, 1, 1440}, {"deep_interval_hours", p.DeepIntervalHours, 1, 720},
+		{"confirm_runs", p.ConfirmRuns, 1, 20}, {"resolve_runs", p.ResolveRuns, 1, 20}, {"edge_pages_per_feed", p.EdgePagesPerFeed, 1, 20},
+		{"probe_url_budget", p.ProbeURLBudget, 0, 500}, {"probe_concurrency", p.ProbeConcurrency, 1, 20}, {"probe_timeout_ms", p.ProbeTimeoutMS, 100, 60000},
+		{"foryou_latency_budget_ms", p.ForYouLatencyMS, 1, 60000}, {"news_latency_budget_ms", p.NewsLatencyMS, 1, 60000},
+		{"expected_min_foryou_units", p.ExpectedForYou, 0, 1000}, {"expected_min_news_slides", p.ExpectedNews, 0, 1000},
+	} {
+		if err := bounded(rule.name, rule.value, rule.min, rule.max); err != nil {
+			return nil, err
+		}
+	}
+	return updates, nil
+}
+
+func decodeFeedIntegrityPolicyPatch(r io.Reader, patch *feedIntegrityPolicyPatch) error {
+	decoder := json.NewDecoder(r)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(patch); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("policy body must contain exactly one JSON object")
+		}
+		return err
+	}
+	return nil
+}
+
 func UpdateFeedIntegrityPolicy(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -1145,23 +1220,28 @@ func UpdateFeedIntegrityPolicy(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	policy := loadFeedIntegrityPolicy(db, principal.TenantID)
-	var patch map[string]interface{}
-	if c.ShouldBindJSON(&patch) != nil {
+	var patch feedIntegrityPolicyPatch
+	if err := decodeFeedIntegrityPolicyPatch(c.Request.Body, &patch); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy"})
 		return
 	}
-	allowed := map[string]bool{"scheduled_enabled": true, "light_interval_minutes": true, "deep_interval_hours": true, "confirm_runs": true, "resolve_runs": true, "edge_pages_per_feed": true, "probe_url_budget": true, "probe_concurrency": true, "probe_timeout_ms": true, "foryou_latency_budget_ms": true, "news_latency_budget_ms": true, "expected_min_foryou_units": true, "expected_min_news_slides": true}
-	updates := map[string]interface{}{}
-	for k, v := range patch {
-		if allowed[k] {
-			updates[k] = v
-		}
+	updates, err := patch.updates()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	if len(updates) > 0 {
 		updates["updated_at"] = time.Now().UTC()
-		_ = db.Model(&policy).Updates(updates).Error
+		if err := db.Model(&policy).Updates(updates).Error; err != nil {
+			feedIntegrityAudit(db, principal, "feed_integrity.policy.update", principal.TenantID, "failure", map[string]interface{}{"error": "save_failed"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save policy"})
+			return
+		}
 	}
-	_ = db.Where("id=?", policy.ID).First(&policy).Error
+	if err := db.Where("id=?", policy.ID).First(&policy).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reload policy"})
+		return
+	}
 	feedIntegrityAudit(db, principal, "feed_integrity.policy.update", principal.TenantID, "success", updates)
 	c.JSON(http.StatusOK, gin.H{"data": policy})
 }

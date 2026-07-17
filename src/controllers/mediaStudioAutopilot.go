@@ -51,7 +51,7 @@ func sanitizeMediaStudioAutopilotPolicy(p models.MediaStudioAutopilotPolicy) mod
 	p.MaxPublishesPerRun = clampIntRange(p.MaxPublishesPerRun, 0, 50, 5)
 	p.MaxRejectsPerRun = clampIntRange(p.MaxRejectsPerRun, 0, 50, 10)
 	p.MaxSTTPerRun = clampIntRange(p.MaxSTTPerRun, 0, 20, 3)
-	p.MaxProposalsPerRun = clampIntRange(p.MaxProposalsPerRun, 0, 50, 15)
+	p.MaxProposalsPerRun = clampIntRange(p.MaxProposalsPerRun, 0, 15, 15)
 	p.AgedThresholdDays = clampIntRange(p.AgedThresholdDays, 1, 90, 7)
 	p.DirtyWorkbenchMinutes = clampIntRange(p.DirtyWorkbenchMinutes, 0, 240, 30)
 	p.TrustMinDecisions = clampIntRange(p.TrustMinDecisions, 1, 1000, 20)
@@ -206,7 +206,11 @@ func GetMediaStudioAutopilotStatus(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID := principal.TenantID
 	policy := loadEffectiveMediaStudioAutopilotPolicy(db, tenantID)
-	health := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
+	health, healthErr := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
+	if healthErr != nil {
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Studio health is temporarily unavailable", Code: "HEALTH_UNAVAILABLE"})
+		return
+	}
 
 	var lastRun models.MediaStudioRun
 	hasLast := db.Where("tenant_id = ?", tenantID).Order("started_at DESC").First(&lastRun).Error == nil
@@ -295,7 +299,7 @@ func ListMediaStudioAutopilotProposals(c *gin.Context) {
 		}
 		age := now.Sub(chapter.CreatedAt)
 		items = append(items, gin.H{
-			"action_id": action.PublicID.String(), "chapter_id": chapter.PublicID.String(), "content_item_id": uuidPtrString(chapter.ChildContentItemID),
+			"action_id": action.PublicID.String(), "chapter_id": chapter.PublicID.String(), "content_item_id": uuidPtrString(chapter.ChildContentItemID), "parent_id": uuidPtrString(child.ParentContentItemID),
 			"title": chapter.Title, "summary": chapter.Summary, "review_code": chapter.NeedsReviewCode, "review_reason": chapter.NeedsReviewReason,
 			"proposal": proposal.Proposal, "confidence": proposal.Confidence, "rationale": proposal.Rationale, "checked": proposal.Checked,
 			"age_hours": age.Hours(), "aged": age >= time.Duration(policy.AgedThresholdDays)*24*time.Hour,
@@ -547,7 +551,7 @@ func startStudioRun(db *gorm.DB, tenantID, trigger, mode, createdBy string, heal
 	return &run, nil
 }
 
-func finishStudioRun(db *gorm.DB, run *models.MediaStudioRun, status, summary string, healthAfter any, runErr string) {
+func finishStudioRun(db *gorm.DB, run *models.MediaStudioRun, status, summary string, healthAfter any, runErr string) error {
 	now := time.Now().UTC()
 	run.Status = status
 	run.Summary = summary
@@ -558,7 +562,7 @@ func finishStudioRun(db *gorm.DB, run *models.MediaStudioRun, status, summary st
 			run.HealthAfter = datatypes.JSON(raw)
 		}
 	}
-	_ = db.Save(run).Error
+	return db.Save(run).Error
 }
 
 // studioActionInput is the ledger row payload for one considered case.
@@ -579,7 +583,7 @@ type studioActionInput struct {
 	Err              string
 }
 
-func recordStudioAction(db *gorm.DB, run *models.MediaStudioRun, in studioActionInput) *models.MediaStudioAction {
+func recordStudioAction(db *gorm.DB, run *models.MediaStudioRun, in studioActionInput) (*models.MediaStudioAction, error) {
 	now := time.Now().UTC()
 	action := models.MediaStudioAction{
 		RunID:            run.ID,
@@ -609,8 +613,10 @@ func recordStudioAction(db *gorm.DB, run *models.MediaStudioRun, in studioAction
 			action.Output = datatypes.JSON(raw)
 		}
 	}
-	_ = db.Create(&action).Error
-	return &action
+	if err := db.Create(&action).Error; err != nil {
+		return nil, err
+	}
+	return &action, nil
 }
 
 // writeStudioAutopilotAudit records human policy/pause changes in the audit log.

@@ -1,35 +1,18 @@
 package controllers
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// Opt-in PostgreSQL integration tests for the Embedding & Model Lifecycle System
-// (stage 10 Slice 6). These exercise the DB-enforced invariants that unit tests
-// cannot: one-non-terminal-campaign-per-space, unique action ownership (the
-// no-double-claim guarantee), and write fencing. Run with
-// EMBEDDING_LIFECYCLE_TEST_DATABASE_URL pointing at a DISPOSABLE test DB.
+// PostgreSQL integration tests for the Embedding & Model Lifecycle System.
 func embeddingLifecycleTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("EMBEDDING_LIFECYCLE_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set EMBEDDING_LIFECYCLE_TEST_DATABASE_URL to run PostgreSQL lifecycle integration tests")
-	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("EMBEDDING_LIFECYCLE_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
+	db := testdb.Open(t)
 	if err := db.AutoMigrate(
 		&models.EmbeddingLifecyclePolicy{}, &models.EmbeddingLifecycleRun{}, &models.EmbeddingLifecycleFinding{},
 		&models.EmbeddingCampaign{}, &models.EmbeddingCampaignAction{}, &models.EmbeddingCampaignException{},

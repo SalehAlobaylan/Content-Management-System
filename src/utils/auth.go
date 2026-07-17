@@ -53,7 +53,10 @@ func GetJWTSecret() ([]byte, error) {
 func GetJWTAllowedIssuers() []string {
 	allowed := strings.TrimSpace(os.Getenv("JWT_ALLOWED_ISSUERS"))
 	if allowed == "" {
-		return []string{"cms-service", "iam-authorization-service"}
+		// CMS accepts human identities from IAM only. CMS-issued automation
+		// credentials belong to the Aggregation trust domain and must never
+		// replay against a CMS human/admin route.
+		return []string{"iam-authorization-service"}
 	}
 
 	parts := strings.Split(allowed, ",")
@@ -66,7 +69,7 @@ func GetJWTAllowedIssuers() []string {
 		out = append(out, value)
 	}
 	if len(out) == 0 {
-		return []string{"cms-service", "iam-authorization-service"}
+		return []string{"iam-authorization-service"}
 	}
 	return out
 }
@@ -268,10 +271,10 @@ func isAllowedIssuer(issuer string) bool {
 	return slices.Contains(GetJWTAllowedIssuers(), normalized)
 }
 
-// GetJWTAllowedAudiences returns the audience allowlist from JWT_ALLOWED_AUDIENCES
-// (comma-separated). When unset, audience validation is skipped — this avoids
-// breaking tokens that legitimately omit `aud`. When set, a token must carry at
-// least one matching audience.
+// GetJWTAllowedAudiences returns the human CMS audience allowlist from
+// JWT_ALLOWED_AUDIENCES (comma-separated). Production requires this to be
+// explicitly configured; development keeps omitted-audience compatibility for
+// the local IAM stack.
 func GetJWTAllowedAudiences() []string {
 	allowed := strings.TrimSpace(os.Getenv("JWT_ALLOWED_AUDIENCES"))
 	if allowed == "" {
@@ -290,66 +293,12 @@ func GetJWTAllowedAudiences() []string {
 	return out
 }
 
-// serviceTokenIssuer / serviceTokenAudience are the identity a CMS-minted
-// service token carries. They match the defaults Aggregation's admin-auth
-// plugin trusts (iss=cms-service, aud=platform-console, role=admin), so a
-// token minted here is accepted by Aggregation's /admin/* routes without any
-// new shared config. Overridable via env for non-default deployments.
-func serviceTokenIssuer() string {
-	if v := strings.TrimSpace(os.Getenv("SERVICE_TOKEN_ISSUER")); v != "" {
-		return v
-	}
-	return "cms-service"
-}
-
-func serviceTokenAudience() string {
-	if v := strings.TrimSpace(os.Getenv("SERVICE_TOKEN_AUDIENCE")); v != "" {
-		return v
-	}
-	return "platform-console"
-}
-
-// MintServiceAdminToken issues a short-lived HS256 admin JWT for CMS→Aggregation
-// service-to-service calls made outside a user request (e.g. the Autopilot
-// scheduler, where there is no inbound Authorization header to forward). CMS
-// holds the shared JWT secret, so it can sign a token Aggregation's admin-auth
-// plugin accepts. Returns the bare token string (no "Bearer " prefix).
-func MintServiceAdminToken(tenantID string, ttl time.Duration) (string, error) {
-	secret, err := GetJWTSecret()
-	if err != nil {
-		return "", err
-	}
-	if ttl <= 0 {
-		ttl = 5 * time.Minute
-	}
-	if strings.TrimSpace(tenantID) == "" {
-		tenantID = GetDefaultTenantID()
-	}
-	now := time.Now()
-	claims := JWTClaims{
-		UserID:   "autopilot",
-		Email:    "autopilot@" + serviceTokenIssuer(),
-		TenantID: tenantID,
-		Role:     "admin",
-		Roles:    []string{"admin"},
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   "autopilot",
-			Issuer:    serviceTokenIssuer(),
-			Audience:  jwt.ClaimStrings{serviceTokenAudience()},
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
-		},
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(secret)
-}
-
-// hasAllowedAudience reports whether the claims carry an audience in the
-// allowlist. Returns true when no allowlist is configured (validation disabled).
+// hasAllowedAudience reports whether claims carry one configured CMS audience.
+// An omitted allowlist is accepted only outside production.
 func hasAllowedAudience(claims *JWTClaims) bool {
 	allowed := GetJWTAllowedAudiences()
 	if len(allowed) == 0 {
-		return true
+		return strings.ToLower(strings.TrimSpace(os.Getenv("ENV"))) != "production"
 	}
 	for _, aud := range claims.Audience {
 		normalized := strings.ToLower(strings.TrimSpace(aud))

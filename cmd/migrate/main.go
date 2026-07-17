@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,15 +23,29 @@ import (
 const ledgerTableDDL = `
 CREATE TABLE IF NOT EXISTS cms_schema_migrations (
 	version varchar(255) PRIMARY KEY,
-	applied_at timestamp NOT NULL DEFAULT now()
+	applied_at timestamp NOT NULL DEFAULT now(),
+	checksum_sha256 varchar(64),
+	execution_mode varchar(32) NOT NULL DEFAULT 'legacy'
 )`
 
 type migrationFile struct {
-	Version string
-	Path    string
+	Version  string
+	Path     string
+	Checksum string
 }
 
 var timestampedMigrationName = regexp.MustCompile(`^\d{14}_.+\.sql$`)
+
+// These immutable historical files own their own transactions. They execute
+// once outside the runner transaction; a ledger-write failure must be repaired
+// with the explicit audited baseline command, never replayed automatically.
+var legacyTransactionalMigrations = map[string]struct{}{
+	"20260711030000_embedding_space_provenance.sql": {},
+	"20260711040000_embedding_lifecycle.sql":        {},
+	"20260711050000_embedding_campaigns.sql":        {},
+	"20260712010000_ai_spend_governor.sql":          {},
+	"20260712050000_ops_command_center.sql":         {},
+}
 
 func main() {
 	var (
@@ -68,6 +84,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("read migration ledger: %v", err)
 	}
+	if err := verifyAppliedChecksums(files, applied); err != nil {
+		log.Fatalf("migration ledger checksum verification failed: %v", err)
+	}
 
 	if *status {
 		printStatus(files, applied)
@@ -90,11 +109,35 @@ func main() {
 	}
 
 	for _, file := range selected {
+		if record, exists := applied[file.Version]; exists {
+			returnFatalApplied(file, record)
+		}
 		if err := applyMigration(db, file); err != nil {
 			log.Fatalf("apply %s: %v", file.Version, err)
 		}
 		log.Printf("Applied %s", file.Version)
 	}
+}
+
+func verifyAppliedChecksums(files []migrationFile, applied map[string]migrationRecord) error {
+	byVersion := make(map[string]migrationFile, len(files))
+	for _, file := range files {
+		byVersion[file.Version] = file
+	}
+	for version, record := range applied {
+		file, exists := byVersion[version]
+		if !exists {
+			return fmt.Errorf("ledger contains migration %q missing from migrations/", version)
+		}
+		if record.Checksum != "" && record.Checksum != file.Checksum {
+			return fmt.Errorf("migration %q checksum differs from its immutable ledger record", version)
+		}
+	}
+	return nil
+}
+
+func returnFatalApplied(file migrationFile, record migrationRecord) {
+	log.Fatalf("refusing to replay applied migration %s (recorded checksum %s)", file.Version, record.Checksum)
 }
 
 func ensureLedger(db *gorm.DB) error {
@@ -112,9 +155,18 @@ func listMigrationFiles(dir string) ([]migrationFile, error) {
 		if entry.IsDir() || !timestampedMigrationName.MatchString(entry.Name()) {
 			continue
 		}
+		contents, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(string(contents)) == "" {
+			return nil, fmt.Errorf("migration %q is empty", entry.Name())
+		}
+		sum := sha256.Sum256(contents)
 		files = append(files, migrationFile{
-			Version: entry.Name(),
-			Path:    filepath.Join(dir, entry.Name()),
+			Version:  entry.Name(),
+			Path:     filepath.Join(dir, entry.Name()),
+			Checksum: hex.EncodeToString(sum[:]),
 		})
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -123,7 +175,12 @@ func listMigrationFiles(dir string) ([]migrationFile, error) {
 	return files, nil
 }
 
-func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]time.Time, through string) error {
+type migrationRecord struct {
+	AppliedAt time.Time
+	Checksum  string
+}
+
+func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]migrationRecord, through string) error {
 	through = strings.TrimSuffix(through, ".sql")
 	matched := false
 	selected := make([]migrationFile, 0)
@@ -147,8 +204,8 @@ func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]time
 				continue
 			}
 			if err := tx.Exec(
-				"INSERT INTO cms_schema_migrations (version, applied_at) VALUES (?, now()) ON CONFLICT (version) DO NOTHING",
-				file.Version,
+				"INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'adopted') ON CONFLICT (version) DO NOTHING",
+				file.Version, file.Checksum,
 			).Error; err != nil {
 				return err
 			}
@@ -158,36 +215,41 @@ func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]time
 	})
 }
 
-func appliedVersions(db *gorm.DB) (map[string]time.Time, error) {
-	rows, err := db.Raw("SELECT version, applied_at FROM cms_schema_migrations").Rows()
+func appliedVersions(db *gorm.DB) (map[string]migrationRecord, error) {
+	rows, err := db.Raw("SELECT version, applied_at, COALESCE(checksum_sha256, '') FROM cms_schema_migrations").Rows()
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	applied := make(map[string]time.Time)
+	applied := make(map[string]migrationRecord)
 	for rows.Next() {
 		var version string
 		var appliedAt time.Time
-		if err := rows.Scan(&version, &appliedAt); err != nil {
+		var checksum string
+		if err := rows.Scan(&version, &appliedAt, &checksum); err != nil {
 			return nil, err
 		}
-		applied[version] = appliedAt
+		applied[version] = migrationRecord{AppliedAt: appliedAt, Checksum: checksum}
 	}
 	return applied, rows.Err()
 }
 
-func printStatus(files []migrationFile, applied map[string]time.Time) {
+func printStatus(files []migrationFile, applied map[string]migrationRecord) {
 	for _, file := range files {
-		if appliedAt, ok := applied[file.Version]; ok {
-			fmt.Printf("applied  %s  %s\n", file.Version, appliedAt.Format(time.RFC3339))
+		if record, ok := applied[file.Version]; ok {
+			if record.Checksum != "" && record.Checksum != file.Checksum {
+				fmt.Printf("drifted  %s\n", file.Version)
+				continue
+			}
+			fmt.Printf("applied  %s  %s\n", file.Version, record.AppliedAt.Format(time.RFC3339))
 			continue
 		}
 		fmt.Printf("pending  %s\n", file.Version)
 	}
 }
 
-func selectMigrations(files []migrationFile, applied map[string]time.Time, applyAll bool, requested []string) ([]migrationFile, error) {
+func selectMigrations(files []migrationFile, applied map[string]migrationRecord, applyAll bool, requested []string) ([]migrationFile, error) {
 	if applyAll {
 		selected := make([]migrationFile, 0)
 		for _, file := range files {
@@ -210,6 +272,9 @@ func selectMigrations(files []migrationFile, applied map[string]time.Time, apply
 		if !ok {
 			return nil, fmt.Errorf("migration %q not found in migrations/", name)
 		}
+		if _, alreadyApplied := applied[file.Version]; alreadyApplied {
+			return nil, fmt.Errorf("migration %q is already applied and cannot be replayed", name)
+		}
 		selected = append(selected, file)
 	}
 	sort.Slice(selected, func(i, j int) bool {
@@ -227,14 +292,24 @@ func applyMigration(db *gorm.DB, file migrationFile) error {
 	if sql == "" {
 		return errors.New("migration file is empty")
 	}
+	_, legacy := legacyTransactionalMigrations[file.Version]
+	if regexp.MustCompile(`(?im)^\s*(BEGIN|COMMIT|ROLLBACK)\s*;`).MatchString(sql) && !legacy {
+		return errors.New("migration contains top-level transaction control; legacy migrations must be adopted through the audited baseline command")
+	}
+	if legacy {
+		if err := db.Exec(sql).Error; err != nil {
+			return err
+		}
+		return db.Exec("INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'legacy')", file.Version, file.Checksum).Error
+	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec(sql).Error; err != nil {
 			return err
 		}
 		return tx.Exec(
-			"INSERT INTO cms_schema_migrations (version, applied_at) VALUES (?, now()) ON CONFLICT (version) DO UPDATE SET applied_at = EXCLUDED.applied_at",
-			file.Version,
+			"INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'runner')",
+			file.Version, file.Checksum,
 		).Error
 	})
 }

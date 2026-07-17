@@ -1,9 +1,11 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Media Studio Clearance Autopilot — stage 6, Slice 2 (deterministic runner).
@@ -56,6 +59,32 @@ func finishStudioRunLock(tenantID string) {
 	delete(studioAutopilotRunInFlight, tenantID)
 }
 
+// tryAcquireStudioAutopilotLock keeps a PostgreSQL session advisory lock for a
+// tenant's entire run. Unlike the in-process mutex, this survives replica
+// boundaries; closing the owning session releases the lock after a crash.
+func tryAcquireStudioAutopilotLock(db *gorm.DB, tenantID string) (func(), bool) {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return func() {}, false
+	}
+	conn, err := sqlDB.Conn(context.Background())
+	if err != nil {
+		return func() {}, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("media-studio-autopilot/v1/" + tenantID))
+	key := int64(h.Sum64())
+	var acquired bool
+	if err := conn.QueryRowContext(context.Background(), "SELECT pg_try_advisory_lock($1)", key).Scan(&acquired); err != nil || !acquired {
+		_ = conn.Close()
+		return func() {}, false
+	}
+	return func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
+		_ = conn.Close()
+	}, true
+}
+
 type studioAutopilotRunOptions struct {
 	Trigger   string
 	CreatedBy string
@@ -74,41 +103,48 @@ type studioHealthSnapshot struct {
 	Headline             string         `json:"headline"`
 }
 
-func collectStudioHealth(db *gorm.DB, tenantID string, agedThresholdDays int) studioHealthSnapshot {
+func collectStudioHealth(db *gorm.DB, tenantID string, agedThresholdDays int) (studioHealthSnapshot, error) {
 	snap := studioHealthSnapshot{ByCode: map[string]int{}}
-
-	var chapters []models.Chapter
-	_ = db.Where("tenant_id = ? AND status = ? AND child_content_item_id IS NOT NULL", tenantID, chapterStatusReview).
-		Order("created_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&chapters).Error
-	snap.ReviewQueueDepth = len(chapters)
 	now := time.Now().UTC()
 	agedCutoff := now.Add(-time.Duration(agedThresholdDays) * 24 * time.Hour)
-	for i := range chapters {
-		ch := &chapters[i]
-		code := ""
-		if ch.NeedsReviewCode != nil {
-			code = *ch.NeedsReviewCode
-		}
-		if code == "" {
-			code = "unclassified"
-		}
-		snap.ByCode[code]++
-		if ch.CreatedAt.Before(agedCutoff) {
-			snap.AgedCount++
-		}
-		if i == 0 {
-			snap.OldestCaseAgeHours = now.Sub(ch.CreatedAt).Hours()
-		}
+	base := db.Model(&models.Chapter{}).
+		Where("tenant_id = ? AND status = ? AND child_content_item_id IS NOT NULL", tenantID, chapterStatusReview)
+	var aggregate struct {
+		Depth  int64
+		Aged   int64
+		Oldest *time.Time
+	}
+	if err := base.Select("COUNT(*) AS depth, COUNT(*) FILTER (WHERE created_at < ?) AS aged, MIN(created_at) AS oldest", agedCutoff).
+		Scan(&aggregate).Error; err != nil {
+		return snap, err
+	}
+	snap.ReviewQueueDepth = int(aggregate.Depth)
+	snap.AgedCount = int(aggregate.Aged)
+	if aggregate.Oldest != nil {
+		snap.OldestCaseAgeHours = now.Sub(*aggregate.Oldest).Hours()
+	}
+	var codeRows []struct {
+		Code string
+		N    int64
+	}
+	if err := base.Select("COALESCE(NULLIF(needs_review_code, ''), 'unclassified') AS code, COUNT(*) AS n").
+		Group("COALESCE(NULLIF(needs_review_code, ''), 'unclassified')").Scan(&codeRows).Error; err != nil {
+		return snap, err
+	}
+	for _, row := range codeRows {
+		snap.ByCode[row.Code] = int(row.N)
 	}
 
 	var autoRepair int64
-	_ = db.Model(&models.TranscriptQuality{}).
+	if err := db.Model(&models.TranscriptQuality{}).
 		Where("tenant_id = ? AND status = ?", tenantID, models.TranscriptQualityAutoRepair).
-		Count(&autoRepair).Error
+		Count(&autoRepair).Error; err != nil {
+		return snap, err
+	}
 	snap.TranscriptAutoRepair = int(autoRepair)
 
 	snap.Headline = studioHealthHeadline(snap)
-	return snap
+	return snap, nil
 }
 
 func studioHealthHeadline(s studioHealthSnapshot) string {
@@ -134,6 +170,23 @@ func runMediaStudioAutopilot(db *gorm.DB, tenantID string, opts studioAutopilotR
 		return models.MediaStudioRun{}, nil, errStudioAutopilotAlreadyRunning
 	}
 	defer finishStudioRunLock(tenantID)
+	releaseLock, acquired := tryAcquireStudioAutopilotLock(db, tenantID)
+	if !acquired {
+		return models.MediaStudioRun{}, nil, errStudioAutopilotAlreadyRunning
+	}
+	defer releaseLock()
+	var activeRun *models.MediaStudioRun
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if activeRun != nil {
+				if err := finishStudioRun(db, activeRun, models.StudioRunStatusFailed,
+					"Studio runner panicked; operator reconciliation required.", nil, fmt.Sprint(recovered)); err != nil {
+					activeRun.Error = fmt.Sprintf("panic: %v; failure persistence also failed: %v", recovered, err)
+				}
+			}
+			panic(recovered)
+		}
+	}()
 
 	policy := loadEffectiveMediaStudioAutopilotPolicy(db, tenantID)
 	if !policy.AutopilotEnabled {
@@ -142,6 +195,11 @@ func runMediaStudioAutopilot(db *gorm.DB, tenantID string, opts studioAutopilotR
 	// Pause gates ALL triggers, including manual (S7).
 	if policy.PausedUntil != nil && policy.PausedUntil.After(time.Now().UTC()) {
 		return models.MediaStudioRun{}, nil, errStudioAutopilotPaused
+	}
+	// Advisory locks release when a replica dies. Any row left running by that
+	// crash is history, not live ownership; recover it before opening a new run.
+	if err := recoverAbandonedStudioRuns(db, tenantID); err != nil {
+		return models.MediaStudioRun{}, nil, fmt.Errorf("recover abandoned Studio runs: %w", err)
 	}
 
 	trigger := strings.TrimSpace(opts.Trigger)
@@ -154,10 +212,24 @@ func runMediaStudioAutopilot(db *gorm.DB, tenantID string, opts studioAutopilotR
 		createdBy = "automation"
 	}
 
-	healthBefore := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
-	run, err := startStudioRun(db, tenantID, trigger, policy.AutopilotMode, createdBy, healthBefore)
+	// Create the durable run before reading the snapshot. If schema or query
+	// access has failed, operators still receive an explicit failed run rather
+	// than a misleading clear/completed result.
+	run, err := startStudioRun(db, tenantID, trigger, policy.AutopilotMode, createdBy, nil)
 	if err != nil {
 		return models.MediaStudioRun{}, nil, err
+	}
+	activeRun = run
+	healthBefore, err := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
+	if err != nil {
+		finishErr := finishStudioRun(db, run, models.StudioRunStatusFailed, "Studio health snapshot unavailable.", nil, err.Error())
+		return *run, nil, errors.Join(err, finishErr)
+	}
+	if raw, marshalErr := json.Marshal(healthBefore); marshalErr == nil {
+		run.HealthBefore = datatypes.JSON(raw)
+		if err := db.Save(run).Error; err != nil {
+			return *run, nil, err
+		}
 	}
 
 	rn := &studioRunner{
@@ -168,26 +240,63 @@ func runMediaStudioAutopilot(db *gorm.DB, tenantID string, opts studioAutopilotR
 		observe:  observe,
 	}
 
-	rn.processChapterCases()
-	rn.processTranscriptCases()
-	rn.runProposalPhase()
+	if err := rn.processChapterCases(); err != nil {
+		rn.fatalErr = fmt.Errorf("collect chapter review cases: %w", err)
+	}
+	if rn.fatalErr == nil {
+		if err := rn.processTranscriptCases(); err != nil {
+			rn.fatalErr = fmt.Errorf("collect transcript repair cases: %w", err)
+		}
+	}
+	if rn.fatalErr == nil {
+		rn.runProposalPhase()
+	}
 
-	healthAfter := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
+	healthAfter, healthErr := collectStudioHealth(db, tenantID, policy.AgedThresholdDays)
 	status := models.StudioRunStatusCompleted
-	if rn.errorCount > 0 {
+	runErr := ""
+	if rn.fatalErr != nil {
+		status = models.StudioRunStatusFailed
+		runErr = rn.fatalErr.Error()
+	} else if healthErr != nil {
+		status = models.StudioRunStatusFailed
+		runErr = healthErr.Error()
+	} else if rn.errorCount > 0 {
 		status = models.StudioRunStatusPartial
 	}
 	summary := rn.summary(healthBefore, healthAfter)
-	finishStudioRun(db, run, status, summary, healthAfter, "")
-	touchStudioLastRun(db, tenantID, time.Now().UTC())
+	if healthErr != nil {
+		summary = "Studio completion health snapshot unavailable."
+	}
+	if err := finishStudioRun(db, run, status, summary, healthAfter, runErr); err != nil {
+		return *run, nil, fmt.Errorf("finish Studio run: %w", err)
+	}
+	if err := touchStudioLastRun(db, tenantID, time.Now().UTC()); err != nil {
+		return *run, nil, fmt.Errorf("checkpoint Studio run: %w", err)
+	}
 
 	var actions []models.MediaStudioAction
-	_ = db.Where("run_id = ?", run.ID).Order("started_at ASC, id ASC").Find(&actions).Error
-	return *run, actions, nil
+	if err := db.Where("run_id = ?", run.ID).Order("started_at ASC, id ASC").Find(&actions).Error; err != nil {
+		return *run, nil, fmt.Errorf("load Studio actions: %w", err)
+	}
+	if rn.fatalErr != nil {
+		return *run, actions, rn.fatalErr
+	}
+	return *run, actions, healthErr
 }
 
-func touchStudioLastRun(db *gorm.DB, tenantID string, at time.Time) {
-	_ = db.Model(&models.MediaStudioAutopilotPolicy{}).
+func recoverAbandonedStudioRuns(db *gorm.DB, tenantID string) error {
+	now := time.Now().UTC()
+	return db.Model(&models.MediaStudioRun{}).
+		Where("tenant_id = ? AND status = ?", tenantID, "running").
+		Updates(map[string]interface{}{
+			"status": models.StudioRunStatusFailed, "finished_at": now,
+			"error": "Recovered after Studio runner ownership was lost.",
+		}).Error
+}
+
+func touchStudioLastRun(db *gorm.DB, tenantID string, at time.Time) error {
+	return db.Model(&models.MediaStudioAutopilotPolicy{}).
 		Where("tenant_id = ?", tenantID).
 		Update("last_run_at", at).Error
 }
@@ -208,8 +317,23 @@ type studioRunner struct {
 	sttRuns     int
 	errorCount  int
 	approvalCnt int
+	fatalErr    error
 
 	proposalQueue []studioProposalCase
+}
+
+// record is the side-effect boundary for runner ledger writes. A missing
+// ledger row after an apply is an integrity incident: stop processing rather
+// than retrying the action or reporting a completed run.
+func (r *studioRunner) record(in studioActionInput) *models.MediaStudioAction {
+	if r.fatalErr != nil {
+		return nil
+	}
+	action, err := recordStudioAction(r.db, r.run, in)
+	if err != nil {
+		r.fatalErr = fmt.Errorf("persist Studio action: %w", err)
+	}
+	return action
 }
 
 // studioProposalCase pairs an approval-tier ledger row with the chapter data the
@@ -237,17 +361,26 @@ func (r *studioRunner) skipStatus() string {
 	return models.StudioActionStatusSkipped
 }
 
-func (r *studioRunner) processChapterCases() {
+func (r *studioRunner) processChapterCases() error {
 	var chapters []models.Chapter
-	_ = r.db.Where("tenant_id = ? AND status = ? AND child_content_item_id IS NOT NULL", r.tenantID, chapterStatusReview).
-		Order("created_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&chapters).Error
+	if err := r.db.Where("tenant_id = ? AND status = ? AND child_content_item_id IS NOT NULL", r.tenantID, chapterStatusReview).
+		Order("created_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&chapters).Error; err != nil {
+		return err
+	}
 
 	for i := range chapters {
 		r.classifyChapter(&chapters[i])
+		if r.fatalErr != nil {
+			break
+		}
 	}
+	return nil
 }
 
 func (r *studioRunner) classifyChapter(ch *models.Chapter) {
+	if r.fatalErr != nil {
+		return
+	}
 	chID := ch.PublicID
 	var childID *uuid.UUID
 	if ch.ChildContentItemID != nil {
@@ -262,7 +395,14 @@ func (r *studioRunner) classifyChapter(ch *models.Chapter) {
 	// Load child for duration + override + stale checks.
 	var child models.ContentItem
 	if childID != nil {
-		_ = r.db.Where("public_id = ? AND tenant_id = ?", *childID, r.tenantID).First(&child).Error
+		if err := r.db.Where("public_id = ? AND tenant_id = ?", *childID, r.tenantID).First(&child).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				r.emitHoldStale(base, ch)
+				return
+			}
+			r.fatalErr = fmt.Errorf("load Studio chapter child: %w", err)
+			return
+		}
 	}
 
 	// hold_stale: child already archived/hidden while chapter lingers in review.
@@ -272,25 +412,35 @@ func (r *studioRunner) classifyChapter(ch *models.Chapter) {
 	}
 
 	// Overrides consulted before classification (§9).
-	if r.hasBlockingOverride(&child) {
+	blockingOverride, err := r.hasBlockingOverride(&child)
+	if err != nil {
+		r.fatalErr = fmt.Errorf("load Studio overrides: %w", err)
+		return
+	}
+	if blockingOverride {
 		base.Verdict = models.StudioVerdictProposeReject
 		base.ToolName = "chapter.review"
 		base.Status = models.StudioActionStatusApprovalRequired
 		base.Guardrail = models.StudioGuardOverride
 		base.Reason = "Item has a standing editorial override; human-only."
 		r.approvalCnt++
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 
 	// Dirty-workbench courtesy guard (S6): a human is actively editing the parent.
-	if r.recentlyEdited(&child) {
+	recentlyEdited, err := r.recentlyEdited(&child)
+	if err != nil {
+		r.fatalErr = fmt.Errorf("load Studio recent edits: %w", err)
+		return
+	}
+	if recentlyEdited {
 		base.Verdict = models.StudioVerdictProposeReject
 		base.ToolName = "chapter.review"
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardRecentlyEdited
 		base.Reason = "Parent recently edited in the studio; deferring."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 
@@ -349,7 +499,7 @@ func (r *studioRunner) emitHoldStale(base studioActionInput, ch *models.Chapter)
 	base.Reason = "Child superseded/archived; clearing stale review case."
 	if r.observe {
 		base.Status = models.StudioActionStatusWouldApply
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	// Guarded conditional cleanup: only if still needs_review.
@@ -366,7 +516,7 @@ func (r *studioRunner) emitHoldStale(base studioActionInput, ch *models.Chapter)
 	} else {
 		base.Status = models.StudioActionStatusSuccess
 	}
-	recordStudioAction(r.db, r.run, base)
+	r.record(base)
 }
 
 func (r *studioRunner) emitAutoReject(base studioActionInput, ch *models.Chapter) {
@@ -377,12 +527,12 @@ func (r *studioRunner) emitAutoReject(base studioActionInput, ch *models.Chapter
 	if r.clears >= r.policy.MaxClearsPerRun || r.rejects >= r.policy.MaxRejectsPerRun {
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardRejectLimit
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	if r.observe {
 		base.Status = models.StudioActionStatusWouldApply
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	out, revErr := applyAtomizedChapterReviewWithOptions(r.db, r.tenantID, ch.PublicID, false,
@@ -408,7 +558,7 @@ func (r *studioRunner) emitAutoPublishCandidate(base studioActionInput, ch *mode
 		base.Guardrail = models.StudioGuardParentContext
 		base.Reason = "Chapter parent context is unavailable; publish requires human approval."
 		r.approvalCnt++
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	if !upstreamAutoPublish {
@@ -416,7 +566,7 @@ func (r *studioRunner) emitAutoPublishCandidate(base studioActionInput, ch *mode
 		base.Guardrail = models.StudioGuardUpstreamDisabled
 		base.Reason = "Upstream auto-publish is disabled; publish requires human approval."
 		r.approvalCnt++
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	// Trust gate (H5): category must be earned.
@@ -425,20 +575,20 @@ func (r *studioRunner) emitAutoPublishCandidate(base studioActionInput, ch *mode
 		base.Guardrail = models.StudioGuardTrustGate
 		base.Reason = "merged_short has not yet earned auto-publish trust."
 		r.approvalCnt++
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	// Cap check.
 	if r.clears >= r.policy.MaxClearsPerRun || r.publishes >= r.policy.MaxPublishesPerRun {
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardPublishLimit
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	base.Reason = "merged_short earned trust; invariants pass."
 	if r.observe {
 		base.Status = models.StudioActionStatusWouldApply
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	out, revErr := applyAtomizedChapterReviewWithOptions(r.db, r.tenantID, ch.PublicID, true,
@@ -502,7 +652,7 @@ func (r *studioRunner) finalizeApply(base *studioActionInput, out *chapterReview
 		base.Err = revErr.message
 		r.errorCount++
 	}
-	recordStudioAction(r.db, r.run, *base)
+	r.record(*base)
 }
 
 // studioParentAutoPublishPolicy resolves the publication flag from the parent
@@ -535,7 +685,7 @@ func (r *studioRunner) emitProposalTier(base studioActionInput, ch *models.Chapt
 		base.Reason = fmt.Sprintf("Editorial review reason (%s); human decides.", primary)
 	}
 	r.approvalCnt++
-	action := recordStudioAction(r.db, r.run, base)
+	action := r.record(base)
 	// Queue for the LLM proposal phase (Slice 4). The row exists now; the phase
 	// attaches a draft and ranks the case once a proposal comes back.
 	if action != nil {
@@ -572,7 +722,7 @@ func (r *studioRunner) runProposalPhase() {
 	// gets its own ledger row, like the lead's tool rows.
 	if r.observe && !r.policy.ObserveProposals {
 		// Zero spend, zero side effect (S13): one would_propose phase row.
-		recordStudioAction(r.db, r.run, studioActionInput{
+		r.record(studioActionInput{
 			UnitType: models.StudioUnitChapterReview,
 			Verdict:  "proposal_phase",
 			ToolName: "proposals.generate",
@@ -602,7 +752,7 @@ func (r *studioRunner) runProposalPhase() {
 		for _, pc := range queue {
 			r.markProposalGuardrail(pc.ActionID, models.StudioGuardLLMUnavailable, "Enrichment unavailable; case left unranked.")
 		}
-		recordStudioAction(r.db, r.run, studioActionInput{
+		r.record(studioActionInput{
 			UnitType:  models.StudioUnitChapterReview,
 			Verdict:   "proposal_phase",
 			ToolName:  "proposals.generate",
@@ -632,7 +782,7 @@ func (r *studioRunner) runProposalPhase() {
 		r.attachProposal(pc.ActionID, p)
 		attached++
 	}
-	recordStudioAction(r.db, r.run, studioActionInput{
+	r.record(studioActionInput{
 		UnitType: models.StudioUnitChapterReview,
 		Verdict:  "proposal_phase",
 		ToolName: "proposals.generate",
@@ -727,22 +877,50 @@ func (r *studioRunner) markProposalGuardrail(actionID uint, guardrail, note stri
 // Transcript cases (V1: rerun_stt only — H3)
 // ---------------------------------------------------------------
 
-func (r *studioRunner) processTranscriptCases() {
+func (r *studioRunner) processTranscriptCases() error {
 	var qualities []models.TranscriptQuality
-	_ = r.db.Where("tenant_id = ? AND status = ?", r.tenantID, models.TranscriptQualityAutoRepair).
-		Order("computed_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&qualities).Error
+	if err := r.db.Where("tenant_id = ? AND status = ?", r.tenantID, models.TranscriptQualityAutoRepair).
+		Order("computed_at ASC").Limit(studioAutopilotMaxCaseScan).Find(&qualities).Error; err != nil {
+		return err
+	}
 
 	for i := range qualities {
 		r.classifyTranscriptCase(qualities[i])
+		if r.fatalErr != nil {
+			break
+		}
+	}
+	return nil
+}
+
+type studioTranscriptRepairSnapshot struct {
+	QualityID     uuid.UUID
+	ContentItemID uuid.UUID
+	TranscriptID  uuid.UUID
+	ObservedState string
+}
+
+func studioTranscriptRepairSnapshotFromQuality(quality models.TranscriptQuality) studioTranscriptRepairSnapshot {
+	return studioTranscriptRepairSnapshot{
+		QualityID: quality.PublicID, ContentItemID: quality.ContentItemID,
+		TranscriptID: quality.TranscriptID, ObservedState: quality.Status,
 	}
 }
+
+var errStudioTranscriptSnapshotStale = errors.New("studio transcript quality snapshot is stale")
+var errStudioTranscriptJobInFlight = errors.New("studio transcript repair already has a job in flight")
 
 // classifyTranscriptCase carries the exact quality observation into admission;
 // a quality row is not merely a content-id hint because transcription may have
 // been replaced or repaired between collection and action.
 func (r *studioRunner) classifyTranscriptCase(observed models.TranscriptQuality) {
-	var item models.ContentItem
-	if err := r.db.Where("public_id = ? AND tenant_id = ?", observed.ContentItemID, r.tenantID).First(&item).Error; err != nil {
+	snapshot := studioTranscriptRepairSnapshotFromQuality(observed)
+	item, snapshotErr := inspectStudioTranscriptRepairSnapshot(r.db, r.tenantID, snapshot)
+	if snapshotErr != nil && !errors.Is(snapshotErr, errStudioTranscriptSnapshotStale) && !errors.Is(snapshotErr, errStudioTranscriptJobInFlight) {
+		r.fatalErr = fmt.Errorf("inspect Studio transcript snapshot: %w", snapshotErr)
+		return
+	}
+	if snapshotErr != nil && item.ID == 0 {
 		return
 	}
 	cid := item.PublicID
@@ -751,32 +929,20 @@ func (r *studioRunner) classifyTranscriptCase(observed models.TranscriptQuality)
 		ContentItemID: &cid,
 		ToolName:      "transcript.rerun_stt",
 	}
-	if observed.Status != models.TranscriptQualityAutoRepair || item.TranscriptID == nil || *item.TranscriptID != observed.TranscriptID {
+	if errors.Is(snapshotErr, errStudioTranscriptSnapshotStale) {
 		base.Verdict = models.StudioVerdictRerunSTT
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardStaleness
 		base.Reason = "Transcript quality observation is stale; skipping STT admission."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
-	var currentQuality models.TranscriptQuality
-	if err := r.db.Where("public_id = ? AND tenant_id = ? AND content_item_id = ? AND transcript_id = ? AND status = ?",
-		observed.PublicID, r.tenantID, observed.ContentItemID, observed.TranscriptID, models.TranscriptQualityAutoRepair).First(&currentQuality).Error; err != nil {
-		base.Verdict = models.StudioVerdictRerunSTT
-		base.Status = r.skipStatus()
-		base.Guardrail = models.StudioGuardStaleness
-		base.Reason = "Transcript quality observation changed; skipping STT admission."
-		recordStudioAction(r.db, r.run, base)
-		return
-	}
-
-	// In-flight job → blocked (S12 belt-and-suspenders).
-	if hasActiveTranscriptionJob(r.db, item.PublicID) {
+	if errors.Is(snapshotErr, errStudioTranscriptJobInFlight) {
 		base.Verdict = models.StudioVerdictBlockedJobInFlight
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardJobInFlight
 		base.Reason = "A transcription job is already in flight for this item."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 
@@ -786,41 +952,146 @@ func (r *studioRunner) classifyTranscriptCase(observed models.TranscriptQuality)
 		base.Status = r.skipStatus()
 		base.Guardrail = models.StudioGuardSTTLimit
 		base.Reason = "Per-run STT cap reached."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	if r.observe {
-		base.Status = models.StudioActionStatusWouldApply
-		base.Reason = "Quality auto_repair; would re-run STT."
-		recordStudioAction(r.db, r.run, base)
+		admit, reason := evaluateSTTAdmissionReadOnly(r.db, &item, models.TranscriptionTriggerStudioAutopilot)
+		if !admit {
+			base.Status = r.skipStatus()
+			base.Guardrail = studioSTTGuardrail(reason)
+			base.Reason = reason
+		} else {
+			base.Status = models.StudioActionStatusWouldApply
+			base.Reason = "Quality auto_repair; would re-run STT."
+		}
+		r.record(base)
 		return
 	}
 
 	// Single choke point (S11): the existing guarded trigger path enforces the
 	// monthly STT budget identically to humans; budget cap surfaces as a skip.
-	_, err := triggerTranscription(&item, r.db, false, models.TranscriptionTriggerStudioAutopilot)
+	_, err := triggerStudioTranscriptRepairSnapshot(r.db, r.tenantID, snapshot)
 	switch {
 	case err == nil:
 		base.Status = models.StudioActionStatusSuccess
 		base.STTImpact = 1
 		r.sttRuns++
 		base.Reason = "Re-ran STT on auto_repair transcript; re-atomization remains pending verified completion."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	case isSTTSkipped(err):
 		base.Status = models.StudioActionStatusSkipped
-		if strings.Contains(strings.ToLower(err.Error()), "budget") {
-			base.Guardrail = models.StudioGuardBudget
-		} else {
-			base.Guardrail = models.StudioGuardJobInFlight
-		}
+		base.Guardrail = studioSTTGuardrail(err.Error())
 		base.Reason = err.Error()
 	default:
 		base.Status = models.StudioActionStatusError
 		base.Err = err.Error()
 		r.errorCount++
 	}
-	recordStudioAction(r.db, r.run, base)
+	r.record(base)
+}
+
+func inspectStudioTranscriptRepairSnapshot(db *gorm.DB, tenantID string, snapshot studioTranscriptRepairSnapshot) (models.ContentItem, error) {
+	var item models.ContentItem
+	if snapshot.ObservedState != models.TranscriptQualityAutoRepair {
+		return item, errStudioTranscriptSnapshotStale
+	}
+	if err := db.Where("public_id = ? AND tenant_id = ?", snapshot.ContentItemID, tenantID).First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, errStudioTranscriptSnapshotStale
+		}
+		return item, err
+	}
+	if item.TranscriptID == nil || *item.TranscriptID != snapshot.TranscriptID {
+		return item, errStudioTranscriptSnapshotStale
+	}
+	var quality models.TranscriptQuality
+	if err := db.Where("public_id = ? AND tenant_id = ? AND content_item_id = ? AND transcript_id = ? AND status = ?",
+		snapshot.QualityID, tenantID, snapshot.ContentItemID, snapshot.TranscriptID, models.TranscriptQualityAutoRepair).First(&quality).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return item, errStudioTranscriptSnapshotStale
+		}
+		return item, err
+	}
+	var active int64
+	if err := db.Model(&models.TranscriptionJob{}).
+		Where("content_item_id = ? AND status IN ?", item.PublicID, []string{models.TranscriptionJobStatusQueued, models.TranscriptionJobStatusRunning}).
+		Count(&active).Error; err != nil {
+		return item, err
+	}
+	if active > 0 {
+		return item, errStudioTranscriptJobInFlight
+	}
+	return item, nil
+}
+
+func triggerStudioTranscriptRepairSnapshot(db *gorm.DB, tenantID string, snapshot studioTranscriptRepairSnapshot) (string, error) {
+	item, job, triggered, reason, kind, err := claimStudioTranscriptRepairSnapshot(db, tenantID, snapshot)
+	if err != nil {
+		return "", err
+	}
+	if !triggered {
+		return "", &sttSkippedError{reason: reason, kind: kind}
+	}
+	jobID := job.PublicID.String()
+	if err := submitTranscriptionJobToMedia(db, &item, jobID); err != nil {
+		return jobID, err
+	}
+	return jobID, nil
+}
+
+// claimStudioTranscriptRepairSnapshot atomically proves that the collected
+// quality observation still owns the item, then creates the normal queued STT
+// job (the durable claim) through the established admission/budget code.
+func claimStudioTranscriptRepairSnapshot(db *gorm.DB, tenantID string, snapshot studioTranscriptRepairSnapshot) (models.ContentItem, models.TranscriptionJob, bool, string, sttSkipKind, error) {
+	var item models.ContentItem
+	var job models.TranscriptionJob
+	var triggered bool
+	var reason string
+	var kind sttSkipKind
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var quality models.TranscriptQuality
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ? AND content_item_id = ? AND transcript_id = ? AND status = ?",
+				snapshot.QualityID, tenantID, snapshot.ContentItemID, snapshot.TranscriptID, models.TranscriptQualityAutoRepair).First(&quality).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errStudioTranscriptSnapshotStale
+			}
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ? AND transcript_id = ?", snapshot.ContentItemID, tenantID, snapshot.TranscriptID).First(&item).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return errStudioTranscriptSnapshotStale
+			}
+			return err
+		}
+		var active int64
+		if err := tx.Model(&models.TranscriptionJob{}).Where("content_item_id = ? AND status IN ?", item.PublicID, []string{models.TranscriptionJobStatusQueued, models.TranscriptionJobStatusRunning}).Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return errStudioTranscriptJobInFlight
+		}
+		var claimErr error
+		job, triggered, reason, kind, claimErr = createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerStudioAutopilot, false)
+		return claimErr
+	})
+	if err != nil {
+		return item, job, false, "", sttSkipNone, err
+	}
+	return item, job, triggered, reason, kind, nil
+}
+
+func studioSTTGuardrail(reason string) string {
+	if strings.Contains(strings.ToLower(reason), "budget") {
+		return models.StudioGuardBudget
+	}
+	if strings.Contains(strings.ToLower(reason), "stale") {
+		return models.StudioGuardStaleness
+	}
+	return models.StudioGuardJobInFlight
 }
 
 // maybeEmitReatomize emits an atomize_now recommendation into the lead's ledger
@@ -840,7 +1111,7 @@ func (r *studioRunner) maybeEmitReatomize(item *models.ContentItem) {
 	}
 	if r.observe {
 		base.Status = models.StudioActionStatusWouldApply
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	rec := emitReatomizeRecommendation(r.db, r.tenantID, item)
@@ -848,26 +1119,39 @@ func (r *studioRunner) maybeEmitReatomize(item *models.ContentItem) {
 		base.Status = models.StudioActionStatusSkipped
 		base.Guardrail = models.StudioGuardStaleness
 		base.Reason = "No recommendation emitted (ineligible or already pending)."
-		recordStudioAction(r.db, r.run, base)
+		r.record(base)
 		return
 	}
 	recID := rec.PublicID
 	base.RecommendationID = &recID
 	base.Status = models.StudioActionStatusSuccess
-	recordStudioAction(r.db, r.run, base)
+	r.record(base)
 }
 
 // ---------------------------------------------------------------
 // Overrides, recent-edit, summary helpers
 // ---------------------------------------------------------------
 
-func (r *studioRunner) hasBlockingOverride(child *models.ContentItem) bool {
-	return hasStudioBlockingOverride(r.db, r.tenantID, child)
+func (r *studioRunner) hasBlockingOverride(child *models.ContentItem) (bool, error) {
+	if child == nil || child.ID == 0 {
+		return false, nil
+	}
+	subjects := []uuid.UUID{child.PublicID}
+	if child.ParentContentItemID != nil {
+		subjects = append(subjects, *child.ParentContentItemID)
+	}
+	var count int64
+	err := r.db.Model(&models.MediaCirculationOverride{}).
+		Where("tenant_id = ? AND subject_id IN ? AND override_type IN ? AND (expires_at IS NULL OR expires_at > ?)",
+			r.tenantID, subjects,
+			[]string{models.MediaCirculationOverrideEditorialHold, models.MediaCirculationOverrideNoAtomize}, time.Now().UTC()).
+		Count(&count).Error
+	return count > 0, err
 }
 
-func (r *studioRunner) recentlyEdited(child *models.ContentItem) bool {
+func (r *studioRunner) recentlyEdited(child *models.ContentItem) (bool, error) {
 	if r.policy.DirtyWorkbenchMinutes <= 0 || child == nil || child.ID == 0 {
-		return false
+		return false, nil
 	}
 	cutoff := time.Now().UTC().Add(-time.Duration(r.policy.DirtyWorkbenchMinutes) * time.Minute)
 	resources := []string{child.PublicID.String()}
@@ -875,13 +1159,13 @@ func (r *studioRunner) recentlyEdited(child *models.ContentItem) bool {
 		resources = append(resources, child.ParentContentItemID.String())
 	}
 	var count int64
-	_ = r.db.Model(&models.AuditLog{}).
+	err := r.db.Model(&models.AuditLog{}).
 		Where("tenant_id = ? AND target_resource IN ? AND user_email <> ? AND action IN ? AND created_at > ?",
 			r.tenantID, resources, models.StudioAuditPrincipal,
 			[]string{"media_studio.chapters_save", "media_studio.transcript_edit", "media_studio.transcript_approve"},
 			cutoff).
 		Count(&count).Error
-	return count > 0
+	return count > 0, err
 }
 
 func (r *studioRunner) summary(before, after studioHealthSnapshot) string {

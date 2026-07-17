@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+
+	"github.com/google/uuid"
 )
 
 func TestStudioRunnerDoesNotEmitReatomizeAtSTTAdmission(t *testing.T) {
@@ -17,6 +19,14 @@ func TestStudioRunnerDoesNotEmitReatomizeAtSTTAdmission(t *testing.T) {
 	}
 	if strings.Contains(string(data), "r.maybeEmitReatomize(&item)") {
 		t.Fatal("STT admission must not emit a re-atomization recommendation before verified completion")
+	}
+}
+
+func TestStudioTranscriptRepairSnapshotCarriesImmutableIdentity(t *testing.T) {
+	quality := models.TranscriptQuality{PublicID: uuid.New(), ContentItemID: uuid.New(), TranscriptID: uuid.New(), Status: models.TranscriptQualityAutoRepair}
+	snapshot := studioTranscriptRepairSnapshotFromQuality(quality)
+	if snapshot.QualityID != quality.PublicID || snapshot.ContentItemID != quality.ContentItemID || snapshot.TranscriptID != quality.TranscriptID || snapshot.ObservedState != quality.Status {
+		t.Fatalf("snapshot lost immutable quality identity: %+v", snapshot)
 	}
 }
 

@@ -13,12 +13,16 @@ import (
 
 // generateTestJWT creates a JWT token compatible with CMS's ParseJWT for testing.
 func generateTestJWT(t *testing.T, userID, email, role string, permissions []string) string {
+	return generateTenantTestJWT(t, userID, email, "default", role, permissions)
+}
+
+func generateTenantTestJWT(t *testing.T, userID, email, tenantID, role string, permissions []string) string {
 	t.Helper()
 	now := time.Now()
 	claims := utils.JWTClaims{
 		UserID:      userID,
 		Email:       email,
-		TenantID:    "default",
+		TenantID:    tenantID,
 		Role:        role,
 		Roles:       []string{role},
 		Permissions: permissions,

@@ -338,7 +338,7 @@ func evaluatePendingFeedIntegrityRuns(db *gorm.DB) {
 		return
 	}
 	var runs []models.FeedIntegrityRun
-	db.Where("status IN ? AND autopilot_evaluated_at IS NULL", []string{models.FeedIntegrityRunCompleted, models.FeedIntegrityRunPartial}).Order("started_at ASC").Limit(20).Find(&runs)
+	db.Where("status = ? AND autopilot_evaluated_at IS NULL", models.FeedIntegrityRunCompleted).Order("started_at ASC").Limit(20).Find(&runs)
 	for _, run := range runs {
 		if err := evaluateFeedIntegrityAutopilot(db, run.ID); err != nil {
 			_ = db.Model(&models.FeedIntegrityRun{}).Where("id=?", run.ID).Updates(map[string]interface{}{"autopilot_error_class": "evaluation_failed", "updated_at": time.Now().UTC()}).Error
@@ -548,7 +548,7 @@ func feedIntegrityAutopilotStatus(db *gorm.DB, tenant string) gin.H {
 	var latest models.FeedIntegrityRun
 	_ = db.Where("tenant_id=?", tenant).Order("started_at DESC").First(&latest).Error
 	var pending, stuck int64
-	db.Model(&models.FeedIntegrityRun{}).Where("tenant_id=? AND status IN ? AND autopilot_evaluated_at IS NULL", tenant, []string{models.FeedIntegrityRunCompleted, models.FeedIntegrityRunPartial}).Count(&pending)
+	db.Model(&models.FeedIntegrityRun{}).Where("tenant_id=? AND status = ? AND autopilot_evaluated_at IS NULL", tenant, models.FeedIntegrityRunCompleted).Count(&pending)
 	db.Model(&models.FeedIntegrityAction{}).Where("tenant_id=? AND outcome IN ? AND updated_at < ?", tenant, []string{models.FeedIntegrityActionClaimed, models.FeedIntegrityActionRunning, models.FeedIntegrityActionVerifying}, time.Now().UTC().Add(-5*time.Minute)).Count(&stuck)
 	var actions []models.FeedIntegrityAction
 	db.Where("tenant_id=?", tenant).Order("created_at DESC").Limit(20).Find(&actions)
@@ -650,7 +650,7 @@ func RunFeedIntegrityAutopilotNow(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var run models.FeedIntegrityRun
-	if db.Where("tenant_id=? AND status IN ?", principal.TenantID, []string{models.FeedIntegrityRunCompleted, models.FeedIntegrityRunPartial}).Order("started_at DESC").First(&run).Error != nil {
+	if db.Where("tenant_id=? AND status = ?", principal.TenantID, models.FeedIntegrityRunCompleted).Order("started_at DESC").First(&run).Error != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no eligible feed integrity run"})
 		return
 	}

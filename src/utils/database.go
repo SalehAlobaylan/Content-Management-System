@@ -12,18 +12,8 @@ import (
 
 // ConnectDB connects to PostgreSQL using DATABASE_URL environment variable
 func ConnectDB() (*gorm.DB, error) {
-	env := os.Getenv("ENV")
-
 	// Get connection string from DATABASE_URL (required)
 	dsn := getDatabaseURL()
-
-	// In development, try to ensure the database exists
-	if env == "development" || env == "dev" || env == "" {
-		if err := ensureDatabaseExistsFromURL(dsn); err != nil {
-			// Log but don't fail - database might already exist
-			fmt.Printf("Warning: Could not ensure database exists: %v\n", err)
-		}
-	}
 
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  dsn,
@@ -33,11 +23,27 @@ func ConnectDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	// Ensure required PostgreSQL extensions
-	_ = db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error
-	_ = db.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error
-
 	return db, nil
+}
+
+// CheckSchemaReadiness performs only read-only checks. Schema creation and
+// repair belong to the canonical migration runner, never to service startup.
+func CheckSchemaReadiness(db *gorm.DB) error {
+	var missing int
+	if err := db.Raw(`SELECT COUNT(*) FROM pg_extension WHERE extname IN ('pgcrypto', 'vector')`).Scan(&missing).Error; err != nil {
+		return fmt.Errorf("read required extension state: %w", err)
+	}
+	if missing != 2 {
+		return fmt.Errorf("required PostgreSQL extensions pgcrypto and vector are not installed; apply canonical CMS migrations")
+	}
+	var ledger bool
+	if err := db.Raw(`SELECT to_regclass('public.cms_schema_migrations') IS NOT NULL`).Scan(&ledger).Error; err != nil {
+		return fmt.Errorf("read migration ledger state: %w", err)
+	}
+	if !ledger {
+		return fmt.Errorf("CMS migration ledger is missing; apply canonical CMS migrations")
+	}
+	return nil
 }
 
 // EnsureTenantScopeColumns applies an idempotent tenant-scope patch for legacy schemas.

@@ -98,7 +98,7 @@ func GetForYouFeed(c *gin.Context) {
 	if config.IsActive {
 		// Fetch items for ranking — try time window first, then fall back to all
 		var allItems []models.ContentItem
-		baseQuery := forYouEligibleMediaQuery(db, atomizedFeedSchema)
+		baseQuery := forYouEligibleMediaQuery(db, "default", atomizedFeedSchema)
 		baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
 
 		// First try: items from the configured freshness window (minimum 30 days)
@@ -235,7 +235,7 @@ func GetForYouFeed(c *gin.Context) {
 	// Query for VIDEO and PODCAST content with a valid media URL.
 	// Use COALESCE(published_at, created_at) so items with NULL published_at
 	// are still ordered and reachable by cursor pagination.
-	query := forYouEligibleMediaQuery(db, atomizedFeedSchema).
+	query := forYouEligibleMediaQuery(db, "default", atomizedFeedSchema).
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 	query = applyDurationPreference(query, durationTargetMinutes)
 
@@ -263,7 +263,7 @@ func GetForYouFeed(c *gin.Context) {
 	}
 	items = excludeCollapsedRedundancyMembers(db, "default", items)
 	if config.ShowWatchedWhenUnseenExhausted && len(items) == 0 && len(seenIDs) > 0 && !hasCursor(pagination) {
-		query = forYouEligibleMediaQuery(db, atomizedFeedSchema).
+		query = forYouEligibleMediaQuery(db, "default", atomizedFeedSchema).
 			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 		query = applyDurationPreference(query, durationTargetMinutes)
 		if err := query.Limit(pagination.Limit + 1).Find(&items).Error; err != nil {
@@ -434,7 +434,7 @@ func GetNewsFeed(c *gin.Context) {
 		return seenIDs
 	}
 	slides, nextCursor, serveMeta := serveStoryNewsFeed(
-		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr,
+		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
 	)
 	if isFeedIntegritySynthetic(c) {
 		c.Header("X-Wahb-Feed-Source", serveMeta.Source)
@@ -543,7 +543,7 @@ func supportsStorageStateSchema(db *gorm.DB) bool {
 	return db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
 }
 
-func forYouEligibleMediaQuery(db *gorm.DB, atomizedFeedSchema bool) *gorm.DB {
+func forYouEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema bool) *gorm.DB {
 	storageUnavailableStates := []string{
 		models.StorageStateRecoverableDeleted,
 		models.StorageStateMissing,
@@ -552,6 +552,7 @@ func forYouEligibleMediaQuery(db *gorm.DB, atomizedFeedSchema bool) *gorm.DB {
 	}
 	if !atomizedFeedSchema {
 		q := db.Model(&models.ContentItem{}).
+			Where("tenant_id = ?", tenantID).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
 			Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).
@@ -563,6 +564,7 @@ func forYouEligibleMediaQuery(db *gorm.DB, atomizedFeedSchema bool) *gorm.DB {
 	}
 
 	q := db.Model(&models.ContentItem{}).
+		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
 		Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).

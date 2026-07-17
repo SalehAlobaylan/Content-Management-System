@@ -218,7 +218,7 @@ func TestForYouEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T
 		t.Fatalf("open gorm: %v", err)
 	}
 
-	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), false).Find(&[]models.ContentItem{})
+	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", false).Find(&[]models.ContentItem{})
 	sql := query.Statement.SQL.String()
 	if ok, err := regexp.MatchString(`duration_sec IS NOT NULL AND duration_sec BETWEEN \$[0-9]+ AND \$[0-9]+`, sql); err != nil || !ok {
 		t.Fatalf("query does not enforce duration floor and ceiling: %s", sql)
@@ -255,7 +255,7 @@ func TestForYouEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testin
 		t.Fatalf("open gorm: %v", err)
 	}
 
-	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), true).Find(&[]models.ContentItem{})
+	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", true).Find(&[]models.ContentItem{})
 	sql := query.Statement.SQL.String()
 	if !strings.Contains(sql, "is_feed_unit = TRUE") || !strings.Contains(sql, "feed_visibility =") {
 		t.Fatalf("atomized query does not require visible feed units: %s", sql)

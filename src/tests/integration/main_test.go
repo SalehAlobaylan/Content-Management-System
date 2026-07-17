@@ -3,51 +3,53 @@ package integration
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/routes"
-	"content-management-system/src/utils"
+	"content-management-system/src/tests/testdb"
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/joho/godotenv/autoload"
 	"gorm.io/gorm"
 )
 
 var (
-	testDB *gorm.DB
-	router *gin.Engine
+	testDB             *gorm.DB
+	router             *gin.Engine
+	integrationCleanup func() error
 )
 
 func TestMain(m *testing.M) {
-	fmt.Println("🚀 Starting integration tests...")
-	setup()
+	if err := setup(); err != nil {
+		fmt.Fprintln(os.Stderr, "integration test setup failed:", err)
+		cleanup()
+		os.Exit(1)
+	}
 	code := m.Run()
 	cleanup()
-	fmt.Printf("✅ Integration tests completed with exit code: %d\n", code)
 	os.Exit(code)
 }
 
-func setup() {
-	fmt.Println("🔧 Setting up test environment...")
+func setup() error {
 	gin.SetMode(gin.TestMode)
 	os.Setenv("JWT_SECRET", "test_secret")
+	os.Setenv("CMS_SERVICE_TOKEN", "")
+	os.Setenv("CMS_AGGREGATION_SERVICE_TOKEN", integrationAggregationToken)
+	os.Setenv("CMS_ENRICHMENT_SERVICE_TOKEN", integrationEnrichmentToken)
+	os.Setenv("CMS_MEDIA_SERVICE_TOKEN", integrationMediaToken)
 
-	// Set DATABASE_URL for tests if not already set
-	if os.Getenv("DATABASE_URL") == "" {
-		// Default test database connection
-		os.Setenv("DATABASE_URL", "postgres://postgres:927319@localhost:5433/cms_test?sslmode=disable")
-	}
-
-	fmt.Printf("📊 Connecting to test database: %s\n", os.Getenv("DATABASE_URL"))
-
+	// testdb validates before opening a connection and creates a fresh database
+	// whenever the CI/local admin URL is available. It never reads service .env.
+	var cleanupFn func() error
 	var err error
-	testDB, err = utils.ConnectDB()
+	testDB, cleanupFn, err = testdb.OpenForMain()
 	if err != nil {
-		log.Fatalf("failed to connect test database: %v", err)
+		return errors.New("failed to connect disposable integration database")
 	}
+	integrationCleanup = cleanupFn
 
-	fmt.Println("🔄 Running database migrations...")
+	// Temporary test schema only. Plan 091 replaces this with canonical
+	// migrations; this fixture does not claim migration coverage.
 	if err := testDB.AutoMigrate(
 		&models.Page{},
 		&models.Media{},
@@ -55,11 +57,14 @@ func setup() {
 		// Wahb Platform models
 		&models.ContentItem{},
 		&models.Transcript{},
+		&models.TranscriptQuality{},
 		&models.UserInteraction{},
 		&models.ContentSource{},
 		// Phase 13 — story feed
 		&models.RankingConfig{},
 		&models.ContentFlag{},
+		// Temporary fixture support for internal vector write fencing.
+		&models.EmbeddingCampaign{},
 		&models.Story{},
 		&models.NewsSnapshot{},
 		&models.NewsCirculationPolicy{},
@@ -70,10 +75,9 @@ func setup() {
 		&models.MediaIntelligenceScore{},
 		&models.MediaDemandStat{},
 	); err != nil {
-		log.Fatalf("failed to migrate test database: %v", err)
+		return errors.New("failed to prepare disposable integration schema")
 	}
 
-	fmt.Println("🌐 Setting up test router and routes...")
 	router = gin.Default()
 	router.Use(func(c *gin.Context) {
 		c.Set("db", testDB)
@@ -89,41 +93,16 @@ func setup() {
 	routes.SetupInteractionRoutes(v1, testDB)
 	routes.SetupContentRoutes(v1, testDB)
 	routes.SetupAdminAuthRoutes(router, testDB)
-	fmt.Println("✅ Test environment setup complete!")
+	routes.SetupInternalRoutes(router, testDB)
+	return nil
 }
 
 func cleanup() {
-	fmt.Println("🧹 Cleaning up test environment...")
-	if testDB == nil {
-		return
+	if integrationCleanup != nil {
+		if err := integrationCleanup(); err != nil {
+			fmt.Fprintln(os.Stderr, "integration database cleanup failed:", err)
+		}
 	}
-	m := testDB.Migrator()
-	// Wahb Platform tables
-	_ = m.DropTable(&models.MediaDemandStat{})
-	_ = m.DropTable(&models.MediaIntelligenceScore{})
-	_ = m.DropTable(&models.SourceCirculationRecommendation{})
-	_ = m.DropTable(&models.SourceRunTelemetry{})
-	_ = m.DropTable(&models.NewsStoryOverride{})
-	_ = m.DropTable(&models.NewsCirculationPolicy{})
-	_ = m.DropTable(&models.NewsSnapshot{})
-	_ = m.DropTable(&models.Story{})
-	_ = m.DropTable(&models.ContentFlag{})
-	_ = m.DropTable(&models.RankingConfig{})
-	_ = m.DropTable(&models.UserInteraction{})
-	_ = m.DropTable(&models.Transcript{})
-	_ = m.DropTable(&models.ContentItem{})
-	_ = m.DropTable(&models.ContentSource{})
-	// Original CMS tables
-	_ = m.DropTable("post_media")
-	_ = m.DropTable(&models.Post{})
-	_ = m.DropTable(&models.Media{})
-	_ = m.DropTable(&models.Page{})
-
-	if sqlDB, err := testDB.DB(); err == nil {
-		_ = sqlDB.Close()
-		fmt.Println("📊 Database connection closed")
-	}
-	fmt.Println("✅ Cleanup complete!")
 }
 
 func setDefaultEnvIfEmpty(key, value string) {
@@ -140,7 +119,6 @@ func getEnvOrDefault(key, defaultValue string) string {
 }
 
 func clearTables() {
-	fmt.Println("🗑️  Clearing test tables...")
 	if testDB == nil {
 		return
 	}
@@ -148,29 +126,4 @@ func clearTables() {
 	_ = testDB.Exec("DELETE FROM posts").Error
 	_ = testDB.Exec("DELETE FROM media").Error
 	_ = testDB.Exec("DELETE FROM pages").Error
-	fmt.Println("✅ Tables cleared")
 }
-
-/*
-TESTING HINTS:
-1. Database Connection:
-   - Use a separate test database
-   - Consider environment variables for credentials
-   - Handle connection errors properly
-
-2. Table Management:
-   - Drop tables in correct order (foreign key constraints)
-   - Clear data between tests
-   - Consider using transactions for tests
-
-3. Error Handling:
-   - Log setup/cleanup errors
-   - Ensure proper resource cleanup
-   - Handle database operation errors
-
-4. Best Practices:
-   - Use constants for connection strings
-   - Consider test helper functions
-   - Add proper logging for debugging
-   - Document any required setup steps
-*/

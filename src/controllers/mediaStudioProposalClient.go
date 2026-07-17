@@ -76,7 +76,9 @@ func generateChapterProposalsViaEnrichment(items []studioProposalItem) (map[stri
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	client := &http.Client{Timeout: 90 * time.Second}
+	// Enrichment bounds each case to 12s with concurrency three; 75s leaves
+	// response overhead while retaining partial valid results from the batch.
+	client := &http.Client{Timeout: 75 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("enrichment chapter-proposal request failed: %w", err)

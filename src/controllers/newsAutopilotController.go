@@ -1056,6 +1056,9 @@ func callAggregationInternal(method, path string, payload interface{}) ([]byte, 
 }
 
 func aggregationInternalServiceToken() string {
+	if token := strings.TrimSpace(os.Getenv("AGGREGATION_CMS_SERVICE_TOKEN")); token != "" {
+		return token
+	}
 	if token := strings.TrimSpace(os.Getenv("AGGREGATION_SERVICE_TOKEN")); token != "" {
 		return token
 	}

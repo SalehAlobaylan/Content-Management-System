@@ -61,6 +61,68 @@ type internalUpdateContentItemRequest struct {
 	Metadata    map[string]interface{} `json:"metadata"`
 }
 
+// internalEnrichmentMetadataRequest is intentionally narrow: Enrichment owns
+// only generated summaries, key points, and language-specific translations.
+// It must not receive a general metadata replacement capability.
+type internalEnrichmentMetadataRequest struct {
+	Fields map[string]interface{} `json:"fields"`
+}
+
+func validEnrichmentMetadataField(key string, value interface{}) bool {
+	if key == "summary" {
+		_, ok := value.(string)
+		return ok
+	}
+	if key == "key_points" {
+		_, ok := value.([]interface{})
+		return ok
+	}
+	if strings.HasPrefix(key, "translation_") && len(key) > len("translation_") {
+		_, ok := value.(string)
+		return ok
+	}
+	return false
+}
+
+// InternalMergeEnrichmentMetadata atomically merges Enrichment-owned fields
+// into metadata. The JSONB operation preserves ingest/artifact keys even when
+// the two services write concurrently.
+func InternalMergeEnrichmentMetadata(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content ID"})
+		return
+	}
+	var req internalEnrichmentMetadataRequest
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Fields) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid enrichment metadata"})
+		return
+	}
+	for key, value := range req.Fields {
+		if !validEnrichmentMetadataField(key, value) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported enrichment metadata field"})
+			return
+		}
+	}
+	raw, err := json.Marshal(req.Fields)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid enrichment metadata"})
+		return
+	}
+	result := db.Model(&models.ContentItem{}).Where("public_id = ?", id).
+		UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
+	if result.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to merge enrichment metadata"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "fields": req.Fields})
+}
+
 type internalUpdateStatusRequest struct {
 	Status           string  `json:"status"`
 	FailureReason    *string `json:"failure_reason"`
@@ -660,25 +722,25 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
-// ─── Slice A: hybrid retrieval endpoints ────────────────────────────
+// ─── Dense related-content retrieval endpoints ──────────────────────
 //
-// Three internal endpoints support Enrichment-Service's /v1/related:
-//   1. InternalGetContentEmbeddings — fetch the (dense, sparse) tuple for
-//      an anchor content_id so /v1/related can run hybrid kNN without
+// Two active internal endpoints support Enrichment-Service's /v1/related:
+//   1. InternalGetContentEmbeddings — fetch the dense vector for
+//      an anchor content_id so /v1/related can run dense kNN without
 //      re-embedding what's already stored.
 //   2. InternalKNNDense  — pgvector cosine kNN against `embedding`.
-//   3. InternalKNNSparse — sparsevec inner-product kNN against
-//      `embedding_sparse`.
+// InternalKNNSparse remains as a migration-compatibility endpoint only and
+// is not part of the active retrieval path.
 //
 // All three are POST (kNN payloads carry 1024-dim or larger vectors that
 // don't belong in query strings) except the embeddings fetch, which is GET.
-// Filtering by content_type and excluding the anchor + already-shown ids
-// is built in.
+// Filtering by canonical content kind, NEWS format, and excluded ids is built in.
 
 type internalKNNDenseRequest struct {
 	Embedding  []float32 `json:"embedding"`
 	SpaceID    string    `json:"space_id"`
 	Types      []string  `json:"types"`       // optional — when empty, no type filter
+	Formats    []string  `json:"formats"`     // optional NEWS format filter, independent of type
 	K          int       `json:"k"`           // required, >0
 	ExcludeIDs []string  `json:"exclude_ids"` // optional public_ids to skip
 }
@@ -691,9 +753,10 @@ type internalKNNSparseRequest struct {
 }
 
 type internalKNNHit struct {
-	ID    string  `json:"id"`   // public_id (UUID string)
-	Type  string  `json:"type"` // ContentType (TWEET, COMMENT, ARTICLE, ...)
-	Score float64 `json:"score"`
+	ID     string  `json:"id"`   // public_id (UUID string)
+	Type   string  `json:"type"` // canonical ContentType (NEWS, VIDEO, PODCAST)
+	Format *string `json:"format,omitempty"`
+	Score  float64 `json:"score"`
 	// SourceName + PublishedAt let downstream ranking rules (source
 	// diversity, freshness decay) run on the kNN results directly,
 	// without a second round-trip to /internal/content-items/batch-text.
@@ -709,12 +772,12 @@ type internalKNNResponse struct {
 type internalEmbeddingsResponse struct {
 	Embedding        []float32          `json:"embedding"` // 1024 dense, null if missing
 	EmbeddingSpaceID string             `json:"embedding_space_id,omitempty"`
-	EmbeddingSparse  map[string]float32 `json:"embedding_sparse"` // BGE-M3 sparse, null if missing
+	EmbeddingSparse  map[string]float32 `json:"embedding_sparse"` // legacy BGE-M3 sparse, null for new content
 }
 
 // InternalGetContentEmbeddings handles GET /internal/content-items/:id/embeddings.
-// Returns the dense + sparse vectors for one content item so the caller
-// (Enrichment /v1/related) can skip re-embedding when given an anchor id.
+// Returns the dense vector (and legacy sparse field for compatibility) for one
+// content item so Enrichment /v1/related can skip re-embedding for an anchor.
 func InternalGetContentEmbeddings(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
@@ -780,7 +843,7 @@ func InternalKNNDense(c *gin.Context) {
 	}
 
 	hits := runKNNQuery(db, "embedding", utils.PgvectorToLiteral(req.Embedding),
-		req.SpaceID, req.Types, req.K, req.ExcludeIDs)
+		req.SpaceID, req.Types, req.Formats, req.K, req.ExcludeIDs)
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
@@ -822,7 +885,7 @@ func InternalKNNSparse(c *gin.Context) {
 	sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
 
 	hits := runKNNQuery(db, "embedding_sparse", sparse.String(), "",
-		req.Types, req.K, req.ExcludeIDs)
+		req.Types, nil, req.K, req.ExcludeIDs)
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
@@ -996,7 +1059,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 // operator works on both vector and sparsevec when the matching ops class
 // is on the index. The RRF fusion in Enrichment only uses RANK, not raw
 // scores, so cross-mode score scales don't need to match.
-func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string, k int, excludeIDs []string) []internalKNNHit {
+func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string) []internalKNNHit {
 	q := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).
 		Where(column + " IS NOT NULL")
@@ -1006,6 +1069,9 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string
 
 	if len(types) > 0 {
 		q = q.Where("type IN ?", types)
+	}
+	if len(formats) > 0 {
+		q = q.Where("format IN ?", formats)
 	}
 	if len(excludeIDs) > 0 {
 		// Parse UUIDs once; skip invalid ones silently.
@@ -1023,6 +1089,7 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string
 	type row struct {
 		PublicID    uuid.UUID
 		Type        string
+		Format      *string
 		Distance    float64
 		SourceName  *string
 		PublishedAt *time.Time
@@ -1034,7 +1101,7 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string
 	// `<column> IS NOT NULL`, so the planner uses the index. source_name
 	// + published_at are pulled so callers can run freshness + diversity
 	// rules without a second round-trip.
-	err := q.Select("public_id, type, source_name, published_at, (" + column + " <=> '" + vecLiteral + "') AS distance").
+	err := q.Select("public_id, type, format, source_name, published_at, (" + column + " <=> '" + vecLiteral + "') AS distance").
 		Order(column + " <=> '" + vecLiteral + "'").
 		Limit(k).
 		Scan(&rows).Error
@@ -1052,6 +1119,7 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types []string
 		hits = append(hits, internalKNNHit{
 			ID:          r.PublicID.String(),
 			Type:        r.Type,
+			Format:      r.Format,
 			Score:       1.0 - r.Distance,
 			SourceName:  r.SourceName,
 			PublishedAt: publishedAt,

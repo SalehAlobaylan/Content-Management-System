@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -191,7 +192,7 @@ func TestSystemHTTPProbeRejectsOversizedResponse(t *testing.T) {
 		_, _ = w.Write([]byte(strings.Repeat("x", systemProbeBodyLimit+1)))
 	}))
 	defer server.Close()
-	probe := systemHTTPProbe(server.URL, false)
+	probe := systemHTTPProbe(context.Background(), server.URL, false)
 	if probe.Error == "" || !strings.Contains(probe.Error, "exceeds") {
 		t.Fatalf("oversized response must be rejected, got %+v", probe)
 	}
@@ -220,6 +221,22 @@ func TestSystemEpisodeObservablyHealthyRequiresEveryCorrelatedMember(t *testing.
 	snapshot.Services[1].Status = "healthy"
 	if !systemEpisodeObservablyHealthy(ep, snapshot) {
 		t.Fatal("all healthy members must allow recovery")
+	}
+}
+
+func TestSystemIncidentListProjectionOmitsLargeDiagnosticJSON(t *testing.T) {
+	ep := models.SystemIncidentEpisode{
+		RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Evidence: []byte(`{"large":"diagnostic"}`), Timeline: []byte(`[{"transition":"opened"}]`),
+	}
+	payload, err := json.Marshal(systemIncidentEpisodeListProjection(ep))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "evidence") || strings.Contains(string(payload), "timeline") {
+		t.Fatalf("list projection leaked diagnostic JSON: %s", payload)
+	}
+	if !strings.Contains(string(payload), `"kind":"system_health.inspect"`) || !strings.Contains(string(payload), `"href":"/platform/system-health"`) {
+		t.Fatalf("missing deterministic human recommendation: %s", payload)
 	}
 }
 

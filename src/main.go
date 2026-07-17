@@ -87,11 +87,9 @@ func main() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	log.Println("Successfully connected to database")
-
-	if err := utils.EnsureTenantScopeColumns(db); err != nil {
-		log.Fatalf("Failed to apply tenant scope schema patch: %v", err)
+	if err := utils.CheckSchemaReadiness(db); err != nil {
+		log.Fatalf("CMS schema is not ready: %v", err)
 	}
-	log.Println("Tenant scope schema patch verified")
 
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -114,7 +112,7 @@ func main() {
 	// skip the sweep (set AUTO_MIGRATE=false in .env.local). Unset = migrate,
 	// the safe default for fresh setups.
 	// Note: In production, use manual migrations or migration tools to avoid conflicts
-	if (env == "development" || env == "dev") && os.Getenv("AUTO_MIGRATE") != "false" {
+	if false { // Legacy AutoMigrate implementation retained temporarily while plan 091 moves every model to canonical SQL; it is never reachable at startup.
 		log.Println("Migrating database...")
 		if err := utils.AutoMigrate(db,
 			&models.Page{},

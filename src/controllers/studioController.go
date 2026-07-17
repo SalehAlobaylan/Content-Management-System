@@ -745,7 +745,7 @@ func SaveTranscript(c *gin.Context) {
 	itemCopy := *item
 	go func() {
 		if text := buildEmbeddingText(&itemCopy); text != "" {
-			_ = triggerEmbedding(text, itemCopy.PublicID.String(), true)
+			_ = triggerEmbedding(text, itemCopy.PublicID.String())
 		}
 	}()
 

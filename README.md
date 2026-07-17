@@ -35,7 +35,7 @@ go build ./...
 docker build -t wahb-cms .
 ```
 
-In `development` the server can auto-migrate the schema on boot with GORM `AutoMigrate`, but the supported `./start.sh` flow keeps that disabled. When `AUTO_SQL_MIGRATE=true`, the launcher runs `go run ./cmd/migrate --all` before CMS, applying only pending timestamped SQL migrations recorded in `cms_schema_migrations`. The default is `false`.
+CMS startup never mutates the schema. Apply pending canonical SQL migrations deliberately with the migration runner; the runner records immutable checksums in `cms_schema_migrations`.
 
 Inspect or apply canonical CMS SQL migrations explicitly:
 
@@ -62,10 +62,10 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `DATABASE_URL` | **yes** | — | PostgreSQL DSN (`postgres://…?sslmode=disable`). Use the connection **pooler** (port 6543) on Supabase. |
+| `DATABASE_URL` | **yes** | — | PostgreSQL DSN (`postgres://…?sslmode=disable`). Use the approved Neon connection endpoint. |
 | `JWT_SECRET` | **yes** | — | Shared HS256 secret — must match IAM. Boot fails if unset. |
 | `PORT` | no | 8080 | HTTP port |
-| `ENV` | no | development | `development`/`production` (gates auto-migrate) |
+| `ENV` | no | development | `development`/`production` |
 | `PUBLIC_BASE_URL` | no | request host | Absolute base for syndication (RSS/Atom/JSON) links |
 | `JWT_EXPIRATION_HOURS` | no | 24 | Token lifetime (dev admin seed) |
 | `JWT_ISSUER` | no | cms-service | Issuer claim |
@@ -79,8 +79,7 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `ENRICHMENT_BASE_URL` | no | http://localhost:5050 | On-demand embed/translate/rerank/news-slide |
 | `ENRICHMENT_SERVICE_TOKEN` | no | falls back to `CMS_SERVICE_TOKEN` | Auth for Enrichment calls |
 | `REDIS_URL` | no | redis://localhost:6379 | Declared; caching is future-use |
-| `AUTO_SQL_MIGRATE` | no | false | Set `true` to apply pending tracked SQL migrations before CMS starts |
-| `AUTO_MIGRATE` | no | false in `./start.sh` | Legacy GORM AutoMigrate; keep disabled when using tracked SQL migrations |
+| `AUTO_SQL_MIGRATE` | no | false | Set `true` only for an explicitly approved startup migration run |
 
 ## Authentication
 
@@ -88,7 +87,7 @@ CMS **does not log anyone in** — IAM issues JWTs (HS256). Platform-Console and
 
 - **Admin routes** (`/admin/*`) — authenticate with a valid IAM JWT (`AdminAuthMiddleware`), then **authorize per route via per-permission RBAC** (`RequireAdminPermission(resource, action)` in `src/utils/admin_authz_middleware.go`). Authorization reads the token's flattened `permissions` claim — the `admin` role bypasses, `resource:*`/`*:*` wildcards are honored, and a plain `user` token gets **403**. `manager`/`editor`/`agent` get exactly their seeded scope. `POST /admin/restart` is `admin`-role-only (`RequireAdminRole`). Mapping: sources/discovery→`source:*`, content/topics/enrichment/quality/transcription/studio/flags/analytics→`content:*`, feeds/intelligence-modes/ranking/circulation→`feed:*`, storage→`aggregation:*`, audit→`iam:*`.
 - **User routes** (`/api/v1/content/mine`, `/content/submit`, `/content/:id/request-restore`, transcribe, interactions) — require a user JWT (`UserAuthMiddleware`); some accept an optional session via `OptionalUserAuthMiddleware`.
-- **Internal routes** (`/internal/*`) — static service token (`CMS_SERVICE_TOKEN`), not user JWTs.
+- **Internal routes** (`/internal/*`) — named Aggregation, Enrichment, or Media machine principal with route-specific capabilities; never a user JWT.
 
 ## API Surface
 

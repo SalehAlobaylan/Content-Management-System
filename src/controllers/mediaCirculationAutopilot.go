@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -16,7 +17,6 @@ import (
 
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
-	"content-management-system/src/utils"
 )
 
 // Media Circulation Autopilot — stage 5, Slice 2 (deterministic runner).
@@ -608,17 +608,13 @@ func runMediaCirculationAutopilot(db *gorm.DB, tenantID string, opts mediaAutopi
 	var intakePaused bool
 	policy, intakePaused = mediaAutopilotElevatedCaps(policy)
 
-	// Mint a short-lived service admin token: the runner has no inbound request
-	// to forward, and Aggregation's /admin/* routes require a valid admin JWT
-	// (they do not honour the internal service-token). Without this every
-	// execution call (pull, atomize, sweep, storage stats) would 401.
-	authToken, tokenErr := utils.MintServiceAdminToken(tenantID, 10*time.Minute)
-	if tokenErr != nil {
-		authToken = ""
-	}
+	// Scheduled automation is a named machine caller, never a CMS-minted human
+	// admin JWT. Aggregation accepts this credential only on its explicitly
+	// registered automation endpoint.
+	automationToken := strings.TrimSpace(os.Getenv("AGGREGATION_AUTOMATION_TOKEN"))
 	bearer := ""
-	if authToken != "" {
-		bearer = "Bearer " + authToken
+	if automationToken != "" {
+		bearer = "Bearer " + automationToken
 	}
 
 	run := models.MediaCirculationRun{
@@ -639,8 +635,8 @@ func runMediaCirculationAutopilot(db *gorm.DB, tenantID string, opts mediaAutopi
 	opBudget := getStorageOpBudgetStatus(db, tenantID)
 	queueStats, queueErr := fetchAggregationQueueStats()
 	var precondition string
-	if tokenErr != nil {
-		precondition = "could not mint service token: " + tokenErr.Error()
+	if automationToken == "" {
+		precondition = "aggregation automation credential is not configured"
 	} else if opBudget.ClassAStatus == "cap" {
 		precondition = "Class A op budget is capped for this month"
 	} else if queueErr != nil {

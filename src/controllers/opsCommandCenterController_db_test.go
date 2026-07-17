@@ -2,41 +2,23 @@ package controllers
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// Opt-in PostgreSQL tests for the Operations Command Center, following the
-// Feed Integrity _db_test pattern. They pin the two things unit tests cannot:
+// PostgreSQL tests for the Operations Command Center pin the things unit tests cannot:
 // (1) every hand-written registry/attention SQL string actually executes against
 // the real schema — the adapter contract; (2) a pause value written to a
 // `timestamp` policy column round-trips close enough to the `timestamptz`
 // command ledger for the resume ownership check to recognize its own pause.
-// Run with OPS_TEST_DATABASE_URL pointing at a disposable test DB.
 func opsTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("OPS_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set OPS_TEST_DATABASE_URL to run PostgreSQL Ops Command Center integration tests")
-	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("OPS_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error; err != nil {
-		t.Fatalf("enable pgcrypto in test database: %v", err)
-	}
+	db := testdb.Open(t)
 	// Every table the registry StatusSQL, attention adapters, and command
 	// walker touch. A new roster entry whose tables are missing here will fail
 	// the contract test below — that is the point.

@@ -103,7 +103,7 @@ func CreateInteraction(c *gin.Context) {
 
 	// Verify content item exists
 	var contentItem models.ContentItem
-	if err := db.Where("public_id = ?", contentItemID).First(&contentItem).Error; err != nil {
+	if err := publicContentQuery(db).Where("public_id = ?", contentItemID).First(&contentItem).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Content item not found",
@@ -565,6 +565,14 @@ func DeleteInteraction(c *gin.Context) {
 		})
 		return
 	}
+	// A public interaction endpoint cannot mutate an item after it has become
+	// hidden, failed, archived, or storage-unavailable. Keep the response
+	// indistinguishable from an unknown interaction/content pair.
+	var contentItem models.ContentItem
+	if err := publicContentQuery(db).Where("content_items.public_id = ?", interaction.ContentItemID).First(&contentItem).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Interaction not found"})
+		return
+	}
 
 	// Ownership check: the caller may only delete their own interaction. A 404
 	// (rather than 403) is returned on mismatch to avoid leaking existence.
@@ -637,6 +645,11 @@ func DeleteInteractionByContext(c *gin.Context) {
 			Code:    http.StatusBadRequest,
 			Message: "type must be like or bookmark",
 		})
+		return
+	}
+	var contentItem models.ContentItem
+	if err := publicContentQuery(db).Where("public_id = ?", contentItemID).First(&contentItem).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Content item not found"})
 		return
 	}
 
@@ -714,6 +727,12 @@ func GetContentComments(c *gin.Context) {
 			Code:    http.StatusBadRequest,
 			Message: "Invalid cursor: " + err.Error(),
 		})
+		return
+	}
+
+	var contentItem models.ContentItem
+	if err := publicContentQuery(db).Where("public_id = ?", contentID).First(&contentItem).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Content item not found"})
 		return
 	}
 

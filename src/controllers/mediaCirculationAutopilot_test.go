@@ -10,7 +10,6 @@ import (
 
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
-	"content-management-system/src/utils"
 )
 
 // ----------------------------------------------------------------
@@ -447,41 +446,6 @@ func TestObserveModeMapsStatuses(t *testing.T) {
 // ----------------------------------------------------------------
 // Review-fix regression tests
 // ----------------------------------------------------------------
-
-// The service token the runner mints for CMS→Aggregation calls must carry the
-// identity Aggregation's admin-auth plugin trusts (iss=cms-service,
-// aud=platform-console, role=admin) and a future expiry.
-func TestMintServiceAdminTokenClaims(t *testing.T) {
-	t.Setenv("JWT_SECRET", "test-secret-value")
-	tok, err := utils.MintServiceAdminToken("default", 10*time.Minute)
-	if err != nil {
-		t.Fatalf("mint failed: %v", err)
-	}
-	secret, _ := utils.GetJWTSecret()
-	claims, err := utils.ParseJWT(tok, secret)
-	if err != nil {
-		t.Fatalf("minted token failed to parse: %v", err)
-	}
-	if claims.Issuer != "cms-service" {
-		t.Fatalf("issuer: got %q, want cms-service", claims.Issuer)
-	}
-	if len(claims.Audience) == 0 || claims.Audience[0] != "platform-console" {
-		t.Fatalf("audience: got %v, want [platform-console]", claims.Audience)
-	}
-	if claims.Role != "admin" {
-		t.Fatalf("role: got %q, want admin", claims.Role)
-	}
-	if claims.ExpiresAt == nil || !claims.ExpiresAt.After(time.Now()) {
-		t.Fatal("token must have a future expiry")
-	}
-}
-
-func TestMintServiceAdminTokenRequiresSecret(t *testing.T) {
-	t.Setenv("JWT_SECRET", "")
-	if _, err := utils.MintServiceAdminToken("default", time.Minute); err == nil {
-		t.Fatal("minting without JWT_SECRET must fail, not sign with an empty key")
-	}
-}
 
 // The trust-gate skip reason must interpolate the actual thresholds (regression:
 // it once read "need ≥ human decisions" with no number).

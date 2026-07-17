@@ -838,7 +838,7 @@ func embedBatchViaEnrichmentWithSpace(texts []string) ([][]float32, string, erro
 
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
-func triggerEmbedding(text string, contentID string, extractSparse bool) error {
+func triggerEmbedding(text string, contentID string) error {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -849,14 +849,12 @@ func triggerEmbedding(text string, contentID string, extractSparse bool) error {
 		return fmt.Errorf("enrichment service token is not configured")
 	}
 
-	// extract_sparse populates BGE-M3 lexical weights (hybrid retrieval) in the
-	// same forward pass — free. extract_tags is deliberately OFF for admin
+	// Qwen embeddings are dense-only. extract_tags is deliberately OFF for admin
 	// triggers: it hits the rate-limited LLM and would stall bulk re-embeds;
 	// topic tags are populated by the normal ingest path instead.
 	payload := map[string]interface{}{
-		"texts":          []string{text},
-		"content_ids":    []string{contentID},
-		"extract_sparse": extractSparse,
+		"texts":       []string{text},
+		"content_ids": []string{contentID},
 	}
 
 	payloadBytes, err := json.Marshal(payload)

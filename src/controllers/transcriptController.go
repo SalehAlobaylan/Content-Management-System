@@ -38,7 +38,13 @@ func GetTranscript(c *gin.Context) {
 	}
 
 	var transcript models.Transcript
-	if err := db.Where("public_id = ?", transcriptID).First(&transcript).Error; err != nil {
+	// A transcript is public only through its READY parent and only when it is
+	// that parent's active transcript. This avoids exposing superseded, orphaned,
+	// or hidden-parent transcript text by UUID.
+	if err := db.Model(&models.Transcript{}).
+		Joins("JOIN content_items ON content_items.public_id = transcripts.content_item_id").
+		Where("transcripts.public_id = ? AND content_items.transcript_id = transcripts.public_id AND content_items.status = ?", transcriptID, models.ContentStatusReady).
+		First(&transcript).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Transcript not found",

@@ -3,95 +3,79 @@ package routes
 import (
 	"content-management-system/src/controllers"
 	"content-management-system/src/utils"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
-// SetupInternalRoutes registers internal service-to-service routes
+// SetupInternalRoutes registers service-to-service routes from the capability
+// matrix in utils.InternalRoutePolicies. A route cannot be added here without
+// declaring its owning machine principal and capability first.
 func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal := router.Group("/internal")
 	internal.Use(utils.InternalAuthMiddleware())
+	route := func(method, path string, handler gin.HandlerFunc) {
+		policy := utils.MustInternalRoutePolicy(method, path)
+		internal.Handle(method, path, utils.RequireInternalRoutePolicy(policy), handler)
+	}
 
-	// Feeds Finding — Aggregation posts discovered source candidates here,
-	// and reads config + enabled profiles for scheduled sweeps
-	internal.POST("/source-suggestions", controllers.InternalCreateSourceSuggestions)
-	internal.GET("/discovery/config", controllers.InternalGetDiscoveryConfig)
-	internal.GET("/discovery/profiles", controllers.InternalListEnabledProfiles)
+	route(http.MethodPost, "/source-suggestions", controllers.InternalCreateSourceSuggestions)
+	route(http.MethodGet, "/discovery/config", controllers.InternalGetDiscoveryConfig)
+	route(http.MethodGet, "/discovery/profiles", controllers.InternalListEnabledProfiles)
+	route(http.MethodGet, "/circulation/policy", controllers.InternalGetCirculationPolicy)
+	route(http.MethodPost, "/circulation/claim-sources", controllers.InternalClaimCirculationSources)
+	route(http.MethodPost, "/circulation/source-runs", controllers.InternalReportSourceRun)
 
-	// News Circulation — Aggregation claims due news sources and reports run outcomes.
-	internal.GET("/circulation/policy", controllers.InternalGetCirculationPolicy)
-	internal.POST("/circulation/claim-sources", controllers.InternalClaimCirculationSources)
-	internal.POST("/circulation/source-runs", controllers.InternalReportSourceRun)
+	route(http.MethodGet, "/intel/corpus-citations", controllers.InternalGetCorpusCitations)
+	route(http.MethodGet, "/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
+	route(http.MethodGet, "/intel/approved-telegram-channels", controllers.InternalGetApprovedTelegramChannels)
+	route(http.MethodGet, "/intel/approved-twitter-handles", controllers.InternalGetApprovedTwitterHandles)
+	route(http.MethodGet, "/intel/approved-youtube-channels", controllers.InternalGetApprovedYouTubeChannels)
+	route(http.MethodGet, "/intel/approved-podcast-feeds", controllers.InternalGetApprovedPodcastFeeds)
+	route(http.MethodPost, "/intel/candidates", controllers.InternalUpsertCandidates)
+	route(http.MethodGet, "/intel/candidates", controllers.InternalListCandidates)
 
-	// Slice 4 — Source Intelligence Graph
-	internal.GET("/intel/corpus-citations", controllers.InternalGetCorpusCitations)
-	internal.GET("/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
-	internal.GET("/intel/approved-telegram-channels", controllers.InternalGetApprovedTelegramChannels)
-	internal.GET("/intel/approved-twitter-handles", controllers.InternalGetApprovedTwitterHandles)
-	internal.GET("/intel/approved-youtube-channels", controllers.InternalGetApprovedYouTubeChannels)
-	internal.GET("/intel/approved-podcast-feeds", controllers.InternalGetApprovedPodcastFeeds)
-	internal.POST("/intel/candidates", controllers.InternalUpsertCandidates)
-	internal.GET("/intel/candidates", controllers.InternalListCandidates)
+	route(http.MethodGet, "/content-items", controllers.InternalListContentItems)
+	route(http.MethodPost, "/redundancy/precheck", controllers.InternalRedundancyPrecheck)
+	route(http.MethodGet, "/content-items/:id", controllers.InternalGetContentItem)
+	route(http.MethodGet, "/atomization/candidates", controllers.InternalListAtomizationCandidates)
+	route(http.MethodPost, "/atomization/repair-leaks", controllers.InternalRepairMediaAtomizationLeaks)
+	route(http.MethodGet, "/content-items/:id/atomization", controllers.InternalGetAtomizationInput)
+	route(http.MethodPost, "/content-items", controllers.InternalCreateContentItem)
+	route(http.MethodPut, "/content-items/:id", controllers.InternalUpdateContentItem)
+	route(http.MethodPatch, "/content-items/:id/enrichment-metadata", controllers.InternalMergeEnrichmentMetadata)
+	route(http.MethodPatch, "/content-items/:id/status", controllers.InternalUpdateContentStatus)
+	route(http.MethodPatch, "/content-items/:id/artifacts", controllers.InternalUpdateContentArtifacts)
+	route(http.MethodPatch, "/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
+	route(http.MethodPatch, "/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
+	route(http.MethodPatch, "/content-items/:id/transcript", controllers.InternalLinkTranscript)
+	route(http.MethodPost, "/content-items/:id/atomization/plan", controllers.InternalSaveAtomizationPlan)
+	route(http.MethodPost, "/content-items/:id/atomization/children", controllers.InternalCreateAtomizedChildren)
+	route(http.MethodPost, "/content-items/:id/atomization/runs", controllers.InternalReportAtomizationRun)
+	route(http.MethodPost, "/content-items/:id/request-stt", controllers.InternalRequestSTT)
+	route(http.MethodPatch, "/transcription-jobs/:id", controllers.InternalUpdateTranscriptionJob)
+	route(http.MethodPost, "/transcription-jobs/:id/complete", controllers.InternalCompleteTranscriptionJob)
 
-	internal.GET("/content-items", controllers.InternalListContentItems)
-	internal.POST("/redundancy/precheck", controllers.InternalRedundancyPrecheck)
-	internal.GET("/content-items/:id", controllers.InternalGetContentItem)
-	internal.GET("/atomization/candidates", controllers.InternalListAtomizationCandidates)
-	internal.POST("/atomization/repair-leaks", controllers.InternalRepairMediaAtomizationLeaks)
-	internal.GET("/content-items/:id/atomization", controllers.InternalGetAtomizationInput)
-	internal.POST("/content-items", controllers.InternalCreateContentItem)
-	internal.PUT("/content-items/:id", controllers.InternalUpdateContentItem)
-	internal.PATCH("/content-items/:id/status", controllers.InternalUpdateContentStatus)
-	internal.PATCH("/content-items/:id/artifacts", controllers.InternalUpdateContentArtifacts)
-	internal.PATCH("/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
-	internal.PATCH("/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
-	internal.PATCH("/content-items/:id/transcript", controllers.InternalLinkTranscript)
-	internal.POST("/content-items/:id/atomization/plan", controllers.InternalSaveAtomizationPlan)
-	internal.POST("/content-items/:id/atomization/children", controllers.InternalCreateAtomizedChildren)
-	internal.POST("/content-items/:id/atomization/runs", controllers.InternalReportAtomizationRun)
-	// Auto-STT path (Aggregation AI worker) — guard-enforced (toggle + budget).
-	internal.POST("/content-items/:id/request-stt", controllers.InternalRequestSTT)
-	internal.PATCH("/transcription-jobs/:id", controllers.InternalUpdateTranscriptionJob)
-	internal.POST("/transcription-jobs/:id/complete", controllers.InternalCompleteTranscriptionJob)
+	route(http.MethodGet, "/content-items/:id/embeddings", controllers.InternalGetContentEmbeddings)
+	route(http.MethodPost, "/content-items/knn", controllers.InternalKNNDense)
+	route(http.MethodPost, "/content-items/knn-sparse", controllers.InternalKNNSparse)
+	route(http.MethodPost, "/content-items/batch-text", controllers.InternalBatchText)
+	route(http.MethodGet, "/content-items/missing-embedding", controllers.InternalListMissingEmbedding)
+	route(http.MethodPost, "/transcripts", controllers.InternalCreateTranscript)
+	route(http.MethodPost, "/ai-spend/events", controllers.InternalIngestAISpendEvents)
+	route(http.MethodGet, "/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
 
-	// Slice A hybrid retrieval — used by Enrichment-Service's /v1/related.
-	// GET /:id/embeddings: fetch (dense, sparse) for an anchor.
-	// POST /knn:           cosine kNN against `embedding` (1024-dim Qwen3-Embedding-0.6B dense).
-	// POST /knn-sparse:    inner-product kNN against the legacy `embedding_sparse` (sparsevec) —
-	//                      dead BGE-M3-era column, retained only for the legacy hybrid path.
-	internal.GET("/content-items/:id/embeddings", controllers.InternalGetContentEmbeddings)
-	internal.POST("/content-items/knn", controllers.InternalKNNDense)
-	internal.POST("/content-items/knn-sparse", controllers.InternalKNNSparse)
+	route(http.MethodGet, "/storage/policies", controllers.InternalListStoragePolicies)
+	route(http.MethodGet, "/storage/candidates", controllers.InternalListStorageCandidates)
+	route(http.MethodPost, "/storage/archive", controllers.InternalArchiveItems)
+	route(http.MethodPost, "/storage/move-to-cold", controllers.InternalMoveItemsToCold)
+	route(http.MethodPost, "/storage/sweep-runs", controllers.InternalCreateSweepRun)
+	route(http.MethodPost, "/storage/artifact-events", controllers.InternalRecordStorageArtifactEvent)
+	route(http.MethodPost, "/storage/op-metrics", controllers.InternalWriteOpMetrics)
+	route(http.MethodGet, "/storage/op-budget", controllers.InternalGetStorageOpBudget)
 
-	// Slice B — batch-fetch text for a small set of ids (typically the
-	// post-RRF candidate pool that the cross-encoder reranker scores).
-	internal.POST("/content-items/batch-text", controllers.InternalBatchText)
-
-	// Reconciliation sweep — READY items still missing a dense embedding.
-	internal.GET("/content-items/missing-embedding", controllers.InternalListMissingEmbedding)
-
-	internal.POST("/transcripts", controllers.InternalCreateTranscript)
-
-	// AI Spend Governor — metering is service-to-service only; policy remains
-	// behind the admin surface.
-	internal.POST("/ai-spend/events", controllers.InternalIngestAISpendEvents)
-	internal.GET("/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
-
-	// Storage management — used by Aggregation's storage worker
-	internal.GET("/storage/policies", controllers.InternalListStoragePolicies)
-	internal.GET("/storage/candidates", controllers.InternalListStorageCandidates)
-	internal.POST("/storage/archive", controllers.InternalArchiveItems)
-	internal.POST("/storage/move-to-cold", controllers.InternalMoveItemsToCold)
-	internal.POST("/storage/sweep-runs", controllers.InternalCreateSweepRun)
-	internal.POST("/storage/artifact-events", controllers.InternalRecordStorageArtifactEvent)
-	internal.POST("/storage/op-metrics", controllers.InternalWriteOpMetrics)
-	internal.GET("/storage/op-budget", controllers.InternalGetStorageOpBudget)
-
-	// Quality / Ingest configuration — used by Aggregation media worker
-	// (resolves the profile per ingest job) and the re-encode worker
-	// invoked from Storage sweeps.
-	internal.GET("/quality/profiles/resolve", controllers.InternalResolveQualityProfile)
-	internal.GET("/quality/profiles/:id", controllers.InternalGetQualityProfile)
-	internal.PATCH("/content-items/:id/quality", controllers.InternalUpdateContentItemQuality)
+	route(http.MethodGet, "/quality/profiles/resolve", controllers.InternalResolveQualityProfile)
+	route(http.MethodGet, "/quality/profiles/:id", controllers.InternalGetQualityProfile)
+	route(http.MethodPatch, "/content-items/:id/quality", controllers.InternalUpdateContentItemQuality)
 }

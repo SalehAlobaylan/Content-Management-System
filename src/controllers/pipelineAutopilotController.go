@@ -550,9 +550,10 @@ type pipelineAttemptState struct {
 }
 
 // pipelineAttemptStates returns per-item executed-attempt counts and the most
-// recent attempt time for a set of ids in a single grouped query. Only real
-// executed retries (status=success) count — Observe would_execute rows never do,
-// so Observe writes no attempt memory (G6).
+// recent attempt time for a set of ids in a single grouped query. Only terminal
+// execution rows (success/error) count — Observe would_execute rows never do,
+// so Observe writes no attempt memory (G6). Error rows hold backoff and consume
+// the separate error budget without being treated as successful retries.
 func pipelineAttemptStates(db *gorm.DB, tenantID string, ids []uuid.UUID) map[uuid.UUID]pipelineAttemptState {
 	out := map[uuid.UUID]pipelineAttemptState{}
 	if len(ids) == 0 {

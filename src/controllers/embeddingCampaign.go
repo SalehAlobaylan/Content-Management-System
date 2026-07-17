@@ -453,7 +453,7 @@ func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string) error {
 		if text == "" {
 			return fmt.Errorf("no text content to embed")
 		}
-		return triggerEmbedding(text, targetID, false)
+		return triggerEmbedding(text, targetID)
 	case "content_image":
 		if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
 			return fmt.Errorf("no thumbnail_url to embed")

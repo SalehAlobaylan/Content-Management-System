@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -23,6 +25,7 @@ import (
 )
 
 var errTranscriptionBudgetCapReached = errors.New("monthly STT budget cap reached")
+var errTranscriptionJobInFlight = errors.New("a transcription job is already in flight")
 
 type transcriptionJobResponse struct {
 	ID                string                 `json:"id"`
@@ -214,12 +217,28 @@ func createSkippedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigge
 }
 
 func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, triggerSource string) (models.TranscriptionJob, error) {
-	est := estimateSTTCostUSD(item.DurationSec)
 	var job models.TranscriptionJob
 	err := db.Transaction(func(tx *gorm.DB) error {
+		// Serialize all job admissions for this content item, not merely Studio's
+		// callers. The active-job recheck closes the evaluate→create race.
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ?", item.PublicID, item.TenantID).First(&current).Error; err != nil {
+			return err
+		}
+		var active int64
+		if err := tx.Model(&models.TranscriptionJob{}).
+			Where("content_item_id = ? AND status IN ?", current.PublicID, []string{models.TranscriptionJobStatusQueued, models.TranscriptionJobStatusRunning}).
+			Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return errTranscriptionJobInFlight
+		}
+		est := estimateSTTCostUSD(current.DurationSec)
 		var cfg models.TranscriptionConfig
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("tenant_id = ?", item.TenantID).
+			Where("tenant_id = ?", current.TenantID).
 			First(&cfg).Error; err != nil {
 			return err
 		}
@@ -227,9 +246,9 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 			return errTranscriptionBudgetCapReached
 		}
 		job = models.TranscriptionJob{
-			TenantID:         item.TenantID,
-			ContentItemID:    item.PublicID,
-			TranscriptID:     item.TranscriptID,
+			TenantID:         current.TenantID,
+			ContentItemID:    current.PublicID,
+			TranscriptID:     current.TranscriptID,
 			TriggerSource:    triggerSource,
 			Status:           models.TranscriptionJobStatusQueued,
 			EstimatedCostUsd: est,
@@ -273,6 +292,21 @@ func latestTranscriptQuality(db *gorm.DB, contentID uuid.UUID) *models.Transcrip
 // without creating a job. Observe mode uses this same decision as the live path.
 func evaluateSTTAdmission(db *gorm.DB, item *models.ContentItem, triggerSource string) (bool, string) {
 	cfg := getOrCreateTranscriptionConfig(db, item.TenantID)
+	return evaluateSTTAdmissionWithConfig(db, item, triggerSource, *cfg)
+}
+
+// evaluateSTTAdmissionReadOnly mirrors admission without creating a default
+// config row, so Observe can remain mutation-free even for a new tenant.
+func evaluateSTTAdmissionReadOnly(db *gorm.DB, item *models.ContentItem, triggerSource string) (bool, string) {
+	cfg := models.DefaultTranscriptionConfig(item.TenantID)
+	var stored models.TranscriptionConfig
+	if err := db.Where("tenant_id = ?", item.TenantID).First(&stored).Error; err == nil {
+		cfg = stored
+	}
+	return evaluateSTTAdmissionWithConfig(db, item, triggerSource, cfg)
+}
+
+func evaluateSTTAdmissionWithConfig(db *gorm.DB, item *models.ContentItem, triggerSource string, cfg models.TranscriptionConfig) (bool, string) {
 	state := ""
 	if item.CaptionState != nil {
 		state = *item.CaptionState
@@ -333,6 +367,10 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 		if errors.Is(err, errTranscriptionBudgetCapReached) {
 			job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
 			return job, false, job.SkipReason, sttSkipBudget, nil
+		}
+		if errors.Is(err, errTranscriptionJobInFlight) {
+			job := createSkippedTranscriptionJob(db, item, triggerSource, errTranscriptionJobInFlight.Error())
+			return job, false, job.SkipReason, sttSkipGuard, nil
 		}
 		return job, false, "", sttSkipNone, err
 	}
@@ -709,6 +747,24 @@ func CreateTranscriptionJob(c *gin.Context) {
 type bulkTranscriptionJobRequest struct {
 	ContentIDs []string `json:"content_ids"`
 	Force      bool     `json:"force"`
+}
+
+const maxTranscriptionBatchItems = 100
+
+const (
+	transcriptionDispatcherWorkers   = 4
+	transcriptionDispatcherQueueSize = 64
+	transcriptionDispatcherScanEvery = 5 * time.Second
+)
+
+// transcriptionBatchDispatcher is process-owned work admission for persisted
+// batches. HTTP handlers only create the durable batch receipt and wake this
+// dispatcher; they never acquire unbounded request-owned goroutines.
+var transcriptionBatchDispatcher struct {
+	sync.RWMutex
+	started bool
+	queue   chan uuid.UUID
+	queued  map[uuid.UUID]struct{}
 }
 
 type transcriptionBatchItemResponse struct {
@@ -1088,48 +1144,74 @@ func CreateTranscriptionBatch(c *gin.Context) {
 	if req.Force != nil {
 		force = *req.Force
 	}
-	seen := map[uuid.UUID]bool{}
-	items := make([]models.TranscriptionBatchItem, 0, len(req.ContentIDs))
-	for _, raw := range req.ContentIDs {
-		id, err := uuid.Parse(raw)
-		if err != nil || seen[id] {
-			continue
-		}
-		seen[id] = true
-		items = append(items, models.TranscriptionBatchItem{
-			TenantID:      principal.TenantID,
-			ContentItemID: id,
-			Status:        models.TranscriptionBatchItemStatusPending,
-		})
-	}
-	if len(items) == 0 {
-		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "No valid content IDs", Code: "INVALID_REQUEST"})
+	batch, items, err := createPersistedTranscriptionBatch(db, principal.TenantID, principal.Email, req.ContentIDs, force)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}
-	batch := models.TranscriptionBatch{
-		TenantID:   principal.TenantID,
-		Status:     models.TranscriptionBatchStatusQueued,
-		Force:      force,
-		Actor:      principal.Email,
-		TotalCount: len(items),
-	}
-	if err := db.Create(&batch).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create batch", Code: "CREATE_FAILED"})
-		return
-	}
-	for i := range items {
-		items[i].BatchID = batch.PublicID
-	}
-	if err := db.Create(&items).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create batch items", Code: "CREATE_FAILED"})
-		return
-	}
-	go dispatchTranscriptionBatch(db, batch.PublicID)
+	requestTranscriptionBatchDispatch(batch.PublicID)
 	c.JSON(http.StatusAccepted, utils.ResponseMessage{
 		Code:    http.StatusAccepted,
 		Message: "Transcription batch accepted",
 		Data:    mapTranscriptionBatch(batch, items),
 	})
+}
+
+// createPersistedTranscriptionBatch is the sole admission point for a manual
+// bulk transcription request. It bounds the request before database work,
+// rejects duplicate/cross-tenant IDs, and persists the batch atomically for
+// the dispatcher to resume after a process restart.
+func createPersistedTranscriptionBatch(db *gorm.DB, tenantID, actor string, rawIDs []string, force bool) (models.TranscriptionBatch, []models.TranscriptionBatchItem, error) {
+	if len(rawIDs) == 0 {
+		return models.TranscriptionBatch{}, nil, fmt.Errorf("content_ids are required")
+	}
+	if len(rawIDs) > maxTranscriptionBatchItems {
+		return models.TranscriptionBatch{}, nil, fmt.Errorf("content_ids exceeds the maximum of %d", maxTranscriptionBatchItems)
+	}
+	ids := make([]uuid.UUID, 0, len(rawIDs))
+	seen := make(map[uuid.UUID]struct{}, len(rawIDs))
+	for _, rawID := range rawIDs {
+		id, err := uuid.Parse(rawID)
+		if err != nil {
+			return models.TranscriptionBatch{}, nil, fmt.Errorf("content_ids contains an invalid id")
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return models.TranscriptionBatch{}, nil, fmt.Errorf("content_ids must not contain duplicates")
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	batch := models.TranscriptionBatch{
+		TenantID: tenantID, Status: models.TranscriptionBatchStatusQueued,
+		Force: force, Actor: actor, TotalCount: len(ids),
+	}
+	items := make([]models.TranscriptionBatchItem, 0, len(ids))
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var ownedCount int64
+		if err := tx.Model(&models.ContentItem{}).
+			Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
+			Count(&ownedCount).Error; err != nil {
+			return err
+		}
+		if ownedCount != int64(len(ids)) {
+			return fmt.Errorf("one or more content items were not found")
+		}
+		if err := tx.Create(&batch).Error; err != nil {
+			return err
+		}
+		for _, id := range ids {
+			items = append(items, models.TranscriptionBatchItem{
+				TenantID: tenantID, BatchID: batch.PublicID, ContentItemID: id,
+				Status: models.TranscriptionBatchItemStatusPending,
+			})
+		}
+		return tx.Create(&items).Error
+	})
+	if err != nil {
+		return models.TranscriptionBatch{}, nil, err
+	}
+	return batch, items, nil
 }
 
 func GetTranscriptionBatch(c *gin.Context) {
@@ -1271,12 +1353,76 @@ func CancelTranscriptionBatch(c *gin.Context) {
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Transcription batch canceled", Data: mapTranscriptionBatch(batch, items)})
 }
 
+// ResumeTranscriptionBatches starts the bounded, process-owned dispatcher and
+// immediately reconciles durable batches left active by a prior process.
 func ResumeTranscriptionBatches(db *gorm.DB) {
+	transcriptionBatchDispatcher.Lock()
+	if transcriptionBatchDispatcher.started {
+		transcriptionBatchDispatcher.Unlock()
+		return
+	}
+	transcriptionBatchDispatcher.started = true
+	transcriptionBatchDispatcher.queue = make(chan uuid.UUID, transcriptionDispatcherQueueSize)
+	transcriptionBatchDispatcher.queued = make(map[uuid.UUID]struct{})
+	queue := transcriptionBatchDispatcher.queue
+	transcriptionBatchDispatcher.Unlock()
+
+	for range transcriptionDispatcherWorkers {
+		go func() {
+			for batchID := range queue {
+				dispatchTranscriptionBatch(db, batchID)
+				transcriptionBatchDispatcher.Lock()
+				delete(transcriptionBatchDispatcher.queued, batchID)
+				transcriptionBatchDispatcher.Unlock()
+			}
+		}()
+	}
+	go func() {
+		enqueueActiveTranscriptionBatches(db)
+		ticker := time.NewTicker(transcriptionDispatcherScanEvery)
+		defer ticker.Stop()
+		for range ticker.C {
+			enqueueActiveTranscriptionBatches(db)
+		}
+	}()
+}
+
+// requestTranscriptionBatchDispatch is intentionally non-blocking. If the
+// bounded in-memory wake queue is full (or CMS is still starting), the durable
+// scanner will pick the QUEUED/RUNNING batch up on its next pass.
+func requestTranscriptionBatchDispatch(batchID uuid.UUID) {
+	transcriptionBatchDispatcher.Lock()
+	queue := transcriptionBatchDispatcher.queue
+	started := transcriptionBatchDispatcher.started
+	if !started {
+		transcriptionBatchDispatcher.Unlock()
+		return
+	}
+	if _, exists := transcriptionBatchDispatcher.queued[batchID]; exists {
+		transcriptionBatchDispatcher.Unlock()
+		return
+	}
+	transcriptionBatchDispatcher.queued[batchID] = struct{}{}
+	transcriptionBatchDispatcher.Unlock()
+	select {
+	case queue <- batchID:
+	default:
+		transcriptionBatchDispatcher.Lock()
+		delete(transcriptionBatchDispatcher.queued, batchID)
+		transcriptionBatchDispatcher.Unlock()
+	}
+}
+
+func enqueueActiveTranscriptionBatches(db *gorm.DB) {
 	var batches []models.TranscriptionBatch
-	db.Where("status IN ?", []string{models.TranscriptionBatchStatusQueued, models.TranscriptionBatchStatusRunning}).Find(&batches)
+	if err := db.Where("status IN ?", []string{
+		models.TranscriptionBatchStatusQueued,
+		models.TranscriptionBatchStatusRunning,
+	}).Order("created_at ASC").Limit(transcriptionDispatcherQueueSize).Find(&batches).Error; err != nil {
+		return
+	}
 	for _, batch := range batches {
-		batchID := batch.PublicID
-		go dispatchTranscriptionBatch(db, batchID)
+		requestTranscriptionBatchDispatch(batch.PublicID)
 	}
 }
 
@@ -1291,51 +1437,16 @@ func BulkCreateTranscriptionJobs(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "content_ids are required", Code: "INVALID_REQUEST"})
 		return
 	}
-	results := []gin.H{}
-	accepted, skipped, failed := 0, 0, 0
-	for _, rawID := range req.ContentIDs {
-		id, err := uuid.Parse(rawID)
-		if err != nil {
-			failed++
-			results = append(results, gin.H{"content_id": rawID, "status": "failed", "error": "invalid id"})
-			continue
-		}
-		var item models.ContentItem
-		if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&item).Error; err != nil {
-			failed++
-			results = append(results, gin.H{"content_id": rawID, "status": "failed", "error": "not found"})
-			continue
-		}
-		job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerBulkManual, req.Force)
-		if err != nil {
-			failed++
-			results = append(results, gin.H{"content_id": rawID, "status": "failed", "error": err.Error()})
-			continue
-		}
-		if !triggered {
-			skipped++
-			results = append(results, gin.H{"content_id": rawID, "status": "skipped", "reason": reason, "job_id": job.PublicID.String()})
-			continue
-		}
-		accepted++
-		results = append(results, gin.H{"content_id": rawID, "status": "accepted", "job_id": job.PublicID.String()})
-		itemCopy := item
-		jobID := job.PublicID.String()
-		go func() {
-			if err := submitTranscriptionJobToMedia(db, &itemCopy, jobID); err != nil {
-				_ = updateTranscriptionJobTerminal(db, jobID, models.TranscriptionJobStatusFailed, err.Error())
-			}
-		}()
+	batch, items, err := createPersistedTranscriptionBatch(db, principal.TenantID, principal.Email, req.ContentIDs, req.Force)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: err.Error(), Code: "INVALID_REQUEST"})
+		return
 	}
+	requestTranscriptionBatchDispatch(batch.PublicID)
 	c.JSON(http.StatusAccepted, utils.ResponseMessage{
 		Code:    http.StatusAccepted,
-		Message: "Bulk transcription jobs processed",
-		Data: gin.H{
-			"accepted": accepted,
-			"skipped":  skipped,
-			"failed":   failed,
-			"results":  results,
-		},
+		Message: "Bulk transcription batch accepted",
+		Data:    mapTranscriptionBatch(batch, items),
 	})
 }
 

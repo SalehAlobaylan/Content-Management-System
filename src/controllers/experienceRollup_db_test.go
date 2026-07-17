@@ -1,37 +1,20 @@
 package controllers
 
 import (
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
 	"github.com/google/uuid"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// Opt-in PostgreSQL integration tests for the RUX rollup + retention path. Run
-// with EXPERIENCE_TEST_DATABASE_URL pointing at a disposable test DB.
+// PostgreSQL integration tests for the RUX rollup + retention path.
 func experienceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("EXPERIENCE_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set EXPERIENCE_TEST_DATABASE_URL to run RUX PostgreSQL integration tests")
-	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("EXPERIENCE_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error; err != nil {
-		t.Fatalf("enable pgcrypto: %v", err)
-	}
+	db := testdb.Open(t)
 	if err := db.AutoMigrate(&models.ExperienceEvent{}, &models.ExperienceMetricRollup{}, &models.ExperiencePolicy{},
 		&models.ExperienceEvaluationRun{}, &models.ExperienceIncident{}, &models.ExperienceAction{}, &models.ExperienceSuppression{}); err != nil {
 		t.Fatalf("migrate: %v", err)

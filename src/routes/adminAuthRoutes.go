@@ -341,7 +341,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/system/autopilot/episodes/:id", utils.RequireAdminRole("admin"), controllers.GetSystemIncidentEpisode)
 	adminGroup.POST("/system/autopilot/episodes/:id/close", utils.RequireAdminRole("admin"), controllers.CloseSystemIncidentEpisode)
 	adminGroup.GET("/system/autopilot/runs", utils.RequireAdminRole("admin"), controllers.ListSystemAutopilotRuns)
-	adminGroup.GET("/system/autopilot/runs/:id", perm("aggregation", "read"), controllers.GetSystemAutopilotRun)
+	adminGroup.GET("/system/autopilot/runs/:id", utils.RequireAdminRole("admin"), controllers.GetSystemAutopilotRun)
 
 	// Feed Integrity / Experience QA System — deterministic CMS-edge checks only.
 	adminGroup.GET("/feed-integrity/status", perm("feed", "read"), controllers.GetFeedIntegrityStatus)

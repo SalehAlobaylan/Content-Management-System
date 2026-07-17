@@ -258,7 +258,7 @@ func opsOpenAttention(db *gorm.DB, now time.Time) ([]opsAttentionItem, []string)
 		}
 	}
 	appendRows("system_health", "episode", "/platform/system-health", "SELECT 'platform' AS tenant_id, public_id::text AS native_id, severity, COALESCE(summary, verdict) AS title, COALESCE(root_service, 'platform') AS detail, 1 AS count, first_detected_at AS first_seen FROM system_incident_episodes WHERE status IN ('open','recovering')")
-	appendRows("feed_integrity", "episode", "/platform/feed-integrity", "SELECT tenant_id, public_id::text AS native_id, severity, COALESCE(summary, check_key) AS title, COALESCE(feed, 'feed') AS detail, 1 AS count, first_seen_at AS first_seen FROM feed_integrity_episodes WHERE status IN ('open','recovering')")
+	appendRows("feed_integrity", "episode", "/platform/feed-integrity", "SELECT tenant_id, public_id::text AS native_id, severity, COALESCE(summary, check_key) AS title, COALESCE(feed, 'feed') AS detail, 1 AS count, first_detected_at AS first_seen FROM feed_integrity_episodes WHERE status IN ('open','recovering')")
 	appendRows("experience", "episode", "/platform/real-experience", "SELECT tenant_id, public_id::text AS native_id, severity, COALESCE(summary, 'Experience incident') AS title, COALESCE(surface, 'experience') AS detail, 1 AS count, first_seen_at AS first_seen FROM experience_incidents WHERE status IN ('open','recovering')")
 	appendRows("ai_spend", "budget", "/platform/economics", "SELECT tenant_id, id::text AS native_id, 'major' AS severity, kind AS title, COALESCE(scope, 'platform') AS detail, 1 AS count, first_seen_at AS first_seen FROM ai_spend_episodes WHERE status='open'")
 	// 'pending' alone is every generated recommendation (Safe Auto applies most

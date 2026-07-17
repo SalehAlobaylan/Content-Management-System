@@ -5,7 +5,6 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
-	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"golang.org/x/net/html"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -895,10 +893,6 @@ func UpdateContentSource(c *gin.Context) {
 	if req.ImageURL != nil {
 		source.ImageURL = req.ImageURL
 	}
-	if source.ImageURL == nil || strings.TrimSpace(*source.ImageURL) == "" {
-		source.ImageURL = discoverSourceImageURL(source.FeedURL)
-	}
-
 	if req.APIConfig != nil {
 		apiConfig, err := mapToJSON(req.APIConfig)
 		if err != nil {
@@ -1340,192 +1334,15 @@ func mapToJSON(value map[string]interface{}) (datatypes.JSON, error) {
 }
 
 func sourceImageURL(imageURL *string, feedURL *string) *string {
+	// CMS stores an explicit operator-approved image URL but never fetches a
+	// source/feed to discover one. Source retrieval belongs to Aggregation or
+	// Enrichment, whose transports own SSRF and redirect containment.
+	_ = feedURL
 	if imageURL != nil && strings.TrimSpace(*imageURL) != "" {
 		value := strings.TrimSpace(*imageURL)
 		return &value
 	}
-	return discoverSourceImageURL(feedURL)
-}
-
-func discoverSourceImageURL(feedURL *string) *string {
-	if feedURL == nil || strings.TrimSpace(*feedURL) == "" {
-		return nil
-	}
-	baseURL := strings.TrimSpace(*feedURL)
-	req, err := http.NewRequest(http.MethodGet, baseURL, nil)
-	if err != nil {
-		return faviconURL(baseURL)
-	}
-	req.Header.Set("User-Agent", "Wahb-CMS/1.0 (+https://wahb.salehspace.dev)")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.8")
-
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return faviconURL(baseURL)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return faviconURL(baseURL)
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return faviconURL(baseURL)
-	}
-
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-	var candidate string
-	if strings.Contains(contentType, "xml") || strings.Contains(contentType, "rss") || strings.Contains(contentType, "atom") {
-		candidate = imageFromFeedXML(body, baseURL)
-	} else {
-		candidate = imageFromHTML(body, baseURL)
-	}
-	if candidate != "" {
-		return &candidate
-	}
-	return faviconURL(baseURL)
-}
-
-func imageFromFeedXML(body []byte, baseURL string) string {
-	decoder := xml.NewDecoder(bytes.NewReader(body))
-	stack := make([]string, 0, 8)
-	for {
-		token, err := decoder.Token()
-		if err != nil {
-			return ""
-		}
-		switch t := token.(type) {
-		case xml.StartElement:
-			name := strings.ToLower(t.Name.Local)
-			stack = append(stack, name)
-			if name == "image" || name == "thumbnail" {
-				for _, attr := range t.Attr {
-					if strings.EqualFold(attr.Name.Local, "href") || strings.EqualFold(attr.Name.Local, "url") {
-						if resolved := resolveSourceImageURL(attr.Value, baseURL); resolved != "" {
-							return resolved
-						}
-					}
-				}
-			}
-		case xml.EndElement:
-			if len(stack) > 0 {
-				stack = stack[:len(stack)-1]
-			}
-		case xml.CharData:
-			if len(stack) >= 2 && stack[len(stack)-1] == "url" && stack[len(stack)-2] == "image" {
-				if resolved := resolveSourceImageURL(string(t), baseURL); resolved != "" {
-					return resolved
-				}
-			}
-		}
-	}
-}
-
-func imageFromHTML(body []byte, baseURL string) string {
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		return ""
-	}
-	var firstIcon string
-	var walk func(*html.Node) string
-	walk = func(n *html.Node) string {
-		if n.Type == html.ElementNode {
-			switch strings.ToLower(n.Data) {
-			case "meta":
-				name := lowerAttr(n, "property")
-				if name == "" {
-					name = lowerAttr(n, "name")
-				}
-				if name == "og:image" || name == "og:image:url" || name == "twitter:image" || name == "twitter:image:src" {
-					if resolved := resolveSourceImageURL(attrValue(n, "content"), baseURL); resolved != "" {
-						return resolved
-					}
-				}
-			case "link":
-				rel := lowerAttr(n, "rel")
-				if strings.Contains(rel, "apple-touch-icon") || strings.Contains(rel, "icon") {
-					if firstIcon == "" {
-						firstIcon = resolveSourceImageURL(attrValue(n, "href"), baseURL)
-					}
-				}
-			}
-		}
-		for child := n.FirstChild; child != nil; child = child.NextSibling {
-			if found := walk(child); found != "" {
-				return found
-			}
-		}
-		return ""
-	}
-	if found := walk(doc); found != "" {
-		return found
-	}
-	return firstIcon
-}
-
-func attrValue(n *html.Node, key string) string {
-	for _, attr := range n.Attr {
-		if strings.EqualFold(attr.Key, key) {
-			return strings.TrimSpace(attr.Val)
-		}
-	}
-	return ""
-}
-
-func lowerAttr(n *html.Node, key string) string {
-	return strings.ToLower(attrValue(n, key))
-}
-
-func resolveSourceImageURL(rawImageURL string, baseURL string) string {
-	rawImageURL = strings.TrimSpace(rawImageURL)
-	if rawImageURL == "" {
-		return ""
-	}
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return ""
-	}
-	ref, err := url.Parse(rawImageURL)
-	if err != nil {
-		return ""
-	}
-	if ref.Scheme == "" && strings.HasPrefix(rawImageURL, "//") {
-		ref.Scheme = base.Scheme
-	}
-	resolved := base.ResolveReference(ref)
-	if resolved.Scheme != "http" && resolved.Scheme != "https" {
-		return ""
-	}
-	return resolved.String()
-}
-
-func faviconURL(rawURL string) *string {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return nil
-	}
-	candidate := (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: "/favicon.ico"}).String()
-	req, err := http.NewRequest(http.MethodHead, candidate, nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("User-Agent", "Wahb-CMS/1.0 (+https://wahb.salehspace.dev)")
-
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil
-	}
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-	if contentType != "" && !strings.Contains(contentType, "image") && !strings.Contains(contentType, "octet-stream") {
-		return nil
-	}
-	return &candidate
+	return nil
 }
 
 func parseSourceAPIConfig(raw datatypes.JSON) (map[string]interface{}, error) {

@@ -27,6 +27,7 @@ const (
 	systemProbeTimeout         = 3 * time.Second
 	systemProbePhaseTimeout    = 10 * time.Second
 	systemProbeBodyLimit       = 256 * 1024
+	systemQueueProbeBodyLimit  = 1024 * 1024
 	systemQueueWaitingWarn     = 100
 	systemAutopilotHistoryRuns = 12
 	systemAutopilotAdvisoryKey = 7_070_000_001
@@ -55,57 +56,6 @@ var defaultSystemAutopilotDeps = systemAutopilotDeps{
 	collect: collectSystemHealthSnapshot,
 }
 
-type systemProbeDependency struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Detail string `json:"detail,omitempty"`
-}
-
-type systemProbeModel struct {
-	Name   string `json:"name"`
-	Loaded bool   `json:"loaded"`
-	Detail string `json:"detail,omitempty"`
-}
-
-type systemProbeWorker struct {
-	Configured bool `json:"configured"`
-	Alive      bool `json:"alive"`
-	Queued     int  `json:"queued"`
-	Ongoing    int  `json:"ongoing"`
-	Complete   int  `json:"complete"`
-	Failed     int  `json:"failed"`
-	Retried    int  `json:"retried"`
-}
-
-type systemProbeResult struct {
-	Name        string                  `json:"name"`
-	DisplayName string                  `json:"display_name"`
-	EndpointURL string                  `json:"endpoint_url"`
-	Status      string                  `json:"status"`
-	LatencyMS   *int64                  `json:"latency_ms,omitempty"`
-	HTTPStatus  *int                    `json:"http_status,omitempty"`
-	Version     string                  `json:"version,omitempty"`
-	Deps        []systemProbeDependency `json:"deps,omitempty"`
-	Queues      []autopilotQueueStat    `json:"queues,omitempty"`
-	Models      []systemProbeModel      `json:"models,omitempty"`
-	Worker      *systemProbeWorker      `json:"worker,omitempty"`
-	RawError    string                  `json:"raw_error,omitempty"`
-	Verdicts    []string                `json:"verdicts,omitempty"`
-}
-
-type systemHealthSnapshot struct {
-	Timestamp string              `json:"timestamp"`
-	Overall   string              `json:"overall"`
-	Services  []systemProbeResult `json:"services"`
-	Issues    []systemHealthIssue `json:"issues"`
-}
-
-type systemHealthIssue struct {
-	Severity string `json:"severity"`
-	Service  string `json:"service,omitempty"`
-	Message  string `json:"message"`
-}
-
 type systemAnomaly struct {
 	Key       string                 `json:"key"`
 	Service   string                 `json:"service"`
@@ -117,9 +67,10 @@ type systemAnomaly struct {
 }
 
 type systemRunSnapshot struct {
-	Timestamp string          `json:"timestamp"`
-	Overall   string          `json:"overall"`
-	Anomalies []systemAnomaly `json:"anomalies"`
+	Timestamp string              `json:"timestamp"`
+	Overall   string              `json:"overall"`
+	Services  []systemProbeResult `json:"services"`
+	Anomalies []systemAnomaly     `json:"anomalies"`
 }
 
 type systemSiblingAutopilot struct {
@@ -274,9 +225,10 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	prev := recentSystemRunSnapshots(db, systemAutopilotHistoryRuns)
 	confirmed := confirmSystemAnomalies(anomalies, prev, policy.ConfirmProbes)
 	confirmed = correlateSystemAnomalies(confirmed)
-	confirmed = applySystemFlapGuard(db, confirmed, policy.FlapCycles24h, writeAction)
+	confirmed = applySystemFlapGuard(db, confirmed, policy.FlapCycles24h, now, writeAction)
+	observed := correlateSystemAnomalies(anomalies)
 
-	for _, anomaly := range anomalies {
+	for _, anomaly := range observed {
 		if anomaly.Verdict == models.SystemVerdictQueueBacklog {
 			if systemAnomalyStreak(anomaly, prev) < 3 {
 				continue
@@ -325,18 +277,23 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 		key := systemIncidentKey(anomaly.Service, anomaly.Verdict)
 		ep, exists := episodesByKey[key]
 		if exists {
-			transition := "updated"
+			transition := ""
 			if ep.Status == models.SystemIncidentStatusRecovering {
 				transition = "relapsed"
+			} else if systemEpisodeScopeChanged(ep, anomaly) || ep.Severity != anomaly.Severity || ep.Summary != anomaly.Summary {
+				transition = "scope_changed"
 			}
 			ep.LastSeenAt = now
 			ep.Status = models.SystemIncidentStatusOpen
 			ep.Shadow = policy.Mode != models.SystemAutopilotModeSafeAuto
-			ep.Summary = anomaly.Summary
-			ep.RootCauseHint = systemRootCauseHint(anomaly)
-			ep.Evidence = marshalAutopilotJSON(anomaly.Evidence)
-			ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, transition, now, anomaly, snapshot)
 			ep.RecoveringSince = nil
+			if transition != "" {
+				ep.Severity = anomaly.Severity
+				ep.Summary = anomaly.Summary
+				ep.RootCauseHint = systemRootCauseHint(anomaly)
+				ep.Evidence = marshalAutopilotJSON(anomaly.Evidence)
+				ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, transition, now, anomaly, snapshot)
+			}
 			if err := db.Save(&ep).Error; err != nil {
 				episodeWriteErrors++
 				writeAction(models.SystemAutopilotAction{
@@ -350,14 +307,16 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 				continue
 			}
 			handledConfirmed = append(handledConfirmed, anomaly)
-			writeAction(models.SystemAutopilotAction{
-				EpisodeID: &ep.ID,
-				Target:    anomaly.Service,
-				Action:    models.SystemAutopilotActionUpdateEpisode,
-				Verdict:   anomaly.Verdict,
-				Reason:    anomaly.Summary,
-				Output:    marshalAutopilotJSON(anomaly),
-			})
+			if transition != "" {
+				writeAction(models.SystemAutopilotAction{
+					EpisodeID: &ep.ID,
+					Target:    anomaly.Service,
+					Action:    models.SystemAutopilotActionUpdateEpisode,
+					Verdict:   anomaly.Verdict,
+					Reason:    anomaly.Summary,
+					Output:    marshalAutopilotJSON(anomaly),
+				})
+			}
 		} else {
 			ep = models.SystemIncidentEpisode{
 				RootService:     anomaly.Service,
@@ -396,7 +355,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 			})
 		}
 		if isSystemHardDownVerdict(anomaly.Verdict) {
-			applied, containmentWriteErrors := handleSystemContainment(db, policy, anomaly, &ep, storeAction, func(action models.SystemAutopilotAction) {
+			applied, containmentWriteErrors := handleSystemContainment(db, policy, anomaly, &ep, now, storeAction, func(action models.SystemAutopilotAction) {
 				actions = append(actions, action)
 			})
 			episodeWriteErrors += containmentWriteErrors
@@ -416,15 +375,15 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 		}
 	}
 
-	resolvedEpisodes, resolutionWriteErrors := resolveRecoveredSystemEpisodes(db, openEpisodes, snapshot, prev, policy.ResolveProbes, writeAction)
+	resolvedEpisodes, resolutionWriteErrors := resolveRecoveredSystemEpisodes(db, openEpisodes, snapshot, prev, policy.ResolveProbes, now, writeAction)
 	episodeWriteErrors += resolutionWriteErrors
 	if len(resolvedEpisodes) > 0 {
-		episodeWriteErrors += resumeRecoveredSystemContainment(db, policy, resolvedEpisodes, storeAction, func(action models.SystemAutopilotAction) {
+		episodeWriteErrors += resumeRecoveredSystemContainment(db, policy, resolvedEpisodes, now, storeAction, func(action models.SystemAutopilotAction) {
 			actions = append(actions, action)
 		})
 	}
 
-	runSnapshot := systemRunSnapshot{Timestamp: snapshot.Timestamp, Overall: snapshot.Overall, Anomalies: anomalies}
+	runSnapshot := systemRunSnapshot{Timestamp: snapshot.Timestamp, Overall: snapshot.Overall, Services: snapshot.Services, Anomalies: anomalies}
 	run.ProbeResults = marshalAutopilotJSON(gin.H{
 		"snapshot":  snapshot,
 		"anomalies": anomalies,
@@ -487,63 +446,7 @@ func tryAcquireSystemAutopilotAdvisoryLock(db *gorm.DB) (func(), bool) {
 	}, true
 }
 
-func collectSystemHealthSnapshot(db *gorm.DB) (systemHealthSnapshot, []systemAnomaly) {
-	now := time.Now().UTC()
-	checks := []func() systemProbeResult{
-		func() systemProbeResult { return checkSystemCMS(db) },
-		checkSystemIAM,
-		checkSystemAggregation,
-		checkSystemEnrichment,
-		checkSystemMedia,
-		checkSystemPlatform,
-	}
-	services := make([]systemProbeResult, len(checks))
-	type result struct {
-		index int
-		probe systemProbeResult
-	}
-	results := make(chan result, len(checks))
-	for index, check := range checks {
-		go func(index int, check func() systemProbeResult) { results <- result{index: index, probe: check()} }(index, check)
-	}
-	deadline := time.NewTimer(systemProbePhaseTimeout)
-	defer deadline.Stop()
-	received := make([]bool, len(checks))
-	for range checks {
-		select {
-		case result := <-results:
-			services[result.index], received[result.index] = result.probe, true
-		case <-deadline.C:
-			for index := range services {
-				if !received[index] {
-					services[index] = systemProbeResult{Name: []string{"cms", "iam", "aggregation", "enrichment", "media", "platform"}[index], Status: "unknown", RawError: "system health probe phase timed out", Verdicts: []string{models.SystemVerdictTransientProbeFailure}}
-				}
-			}
-			goto collected
-		}
-	}
-collected:
-	overall := "healthy"
-	for _, svc := range services {
-		if svc.Status == "unhealthy" {
-			overall = "unhealthy"
-			break
-		}
-		if svc.Status == "degraded" || svc.Status == "unknown" {
-			overall = "degraded"
-		}
-	}
-	issues := systemIssuesFromServices(services)
-	anomalies := systemAnomaliesFromServices(services)
-	return systemHealthSnapshot{
-		Timestamp: now.Format(time.RFC3339),
-		Overall:   overall,
-		Services:  services,
-		Issues:    issues,
-	}, anomalies
-}
-
-func checkSystemCMS(db *gorm.DB) systemProbeResult {
+func checkSystemCMS(ctx context.Context, db *gorm.DB) systemProbeResult {
 	start := time.Now()
 	result := systemProbeResult{Name: "cms", DisplayName: "CMS", EndpointURL: "local", Status: "healthy"}
 	sqlDB, err := db.DB()
@@ -553,7 +456,7 @@ func checkSystemCMS(db *gorm.DB) systemProbeResult {
 		result.Verdicts = []string{models.SystemVerdictServiceDown}
 		return result
 	}
-	err = sqlDB.Ping()
+	err = sqlDB.PingContext(ctx)
 	latency := time.Since(start).Milliseconds()
 	result.LatencyMS = &latency
 	if err != nil {
@@ -568,12 +471,12 @@ func checkSystemCMS(db *gorm.DB) systemProbeResult {
 	return result
 }
 
-func checkSystemIAM() systemProbeResult {
+func checkSystemIAM(ctx context.Context) systemProbeResult {
 	display := systemProbeResult{Name: "iam", DisplayName: "IAM", EndpointURL: systemBaseURL("IAM_BASE_URL")}
 	if display.EndpointURL == "" {
 		return systemMissingProbe(display, "IAM_BASE_URL")
 	}
-	r := systemHTTPProbe(display.EndpointURL+"/health", false)
+	r := systemHTTPProbe(ctx, display.EndpointURL+"/health", false)
 	body := asSystemRecord(r.Body)
 	reported := systemString(body["status"])
 	display.EndpointURL = display.EndpointURL + "/health"
@@ -581,16 +484,18 @@ func checkSystemIAM() systemProbeResult {
 	display.HTTPStatus = r.HTTPStatus
 	display.RawError = r.Error
 	display.Version = systemString(body["version"])
-	if r.OK && reported == "healthy" {
+	display.ReadinessObserved = r.OK && r.JSONObserved && reported == "healthy"
+	if display.ReadinessObserved {
 		display.Status = "healthy"
 		display.Deps = []systemProbeDependency{{Name: "postgres", Status: "healthy"}}
 		display.Verdicts = []string{models.SystemVerdictHealthy}
 		return display
 	}
-	if r.OK {
+	if r.HTTPStatus != nil {
 		display.Status = "degraded"
-		display.Deps = []systemProbeDependency{{Name: "postgres", Status: "unhealthy", Detail: reported}}
-		display.Verdicts = []string{models.SystemVerdictDependencyDown}
+		if reported != "" {
+			display.Deps = []systemProbeDependency{{Name: "postgres", Status: "unknown", Detail: reported}}
+		}
 		return display
 	}
 	display.Status = "unhealthy"
@@ -598,24 +503,33 @@ func checkSystemIAM() systemProbeResult {
 	return display
 }
 
-func checkSystemAggregation() systemProbeResult {
+func checkSystemAggregation(ctx context.Context) systemProbeResult {
 	display := systemProbeResult{Name: "aggregation", DisplayName: "Aggregation", EndpointURL: systemBaseURL("AGGREGATION_BASE_URL")}
 	if display.EndpointURL == "" {
 		return systemMissingProbe(display, "AGGREGATION_BASE_URL")
 	}
-	health := systemHTTPProbe(display.EndpointURL+"/health", false)
-	ready := systemHTTPProbe(display.EndpointURL+"/ready", false)
+	var health, ready systemHTTPProbeResult
+	var queues []autopilotQueueStat
+	var queueErr error
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); health = systemHTTPProbe(ctx, display.EndpointURL+"/health", false) }()
+	go func() { defer wg.Done(); ready = systemHTTPProbe(ctx, display.EndpointURL+"/ready", false) }()
+	go func() { defer wg.Done(); queues, queueErr = fetchSystemAggregationQueueStats(ctx) }()
+	wg.Wait()
 	display.LatencyMS = firstLatency(health.LatencyMS, ready.LatencyMS)
 	display.HTTPStatus = firstHTTPStatus(health.HTTPStatus, ready.HTTPStatus)
 	display.RawError = firstNonEmpty(health.Error, ready.Error)
 	readyBody := asSystemRecord(ready.Body)
 	display.Deps = mapSystemDependencies(asSystemRecord(readyBody["dependencies"]))
-	if stats, err := fetchAggregationQueueStats(); err == nil {
-		display.Queues = stats
+	healthObserved := health.JSONObserved && systemHealthStatusObserved(asSystemRecord(health.Body), "healthy")
+	display.ReadinessObserved = ready.JSONObserved && readinessAggregationBodyObserved(readyBody)
+	if queueErr == nil {
+		display.Queues = queues
 	} else if display.RawError == "" {
-		display.RawError = err.Error()
+		display.RawError = queueErr.Error()
 	}
-	reachable := health.OK || ready.OK
+	reachable := health.HTTPStatus != nil || ready.HTTPStatus != nil
 	switch {
 	case !reachable:
 		display.Status = "unhealthy"
@@ -623,6 +537,10 @@ func checkSystemAggregation() systemProbeResult {
 	case hasUnhealthySystemDeps(display.Deps):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictDependencyDown}
+	case !healthObserved || !display.ReadinessObserved:
+		display.Status = "degraded"
+	case queueErr != nil:
+		display.Status = "degraded"
 	case hasBackloggedQueues(display.Queues):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictQueueBacklog}
@@ -633,22 +551,30 @@ func checkSystemAggregation() systemProbeResult {
 	return display
 }
 
-func checkSystemEnrichment() systemProbeResult {
-	return checkSystemMLService("enrichment", "Enrichment", "ENRICHMENT_BASE_URL", false)
+func checkSystemEnrichment(ctx context.Context) systemProbeResult {
+	return checkSystemMLService(ctx, "enrichment", "Enrichment", "ENRICHMENT_BASE_URL", false)
 }
 
-func checkSystemMedia() systemProbeResult {
-	return checkSystemMLService("media", "Media", "MEDIA_BASE_URL", true)
+func checkSystemMedia(ctx context.Context) systemProbeResult {
+	return checkSystemMLService(ctx, "media", "Media", "MEDIA_BASE_URL", true)
 }
 
-func checkSystemMLService(name, displayName, envKey string, includeWorker bool) systemProbeResult {
+func checkSystemMLService(ctx context.Context, name, displayName, envKey string, includeWorker bool) systemProbeResult {
 	base := systemBaseURL(envKey)
 	display := systemProbeResult{Name: name, DisplayName: displayName, EndpointURL: base}
 	if base == "" {
 		return systemMissingProbe(display, envKey)
 	}
-	health := systemHTTPProbe(base+"/health", false)
-	ready := systemHTTPProbe(base+"/ready", false)
+	var health, ready, queue systemHTTPProbeResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); health = systemHTTPProbe(ctx, base+"/health", false) }()
+	go func() { defer wg.Done(); ready = systemHTTPProbe(ctx, base+"/ready", false) }()
+	if includeWorker {
+		wg.Add(1)
+		go func() { defer wg.Done(); queue = systemHTTPProbe(ctx, base+"/health/queue", false) }()
+	}
+	wg.Wait()
 	display.LatencyMS = firstLatency(health.LatencyMS, ready.LatencyMS)
 	display.HTTPStatus = firstHTTPStatus(health.HTTPStatus, ready.HTTPStatus)
 	display.RawError = firstNonEmpty(health.Error, ready.Error)
@@ -657,15 +583,16 @@ func checkSystemMLService(name, displayName, envKey string, includeWorker bool) 
 	display.Version = systemString(healthBody["version"])
 	display.Models = mapSystemModels(readyBody)
 	display.Deps = mapSystemDependencies(asSystemRecord(readyBody["dependencies"]))
+	healthObserved := health.JSONObserved && systemHealthStatusObserved(healthBody, "ok")
+	display.ReadinessObserved = ready.JSONObserved && readinessMLBodyObserved(readyBody)
 	if includeWorker {
-		queue := systemHTTPProbe(base+"/health/queue", false)
-		if worker := mapSystemWorker(asSystemRecord(queue.Body)); worker != nil {
+		if worker := mapSystemWorker(asSystemRecord(queue.Body)); queue.JSONObserved && worker != nil {
 			display.Worker = worker
 			// A stalled worker is degraded execution evidence, not a hard
 			// service dependency eligible for sibling containment.
 		}
 	}
-	reachable := health.OK || ready.OK
+	reachable := health.HTTPStatus != nil || ready.HTTPStatus != nil
 	switch {
 	case !reachable:
 		display.Status = "unhealthy"
@@ -673,6 +600,8 @@ func checkSystemMLService(name, displayName, envKey string, includeWorker bool) 
 	case hasUnhealthySystemDeps(display.Deps):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictDependencyDown}
+	case !healthObserved || !display.ReadinessObserved:
+		display.Status = "degraded"
 	case hasUnloadedModels(display.Models):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictModelUnloaded}
@@ -686,13 +615,13 @@ func checkSystemMLService(name, displayName, envKey string, includeWorker bool) 
 	return display
 }
 
-func checkSystemPlatform() systemProbeResult {
+func checkSystemPlatform(ctx context.Context) systemProbeResult {
 	base := systemBaseURL("PLATFORM_BASE_URL")
 	display := systemProbeResult{Name: "platform", DisplayName: "Wahb-Platform", EndpointURL: base}
 	if base == "" {
 		return systemMissingProbe(display, "PLATFORM_BASE_URL")
 	}
-	r := systemHTTPProbe(base, true)
+	r := systemHTTPProbe(ctx, base, true)
 	display.LatencyMS = r.LatencyMS
 	display.HTTPStatus = r.HTTPStatus
 	display.RawError = r.Error
@@ -707,17 +636,20 @@ func checkSystemPlatform() systemProbeResult {
 }
 
 type systemHTTPProbeResult struct {
-	OK         bool
-	HTTPStatus *int
-	LatencyMS  *int64
-	Body       interface{}
-	Error      string
+	OK           bool
+	JSONObserved bool
+	HTTPStatus   *int
+	LatencyMS    *int64
+	Body         interface{}
+	Error        string
 }
 
-func systemHTTPProbe(url string, allowText bool) systemHTTPProbeResult {
+func systemHTTPProbe(parent context.Context, url string, allowText bool) systemHTTPProbeResult {
 	start := time.Now()
-	client := &http.Client{Timeout: systemProbeTimeout}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(parent, systemProbeTimeout)
+	defer cancel()
+	client := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		latency := time.Since(start).Milliseconds()
 		return systemHTTPProbeResult{LatencyMS: &latency, Error: err.Error()}
@@ -746,15 +678,78 @@ func systemHTTPProbe(url string, allowText bool) systemHTTPProbeResult {
 	if allowText {
 		return result
 	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		result.Error = "probe response is missing JSON"
+		return result
+	}
 	var body interface{}
-	if len(bytes.TrimSpace(raw)) > 0 {
-		if err := json.Unmarshal(raw, &body); err != nil {
-			result.Body = string(raw)
-			return result
-		}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		result.Error = "probe response is not valid JSON"
+		return result
 	}
 	result.Body = body
+	result.JSONObserved = true
 	return result
+}
+
+// fetchSystemAggregationQueueStats is intentionally separate from the generic
+// Aggregation helper: System Health must obey its phase context and cannot let
+// a queue read consume the generic helper's 30-second, unbounded budget.
+func fetchSystemAggregationQueueStats(parent context.Context) ([]autopilotQueueStat, error) {
+	base := systemBaseURL("AGGREGATION_BASE_URL")
+	if base == "" {
+		return nil, fmt.Errorf("aggregation service URL is not configured")
+	}
+	token := aggregationInternalServiceToken()
+	if token == "" {
+		return nil, fmt.Errorf("aggregation service token is not configured")
+	}
+	ctx, cancel := context.WithTimeout(parent, systemProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/internal/queues", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("aggregation queues responded with status %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, systemQueueProbeBodyLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > systemQueueProbeBodyLimit {
+		return nil, fmt.Errorf("aggregation queue response exceeds 1 MiB limit")
+	}
+	var wrapped struct {
+		Data []autopilotQueueStat `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &wrapped); err != nil {
+		return nil, fmt.Errorf("decode aggregation queues: %w", err)
+	}
+	return wrapped.Data, nil
+}
+
+func readinessAggregationBodyObserved(body map[string]interface{}) bool {
+	status := systemString(body["status"])
+	_, hasDeps := body["dependencies"]
+	return (status == "ready" || status == "not_ready") && hasDeps
+}
+
+func readinessMLBodyObserved(body map[string]interface{}) bool {
+	status := systemString(body["status"])
+	_, hasModels := body["models"]
+	_, hasDeps := body["dependencies"]
+	return (status == "ok" || status == "not_ready") && hasModels && hasDeps
+}
+
+func systemHealthStatusObserved(body map[string]interface{}, expected string) bool {
+	return systemString(body["status"]) == expected
 }
 
 func systemBaseURL(key string) string {
@@ -764,7 +759,6 @@ func systemBaseURL(key string) string {
 func systemMissingProbe(result systemProbeResult, envKey string) systemProbeResult {
 	result.Status = "unknown"
 	result.RawError = envKey + " not configured"
-	result.Verdicts = []string{models.SystemVerdictTransientProbeFailure}
 	return result
 }
 
@@ -821,12 +815,12 @@ func mapSystemDependencies(input map[string]interface{}) []systemProbeDependency
 		case bool:
 			if v {
 				status = "healthy"
+			} else {
+				status = "unhealthy"
 			}
 		case string:
 			detail = v
-			if systemDependencyHealthyString(v) {
-				status = "healthy"
-			}
+			status = systemDependencyStatus(v)
 		default:
 			detail = fmt.Sprintf("%v", value)
 		}
@@ -837,11 +831,17 @@ func mapSystemDependencies(input map[string]interface{}) []systemProbeDependency
 }
 
 func systemDependencyHealthyString(value string) bool {
+	return systemDependencyStatus(value) == "healthy"
+}
+
+func systemDependencyStatus(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "connected", "reachable", "configured", "ready", "ok", "true":
-		return true
+		return "healthy"
+	case "disconnected", "unreachable", "circuit_open", "not_ready", "false":
+		return "unhealthy"
 	default:
-		return false
+		return "unknown"
 	}
 }
 
@@ -1013,6 +1013,42 @@ func systemAnomalySummary(svc systemProbeResult, verdict string) string {
 	default:
 		return fmt.Sprintf("%s reported %s", svc.DisplayName, verdict)
 	}
+}
+
+// systemEpisodeScopeChanged deliberately compares only the stable causal
+// scope. Probe payloads contain latency and other live diagnostics that change
+// on every run and must not grow an incident timeline indefinitely.
+func systemEpisodeScopeChanged(ep models.SystemIncidentEpisode, anomaly systemAnomaly) bool {
+	var stored struct {
+		Evidence map[string]interface{} `json:"evidence"`
+	}
+	if err := json.Unmarshal(ep.Evidence, &stored); err != nil {
+		return true
+	}
+	return systemEvidenceScope(stored.Evidence, ep.RootService) != systemEvidenceScope(anomaly.Evidence, anomaly.Service)
+}
+
+func systemEvidenceScope(evidence map[string]interface{}, fallback string) string {
+	services := []string{}
+	for _, value := range []interface{}{evidence["services"], evidence["members"]} {
+		switch items := value.(type) {
+		case []string:
+			services = append(services, items...)
+		case []interface{}:
+			for _, item := range items {
+				if service := systemString(asSystemRecord(item)["service"]); service != "" {
+					services = append(services, service)
+				} else if service, ok := item.(string); ok && service != "" {
+					services = append(services, service)
+				}
+			}
+		}
+	}
+	if len(services) == 0 {
+		services = append(services, fallback)
+	}
+	sort.Strings(services)
+	return strings.Join(services, ",")
 }
 
 func systemRootCauseHint(anomaly systemAnomaly) string {
@@ -1218,16 +1254,16 @@ func systemAnomalyStreak(current systemAnomaly, prev []systemRunSnapshot) int {
 	return count
 }
 
-func applySystemFlapGuard(db *gorm.DB, current []systemAnomaly, maxFlaps int, writeAction func(models.SystemAutopilotAction)) []systemAnomaly {
+func applySystemFlapGuard(db *gorm.DB, current []systemAnomaly, maxFlaps int, now time.Time, writeAction func(models.SystemAutopilotAction)) []systemAnomaly {
 	if maxFlaps <= 0 {
 		return current
 	}
 	out := []systemAnomaly{}
 	for _, anomaly := range current {
 		var count int64
-		since := time.Now().UTC().Add(-24 * time.Hour)
+		since := now.UTC().Add(-24 * time.Hour)
 		_ = db.Model(&models.SystemIncidentEpisode{}).
-			Where("root_service = ? AND verdict = ? AND created_at >= ?", anomaly.Service, anomaly.Verdict, since).
+			Where("root_service = ? AND verdict = ? AND status = ? AND resolved_at >= ?", anomaly.Service, anomaly.Verdict, models.SystemIncidentStatusResolved, since).
 			Count(&count).Error
 		if int(count) >= maxFlaps {
 			writeAction(models.SystemAutopilotAction{
@@ -1253,7 +1289,7 @@ func openSystemIncidentEpisodes(db *gorm.DB) []models.SystemIncidentEpisode {
 	return episodes
 }
 
-func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemIncidentEpisode, snapshot systemHealthSnapshot, prev []systemRunSnapshot, resolveProbes int, writeAction func(models.SystemAutopilotAction)) ([]models.SystemIncidentEpisode, int) {
+func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemIncidentEpisode, snapshot systemHealthSnapshot, prev []systemRunSnapshot, resolveProbes int, now time.Time, writeAction func(models.SystemAutopilotAction)) ([]models.SystemIncidentEpisode, int) {
 	if resolveProbes < 1 {
 		resolveProbes = 1
 	}
@@ -1265,7 +1301,7 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 		}
 		ok := 1
 		for _, run := range prev {
-			if !runHasSystemAnomaly(run, systemIncidentKey(ep.RootService, ep.Verdict)) {
+			if systemEpisodeObservablyHealthyServices(ep, run.Services) {
 				ok++
 				if ok >= resolveProbes {
 					break
@@ -1276,9 +1312,9 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 		}
 		if ok < resolveProbes {
 			if ep.Status != models.SystemIncidentStatusRecovering {
-				now := time.Now().UTC()
+				recoveringAt := now.UTC()
 				ep.Status = models.SystemIncidentStatusRecovering
-				ep.RecoveringSince = &now
+				ep.RecoveringSince = &recoveringAt
 				if err := db.Save(&ep).Error; err != nil {
 					writeErrors++
 					writeAction(models.SystemAutopilotAction{
@@ -1293,10 +1329,10 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 			}
 			continue
 		}
-		now := time.Now().UTC()
+		resolvedAt := now.UTC()
 		ep.Status = models.SystemIncidentStatusResolved
-		ep.ResolvedAt = &now
-		ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, "resolved", now, systemAnomaly{
+		ep.ResolvedAt = &resolvedAt
+		ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, "resolved", resolvedAt, systemAnomaly{
 			Key:      systemIncidentKey(ep.RootService, ep.Verdict),
 			Service:  ep.RootService,
 			Verdict:  ep.Verdict,
@@ -1328,8 +1364,12 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 }
 
 func systemEpisodeObservablyHealthy(ep models.SystemIncidentEpisode, snapshot systemHealthSnapshot) bool {
+	return systemEpisodeObservablyHealthyServices(ep, snapshot.Services)
+}
+
+func systemEpisodeObservablyHealthyServices(ep models.SystemIncidentEpisode, services []systemProbeResult) bool {
 	healthy := map[string]bool{}
-	for _, svc := range snapshot.Services {
+	for _, svc := range services {
 		healthy[svc.Name] = svc.Status == "healthy"
 	}
 	switch ep.RootService {
@@ -1408,9 +1448,9 @@ func storeSystemContainmentEntry(tx *gorm.DB, ep *models.SystemIncidentEpisode, 
 	return payload, nil
 }
 
-func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, anomaly systemAnomaly, ep *models.SystemIncidentEpisode, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) (bool, int) {
+func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, anomaly systemAnomaly, ep *models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) (bool, int) {
 	disabled := containmentDisabledSet(policy)
-	now := time.Now().UTC()
+	now = now.UTC()
 	containmentPaused := policy.ContainmentPausedUntil != nil && policy.ContainmentPausedUntil.After(now)
 	desiredUntil := now.Add(time.Duration(policy.ContainmentTTLMinutes) * time.Minute)
 	applied, writeErrors := false, 0
@@ -1559,12 +1599,13 @@ func ensureSystemSiblingPolicyRow(db *gorm.DB, sibling systemSiblingAutopilot) e
 	return fmt.Errorf("unregistered sibling autopilot %q", sibling.Key)
 }
 
-func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, episodes []models.SystemIncidentEpisode, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) int {
+func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, episodes []models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) int {
 	if policy.Mode != models.SystemAutopilotModeSafeAuto {
 		return 0
 	}
 	writeErrors := 0
-	containmentPaused := policy.ContainmentPausedUntil != nil && policy.ContainmentPausedUntil.After(time.Now().UTC())
+	now = now.UTC()
+	containmentPaused := policy.ContainmentPausedUntil != nil && policy.ContainmentPausedUntil.After(now)
 	for _, episode := range episodes {
 		ledger, legacy := readSystemContainmentLedger(episode.Containment)
 		if legacy {
@@ -1616,7 +1657,7 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 				var updatedContainment datatypes.JSON
 				err = db.Transaction(func(tx *gorm.DB) error {
 					query := systemResumeCompareAndSetSQL(sibling)
-					result := tx.Exec(query, time.Now().UTC(), tenantID, until)
+					result := tx.Exec(query, now, tenantID, until)
 					entry := ownership
 					if result.Error != nil {
 						return result.Error
@@ -1893,6 +1934,47 @@ func PauseSystemAutopilotContainment(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"containment_paused_until": until}})
 }
 
+type systemRecommendedAction struct {
+	Label  string `json:"label"`
+	Kind   string `json:"kind"`
+	Target string `json:"target"`
+	Href   string `json:"href"`
+}
+
+type systemIncidentEpisodeListItem struct {
+	ID                uuid.UUID               `json:"id"`
+	RootService       string                  `json:"root_service"`
+	Verdict           string                  `json:"verdict"`
+	Status            string                  `json:"status"`
+	Severity          string                  `json:"severity"`
+	Shadow            bool                    `json:"shadow"`
+	Summary           string                  `json:"summary"`
+	RootCauseHint     string                  `json:"root_cause_hint,omitempty"`
+	FirstDetectedAt   time.Time               `json:"first_detected_at"`
+	LastSeenAt        time.Time               `json:"last_seen_at"`
+	RecoveringSince   *time.Time              `json:"recovering_since,omitempty"`
+	ResolvedAt        *time.Time              `json:"resolved_at,omitempty"`
+	RecommendedAction systemRecommendedAction `json:"recommended_action"`
+}
+
+func recommendedSystemAction(ep models.SystemIncidentEpisode) systemRecommendedAction {
+	return systemRecommendedAction{
+		Label:  "Inspect System Health incident",
+		Kind:   "system_health.inspect",
+		Target: ep.PublicID.String(),
+		Href:   "/platform/system-health",
+	}
+}
+
+func systemIncidentEpisodeListProjection(ep models.SystemIncidentEpisode) systemIncidentEpisodeListItem {
+	return systemIncidentEpisodeListItem{
+		ID: ep.PublicID, RootService: ep.RootService, Verdict: ep.Verdict, Status: ep.Status, Severity: ep.Severity,
+		Shadow: ep.Shadow, Summary: ep.Summary, RootCauseHint: ep.RootCauseHint, FirstDetectedAt: ep.FirstDetectedAt,
+		LastSeenAt: ep.LastSeenAt, RecoveringSince: ep.RecoveringSince, ResolvedAt: ep.ResolvedAt,
+		RecommendedAction: recommendedSystemAction(ep),
+	}
+}
+
 func ListSystemIncidentEpisodes(c *gin.Context) {
 	if _, ok := requireAdminPrincipal(c); !ok {
 		return
@@ -1901,7 +1983,11 @@ func ListSystemIncidentEpisodes(c *gin.Context) {
 	limit := clampQueryInt(c, "limit", 50, 1, 200)
 	var episodes []models.SystemIncidentEpisode
 	_ = db.Order("last_seen_at DESC").Limit(limit).Find(&episodes).Error
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": episodes}})
+	items := make([]systemIncidentEpisodeListItem, 0, len(episodes))
+	for _, episode := range episodes {
+		items = append(items, systemIncidentEpisodeListProjection(episode))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items}})
 }
 
 func GetSystemIncidentEpisode(c *gin.Context) {
@@ -1921,7 +2007,7 @@ func GetSystemIncidentEpisode(c *gin.Context) {
 	}
 	var actions []models.SystemAutopilotAction
 	_ = db.Where("episode_id = ?", ep.ID).Order("started_at ASC").Find(&actions).Error
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"episode": ep, "actions": actions}})
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"episode": ep, "actions": actions, "recommended_action": recommendedSystemAction(ep)}})
 }
 
 func CloseSystemIncidentEpisode(c *gin.Context) {
@@ -1961,7 +2047,22 @@ func CloseSystemIncidentEpisode(c *gin.Context) {
 		Severity: ep.Severity,
 		Summary:  body.Reason,
 	}, systemHealthSnapshot{Overall: "human_override"})
-	if err := db.Save(&ep).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&ep).Error; err != nil {
+			return err
+		}
+		return tx.Create(&models.SystemAutopilotAction{
+			RunID:      0,
+			EpisodeID:  &ep.ID,
+			Target:     ep.RootService,
+			Action:     models.SystemAutopilotActionCloseEpisode,
+			Verdict:    ep.Verdict,
+			Status:     "success",
+			Reason:     body.Reason,
+			StartedAt:  now,
+			FinishedAt: &now,
+		}).Error
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

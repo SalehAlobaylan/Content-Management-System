@@ -4,6 +4,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/lib/pq"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ─── Topics overview ────────────────────────────────────────
@@ -389,6 +391,15 @@ func MergeTopics(c *gin.Context) {
 
 	var moved int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// Lock the destination in the caller's tenant before re-pointing any
+		// rows. A public UUID is globally unique, but it is not an authority to
+		// attach this tenant's content to another tenant's story.
+		var targetStory models.Story
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("public_id = ? AND tenant_id = ?", target, principal.TenantID).
+			First(&targetStory).Error; err != nil {
+			return err
+		}
 		res := tx.Model(&models.ContentItem{}).
 			Where("tenant_id = ? AND story_id IN ?", principal.TenantID, sources).
 			Update("story_id", target)
@@ -398,13 +409,21 @@ func MergeTopics(c *gin.Context) {
 		moved = res.RowsAffected
 
 		var cnt int64
-		tx.Model(&models.ContentItem{}).Where("story_id = ?", target).Count(&cnt)
-		tx.Model(&models.Story{}).Where("public_id = ?", target).Update("article_count", cnt)
+		if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND story_id = ?", principal.TenantID, target).Count(&cnt).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.Story{}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, target).Update("article_count", cnt).Error; err != nil {
+			return err
+		}
 
 		return tx.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, sources).
 			Delete(&models.Story{}).Error
 	})
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, authErrorResponse{Message: "Target topic not found", Code: "NOT_FOUND"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to merge topics: " + err.Error(), Code: "MERGE_FAILED"})
 		return
 	}
@@ -545,20 +564,40 @@ func BulkAssignTopic(c *gin.Context) {
 		targetID = &tid
 	}
 
-	res := apply(db.Model(&models.ContentItem{})).Update("story_id", target)
-	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assign topic: " + res.Error.Error(), Code: "ASSIGN_FAILED"})
+	var updated int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if targetID != nil {
+			var targetStory models.Story
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("public_id = ? AND tenant_id = ?", *targetID, principal.TenantID).
+				First(&targetStory).Error; err != nil {
+				return err
+			}
+		}
+		res := apply(tx.Model(&models.ContentItem{})).Update("story_id", target)
+		if res.Error != nil {
+			return res.Error
+		}
+		updated = res.RowsAffected
+		if targetID == nil {
+			return nil
+		}
+		var cnt int64
+		if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND story_id = ?", principal.TenantID, *targetID).Count(&cnt).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.Story{}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, *targetID).Update("article_count", cnt).Error
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, authErrorResponse{Message: "Target topic not found", Code: "NOT_FOUND"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assign topic: " + err.Error(), Code: "ASSIGN_FAILED"})
 		return
 	}
 
-	// Keep the target's article_count roughly in sync with live membership.
-	if targetID != nil {
-		var cnt int64
-		db.Model(&models.ContentItem{}).Where("story_id = ?", *targetID).Count(&cnt)
-		db.Model(&models.Story{}).Where("public_id = ?", *targetID).Update("article_count", cnt)
-	}
-
-	c.JSON(http.StatusOK, bulkEditTagsResponse{UpdatedCount: res.RowsAffected, Message: "Moved items to topic"})
+	c.JSON(http.StatusOK, bulkEditTagsResponse{UpdatedCount: updated, Message: "Moved items to topic"})
 }
 
 type reclassifyRequest struct {

@@ -1,36 +1,29 @@
 package controllers
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
+	"content-management-system/src/utils"
 
-	"gorm.io/driver/postgres"
+	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// Opt-in lifecycle tests use a disposable Postgres only. Never point this at a
-// shared database: the fixture migrates and clears the listed tables.
+// Lifecycle tests use the shared disposable PostgreSQL fixture.
 func systemHealthAutopilotTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("SYSTEM_HEALTH_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set SYSTEM_HEALTH_TEST_DATABASE_URL to run System Health PostgreSQL tests")
+	if os.Getenv("CMS_TEST_ADMIN_URL") == "" && os.Getenv("CMS_TEST_DATABASE_URL") == "" {
+		t.Skip("set guarded CMS_TEST_ADMIN_URL or CMS_TEST_DATABASE_URL to run System Health DB tests")
 	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("SYSTEM_HEALTH_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error; err != nil {
-		t.Fatal(err)
-	}
+	db := testdb.Open(t)
 	if err := db.AutoMigrate(
 		&models.SystemAutopilotPolicy{}, &models.SystemIncidentEpisode{}, &models.SystemAutopilotRun{}, &models.SystemAutopilotAction{}, &models.AuditLog{},
 		&models.PipelineAutopilotPolicy{}, &models.EnrichmentAutopilotPolicy{}, &models.NewsCirculationPolicy{},
@@ -206,5 +199,300 @@ func TestSystemHealthDB_ResolveMHealthyClosesEpisode(t *testing.T) {
 	}
 	if episode.Status != models.SystemIncidentStatusResolved {
 		t.Fatalf("status = %q, want resolved", episode.Status)
+	}
+}
+
+func TestSystemHealthDB_UnknownProbeBreaksRecoveryStreak(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes, p.ResolveProbes = 1, 3 })
+	now := time.Date(2026, 7, 13, 13, 0, 0, 0, time.UTC)
+	failure, anomalies := systemHealthFailure(now)
+	runSystemHealthFixture(t, db, now, failure, anomalies)
+	healthy, none := healthySystemSnapshotAt(now.Add(time.Minute))
+	runSystemHealthFixture(t, db, now.Add(time.Minute), healthy, none)
+	unknown := healthy
+	unknown.Timestamp = now.Add(2 * time.Minute).UTC().Format(time.RFC3339)
+	for i := range unknown.Services {
+		if unknown.Services[i].Name == "aggregation" {
+			unknown.Services[i].Status = "unknown"
+		}
+	}
+	unknown.Overall = "degraded"
+	runSystemHealthFixture(t, db, now.Add(2*time.Minute), unknown, none)
+	finalHealthy, finalNone := healthySystemSnapshotAt(now.Add(3 * time.Minute))
+	runSystemHealthFixture(t, db, now.Add(3*time.Minute), finalHealthy, finalNone)
+	var episode models.SystemIncidentEpisode
+	if err := db.First(&episode).Error; err != nil {
+		t.Fatal(err)
+	}
+	if episode.Status != models.SystemIncidentStatusRecovering {
+		t.Fatalf("status = %q, want recovering after unknown probe broke the streak", episode.Status)
+	}
+}
+
+func TestSystemHealthDB_FirstRelapseImmediatelyReopensEpisode(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes, p.ResolveProbes = 2, 3 })
+	now := time.Date(2026, 7, 13, 14, 0, 0, 0, time.UTC)
+	failure, anomalies := systemHealthFailure(now)
+	runSystemHealthFixture(t, db, now, failure, anomalies)
+	runSystemHealthFixture(t, db, now.Add(time.Minute), failure, anomalies)
+	healthy, none := healthySystemSnapshotAt(now.Add(2 * time.Minute))
+	runSystemHealthFixture(t, db, now.Add(2*time.Minute), healthy, none)
+	// This relapse has no preceding matching failure, so it is not a fresh
+	// confirmed anomaly. A recovering episode must still reopen immediately.
+	runSystemHealthFixture(t, db, now.Add(3*time.Minute), failure, anomalies)
+	var episode models.SystemIncidentEpisode
+	if err := db.First(&episode).Error; err != nil {
+		t.Fatal(err)
+	}
+	if episode.Status != models.SystemIncidentStatusOpen || episode.RecoveringSince != nil {
+		t.Fatalf("relapse must immediately reopen the episode, got %+v", episode)
+	}
+	var timeline []map[string]interface{}
+	if err := json.Unmarshal(episode.Timeline, &timeline); err != nil {
+		t.Fatal(err)
+	}
+	if len(timeline) == 0 || timeline[len(timeline)-1]["transition"] != "relapsed" {
+		t.Fatalf("expected a relapsed transition, got %+v", timeline)
+	}
+}
+
+func TestSystemHealthDB_UnchangedIncidentDoesNotGrowTimeline(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 1 })
+	now := time.Date(2026, 7, 13, 15, 0, 0, 0, time.UTC)
+	failure, anomalies := systemHealthFailure(now)
+	for i := 0; i < 500; i++ {
+		at := now.Add(time.Duration(i) * time.Minute)
+		failure.Timestamp = at.UTC().Format(time.RFC3339)
+		runSystemHealthFixture(t, db, at, failure, anomalies)
+	}
+	var episode models.SystemIncidentEpisode
+	if err := db.First(&episode).Error; err != nil {
+		t.Fatal(err)
+	}
+	var timeline []map[string]interface{}
+	if err := json.Unmarshal(episode.Timeline, &timeline); err != nil {
+		t.Fatal(err)
+	}
+	if len(timeline) != 1 || timeline[0]["transition"] != "opened" {
+		t.Fatalf("unchanged incident must retain only its opened transition, got %+v", timeline)
+	}
+}
+
+func TestSystemHealthDB_FlapGuardCountsResolvedCyclesNotHumanCloses(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	now := time.Date(2026, 7, 13, 16, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if err := db.Create(&models.SystemIncidentEpisode{
+			RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Status: models.SystemIncidentStatusClosedByHuman,
+			Severity: "critical", FirstDetectedAt: now, LastSeenAt: now, ResolvedAt: &now,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	anomaly := systemAnomaly{Key: "aggregation:service_down", Service: "aggregation", Verdict: models.SystemVerdictServiceDown, Severity: "critical"}
+	if got := applySystemFlapGuard(db, []systemAnomaly{anomaly}, 3, now, func(models.SystemAutopilotAction) {}); len(got) != 1 {
+		t.Fatalf("human closes must not count as flaps, got %+v", got)
+	}
+	for i := 0; i < 3; i++ {
+		if err := db.Create(&models.SystemIncidentEpisode{
+			RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Status: models.SystemIncidentStatusResolved,
+			Severity: "critical", FirstDetectedAt: now, LastSeenAt: now, ResolvedAt: &now,
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	attention := 0
+	if got := applySystemFlapGuard(db, []systemAnomaly{anomaly}, 3, now, func(action models.SystemAutopilotAction) {
+		if action.Guardrail == models.SystemAutopilotGuardFlapping {
+			attention++
+		}
+	}); len(got) != 0 || attention != 1 {
+		t.Fatalf("three resolved cycles must freeze a fresh opening, got=%+v attention=%d", got, attention)
+	}
+}
+
+func TestSystemHealthDB_HumanCloseWritesEpisodeAction(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	now := time.Date(2026, 7, 13, 17, 0, 0, 0, time.UTC)
+	ep := models.SystemIncidentEpisode{
+		RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Status: models.SystemIncidentStatusOpen,
+		Severity: "critical", FirstDetectedAt: now, LastSeenAt: now,
+	}
+	if err := db.Create(&ep).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"reason":"operator verified recovery"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "id", Value: ep.PublicID.String()}}
+	c.Set("db", db)
+	c.Set(utils.AdminPrincipalContextKey, utils.AdminPrincipal{UserID: "admin", Email: "admin@example.test", TenantID: "default"})
+	CloseSystemIncidentEpisode(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("close status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var actions []models.SystemAutopilotAction
+	if err := db.Where("episode_id = ? AND action = ?", ep.ID, models.SystemAutopilotActionCloseEpisode).Find(&actions).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) != 1 || actions[0].Reason != "operator verified recovery" {
+		t.Fatalf("missing close episode ledger action: %+v", actions)
+	}
+}
+
+func TestSystemHealthDB_AdvisoryLockExcludesSecondConnection(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	releaseFirst, acquiredFirst := tryAcquireSystemAutopilotAdvisoryLock(db)
+	if !acquiredFirst {
+		t.Fatal("first advisory-lock acquisition failed")
+	}
+	defer releaseFirst()
+	if releaseSecond, acquiredSecond := tryAcquireSystemAutopilotAdvisoryLock(db); acquiredSecond {
+		releaseSecond()
+		t.Fatal("second connection acquired the same System Health advisory lock")
+	}
+	releaseFirst()
+	if releaseThird, acquiredThird := tryAcquireSystemAutopilotAdvisoryLock(db); !acquiredThird {
+		t.Fatal("advisory lock did not release after the first run")
+	} else {
+		releaseThird()
+	}
+}
+
+func TestSystemHealthDB_ContainmentUsesPerTenantExactOwnership(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	now := time.Date(2026, 7, 13, 18, 0, 0, 0, time.UTC)
+	ep := models.SystemIncidentEpisode{
+		RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Status: models.SystemIncidentStatusOpen,
+		Severity: "critical", FirstDetectedAt: now, LastSeenAt: now,
+	}
+	if err := db.Create(&ep).Error; err != nil {
+		t.Fatal(err)
+	}
+	policy := models.DefaultSystemAutopilotPolicy()
+	policy.Mode, policy.ContainmentTTLMinutes = models.SystemAutopilotModeSafeAuto, 60
+	store := func(tx *gorm.DB, action models.SystemAutopilotAction) (models.SystemAutopilotAction, error) {
+		action.RunID, action.StartedAt = 0, now
+		action.FinishedAt = &now
+		if err := tx.Create(&action).Error; err != nil {
+			return action, err
+		}
+		return action, nil
+	}
+	anomaly := systemAnomaly{Key: "aggregation:service_down", Service: "aggregation", Verdict: models.SystemVerdictServiceDown, Severity: "critical"}
+	applied, writeErrors := handleSystemContainment(db, policy, anomaly, &ep, now, store, func(models.SystemAutopilotAction) {})
+	if !applied || writeErrors != 0 {
+		t.Fatalf("containment result applied=%t errors=%d", applied, writeErrors)
+	}
+	var pipeline models.PipelineAutopilotPolicy
+	if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&pipeline).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pipeline.PausedUntil == nil {
+		t.Fatal("Pipeline policy was not paused")
+	}
+	ledger, legacy := readSystemContainmentLedger(ep.Containment)
+	if legacy {
+		t.Fatal("new containment must use per-tenant ownership ledger")
+	}
+	owned, ok := containmentEntry(ledger, "pipeline", defaultCirculationTenant)
+	if !ok || owned.WrittenUntil == "" || owned.Outcome != "paused" {
+		t.Fatalf("missing Pipeline tenant ownership: %+v", ledger)
+	}
+	resumeActions := []models.SystemAutopilotAction{}
+	if errors := resumeRecoveredSystemContainment(db, policy, []models.SystemIncidentEpisode{ep}, now.Add(time.Minute), store, func(action models.SystemAutopilotAction) { resumeActions = append(resumeActions, action) }); errors != 0 {
+		t.Fatalf("resume errors = %d", errors)
+	}
+	var resumedPipeline models.PipelineAutopilotPolicy
+	if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&resumedPipeline).Error; err != nil {
+		t.Fatal(err)
+	}
+	if resumedPipeline.PausedUntil != nil {
+		t.Fatalf("exactly owned pause was not resumed: %v; episode=%d actions=%+v", resumedPipeline.PausedUntil, ep.ID, resumeActions)
+	}
+}
+
+func TestSystemHealthDB_QueueBacklogIsAttentionOnly(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, nil)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	anomaly := systemAnomaly{
+		Key: "aggregation:queue_backlog", Service: "aggregation", Verdict: models.SystemVerdictQueueBacklog,
+		Severity: "warning", Summary: "Aggregation queue is backed up",
+	}
+	for i := 0; i < 3; i++ {
+		at := now.Add(time.Duration(i) * time.Minute)
+		snapshot, anomalies := systemHealthSnapshotAt(at, anomaly)
+		runSystemHealthFixture(t, db, at, snapshot, anomalies)
+	}
+	var episodes int64
+	if err := db.Model(&models.SystemIncidentEpisode{}).Count(&episodes).Error; err != nil {
+		t.Fatal(err)
+	}
+	if episodes != 0 {
+		t.Fatalf("queue backlog opened %d incident episodes", episodes)
+	}
+	var attention int64
+	if err := db.Model(&models.SystemAutopilotAction{}).
+		Where("guardrail = ? AND status = ?", models.SystemAutopilotGuardQueueBacklogNoIncident, "attention").
+		Count(&attention).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attention != 1 {
+		t.Fatalf("queue backlog attention actions = %d, want 1", attention)
+	}
+}
+
+func TestSystemHealthDB_EmptyRunHistoryDoesNotConfirm(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 2 })
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-time.Minute)
+	if err := db.Create(&models.SystemAutopilotRun{
+		Trigger: "test", Mode: models.SystemAutopilotModeObserve, Status: models.SystemAutopilotRunStatusCompleted,
+		Headline: models.SystemAutopilotHeadlineWatching, StartedAt: finished, FinishedAt: &finished,
+		// JSONB rejects malformed payloads at the database boundary. An empty
+		// object is the persisted equivalent: it has no run_snapshot and must
+		// not contribute to a confirmation streak.
+		ProbeResults: []byte(`{}`), ErrorClass: models.SystemAutopilotErrorClassNone,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, anomalies := systemHealthFailure(now)
+	runSystemHealthFixture(t, db, now, snapshot, anomalies)
+	var episodes int64
+	if err := db.Model(&models.SystemIncidentEpisode{}).Count(&episodes).Error; err != nil {
+		t.Fatal(err)
+	}
+	if episodes != 0 {
+		t.Fatalf("empty history confirmed %d incidents", episodes)
+	}
+}
+
+func TestSystemHealthDB_WorkerStallNeverPausesSiblings(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeSafeAuto, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 1 })
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	anomaly := systemAnomaly{
+		Key: "media:worker_stalled", Service: "media", Verdict: models.SystemVerdictWorkerStalled,
+		Severity: "critical", Summary: "Media worker is stalled",
+	}
+	snapshot, anomalies := systemHealthSnapshotAt(now, anomaly)
+	_, actions := runSystemHealthFixture(t, db, now, snapshot, anomalies)
+	var episodes int64
+	if err := db.Model(&models.SystemIncidentEpisode{}).Count(&episodes).Error; err != nil {
+		t.Fatal(err)
+	}
+	if episodes != 1 {
+		t.Fatalf("worker stall episodes = %d, want 1", episodes)
+	}
+	for _, action := range actions {
+		if action.Action == models.SystemAutopilotActionPauseSibling {
+			t.Fatalf("worker stall must not pause sibling autopilots: %+v", actions)
+		}
 	}
 }

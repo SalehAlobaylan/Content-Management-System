@@ -39,6 +39,34 @@ type ContentItemResponse struct {
 	TranscriptID *string   `json:"transcript_id,omitempty"`
 }
 
+// publicContentQuery is the baseline visibility scope for UUID-addressable
+// public content. Surface-specific feed rules may be stricter, but public
+// detail and interaction endpoints must never reveal or mutate workflow-only
+// items merely because their UUID was guessed.
+func publicContentQuery(db *gorm.DB) *gorm.DB {
+	// UUID-addressable public content must satisfy the same publication
+	// baseline as its public feed surface. In particular, a READY workflow
+	// state alone must not expose a hidden atomization parent/child or an item
+	// whose storage is unavailable.
+	storageUnavailable := []string{
+		models.StorageStateRecoverableDeleted,
+		models.StorageStateMissing,
+		models.StorageStateRecoveryPending,
+		models.StorageStateUnrecoverable,
+	}
+	return db.
+		Where("content_items.status = ?", models.ContentStatusReady).
+		Where("content_items.feed_visibility = ?", feedVisibilityVisible).
+		Where("(content_items.storage_state IS NULL OR content_items.storage_state NOT IN ?)", storageUnavailable).
+		Where(`content_items.type NOT IN ? OR (
+			content_items.is_feed_unit = TRUE AND
+			content_items.duration_sec BETWEEN ? AND ? AND
+			COALESCE(content_items.playback_url, content_items.media_url) IS NOT NULL AND
+			COALESCE(content_items.playback_url, content_items.media_url) <> '' AND
+			content_items.thumbnail_url IS NOT NULL AND content_items.thumbnail_url <> ''
+		)`, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, forYouMinDurationSec, forYouHardMaxDurationSec)
+}
+
 // GetContentItem returns a single content item by ID
 // GET /api/v1/content/:id
 func GetContentItem(c *gin.Context) {
@@ -55,7 +83,7 @@ func GetContentItem(c *gin.Context) {
 	}
 
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", contentID).First(&item).Error; err != nil {
+	if err := publicContentQuery(db).Where("public_id = ?", contentID).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Content not found",

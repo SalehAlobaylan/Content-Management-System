@@ -2,18 +2,19 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"gorm.io/datatypes"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 func studioTrustChapter(t *testing.T, db *gorm.DB, tenantID, code string) models.Chapter {
@@ -23,6 +24,10 @@ func studioTrustChapter(t *testing.T, db *gorm.DB, tenantID, code string) models
 		t.Fatal(err)
 	}
 	return chapter
+}
+
+func studioUUIDPtr(id uuid.UUID) *uuid.UUID {
+	return &id
 }
 
 func studioTrustAudit(t *testing.T, db *gorm.DB, tenantID, userID, email, action string, chapterID uuid.UUID) {
@@ -36,32 +41,15 @@ func studioTrustAudit(t *testing.T, db *gorm.DB, tenantID, userID, email, action
 	}
 }
 
-// mediaStudioTestDB is deliberately opt-in because it migrates and clears a
-// disposable database. It covers the row-lock and policy-precedence behavior
-// that SQLite/sqlmock cannot faithfully exercise.
+// mediaStudioTestDB covers row-lock and policy precedence on disposable Postgres.
 func mediaStudioTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("MEDIA_STUDIO_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set MEDIA_STUDIO_TEST_DATABASE_URL to run Media Studio PostgreSQL tests")
-	}
-	if err := validateMediaStudioTestDSN(dsn); err != nil {
-		t.Fatal(err)
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	for _, extension := range []string{"vector", "pgcrypto"} {
-		if err := db.Exec("CREATE EXTENSION IF NOT EXISTS " + extension).Error; err != nil {
-			t.Fatalf("enable %s extension: %v", extension, err)
-		}
-	}
-	if err := db.AutoMigrate(&models.ContentSource{}, &models.MediaAtomizationPolicy{}, &models.ContentItem{}, &models.Chapter{}, &models.MediaCirculationOverride{}, &models.AuditLog{}); err != nil {
+	db := testdb.Open(t)
+	if err := db.AutoMigrate(&models.ContentSource{}, &models.MediaAtomizationPolicy{}, &models.ContentItem{}, &models.Chapter{}, &models.MediaCirculationOverride{}, &models.MediaStudioAutopilotPolicy{}, &models.MediaStudioRun{}, &models.MediaStudioAction{}, &models.TranscriptionConfig{}, &models.TranscriptionJob{}, &models.TranscriptQuality{}, &models.AuditLog{}); err != nil {
 		t.Fatalf("migrate Media Studio fixture: %v", err)
 	}
 	clear := func() {
-		for _, table := range []string{"audit_logs", "media_circulation_overrides", "chapters", "content_items", "content_sources", "media_atomization_policies"} {
+		for _, table := range []string{"audit_logs", "media_studio_actions", "media_studio_runs", "media_studio_autopilot_policies", "transcription_jobs", "transcript_quality", "transcription_configs", "media_circulation_overrides", "chapters", "content_items", "content_sources", "media_atomization_policies"} {
 			_ = db.Exec("DELETE FROM " + table).Error
 		}
 	}
@@ -70,20 +58,25 @@ func mediaStudioTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func validateMediaStudioTestDSN(dsn string) error {
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		return fmt.Errorf("MEDIA_STUDIO_TEST_DATABASE_URL must name a disposable test database")
+func studioTranscriptRepairFixture(t *testing.T, db *gorm.DB, tenantID string) (models.ContentItem, models.TranscriptQuality) {
+	t.Helper()
+	mediaURL := "https://media.example.test/episode.mp3"
+	captionState := models.CaptionStateSTTDone
+	transcriptID := uuid.New()
+	item := models.ContentItem{TenantID: tenantID, Type: models.ContentTypePodcast, Source: models.SourceTypePodcast, MediaURL: &mediaURL, TranscriptID: &transcriptID, CaptionState: &captionState}
+	if err := db.Create(&item).Error; err != nil {
+		t.Fatal(err)
 	}
-	return nil
-}
-
-func TestMediaStudioDSNSafetyGuard(t *testing.T) {
-	if err := validateMediaStudioTestDSN("postgres://localhost/wahb"); err == nil {
-		t.Fatal("non-test DSN must be rejected before opening a database")
+	config := models.DefaultTranscriptionConfig(tenantID)
+	config.AutoRepairEnabled = true
+	if err := db.Create(&config).Error; err != nil {
+		t.Fatal(err)
 	}
-	if err := validateMediaStudioTestDSN("postgres://localhost/wahb_test"); err != nil {
-		t.Fatalf("test DSN rejected: %v", err)
+	quality := models.TranscriptQuality{TenantID: tenantID, ContentItemID: item.PublicID, TranscriptID: transcriptID, Status: models.TranscriptQualityAutoRepair}
+	if err := db.Create(&quality).Error; err != nil {
+		t.Fatal(err)
 	}
+	return item, quality
 }
 
 func studioPolicyFixture(t *testing.T, db *gorm.DB, tenantID string, sourcePolicy bool) (models.ContentItem, models.ContentItem, models.ContentSource) {
@@ -167,7 +160,7 @@ func TestStudioDB_ApplyRechecksMechanicalFactsAtMutationTime(t *testing.T) {
 	}
 	// A sponsor/second code added after classification converts the case into an
 	// editorial multi-code case and cannot publish.
-	if err := db.Model(&models.Chapter{}).Where("public_id = ?", chapter.PublicID).Updates(map[string]interface{}{"contains_sponsor_intro": true, "needs_review_codes": []string{code, models.StudioReviewCodeSponsorIntro}}).Error; err != nil {
+	if err := db.Model(&models.Chapter{}).Where("public_id = ?", chapter.PublicID).Updates(map[string]interface{}{"contains_sponsor_intro": true, "needs_review_codes": pq.StringArray{code, models.StudioReviewCodeSponsorIntro}}).Error; err != nil {
 		t.Fatal(err)
 	}
 	_, reviewErr := applyAtomizedChapterReviewWithOptions(db, "studio-facts", chapter.PublicID, true,
@@ -178,7 +171,7 @@ func TestStudioDB_ApplyRechecksMechanicalFactsAtMutationTime(t *testing.T) {
 	if err := db.Create(&models.MediaCirculationOverride{TenantID: "studio-facts", SubjectKind: "content_item", SubjectID: parent.PublicID, OverrideType: models.MediaCirculationOverrideEditorialHold}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Model(&models.Chapter{}).Where("public_id = ?", chapter.PublicID).Updates(map[string]interface{}{"contains_sponsor_intro": false, "needs_review_codes": []string{code}}).Error; err != nil {
+	if err := db.Model(&models.Chapter{}).Where("public_id = ?", chapter.PublicID).Updates(map[string]interface{}{"contains_sponsor_intro": false, "needs_review_codes": pq.StringArray{code}}).Error; err != nil {
 		t.Fatal(err)
 	}
 	_, reviewErr = applyAtomizedChapterReviewWithOptions(db, "studio-facts", chapter.PublicID, true,
@@ -240,5 +233,128 @@ func TestStudioDB_AnyHumanReversalLocksTrust(t *testing.T) {
 	trust := computeStudioReasonCodeTrust(db, tenantID, code, policy)
 	if trust.Reversals != 1 || trust.Earned {
 		t.Fatalf("one explicit human reversal must lock trust even below the percentage threshold: %+v", trust)
+	}
+}
+
+func TestStudioDB_StaleTranscriptSnapshotCannotCreateJob(t *testing.T) {
+	db := mediaStudioTestDB(t)
+	item, quality := studioTranscriptRepairFixture(t, db, "studio-stale-snapshot")
+	snapshot := studioTranscriptRepairSnapshotFromQuality(quality)
+	replacement := uuid.New()
+	if err := db.Model(&models.ContentItem{}).Where("public_id = ?", item.PublicID).Update("transcript_id", replacement).Error; err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, err := claimStudioTranscriptRepairSnapshot(db, item.TenantID, snapshot)
+	if !errors.Is(err, errStudioTranscriptSnapshotStale) {
+		t.Fatalf("replaced transcript must make claim stale, got %v", err)
+	}
+	var jobs int64
+	if err := db.Model(&models.TranscriptionJob{}).Where("content_item_id = ?", item.PublicID).Count(&jobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 {
+		t.Fatalf("stale snapshot created %d jobs", jobs)
+	}
+}
+
+func TestStudioDB_ConcurrentTranscriptClaimsAdmitOneJob(t *testing.T) {
+	db := mediaStudioTestDB(t)
+	item, quality := studioTranscriptRepairFixture(t, db, "studio-concurrent-claim")
+	snapshot := studioTranscriptRepairSnapshotFromQuality(quality)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, _, _, _, err := claimStudioTranscriptRepairSnapshot(db, item.TenantID, snapshot)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	var accepted, blocked int
+	for err := range errs {
+		if err == nil {
+			accepted++
+		} else if errors.Is(err, errStudioTranscriptJobInFlight) {
+			blocked++
+		} else {
+			t.Fatalf("unexpected concurrent claim error: %v", err)
+		}
+	}
+	if accepted != 1 || blocked != 1 {
+		t.Fatalf("claims accepted=%d blocked=%d, want 1/1", accepted, blocked)
+	}
+	var jobs int64
+	if err := db.Model(&models.TranscriptionJob{}).Where("content_item_id = ? AND status = ?", item.PublicID, models.TranscriptionJobStatusQueued).Count(&jobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("concurrent claims created %d queued jobs", jobs)
+	}
+}
+
+func TestStudioDB_LeaseSerializesSameTenantAndReleasesOnClose(t *testing.T) {
+	db := mediaStudioTestDB(t)
+	releaseFirst, first := tryAcquireStudioAutopilotLock(db, "studio-lease-a")
+	if !first {
+		t.Fatal("first same-tenant lease must acquire")
+	}
+	_, second := tryAcquireStudioAutopilotLock(db, "studio-lease-a")
+	if second {
+		t.Fatal("second connection acquired same-tenant Studio lease")
+	}
+	releaseOther, other := tryAcquireStudioAutopilotLock(db, "studio-lease-b")
+	if !other {
+		t.Fatal("different tenant Studio lease must acquire independently")
+	}
+	releaseOther()
+	releaseFirst()
+	releaseReacquired, reacquired := tryAcquireStudioAutopilotLock(db, "studio-lease-a")
+	if !reacquired {
+		t.Fatal("released session lease must be acquirable by a later runner")
+	}
+	releaseReacquired()
+}
+
+func TestStudioDB_HealthAggregatesBeyondExecutionScan(t *testing.T) {
+	db := mediaStudioTestDB(t)
+	const tenantID = "studio-health-aggregate"
+	now := time.Now().UTC()
+	merged := models.StudioReviewCodeMergedShort
+	chapters := make([]models.Chapter, 0, studioAutopilotMaxCaseScan+51)
+	for i := 0; i < studioAutopilotMaxCaseScan+51; i++ {
+		code := merged
+		createdAt := now
+		if i < 11 {
+			code = models.StudioReviewCodeShortUnmergeable
+			createdAt = now.Add(-8 * 24 * time.Hour)
+		}
+		chapters = append(chapters, models.Chapter{
+			TenantID: tenantID, TranscriptID: uuid.New(), ChildContentItemID: studioUUIDPtr(uuid.New()),
+			Title: "health case", Source: models.ChapterSourceDerived, Status: chapterStatusReview,
+			NeedsReviewCode: &code, NeedsReviewCodes: []string{code}, CreatedAt: createdAt,
+		})
+	}
+	if err := db.CreateInBatches(&chapters, 100).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	health, err := collectStudioHealth(db, tenantID, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health.ReviewQueueDepth != studioAutopilotMaxCaseScan+51 {
+		t.Fatalf("queue depth=%d, want complete aggregate", health.ReviewQueueDepth)
+	}
+	if health.AgedCount != 11 || health.ByCode[models.StudioReviewCodeShortUnmergeable] != 11 || health.ByCode[merged] != studioAutopilotMaxCaseScan+40 {
+		t.Fatalf("incorrect full health aggregate: %+v", health)
+	}
+	if health.OldestCaseAgeHours < 7*24 {
+		t.Fatalf("oldest age did not include aged rows: %f", health.OldestCaseAgeHours)
 	}
 }

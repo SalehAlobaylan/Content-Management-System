@@ -204,6 +204,7 @@ func assembleStoryNewsFeed(
 	slideLimit int,
 	seenIDs []uuid.UUID,
 	userIDStr string,
+	recordTelemetry bool,
 ) ([]StorySlide, *string) {
 	config = applyLatestPlusPolicy(config, circ.Policy)
 	now := circ.Window.Now
@@ -566,7 +567,9 @@ func assembleStoryNewsFeed(
 			boosted++
 		}
 	}
-	recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(page)))
+	if recordTelemetry {
+		recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(page)))
+	}
 
 	return slides, nextCursor
 }
@@ -976,7 +979,7 @@ func buildRelatedStories(
 func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error) {
 	config := loadTenantConfig(db, tenantID)
 	circ := circulationContextFor(db, tenantID, window, time.Now())
-	slides, _ := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "")
+	slides, _ := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "", false)
 	if slides == nil {
 		slides = []StorySlide{}
 	}
@@ -1219,6 +1222,7 @@ func serveStoryNewsFeed(
 	slideLimit int,
 	waitSeen func() []uuid.UUID,
 	userIDStr string,
+	recordTelemetry bool,
 ) ([]StorySlide, *string, newsServeMeta) {
 	if config.NewsFeedMode == "cached_only" {
 		slides, cursor := serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
@@ -1232,7 +1236,7 @@ func serveStoryNewsFeed(
 	}
 	if shouldPersonalizeNews(db, tenantID, userIDStr) {
 		slides, nextCursor := assembleStoryNewsFeed(
-			db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
+			db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr, recordTelemetry,
 		)
 		startSnapshotRebuild(db, tenantID, circ.Window.Name)
 		return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}
@@ -1278,7 +1282,7 @@ func serveStoryNewsFeed(
 	// Cache can't serve this request (cold, idle past the stale ceiling, deep
 	// cursor, or seen-exhausted page) — assemble inline from the full corpus.
 	slides, nextCursor := assembleStoryNewsFeed(
-		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr,
+		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr, recordTelemetry,
 	)
 	startSnapshotRebuild(db, tenantID, circ.Window.Name)
 	return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}

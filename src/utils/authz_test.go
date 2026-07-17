@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func TestAdminPrincipalHasPermission(t *testing.T) {
@@ -81,6 +82,14 @@ func TestHasAllowedAudience(t *testing.T) {
 	}
 	if hasAllowedAudience(&JWTClaims{}) {
 		t.Fatal("missing audience must be rejected when allowlist is set")
+	}
+}
+
+func TestHasAllowedAudienceFailsClosedInProduction(t *testing.T) {
+	t.Setenv("ENV", "production")
+	t.Setenv("JWT_ALLOWED_AUDIENCES", "")
+	if hasAllowedAudience(&JWTClaims{RegisteredClaims: jwt.RegisteredClaims{Audience: []string{"platform-console"}}}) {
+		t.Fatal("production must reject human JWTs when no CMS audience is configured")
 	}
 }
 

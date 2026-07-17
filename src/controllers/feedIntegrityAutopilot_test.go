@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"strings"
 	"testing"
 
 	"content-management-system/src/models"
@@ -85,5 +86,40 @@ func TestFeedIntegrityPriorityAndDecisionPromotion(t *testing.T) {
 	}
 	if got := promoteFeedIntegrityDecision(models.FeedIntegrityDecisionBlocked, models.FeedIntegrityDecisionApprovalRequired); got != models.FeedIntegrityDecisionApprovalRequired {
 		t.Fatalf("higher-value operator decision must win, got %q", got)
+	}
+}
+
+func TestFeedIntegrityPolicyPatchBoundsPreserveZeroCap(t *testing.T) {
+	zero, pages := 0, 4
+	updates, err := (feedIntegrityPolicyPatch{
+		ProbeURLBudget:   &zero,
+		EdgePagesPerFeed: &pages,
+	}).updates()
+	if err != nil {
+		t.Fatalf("valid policy patch was rejected: %v", err)
+	}
+	if got := updates["probe_url_budget"]; got != 0 {
+		t.Fatalf("zero probe budget must be preserved, got %#v", got)
+	}
+	if got := updates["edge_pages_per_feed"]; got != 4 {
+		t.Fatalf("unexpected edge pages update: %#v", got)
+	}
+
+	invalid := 0
+	if _, err := (feedIntegrityPolicyPatch{LightIntervalMinutes: &invalid}).updates(); err == nil {
+		t.Fatal("zero light interval must be rejected")
+	}
+}
+
+func TestDecodeFeedIntegrityPolicyPatchRejectsUnknownAndTrailingJSON(t *testing.T) {
+	var patch feedIntegrityPolicyPatch
+	if err := decodeFeedIntegrityPolicyPatch(strings.NewReader(`{"probe_url_budget":0}`), &patch); err != nil || patch.ProbeURLBudget == nil || *patch.ProbeURLBudget != 0 {
+		t.Fatalf("valid typed patch was rejected: patch=%+v err=%v", patch, err)
+	}
+	if err := decodeFeedIntegrityPolicyPatch(strings.NewReader(`{"unexpected":1}`), &patch); err == nil {
+		t.Fatal("unknown policy field must be rejected")
+	}
+	if err := decodeFeedIntegrityPolicyPatch(strings.NewReader(`{} {}`), &patch); err == nil {
+		t.Fatal("trailing JSON value must be rejected")
 	}
 }

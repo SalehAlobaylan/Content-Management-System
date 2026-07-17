@@ -1,41 +1,20 @@
 package controllers
 
 import (
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
 	"github.com/google/uuid"
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// These opt-in tests cover persisted Enrichment Autopilot invariants. They
-// migrate and clear only a disposable Postgres database; set
-// ENRICHMENT_AUTOPILOT_TEST_DATABASE_URL to a DSN containing "test" to run.
+// These tests cover persisted Enrichment Autopilot invariants.
 func enrichmentAutopilotTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("ENRICHMENT_AUTOPILOT_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set ENRICHMENT_AUTOPILOT_TEST_DATABASE_URL to run Enrichment Autopilot PostgreSQL tests")
-	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("ENRICHMENT_AUTOPILOT_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS vector").Error; err != nil {
-		t.Fatalf("enable vector extension: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error; err != nil {
-		t.Fatalf("enable pgcrypto extension: %v", err)
-	}
+	db := testdb.Open(t)
 	if err := db.AutoMigrate(&models.ContentItem{}, &models.TranscriptionConfig{}, &models.TranscriptionJob{}, &models.EnrichmentAutopilotPolicy{}, &models.EnrichmentAutopilotRun{}, &models.EnrichmentAutopilotAction{}, &models.AuditLog{}); err != nil {
 		t.Fatalf("migrate autopilot test schema: %v", err)
 	}

@@ -2,38 +2,20 @@ package controllers
 
 import (
 	"encoding/json"
-	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/tests/testdb"
 
-	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
-// These tests exercise PostgreSQL row claims and persisted ledger behavior. They
-// are intentionally opt-in because they migrate and clear a disposable test DB.
-// Run with FEED_INTEGRITY_TEST_DATABASE_URL pointing at a disposable test DB.
+// These tests exercise PostgreSQL row claims and persisted ledger behavior.
 func feedIntegrityTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("FEED_INTEGRITY_TEST_DATABASE_URL"))
-	if dsn == "" {
-		t.Skip("set FEED_INTEGRITY_TEST_DATABASE_URL to run PostgreSQL Feed Integrity integration tests")
-	}
-	if !strings.Contains(strings.ToLower(dsn), "test") {
-		t.Fatal("FEED_INTEGRITY_TEST_DATABASE_URL must name a disposable test database")
-	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	if err := db.Exec("CREATE EXTENSION IF NOT EXISTS pgcrypto").Error; err != nil {
-		t.Fatalf("enable pgcrypto in test database: %v", err)
-	}
+	db := testdb.Open(t)
 	if err := db.AutoMigrate(&models.FeedIntegrityPolicy{}, &models.FeedIntegrityRun{}, &models.FeedIntegrityFinding{}, &models.FeedIntegrityEpisode{}, &models.FeedIntegritySuppression{}, &models.FeedIntegrityAction{}, &models.NewsSnapshot{}, &models.AuditLog{}); err != nil {
 		t.Fatalf("migrate feed integrity test schema: %v", err)
 	}
