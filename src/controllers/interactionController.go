@@ -3,7 +3,10 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -16,6 +19,10 @@ import (
 
 // maxCommentLength caps comment text to keep payloads and rendering sane.
 const maxCommentLength = 1000
+
+const maxConsumerIdempotencyKeyLength = 160
+
+var errConsumerIdempotencyConflict = errors.New("idempotency key was reused with a different request")
 
 // commentMetadata is the expected Metadata shape for comment interactions.
 type commentMetadata struct {
@@ -75,6 +82,19 @@ func interactionLockKey(contentItemID uuid.UUID, interactionType models.Interact
 		return "user:" + interaction.UserID.String() + ":" + contentItemID.String() + ":" + string(interactionType)
 	}
 	return "session:" + *interaction.SessionID + ":" + contentItemID.String() + ":" + string(interactionType)
+}
+
+func interactionIdentityScope(interaction models.UserInteraction) string {
+	if interaction.UserID != nil {
+		return "user:" + interaction.UserID.String()
+	}
+	return "session:" + *interaction.SessionID
+}
+
+func interactionRequestDigest(req models.CreateInteractionRequest) string {
+	value := req.ContentItemID + "\n" + string(req.InteractionType) + "\n" + string(req.Metadata)
+	digest := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", digest[:])
 }
 
 // CreateInteraction records a user interaction (like, bookmark, view, share, complete)
@@ -152,58 +172,93 @@ func CreateInteraction(c *gin.Context) {
 		return
 	}
 
-	if isIdempotentInteraction(req.InteractionType) {
-		var saved models.UserInteraction
-		created := false
-		err := db.Transaction(func(tx *gorm.DB) error {
-			lockKey := interactionLockKey(contentItemID, req.InteractionType, interaction)
+	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if len(idempotencyKey) > maxConsumerIdempotencyKeyLength {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{
+			Code:    http.StatusBadRequest,
+			Message: "Idempotency-Key is too long",
+		})
+		return
+	}
+
+	var saved models.UserInteraction
+	created := false
+	replayed := false
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if idempotencyKey != "" {
+			identityScope := interactionIdentityScope(interaction)
+			lockKey := "consumer-interaction:" + identityScope + ":" + idempotencyKey
 			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", lockKey).Error; err != nil {
 				return err
 			}
 
-			query := scopedInteractionQuery(tx, contentItemID, req.InteractionType, interaction)
-			var existing models.UserInteraction
-			if err := query.First(&existing).Error; err == nil {
-				saved = existing
+			var existingRequest models.ConsumerRequestIdempotency
+			err := tx.Where("identity_scope = ? AND endpoint = ? AND idempotency_key = ?", identityScope, "POST /api/v1/interactions", idempotencyKey).First(&existingRequest).Error
+			if err == nil {
+				if existingRequest.RequestDigest != interactionRequestDigest(req) {
+					return errConsumerIdempotencyConflict
+				}
+				if err := tx.Where("public_id = ?", existingRequest.InteractionID).First(&saved).Error; err != nil {
+					return err
+				}
+				replayed = true
 				return nil
-			} else if err != gorm.ErrRecordNotFound {
+			}
+			if err != gorm.ErrRecordNotFound {
 				return err
 			}
+		}
 
+		if isIdempotentInteraction(req.InteractionType) {
+			lockKey := interactionLockKey(contentItemID, req.InteractionType, interaction)
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", lockKey).Error; err != nil {
+				return err
+			}
+			query := scopedInteractionQuery(tx, contentItemID, req.InteractionType, interaction)
+			if err := query.First(&saved).Error; err == nil {
+				// Existing toggles are a successful no-op, but the request key is
+				// still recorded below so an offline retry is deterministic.
+			} else if err != gorm.ErrRecordNotFound {
+				return err
+			} else {
+				if err := tx.Create(&interaction).Error; err != nil {
+					return err
+				}
+				saved = interaction
+				created = true
+			}
+		} else {
 			if err := tx.Create(&interaction).Error; err != nil {
 				return err
 			}
 			saved = interaction
 			created = true
-			return nil
-		})
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, utils.HTTPError{
-				Code:    http.StatusInternalServerError,
-				Message: "Failed to create interaction: " + err.Error(),
-			})
-			return
 		}
-		if !created {
-			c.JSON(http.StatusOK, utils.ResponseMessage{
-				Code:    http.StatusOK,
-				Message: "Interaction already exists",
-				Data:    saved,
-			})
-			return
+
+		if created {
+			if err := updateEngagementCount(tx, contentItemID, req.InteractionType, 1); err != nil {
+				return err
+			}
 		}
-		if err := updateEngagementCount(db, contentItemID, req.InteractionType, 1); err != nil {
-			log.Printf("failed to update engagement counter for interaction %s on content %s: %v", req.InteractionType, contentItemID, err)
+
+		if idempotencyKey != "" {
+			if err := tx.Create(&models.ConsumerRequestIdempotency{
+				IdentityScope:  interactionIdentityScope(interaction),
+				Endpoint:       "POST /api/v1/interactions",
+				IdempotencyKey: idempotencyKey,
+				RequestDigest:  interactionRequestDigest(req),
+				InteractionID:  saved.PublicID,
+			}).Error; err != nil {
+				return err
+			}
 		}
-		c.JSON(http.StatusCreated, utils.ResponseMessage{
-			Code:    http.StatusCreated,
-			Message: "Interaction created successfully",
-			Data:    saved,
-		})
+		return nil
+	})
+	if errors.Is(err, errConsumerIdempotencyConflict) {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Idempotency-Key was reused with a different request"})
 		return
 	}
-
-	if err := db.Create(&interaction).Error; err != nil {
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
 			Message: "Failed to create interaction: " + err.Error(),
@@ -211,15 +266,11 @@ func CreateInteraction(c *gin.Context) {
 		return
 	}
 
-	if err := updateEngagementCount(db, contentItemID, req.InteractionType, 1); err != nil {
-		log.Printf("failed to update engagement counter for interaction %s on content %s: %v", req.InteractionType, contentItemID, err)
+	if replayed || !created {
+		c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Interaction already exists", Data: saved})
+		return
 	}
-
-	c.JSON(http.StatusCreated, utils.ResponseMessage{
-		Code:    http.StatusCreated,
-		Message: "Interaction created successfully",
-		Data:    interaction,
-	})
+	c.JSON(http.StatusCreated, utils.ResponseMessage{Code: http.StatusCreated, Message: "Interaction created successfully", Data: saved})
 }
 
 // GetBookmarks returns the user's bookmarked content

@@ -16,6 +16,8 @@ func SetupFeedRoutes(group *gin.RouterGroup, db *gorm.DB) {
 
 	// For You feed - audio/video content
 	group.GET("/feed/foryou", auth, controllers.GetForYouFeed)
+	group.POST("/feed/foryou/sessions", auth, controllers.CreateForYouFeedSession)
+	group.GET("/feed/foryou/sessions/:id", auth, controllers.GetForYouFeedSessionPage)
 
 	// News feed - magazine-style slides
 	group.GET("/feed/news", auth, controllers.GetNewsFeed)
