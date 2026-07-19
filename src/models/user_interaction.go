@@ -15,6 +15,9 @@ const (
 	InteractionTypeBookmark InteractionType = "bookmark"
 	InteractionTypeShare    InteractionType = "share"
 	InteractionTypeView     InteractionType = "view"
+	// InteractionTypeProgress is a durable playback checkpoint. Position and
+	// accumulated played time live in Metadata so this remains append-only.
+	InteractionTypeProgress InteractionType = "progress"
 	InteractionTypeComplete InteractionType = "complete"
 	// InteractionTypeComment stores the comment body in Metadata:
 	// {"text": "...", "author": "display name (optional)"}

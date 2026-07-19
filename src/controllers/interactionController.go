@@ -848,15 +848,16 @@ func GetContentComments(c *gin.Context) {
 
 // HistoryItem is a single entry in the user's watch history
 type HistoryItem struct {
-	ContentID    uuid.UUID `json:"content_id"`
-	ViewedAt     time.Time `json:"viewed_at"`
-	Type         string    `json:"type"`
-	Title        string    `json:"title,omitempty"`
-	ThumbnailURL *string   `json:"thumbnail_url,omitempty"`
-	MediaURL     *string   `json:"media_url,omitempty"`
-	DurationSec  *int      `json:"duration_sec,omitempty"`
-	Author       *string   `json:"author,omitempty"`
-	SourceName   *string   `json:"source_name,omitempty"`
+	ContentID       uuid.UUID `json:"content_id"`
+	ViewedAt        time.Time `json:"viewed_at"`
+	Type            string    `json:"type"`
+	Title           string    `json:"title,omitempty"`
+	ThumbnailURL    *string   `json:"thumbnail_url,omitempty"`
+	MediaURL        *string   `json:"media_url,omitempty"`
+	DurationSec     *int      `json:"duration_sec,omitempty"`
+	Author          *string   `json:"author,omitempty"`
+	SourceName      *string   `json:"source_name,omitempty"`
+	ProgressSeconds *int      `json:"progress_seconds,omitempty"`
 }
 
 // GetWatchHistory returns a user's watch history (view interactions) with content details.
@@ -874,7 +875,7 @@ func GetWatchHistory(c *gin.Context) {
 	// identity (verified JWT when present, otherwise the caller's session).
 	latestViews := db.Model(&models.UserInteraction{}).
 		Select("DISTINCT ON (content_item_id) user_interactions.*").
-		Where("type = ?", models.InteractionTypeView)
+		Where("type IN ?", []models.InteractionType{models.InteractionTypeView, models.InteractionTypeProgress})
 
 	if uid, ok := authedUserID(c); ok {
 		latestViews = latestViews.Where("user_id = ?", uid)
@@ -951,6 +952,14 @@ func GetWatchHistory(c *gin.Context) {
 		if item.Title != nil {
 			h.Title = *item.Title
 		}
+		if v.Type == models.InteractionTypeProgress && len(v.Metadata) > 0 {
+			var metadata struct {
+				PositionSeconds *int `json:"position_seconds"`
+			}
+			if json.Unmarshal(v.Metadata, &metadata) == nil {
+				h.ProgressSeconds = metadata.PositionSeconds
+			}
+		}
 		items = append(items, h)
 	}
 
@@ -974,7 +983,7 @@ func DeleteWatchHistory(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
 	// Scope deletion to the caller's own identity (verified JWT or session).
-	query := db.Where("type = ?", models.InteractionTypeView)
+	query := db.Where("type IN ?", []models.InteractionType{models.InteractionTypeView, models.InteractionTypeProgress})
 	if uid, ok := authedUserID(c); ok {
 		query = query.Where("user_id = ?", uid)
 	} else if sessionID := c.Query("session_id"); sessionID != "" {
