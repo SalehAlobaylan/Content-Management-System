@@ -65,6 +65,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 	routes.SetupContentRoutes(v1, db)
 	routes.SetupTranscriptRoutes(v1, db)
 	routes.SetupPreferenceRoutes(v1, db)
+	routes.SetupModerationRoutes(v1, db)
 	// Real User Experience — public RUX telemetry ingest (BFF-token guarded)
 	routes.SetupExperienceRoutes(v1, db)
 

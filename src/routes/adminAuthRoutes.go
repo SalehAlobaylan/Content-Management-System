@@ -92,6 +92,12 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/content/bulk-tags", perm("content", "write"), controllers.BulkEditTags)
 	adminGroup.POST("/content/bulk-topic", perm("content", "write"), controllers.BulkAssignTopic)
 
+	// Consumer moderation queue. CMS owns all report status and comment
+	// removal; Platform Console is only the authenticated operator surface.
+	adminGroup.GET("/moderation/reports", perm("content", "read"), controllers.AdminListModerationReports)
+	adminGroup.POST("/moderation/reports/:id/resolve", perm("content", "write"), controllers.AdminResolveModerationReport)
+	adminGroup.DELETE("/moderation/comments/:id", perm("content", "write"), controllers.AdminRemoveComment)
+
 	// First-class topics (LLM-labeled) management
 	adminGroup.PATCH("/stories/:id", perm("content", "write"), controllers.RenameTopic)
 	adminGroup.DELETE("/stories/:id", perm("content", "write"), controllers.DeleteTopic)

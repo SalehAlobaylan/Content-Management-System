@@ -20,6 +20,11 @@ import (
 // maxCommentLength caps comment text to keep payloads and rendering sane.
 const maxCommentLength = 1000
 
+const (
+	maxCommentsPerMinute   = 5
+	commentDuplicateWindow = 5 * time.Minute
+)
+
 const maxConsumerIdempotencyKeyLength = 160
 
 var errConsumerIdempotencyConflict = errors.New("idempotency key was reused with a different request")
@@ -133,6 +138,16 @@ func CreateInteraction(c *gin.Context) {
 
 	// Comments must carry non-blank text (length-capped)
 	if req.InteractionType == models.InteractionTypeComment {
+		// Comments are public user-generated content. Anonymous sessions can read
+		// legacy comments but must never create new ones, even if they know a
+		// valid-looking session_id.
+		if _, authenticated := authedUserID(c); !authenticated {
+			c.JSON(http.StatusUnauthorized, utils.HTTPError{
+				Code:    http.StatusUnauthorized,
+				Message: "Authentication required to comment",
+			})
+			return
+		}
 		var meta commentMetadata
 		if err := json.Unmarshal(req.Metadata, &meta); err != nil || strings.TrimSpace(meta.Text) == "" {
 			c.JSON(http.StatusBadRequest, utils.HTTPError{
@@ -148,6 +163,11 @@ func CreateInteraction(c *gin.Context) {
 			})
 			return
 		}
+		meta.Text = strings.TrimSpace(meta.Text)
+		// Do not retain arbitrary client metadata on comments. This prevents
+		// payload smuggling and makes duplicate detection deterministic.
+		canonical, _ := json.Marshal(meta)
+		req.Metadata = canonical
 	}
 
 	// Build interaction
@@ -170,6 +190,34 @@ func CreateInteraction(c *gin.Context) {
 			Message: "Authentication or session_id required",
 		})
 		return
+	}
+	if req.InteractionType == models.InteractionTypeComment {
+		var meta commentMetadata
+		_ = json.Unmarshal(req.Metadata, &meta)
+		oneMinuteAgo := time.Now().Add(-time.Minute)
+		var recentCount int64
+		if err := db.Model(&models.UserInteraction{}).
+			Where("user_id = ? AND type = ? AND created_at >= ?", *interaction.UserID, models.InteractionTypeComment, oneMinuteAgo).
+			Count(&recentCount).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to validate comment"})
+			return
+		}
+		if recentCount >= maxCommentsPerMinute {
+			c.JSON(http.StatusTooManyRequests, utils.HTTPError{Code: http.StatusTooManyRequests, Message: "Comment rate limit exceeded"})
+			return
+		}
+		var duplicateCount int64
+		if err := db.Model(&models.UserInteraction{}).
+			Where("user_id = ? AND content_item_id = ? AND type = ? AND created_at >= ?", *interaction.UserID, contentItemID, models.InteractionTypeComment, time.Now().Add(-commentDuplicateWindow)).
+			Where("metadata->>'text' = ?", meta.Text).
+			Count(&duplicateCount).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to validate comment"})
+			return
+		}
+		if duplicateCount > 0 {
+			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Duplicate comment"})
+			return
+		}
 	}
 
 	idempotencyKey := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
@@ -636,6 +684,10 @@ func DeleteInteraction(c *gin.Context) {
 			return
 		}
 	} else {
+		if interaction.Type == models.InteractionTypeComment {
+			c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Interaction not found"})
+			return
+		}
 		sessionID := c.Query("session_id")
 		if sessionID == "" || interaction.SessionID == nil || *interaction.SessionID != sessionID {
 			c.JSON(http.StatusNotFound, utils.HTTPError{
@@ -749,11 +801,12 @@ func DeleteInteractionByContext(c *gin.Context) {
 
 // CommentItem is a single comment in a content item's comment list
 type CommentItem struct {
-	ID        uuid.UUID `json:"id"`
-	Text      string    `json:"text"`
-	Author    string    `json:"author,omitempty"`
-	IsMine    bool      `json:"is_mine"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID  `json:"id"`
+	Text      string     `json:"text"`
+	Author    string     `json:"author,omitempty"`
+	AuthorID  *uuid.UUID `json:"author_id,omitempty"`
+	IsMine    bool       `json:"is_mine"`
+	CreatedAt time.Time  `json:"created_at"`
 }
 
 // GetContentComments lists comments for a content item, newest first.
@@ -791,6 +844,18 @@ func GetContentComments(c *gin.Context) {
 		Where("content_item_id = ?", contentID).
 		Where("type = ?", models.InteractionTypeComment).
 		Order("created_at DESC")
+	if uid, authenticated := authedUserID(c); authenticated {
+		var blockedIDs []uuid.UUID
+		if err := db.Model(&models.UserBlock{}).
+			Where("tenant_id = ? AND user_id = ?", "default", uid).
+			Pluck("blocked_user_id", &blockedIDs).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to load comment visibility"})
+			return
+		}
+		if len(blockedIDs) > 0 {
+			query = query.Where("user_id IS NULL OR user_id NOT IN ?", blockedIDs)
+		}
+	}
 
 	if !pagination.Timestamp.IsZero() {
 		query = query.Where("created_at < ?", pagination.Timestamp)
@@ -828,6 +893,7 @@ func GetContentComments(c *gin.Context) {
 			ID:        in.PublicID,
 			Text:      meta.Text,
 			Author:    meta.Author,
+			AuthorID:  in.UserID,
 			IsMine:    isMine,
 			CreatedAt: in.CreatedAt,
 		})
