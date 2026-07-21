@@ -80,7 +80,7 @@ func authenticateMachineToken(header string) (MachinePrincipal, string, bool) {
 }
 
 func configuredMachineCredentials() []machineCredential {
-	credentials := make([]machineCredential, 0, 7)
+	credentials := make([]machineCredential, 0, 8)
 	add := func(principal MachinePrincipal, env, id string) {
 		if secret := strings.TrimSpace(os.Getenv(env)); secret != "" {
 			credentials = append(credentials, machineCredential{principal: principal, credentialID: id, secret: secret})
@@ -92,6 +92,7 @@ func configuredMachineCredentials() []machineCredential {
 	add(MachinePrincipalEnrichment, "CMS_ENRICHMENT_SERVICE_TOKEN_NEXT", "enrichment/next")
 	add(MachinePrincipalMedia, "CMS_MEDIA_SERVICE_TOKEN", "media/current")
 	add(MachinePrincipalMedia, "CMS_MEDIA_SERVICE_TOKEN_NEXT", "media/next")
+	add(MachinePrincipalIAM, "CMS_IAM_SERVICE_TOKEN", "iam/current")
 
 	// The old broad token is a migration bridge only. Production requires an
 	// explicit, future removal time; development remains convenient for the

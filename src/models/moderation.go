@@ -55,3 +55,15 @@ type ConsumerModerationIdempotency struct {
 func (ConsumerModerationIdempotency) TableName() string {
 	return "consumer_moderation_idempotency"
 }
+
+// AuthSuspension is a minimal enforcement mirror pushed by IAM. CMS never
+// creates or decides suspensions; it checks this record after verifying a JWT
+// so access tokens issued before the suspension cannot remain active.
+type AuthSuspension struct {
+	UserID      uuid.UUID `gorm:"type:uuid;primaryKey" json:"-"`
+	TenantID    string    `gorm:"type:varchar(64);not null;index" json:"-"`
+	SuspendedAt time.Time `gorm:"not null" json:"-"`
+	UpdatedAt   time.Time `gorm:"autoUpdateTime" json:"-"`
+}
+
+func (AuthSuspension) TableName() string { return "auth_suspensions" }

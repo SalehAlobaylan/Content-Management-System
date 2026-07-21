@@ -191,11 +191,19 @@ func UnblockAuthor(c *gin.Context) {
 }
 
 type moderationQueueResponse struct {
-	Data       []models.ModerationReport `json:"data"`
-	Total      int64                     `json:"total"`
-	Page       int                       `json:"page"`
-	Limit      int                       `json:"limit"`
-	TotalPages int                       `json:"total_pages"`
+	Data       []adminModerationReport `json:"data"`
+	Total      int64                   `json:"total"`
+	Page       int                     `json:"page"`
+	Limit      int                     `json:"limit"`
+	TotalPages int                     `json:"total_pages"`
+}
+
+// adminModerationReport adds only the reported comment author's UUID. It is
+// operator-only and intentionally never exposes the reporter's identity.
+type adminModerationReport struct {
+	models.ModerationReport
+	AuthorID        *uuid.UUID `json:"author_id,omitempty"`
+	AuthorSuspended bool       `json:"author_suspended"`
 }
 
 // AdminListModerationReports is a tenant-scoped operational queue. The queue
@@ -235,7 +243,53 @@ func AdminListModerationReports(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to load moderation queue"})
 		return
 	}
-	c.JSON(http.StatusOK, moderationQueueResponse{Data: reports, Total: total, Page: page, Limit: limit, TotalPages: int((total + int64(limit) - 1) / int64(limit))})
+	commentIDs := make([]uuid.UUID, 0, len(reports))
+	for _, report := range reports {
+		if report.TargetType == models.ModerationTargetComment {
+			commentIDs = append(commentIDs, report.TargetID)
+		}
+	}
+	authors := make(map[uuid.UUID]uuid.UUID, len(commentIDs))
+	if len(commentIDs) > 0 {
+		var comments []models.UserInteraction
+		if err := db.Where("public_id IN ? AND type = ? AND user_id IS NOT NULL", commentIDs, models.InteractionTypeComment).Find(&comments).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to load reported comment authors"})
+			return
+		}
+		for _, comment := range comments {
+			if comment.UserID != nil {
+				authors[comment.PublicID] = *comment.UserID
+			}
+		}
+	}
+	suspendedAuthors := make(map[uuid.UUID]struct{}, len(authors))
+	if len(authors) > 0 {
+		authorIDs := make([]uuid.UUID, 0, len(authors))
+		for _, authorID := range authors {
+			authorIDs = append(authorIDs, authorID)
+		}
+		var suspensions []models.AuthSuspension
+		if err := db.Where("tenant_id = ? AND user_id IN ?", principal.TenantID, authorIDs).Find(&suspensions).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to load account suspension state"})
+			return
+		}
+		for _, suspension := range suspensions {
+			suspendedAuthors[suspension.UserID] = struct{}{}
+		}
+	}
+	response := make([]adminModerationReport, 0, len(reports))
+	for _, report := range reports {
+		row := adminModerationReport{ModerationReport: report}
+		if report.TargetType == models.ModerationTargetComment {
+			authorID, ok := authors[report.TargetID]
+			if ok {
+				row.AuthorID = &authorID
+				_, row.AuthorSuspended = suspendedAuthors[authorID]
+			}
+		}
+		response = append(response, row)
+	}
+	c.JSON(http.StatusOK, moderationQueueResponse{Data: response, Total: total, Page: page, Limit: limit, TotalPages: int((total + int64(limit) - 1) / int64(limit))})
 }
 
 func AdminResolveModerationReport(c *gin.Context) {

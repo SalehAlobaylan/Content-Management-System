@@ -268,6 +268,11 @@ func UserAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if suspendedUser(c, claims.UserID) {
+			c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Account suspended"})
+			c.Abort()
+			return
+		}
 
 		c.Set("user_id", claims.UserID)
 		c.Next()
@@ -310,8 +315,33 @@ func OptionalUserAuthMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		if suspendedUser(c, claims.UserID) {
+			c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Account suspended"})
+			c.Abort()
+			return
+		}
 
 		c.Set("user_id", claims.UserID)
 		c.Next()
 	}
+}
+
+// suspendedUser is deliberately a direct database lookup rather than a cache:
+// a moderation suspension must invalidate an already-issued JWT immediately.
+func suspendedUser(c *gin.Context, rawUserID string) bool {
+	userID, err := uuid.Parse(strings.TrimSpace(rawUserID))
+	if err != nil {
+		return true
+	}
+	db, ok := c.Get("db")
+	if !ok {
+		return true
+	}
+	var count int64
+	if err := db.(*gorm.DB).Model(&models.AuthSuspension{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		// Fail closed for authenticated mutations when enforcement data cannot
+		// be read. The caller receives the same non-enumerating 401 response.
+		return true
+	}
+	return count > 0
 }

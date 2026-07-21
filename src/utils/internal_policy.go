@@ -15,6 +15,7 @@ const (
 	MachinePrincipalAggregation MachinePrincipal = "aggregation"
 	MachinePrincipalEnrichment  MachinePrincipal = "enrichment"
 	MachinePrincipalMedia       MachinePrincipal = "media"
+	MachinePrincipalIAM         MachinePrincipal = "iam"
 	MachinePrincipalLegacy      MachinePrincipal = "legacy-shared"
 )
 
@@ -40,6 +41,7 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 	agg := []MachinePrincipal{MachinePrincipalAggregation}
 	enrich := []MachinePrincipal{MachinePrincipalEnrichment}
 	media := []MachinePrincipal{MachinePrincipalMedia}
+	iam := []MachinePrincipal{MachinePrincipalIAM}
 	return []InternalRoutePolicy{
 		{http.MethodPost, "/source-suggestions", "discovery.write", agg, true},
 		{http.MethodGet, "/discovery/config", "discovery.read", agg, true},
@@ -96,6 +98,11 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodPatch, "/content-items/:id/image-embedding", "image-embedding.write", media, true},
 		{http.MethodPatch, "/transcription-jobs/:id", "transcript.write", media, true},
 		{http.MethodPost, "/transcription-jobs/:id/complete", "transcript.write", media, true},
+
+		// IAM is the authority for account suspension. CMS stores only this
+		// enforcement mirror so a previously-issued access JWT is rejected
+		// immediately, without CMS taking ownership of user accounts.
+		{http.MethodPut, "/auth/suspensions/:user_id", "auth-suspension.write", iam, false},
 	}
 }
 
