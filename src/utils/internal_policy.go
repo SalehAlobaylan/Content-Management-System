@@ -103,6 +103,7 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		// enforcement mirror so a previously-issued access JWT is rejected
 		// immediately, without CMS taking ownership of user accounts.
 		{http.MethodPut, "/auth/suspensions/:user_id", "auth-suspension.write", iam, false},
+		{http.MethodDelete, "/auth/users/:user_id/product-data", "auth-deletion.write", iam, false},
 	}
 }
 

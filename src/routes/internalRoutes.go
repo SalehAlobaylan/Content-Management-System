@@ -66,6 +66,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/ai-spend/events", controllers.InternalIngestAISpendEvents)
 	route(http.MethodGet, "/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
 	route(http.MethodPut, "/auth/suspensions/:user_id", controllers.InternalSyncAuthSuspension)
+	route(http.MethodDelete, "/auth/users/:user_id/product-data", controllers.InternalDeleteUserProductData)
 
 	route(http.MethodGet, "/storage/policies", controllers.InternalListStoragePolicies)
 	route(http.MethodGet, "/storage/candidates", controllers.InternalListStorageCandidates)
