@@ -26,6 +26,11 @@ type frozenForYouSessionResponse struct {
 	ExpiresAt time.Time    `json:"expires_at"`
 	Cursor    *string      `json:"cursor"`
 	Items     []ForYouItem `json:"items"`
+	CaughtUp  bool         `json:"caught_up"`
+}
+
+type frozenForYouSessionFreshnessResponse struct {
+	HasNewContent bool `json:"has_new_content"`
 }
 
 func consumerFeedIdentityScope(c *gin.Context) (string, bool) {
@@ -170,7 +175,7 @@ func CreateForYouFeedSession(c *gin.Context) {
 	}
 
 	page, nextOffset := visibleFrozenForYouPage(db, items, 0, frozenSessionLimit(c))
-	c.JSON(http.StatusCreated, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page})
+	c.JSON(http.StatusCreated, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: len(items) == 0})
 }
 
 // GetForYouFeedSessionPage serves only the persisted ordering for the session.
@@ -206,5 +211,58 @@ func GetForYouFeedSessionPage(c *gin.Context) {
 		return
 	}
 	page, nextOffset := visibleFrozenForYouPage(db, items, offset, frozenSessionLimit(c))
-	c.JSON(http.StatusOK, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page})
+	c.JSON(http.StatusOK, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: offset >= len(items)})
+}
+
+// GetForYouFeedSessionFreshness reports whether the current policy-selected
+// candidate set contains content that was not in this frozen session. It never
+// alters the persisted order or returns ranked inventory; replacement remains a
+// deliberate client action through session creation.
+func GetForYouFeedSessionFreshness(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	identityScope, ok := consumerFeedIdentityScope(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication or session_id required"})
+		return
+	}
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+		return
+	}
+	var session models.ConsumerFeedSession
+	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "foryou").First(&session).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+		return
+	}
+	if !session.ExpiresAt.After(time.Now().UTC()) {
+		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "For You session has expired"})
+		return
+	}
+	var snapshot []ForYouItem
+	if err := json.Unmarshal(session.Snapshot, &snapshot); err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored For You session is invalid"})
+		return
+	}
+	candidates, err := snapshotCurrentForYouFeed(c, db)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to check For You freshness"})
+		return
+	}
+	c.JSON(http.StatusOK, frozenForYouSessionFreshnessResponse{
+		HasNewContent: hasNewFrozenForYouCandidate(snapshot, candidates),
+	})
+}
+
+func hasNewFrozenForYouCandidate(snapshot, candidates []ForYouItem) bool {
+	known := make(map[uuid.UUID]struct{}, len(snapshot))
+	for _, item := range snapshot {
+		known[item.ID] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		if _, exists := known[candidate.ID]; !exists {
+			return true
+		}
+	}
+	return false
 }

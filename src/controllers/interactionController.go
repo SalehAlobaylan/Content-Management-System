@@ -27,12 +27,103 @@ const (
 
 const maxConsumerIdempotencyKeyLength = 160
 
+const (
+	consumptionContractVersion       = 1
+	maximumConsumptionEvidenceSecond = 24 * 60 * 60
+)
+
 var errConsumerIdempotencyConflict = errors.New("idempotency key was reused with a different request")
 
 // commentMetadata is the expected Metadata shape for comment interactions.
 type commentMetadata struct {
 	Text   string `json:"text"`
 	Author string `json:"author,omitempty"`
+}
+
+// consumptionEvidenceMetadata is deliberately a small, versioned contract.
+// The server derives whether a reported class is plausible from actual played
+// time and furthest position; a seek alone cannot be submitted as completion.
+type consumptionEvidenceMetadata struct {
+	ContractVersion      *int    `json:"consumption_contract_version"`
+	ActualPlayedSeconds  *int    `json:"actual_played_seconds"`
+	FurthestPositionSecs *int    `json:"furthest_position_seconds"`
+	Classification       *string `json:"consumption_classification"`
+}
+
+func isKnownInteractionType(interactionType models.InteractionType) bool {
+	switch interactionType {
+	case models.InteractionTypeLike,
+		models.InteractionTypeBookmark,
+		models.InteractionTypeHide,
+		models.InteractionTypeShare,
+		models.InteractionTypeView,
+		models.InteractionTypeProgress,
+		models.InteractionTypeQuickSkip,
+		models.InteractionTypeSampled,
+		models.InteractionTypeMeaningful,
+		models.InteractionTypeComplete,
+		models.InteractionTypeComment:
+		return true
+	default:
+		return false
+	}
+}
+
+func consumptionClassForEvidence(actualPlayedSeconds, furthestPositionSeconds, durationSeconds int) models.InteractionType {
+	meaningfulThreshold := durationSeconds / 10
+	if meaningfulThreshold > 30 {
+		meaningfulThreshold = 30
+	}
+	if meaningfulThreshold < 1 {
+		meaningfulThreshold = 1
+	}
+	if furthestPositionSeconds*100 >= durationSeconds*90 && actualPlayedSeconds >= meaningfulThreshold {
+		return models.InteractionTypeComplete
+	}
+	if actualPlayedSeconds >= meaningfulThreshold {
+		return models.InteractionTypeMeaningful
+	}
+	if actualPlayedSeconds < 5 {
+		return models.InteractionTypeQuickSkip
+	}
+	return models.InteractionTypeSampled
+}
+
+func validateConsumptionEvidence(interactionType models.InteractionType, metadata []byte, durationSeconds int) error {
+	if interactionType != models.InteractionTypeQuickSkip &&
+		interactionType != models.InteractionTypeSampled &&
+		interactionType != models.InteractionTypeMeaningful &&
+		interactionType != models.InteractionTypeComplete {
+		return nil
+	}
+	var evidence consumptionEvidenceMetadata
+	if len(metadata) == 0 || string(metadata) == "null" {
+		// Preserve legacy completion writes during rollout. New explicit
+		// classifications must always carry evidence below.
+		if interactionType == models.InteractionTypeComplete {
+			return nil
+		}
+		return errors.New("playback classification requires consumption evidence")
+	}
+	if err := json.Unmarshal(metadata, &evidence); err != nil {
+		return errors.New("invalid consumption evidence")
+	}
+	if evidence.ContractVersion != nil && *evidence.ContractVersion != consumptionContractVersion {
+		return errors.New("unsupported consumption contract version")
+	}
+	if evidence.ActualPlayedSeconds == nil || evidence.FurthestPositionSecs == nil || evidence.Classification == nil {
+		return errors.New("incomplete consumption evidence")
+	}
+	if *evidence.ActualPlayedSeconds < 0 || *evidence.FurthestPositionSecs < 0 ||
+		*evidence.ActualPlayedSeconds > maximumConsumptionEvidenceSecond ||
+		*evidence.FurthestPositionSecs > maximumConsumptionEvidenceSecond {
+		return errors.New("consumption evidence is out of range")
+	}
+	expected := consumptionClassForEvidence(*evidence.ActualPlayedSeconds, *evidence.FurthestPositionSecs, durationSeconds)
+	if *evidence.Classification != string(expected) || interactionType != expected {
+		return errors.New("consumption classification does not match playback evidence")
+	}
+	return nil
 }
 
 // authedUserID returns the authenticated user's UUID when the request carried a
@@ -70,7 +161,9 @@ func readIdentity(c *gin.Context) (userIDStr string, sessionID string) {
 }
 
 func isIdempotentInteraction(interactionType models.InteractionType) bool {
-	return interactionType == models.InteractionTypeLike || interactionType == models.InteractionTypeBookmark
+	return interactionType == models.InteractionTypeLike ||
+		interactionType == models.InteractionTypeBookmark ||
+		interactionType == models.InteractionTypeHide
 }
 
 func scopedInteractionQuery(db *gorm.DB, contentItemID uuid.UUID, interactionType models.InteractionType, interaction models.UserInteraction) *gorm.DB {
@@ -115,6 +208,10 @@ func CreateInteraction(c *gin.Context) {
 		})
 		return
 	}
+	if !isKnownInteractionType(req.InteractionType) {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Unknown interaction_type"})
+		return
+	}
 
 	// Parse content item ID
 	contentItemID, err := uuid.Parse(req.ContentItemID)
@@ -133,6 +230,14 @@ func CreateInteraction(c *gin.Context) {
 			Code:    http.StatusNotFound,
 			Message: "Content item not found",
 		})
+		return
+	}
+	durationSeconds := 0
+	if contentItem.DurationSec != nil {
+		durationSeconds = *contentItem.DurationSec
+	}
+	if err := validateConsumptionEvidence(req.InteractionType, req.Metadata, durationSeconds); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, utils.HTTPError{Code: http.StatusUnprocessableEntity, Message: err.Error()})
 		return
 	}
 
@@ -164,6 +269,14 @@ func CreateInteraction(c *gin.Context) {
 			return
 		}
 		meta.Text = strings.TrimSpace(meta.Text)
+		decision := evaluateCommentPolicy(meta.Text)
+		if decision.Outcome == commentPolicyReject {
+			c.JSON(http.StatusUnprocessableEntity, utils.HTTPError{
+				Code:    http.StatusUnprocessableEntity,
+				Message: "Comment violates the community safety policy",
+			})
+			return
+		}
 		// Do not retain arbitrary client metadata on comments. This prevents
 		// payload smuggling and makes duplicate detection deterministic.
 		canonical, _ := json.Marshal(meta)
@@ -175,6 +288,17 @@ func CreateInteraction(c *gin.Context) {
 		ContentItemID: contentItemID,
 		Type:          req.InteractionType,
 		Metadata:      req.Metadata,
+	}
+	if req.InteractionType == models.InteractionTypeComment {
+		var meta commentMetadata
+		_ = json.Unmarshal(req.Metadata, &meta)
+		decision := evaluateCommentPolicy(meta.Text)
+		status := string(decision.Outcome)
+		interaction.CommentModerationStatus = &status
+		if decision.Reason != "" {
+			reason := decision.Reason
+			interaction.CommentModerationReason = &reason
+		}
 	}
 
 	// Identity: prefer the authenticated user (verified JWT). Never trust the
@@ -283,7 +407,9 @@ func CreateInteraction(c *gin.Context) {
 			created = true
 		}
 
-		if created {
+		if created && (interaction.Type != models.InteractionTypeComment ||
+			interaction.CommentModerationStatus == nil ||
+			*interaction.CommentModerationStatus == string(commentPolicyAllow)) {
 			if err := updateEngagementCount(tx, contentItemID, req.InteractionType, 1); err != nil {
 				return err
 			}
@@ -316,6 +442,16 @@ func CreateInteraction(c *gin.Context) {
 
 	if replayed || !created {
 		c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Interaction already exists", Data: saved})
+		return
+	}
+	if saved.Type == models.InteractionTypeComment &&
+		saved.CommentModerationStatus != nil &&
+		*saved.CommentModerationStatus == string(commentPolicyReview) {
+		c.JSON(http.StatusAccepted, utils.ResponseMessage{
+			Code:    http.StatusAccepted,
+			Message: "Comment submitted for review",
+			Data:    saved,
+		})
 		return
 	}
 	c.JSON(http.StatusCreated, utils.ResponseMessage{Code: http.StatusCreated, Message: "Interaction created successfully", Data: saved})
@@ -843,7 +979,8 @@ func GetContentComments(c *gin.Context) {
 	query := db.Model(&models.UserInteraction{}).
 		Where("content_item_id = ?", contentID).
 		Where("type = ?", models.InteractionTypeComment).
-		Order("created_at DESC")
+		Where("comment_moderation_status IS NULL OR comment_moderation_status = ?", string(commentPolicyAllow)).
+		Order("created_at DESC, public_id DESC")
 	if uid, authenticated := authedUserID(c); authenticated {
 		var blockedIDs []uuid.UUID
 		if err := db.Model(&models.UserBlock{}).
@@ -858,7 +995,12 @@ func GetContentComments(c *gin.Context) {
 	}
 
 	if !pagination.Timestamp.IsZero() {
-		query = query.Where("created_at < ?", pagination.Timestamp)
+		query = query.Where(
+			"created_at < ? OR (created_at = ? AND public_id < ?)",
+			pagination.Timestamp,
+			pagination.Timestamp,
+			pagination.LastID,
+		)
 	}
 
 	var interactions []models.UserInteraction
@@ -1093,6 +1235,52 @@ func fetchSeenIDs(db *gorm.DB, sessionID, userIDStr string) []uuid.UUID {
 		ids[i] = v.ContentItemID
 	}
 	return ids
+}
+
+// fetchForYouSuppressedIDs applies the canonical 90/30/7 day repetition
+// windows. A later, stronger classification naturally wins because each event
+// is tested against its own window. Legacy views use the short window so the
+// rollout does not immediately recycle recently shown inventory.
+func fetchForYouSuppressedIDs(db *gorm.DB, sessionID, userIDStr string, config models.RankingConfig, now time.Time) []uuid.UUID {
+	completedDays := clampRepeatWindow(config.ForYouCompletedRepeatDays, 90)
+	meaningfulDays := clampRepeatWindow(config.ForYouMeaningfulRepeatDays, 30)
+	sampleDays := clampRepeatWindow(config.ForYouSampleRepeatDays, 7)
+	query := db.Model(&models.UserInteraction{}).Select("DISTINCT content_item_id").Where(`
+		(type = ? AND created_at >= ?) OR
+		(type = ? AND created_at >= ?) OR
+		(type IN ? AND created_at >= ?) OR
+		type = ?`,
+		models.InteractionTypeComplete, now.AddDate(0, 0, -completedDays),
+		models.InteractionTypeMeaningful, now.AddDate(0, 0, -meaningfulDays),
+		[]models.InteractionType{models.InteractionTypeQuickSkip, models.InteractionTypeSampled, models.InteractionTypeView}, now.AddDate(0, 0, -sampleDays),
+		models.InteractionTypeHide,
+	)
+	if userIDStr != "" {
+		uid, err := uuid.Parse(userIDStr)
+		if err != nil {
+			return nil
+		}
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID != "" {
+		query = query.Where("session_id = ?", sessionID)
+	} else {
+		return nil
+	}
+	var ids []uuid.UUID
+	if err := query.Pluck("content_item_id", &ids).Error; err != nil {
+		return nil
+	}
+	return ids
+}
+
+func clampRepeatWindow(value, fallback int) int {
+	if value < 1 {
+		return fallback
+	}
+	if value > 365 {
+		return 365
+	}
+	return value
 }
 
 // updateEngagementCount updates the like/share count on a content item

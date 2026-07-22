@@ -109,6 +109,9 @@ type ContentItem struct {
 	Title    *string `gorm:"type:text" json:"title,omitempty"`
 	BodyText *string `gorm:"type:text" json:"body_text,omitempty"`
 	Excerpt  *string `gorm:"type:text" json:"excerpt,omitempty"`
+	// ContentLanguage is the source-declared or processor-verified original
+	// language. Delivery preferences must never infer this from UI locale.
+	ContentLanguage *string `gorm:"type:varchar(16);index" json:"content_language,omitempty"`
 
 	// Media
 	MediaURL     *string `gorm:"type:text" json:"media_url,omitempty"`

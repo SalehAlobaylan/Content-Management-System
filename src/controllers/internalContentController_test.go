@@ -62,6 +62,21 @@ func TestInternalMergeEnrichmentMetadataUsesAtomicJSONBMerge(t *testing.T) {
 	}
 }
 
+func TestNormalizeContentLanguageAcceptsOnlyVerifiedDeliveryLanguages(t *testing.T) {
+	for _, value := range []string{"ar", " EN ", "Ar"} {
+		value := value
+		if got := normalizeContentLanguage(&value); got == nil {
+			t.Fatalf("expected %q to normalize", value)
+		}
+	}
+	for _, value := range []string{"", "fr", "ar-SA"} {
+		value := value
+		if got := normalizeContentLanguage(&value); got != nil {
+			t.Fatalf("expected %q to remain unknown, got %q", value, *got)
+		}
+	}
+}
+
 func TestInternalMergeEnrichmentMetadataRejectsUnownedFieldsBeforeDB(t *testing.T) {
 	db, mock := newMockGorm(t)
 	w := callInternalMerge(db, uuid.NewString(), `{"fields":{"ingest_source":"forbidden"}}`)

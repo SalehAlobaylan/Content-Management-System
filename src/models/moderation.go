@@ -14,17 +14,20 @@ const (
 // ModerationReport is an immutable user report. Moderators own its status;
 // consumers can create reports but cannot inspect another reporter's history.
 type ModerationReport struct {
-	ID         uint      `gorm:"primaryKey" json:"-"`
-	PublicID   uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID   string    `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	ReporterID uuid.UUID `gorm:"type:uuid;not null;index" json:"-"`
-	TargetType string    `gorm:"type:varchar(16);not null;index" json:"target_type"`
-	TargetID   uuid.UUID `gorm:"type:uuid;not null;index" json:"target_id"`
-	Reason     string    `gorm:"type:varchar(64);not null" json:"reason"`
-	Detail     *string   `gorm:"type:text" json:"detail,omitempty"`
-	Status     string    `gorm:"type:varchar(24);not null;default:open;index" json:"status"`
-	CreatedAt  time.Time `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt  time.Time `gorm:"autoUpdateTime" json:"updated_at"`
+	ID       uint      `gorm:"primaryKey" json:"-"`
+	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID string    `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	// ReporterID exists only for authenticated accounts. Anonymous reporters are
+	// represented by an opaque, app-local installation scope instead.
+	ReporterID    *uuid.UUID `gorm:"type:uuid;index" json:"-"`
+	ReporterScope string     `gorm:"type:varchar(96);not null;index" json:"-"`
+	TargetType    string     `gorm:"type:varchar(16);not null;index" json:"target_type"`
+	TargetID      uuid.UUID  `gorm:"type:uuid;not null;index" json:"target_id"`
+	Reason        string     `gorm:"type:varchar(64);not null" json:"reason"`
+	Detail        *string    `gorm:"type:text" json:"detail,omitempty"`
+	Status        string     `gorm:"type:varchar(24);not null;default:open;index" json:"status"`
+	CreatedAt     time.Time  `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"autoUpdateTime" json:"updated_at"`
 }
 
 func (ModerationReport) TableName() string { return "moderation_reports" }
@@ -42,9 +45,10 @@ type UserBlock struct {
 func (UserBlock) TableName() string { return "user_blocks" }
 
 // ConsumerModerationIdempotency prevents mobile retries from producing more
-// than one moderation report for a request key and authenticated identity.
+// than one moderation report for a request key and reporter scope. It uses a
+// v2 table because the original primary key could only represent UUID users.
 type ConsumerModerationIdempotency struct {
-	ReporterID     uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ReporterScope  string    `gorm:"type:varchar(96);primaryKey"`
 	Endpoint       string    `gorm:"type:varchar(120);primaryKey"`
 	IdempotencyKey string    `gorm:"type:varchar(160);primaryKey"`
 	RequestDigest  string    `gorm:"type:char(64);not null"`
@@ -53,7 +57,7 @@ type ConsumerModerationIdempotency struct {
 }
 
 func (ConsumerModerationIdempotency) TableName() string {
-	return "consumer_moderation_idempotency"
+	return "consumer_moderation_idempotency_v2"
 }
 
 // AuthSuspension is a minimal enforcement mirror pushed by IAM. CMS never

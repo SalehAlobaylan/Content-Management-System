@@ -15,4 +15,7 @@ func SetupPreferenceRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	group.PUT("/preferences/topics", auth, controllers.PutPreferenceTopics)
 	group.POST("/preferences/topics/:id/mute", auth, controllers.MutePreferenceTopic)
 	group.DELETE("/preferences/topics/:id/mute", auth, controllers.UnmutePreferenceTopic)
+	group.POST("/preferences/sources/:content_id/mute", auth, controllers.MutePreferenceSource)
+	group.DELETE("/preferences/sources/:content_id/mute", auth, controllers.UnmutePreferenceSource)
+	group.DELETE("/preferences/sources/mute", auth, controllers.UnmutePreferenceSourceByKey)
 }

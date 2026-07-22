@@ -11,12 +11,25 @@ import (
 )
 
 func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, scored []ScoredItem) ([]ScoredItem, bool) {
-	if len(scored) < 2 || userIDStr == "" {
+	if userIDStr == "" {
 		return scored, false
 	}
 	userID, err := uuid.Parse(userIDStr)
 	if err != nil {
 		return scored, false
+	}
+	mutedSources := loadMutedSourceKeys(db, tenantID, userID)
+	if len(mutedSources) > 0 {
+		filtered := scored[:0]
+		for _, candidate := range scored {
+			if _, muted := mutedSources[canonicalContentSourceKey(candidate.Item)]; !muted {
+				filtered = append(filtered, candidate)
+			}
+		}
+		scored = filtered
+	}
+	if len(scored) < 2 {
+		return scored, len(mutedSources) > 0
 	}
 	cfg := loadPreferenceSettingsCached(db, tenantID)
 	if !cfg.ForYouEnabled {
@@ -80,12 +93,22 @@ func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, sco
 	return scored, eligible
 }
 
+func loadMutedSourceKeys(db *gorm.DB, tenantID string, userID uuid.UUID) map[string]struct{} {
+	var prefs []models.UserSourcePref
+	db.Where("tenant_id = ? AND user_id = ? AND state = ?", tenantID, userID, "muted").Find(&prefs)
+	keys := make(map[string]struct{}, len(prefs))
+	for _, pref := range prefs {
+		keys[pref.SourceKey] = struct{}{}
+	}
+	return keys
+}
+
 // applyChronologicalPreferenceOrder keeps the default feed chronological at
 // page granularity, while allowing affinities to move a matching item a small
 // number of positions inside that page. The cursor remains tied to the
 // chronological boundary selected before this function runs.
 func applyChronologicalPreferenceOrder(db *gorm.DB, tenantID, userIDStr string, items []models.ContentItem) ([]models.ContentItem, int, bool) {
-	if len(items) < 2 {
+	if len(items) == 0 {
 		return items, 0, false
 	}
 	scored := make([]ScoredItem, len(items))
@@ -95,8 +118,9 @@ func applyChronologicalPreferenceOrder(db *gorm.DB, tenantID, userIDStr string, 
 	var eligible bool
 	scored, eligible = applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
 	boosted := 0
-	for i, s := range scored {
-		items[i] = s.Item
+	items = items[:0]
+	for _, s := range scored {
+		items = append(items, s.Item)
 		if s.ScoreBreakdown.Preference > 0 {
 			boosted++
 		}

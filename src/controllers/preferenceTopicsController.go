@@ -888,6 +888,11 @@ func buildPreferenceResponse(db *gorm.DB, tenantID string, uid uuid.UUID) (gin.H
 	if err := db.Where("tenant_id = ? AND user_id = ? AND score >= ?", tenantID, uid, 0.05).Order("score DESC").Limit(20).Find(&aff).Error; err != nil {
 		return nil, err
 	}
+	var sourcePrefs []models.UserSourcePref
+	if err := db.Where("tenant_id = ? AND user_id = ? AND state = ?", tenantID, uid, "muted").
+		Order("updated_at DESC").Find(&sourcePrefs).Error; err != nil {
+		return nil, err
+	}
 	topicIDs := make([]uuid.UUID, 0, len(prefs)+len(aff))
 	seen := map[uuid.UUID]bool{}
 	for _, p := range prefs {
@@ -942,7 +947,11 @@ func buildPreferenceResponse(db *gorm.DB, tenantID string, uid uuid.UUID) (gin.H
 		}
 		learned = append(learned, topicSubject{ID: t.PublicID, Slug: t.Slug, LabelAR: t.LabelAR, LabelEN: t.LabelEN, CategorySlug: t.CategorySlug, Score: a.Score})
 	}
-	return gin.H{"declared": declared, "learned": learned, "muted": muted}, nil
+	mutedSources := make([]gin.H, 0, len(sourcePrefs))
+	for _, pref := range sourcePrefs {
+		mutedSources = append(mutedSources, gin.H{"source_key": pref.SourceKey, "state": pref.State})
+	}
+	return gin.H{"declared": declared, "learned": learned, "muted": muted, "muted_sources": mutedSources}, nil
 }
 
 // PutPreferenceTopics handles PUT /api/v1/preferences/topics.

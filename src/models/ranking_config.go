@@ -32,8 +32,14 @@ type RankingConfig struct {
 	RecirculationEnabled    bool `gorm:"default:false" json:"recirculation_enabled"`
 	RecirculationMaxAgeDays int  `gorm:"type:integer;default:30" json:"recirculation_max_age_days"`
 
-	// Feed exhaustion behavior: recycle watched items when no unseen For You items remain
-	ShowWatchedWhenUnseenExhausted bool `gorm:"default:true" json:"show_watched_when_unseen_exhausted"`
+	// Deprecated compatibility field. Organic feeds must return caught-up rather
+	// than recycling watched inventory.
+	ShowWatchedWhenUnseenExhausted bool `gorm:"default:false" json:"show_watched_when_unseen_exhausted"`
+	// For You repetition windows are tenant-owned delivery policy, not mobile
+	// ranking knobs. They are clamped by the admin update boundary.
+	ForYouCompletedRepeatDays  int `gorm:"type:integer;default:90" json:"foryou_completed_repeat_days"`
+	ForYouMeaningfulRepeatDays int `gorm:"type:integer;default:30" json:"foryou_meaningful_repeat_days"`
+	ForYouSampleRepeatDays     int `gorm:"type:integer;default:7" json:"foryou_sample_repeat_days"`
 
 	// Engagement normalization strategy
 	EngagementNormalization string `gorm:"type:varchar(20);default:'log'" json:"engagement_normalization"`
@@ -103,7 +109,10 @@ func DefaultRankingConfig(tenantID string) RankingConfig {
 		TrendingThresholdMultiplier:    2.0,
 		RecirculationEnabled:           false,
 		RecirculationMaxAgeDays:        30,
-		ShowWatchedWhenUnseenExhausted: true,
+		ShowWatchedWhenUnseenExhausted: false,
+		ForYouCompletedRepeatDays:      90,
+		ForYouMeaningfulRepeatDays:     30,
+		ForYouSampleRepeatDays:         7,
 		EngagementNormalization:        "log",
 		Mode:                           "balanced",
 		IsActive:                       true,

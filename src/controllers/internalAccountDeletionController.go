@@ -53,6 +53,7 @@ func InternalDeleteUserProductData(c *gin.Context) {
 			{"DELETE FROM consumer_request_idempotency WHERE identity_scope = ?", []any{identityScope}},
 			{"DELETE FROM consumer_feed_sessions WHERE identity_scope = ?", []any{identityScope}},
 			{"DELETE FROM user_topic_prefs WHERE tenant_id = ? AND user_id = ?", []any{req.TenantID, userID}},
+			{"DELETE FROM user_source_prefs WHERE tenant_id = ? AND user_id = ?", []any{req.TenantID, userID}},
 			{"DELETE FROM user_topic_affinity WHERE tenant_id = ? AND user_id = ?", []any{req.TenantID, userID}},
 			{"DELETE FROM user_category_affinity WHERE tenant_id = ? AND user_id = ?", []any{req.TenantID, userID}},
 			{"DELETE FROM preference_affinity_recompute_queue WHERE tenant_id = ? AND user_id = ?", []any{req.TenantID, userID}},

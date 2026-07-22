@@ -16,39 +16,42 @@ import (
 
 // ForYouResponse is the API response for the For You feed
 type ForYouResponse struct {
-	Cursor *string      `json:"cursor"`
-	Items  []ForYouItem `json:"items"`
+	Cursor   *string      `json:"cursor"`
+	Items    []ForYouItem `json:"items"`
+	CaughtUp bool         `json:"caught_up"`
 }
 
 // ForYouItem represents a single item in the For You feed
 type ForYouItem struct {
-	ID                  uuid.UUID  `json:"id"`
-	Type                string     `json:"type"`
-	Title               string     `json:"title"`
-	MediaURL            string     `json:"media_url"`
-	ThumbnailURL        string     `json:"thumbnail_url,omitempty"`
-	DurationSec         int        `json:"duration_sec,omitempty"`
-	ParentID            *string    `json:"parent_id,omitempty"`
-	ChapterIndex        *int       `json:"chapter_index,omitempty"`
-	ChapterStartMs      *int       `json:"chapter_start_ms,omitempty"`
-	ChapterEndMs        *int       `json:"chapter_end_ms,omitempty"`
-	DurationBucket      *string    `json:"duration_bucket,omitempty"`
-	PlaybackURL         *string    `json:"playback_url,omitempty"`
-	PlaybackType        *string    `json:"playback_type,omitempty"`
-	FallbackPlaybackURL *string    `json:"fallback_playback_url,omitempty"`
-	HasVideo            *bool      `json:"has_video,omitempty"`
-	MediaRenditions     any        `json:"media_renditions,omitempty"`
-	Author              string     `json:"author,omitempty"`
-	SourceName          string     `json:"source_name,omitempty"`
-	LikeCount           int        `json:"like_count"`
-	CommentCount        int        `json:"comment_count"`
-	ShareCount          int        `json:"share_count"`
-	PublishedAt         time.Time  `json:"published_at"`
-	BookmarkedAt        *time.Time `json:"bookmarked_at,omitempty"`
-	IsLiked             bool       `json:"is_liked"`
-	IsBookmarked        bool       `json:"is_bookmarked"`
-	IsArchived          bool       `json:"is_archived"`
-	TranscriptID        *string    `json:"transcript_id,omitempty"`
+	ID                   uuid.UUID  `json:"id"`
+	Type                 string     `json:"type"`
+	Title                string     `json:"title"`
+	MediaURL             string     `json:"media_url"`
+	ThumbnailURL         string     `json:"thumbnail_url,omitempty"`
+	DurationSec          int        `json:"duration_sec,omitempty"`
+	ParentID             *string    `json:"parent_id,omitempty"`
+	ChapterIndex         *int       `json:"chapter_index,omitempty"`
+	ChapterStartMs       *int       `json:"chapter_start_ms,omitempty"`
+	ChapterEndMs         *int       `json:"chapter_end_ms,omitempty"`
+	DurationBucket       *string    `json:"duration_bucket,omitempty"`
+	PlaybackURL          *string    `json:"playback_url,omitempty"`
+	PlaybackType         *string    `json:"playback_type,omitempty"`
+	FallbackPlaybackURL  *string    `json:"fallback_playback_url,omitempty"`
+	FallbackPlaybackType *string    `json:"fallback_playback_type,omitempty"`
+	FallbackHasVideo     *bool      `json:"fallback_has_video,omitempty"`
+	HasVideo             *bool      `json:"has_video,omitempty"`
+	MediaRenditions      any        `json:"media_renditions,omitempty"`
+	Author               string     `json:"author,omitempty"`
+	SourceName           string     `json:"source_name,omitempty"`
+	LikeCount            int        `json:"like_count"`
+	CommentCount         int        `json:"comment_count"`
+	ShareCount           int        `json:"share_count"`
+	PublishedAt          time.Time  `json:"published_at"`
+	BookmarkedAt         *time.Time `json:"bookmarked_at,omitempty"`
+	IsLiked              bool       `json:"is_liked"`
+	IsBookmarked         bool       `json:"is_bookmarked"`
+	IsArchived           bool       `json:"is_archived"`
+	TranscriptID         *string    `json:"transcript_id,omitempty"`
 }
 
 const (
@@ -65,6 +68,11 @@ func hasCursor(pagination *utils.CursorPagination) bool {
 // GET /api/v1/feed/foryou?cursor=xxx&limit=20
 func GetForYouFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	deliveryLanguage, ok := parseDeliveryLanguage(c.Query("content_language"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "content_language must be ar, en, or both"})
+		return
+	}
 
 	// Parse cursor pagination
 	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
@@ -81,12 +89,12 @@ func GetForYouFeed(c *gin.Context) {
 	// session_id. A client-supplied ?user_id is never trusted, and an
 	// authenticated caller cannot pass ?session_id to read someone else's state.
 	userIDStr, sessionID := readIdentity(c)
-	excludeSeen := c.Query("exclude_seen") == "true"
-
-	// Pre-fetch IDs the user has already viewed (used by both paths below)
+	// Repetition suppression is always applied while an identity is present.
+	// The old opt-in exclude_seen query parameter is intentionally ignored for
+	// For You: mobile sessions must not accidentally recycle watched inventory.
 	var seenIDs []uuid.UUID
-	if excludeSeen && (sessionID != "" || userIDStr != "") {
-		seenIDs = fetchSeenIDs(db, sessionID, userIDStr)
+	if sessionID != "" || userIDStr != "" {
+		seenIDs = fetchForYouSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, "default"), time.Now().UTC())
 	}
 
 	// Load ranking config (uses "default" tenant for public feeds)
@@ -99,6 +107,7 @@ func GetForYouFeed(c *gin.Context) {
 		// Fetch items for ranking — try time window first, then fall back to all
 		var allItems []models.ContentItem
 		baseQuery := forYouEligibleMediaQuery(db, "default", atomizedFeedSchema)
+		baseQuery = applyDeliveryLanguage(baseQuery, deliveryLanguage)
 		baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
 
 		// First try: items from the configured freshness window (minimum 30 days)
@@ -144,9 +153,7 @@ func GetForYouFeed(c *gin.Context) {
 			}
 			scored = filtered
 		}
-		if config.ShowWatchedWhenUnseenExhausted && len(scored) == 0 && len(unfilteredScored) > 0 && !hasCursor(pagination) {
-			scored = unfilteredScored
-		}
+		_ = unfilteredScored // retained for scoring diagnostics; never recycle it.
 
 		// Apply cursor-based pagination over scored results
 		startIdx := 0
@@ -214,7 +221,7 @@ func GetForYouFeed(c *gin.Context) {
 			responseItems[i] = mapToForYouItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
 		}
 
-		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems})
+		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination)})
 		if !isFeedIntegritySynthetic(c) {
 			recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
 		}
@@ -235,7 +242,7 @@ func GetForYouFeed(c *gin.Context) {
 	// Query for VIDEO and PODCAST content with a valid media URL.
 	// Use COALESCE(published_at, created_at) so items with NULL published_at
 	// are still ordered and reachable by cursor pagination.
-	query := forYouEligibleMediaQuery(db, "default", atomizedFeedSchema).
+	query := applyDeliveryLanguage(forYouEligibleMediaQuery(db, "default", atomizedFeedSchema), deliveryLanguage).
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 	query = applyDurationPreference(query, durationTargetMinutes)
 
@@ -262,19 +269,6 @@ func GetForYouFeed(c *gin.Context) {
 		return
 	}
 	items = excludeCollapsedRedundancyMembers(db, "default", items)
-	if config.ShowWatchedWhenUnseenExhausted && len(items) == 0 && len(seenIDs) > 0 && !hasCursor(pagination) {
-		query = forYouEligibleMediaQuery(db, "default", atomizedFeedSchema).
-			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
-		query = applyDurationPreference(query, durationTargetMinutes)
-		if err := query.Limit(pagination.Limit + 1).Find(&items).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, utils.HTTPError{
-				Code:    http.StatusInternalServerError,
-				Message: "Failed to fetch feed fallback: " + err.Error(),
-			})
-			return
-		}
-		items = excludeCollapsedRedundancyMembers(db, "default", items)
-	}
 
 	// Keep the cursor boundary chronological even when preferences reorder the
 	// returned page. That makes the cursor stable while allowing a deliberately
@@ -318,8 +312,9 @@ func GetForYouFeed(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, ForYouResponse{
-		Cursor: nextCursor,
-		Items:  responseItems,
+		Cursor:   nextCursor,
+		Items:    responseItems,
+		CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
 	})
 	if !isFeedIntegritySynthetic(c) {
 		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
@@ -669,6 +664,7 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 			result.MediaRenditions = renditions
 		}
 	}
+	result.FallbackPlaybackType, result.FallbackHasVideo = typedFallbackMetadata(item)
 	if item.ThumbnailURL != nil {
 		result.ThumbnailURL = *item.ThumbnailURL
 	}
@@ -690,4 +686,35 @@ func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYou
 	}
 
 	return result
+}
+
+type storedPlaybackRendition struct {
+	Type     string `json:"type"`
+	URL      string `json:"url"`
+	HasVideo *bool  `json:"has_video"`
+}
+
+// typedFallbackMetadata only returns a fallback when the stored rendition
+// explicitly records both its media type and video capability. Older rows that
+// have only a URL remain playable through their primary source but are never
+// guessed into an unsafe player transition.
+func typedFallbackMetadata(item models.ContentItem) (*string, *bool) {
+	if item.FallbackPlaybackURL == nil || *item.FallbackPlaybackURL == "" || len(item.MediaRenditions) == 0 {
+		return nil, nil
+	}
+	var renditions []storedPlaybackRendition
+	if json.Unmarshal(item.MediaRenditions, &renditions) != nil {
+		return nil, nil
+	}
+	for _, rendition := range renditions {
+		if rendition.URL != *item.FallbackPlaybackURL || rendition.HasVideo == nil {
+			continue
+		}
+		typeName := rendition.Type
+		switch typeName {
+		case "hls", "mp4", "audio":
+			return &typeName, rendition.HasVideo
+		}
+	}
+	return nil, nil
 }

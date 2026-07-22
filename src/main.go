@@ -147,6 +147,7 @@ func main() {
 			&models.ContentItemTopic{},
 			&models.StoryTopic{},
 			&models.UserTopicPref{},
+			&models.UserSourcePref{},
 			&models.UserTopicAffinity{},
 			&models.UserCategoryAffinity{},
 			&models.PreferenceSettings{},

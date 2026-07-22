@@ -123,6 +123,20 @@ type UserTopicPref struct {
 
 func (UserTopicPref) TableName() string { return "user_topic_prefs" }
 
+// UserSourcePref is a durable, user-owned delivery exclusion. SourceKey is
+// derived server-side from canonical feed provenance, never accepted from a
+// client as an arbitrary label.
+type UserSourcePref struct {
+	TenantID  string    `gorm:"type:varchar(64);primaryKey;index:idx_user_source_prefs_user"`
+	UserID    uuid.UUID `gorm:"type:uuid;primaryKey;index:idx_user_source_prefs_user"`
+	SourceKey string    `gorm:"type:varchar(320);primaryKey"`
+	State     string    `gorm:"type:varchar(16);not null"`
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime"`
+}
+
+func (UserSourcePref) TableName() string { return "user_source_prefs" }
+
 type UserTopicAffinity struct {
 	TenantID  string    `gorm:"type:varchar(64);primaryKey;index:idx_user_topic_affinity_user" json:"tenant_id"`
 	UserID    uuid.UUID `gorm:"type:uuid;primaryKey;index:idx_user_topic_affinity_user" json:"user_id"`

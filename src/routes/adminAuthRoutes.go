@@ -96,6 +96,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// removal; Platform Console is only the authenticated operator surface.
 	adminGroup.GET("/moderation/reports", perm("content", "read"), controllers.AdminListModerationReports)
 	adminGroup.POST("/moderation/reports/:id/resolve", perm("content", "write"), controllers.AdminResolveModerationReport)
+	adminGroup.GET("/moderation/comments/review", perm("content", "read"), controllers.AdminListCommentReviews)
+	adminGroup.POST("/moderation/comments/:id/review", perm("content", "write"), controllers.AdminResolveCommentReview)
 	adminGroup.DELETE("/moderation/comments/:id", perm("content", "write"), controllers.AdminRemoveComment)
 
 	// First-class topics (LLM-labeled) management

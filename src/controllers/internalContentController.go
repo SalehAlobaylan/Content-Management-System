@@ -22,24 +22,25 @@ import (
 )
 
 type internalCreateContentItemRequest struct {
-	IdempotencyKey string                 `json:"idempotency_key"`
-	Type           string                 `json:"type"`
-	Format         *string                `json:"format"`
-	Source         string                 `json:"source"`
-	Status         string                 `json:"status"`
-	Title          string                 `json:"title"`
-	BodyText       *string                `json:"body_text"`
-	Excerpt        *string                `json:"excerpt"`
-	Author         *string                `json:"author"`
-	SourceName     string                 `json:"source_name"`
-	SourceFeedURL  *string                `json:"source_feed_url"`
-	OriginalURL    string                 `json:"original_url"`
-	MediaURL       *string                `json:"media_url"`
-	ThumbnailURL   *string                `json:"thumbnail_url"`
-	DurationSec    *int                   `json:"duration_sec"`
-	TopicTags      []string               `json:"topic_tags"`
-	Metadata       map[string]interface{} `json:"metadata"`
-	PublishedAt    *string                `json:"published_at"`
+	IdempotencyKey  string                 `json:"idempotency_key"`
+	Type            string                 `json:"type"`
+	Format          *string                `json:"format"`
+	Source          string                 `json:"source"`
+	Status          string                 `json:"status"`
+	Title           string                 `json:"title"`
+	BodyText        *string                `json:"body_text"`
+	Excerpt         *string                `json:"excerpt"`
+	ContentLanguage *string                `json:"content_language"`
+	Author          *string                `json:"author"`
+	SourceName      string                 `json:"source_name"`
+	SourceFeedURL   *string                `json:"source_feed_url"`
+	OriginalURL     string                 `json:"original_url"`
+	MediaURL        *string                `json:"media_url"`
+	ThumbnailURL    *string                `json:"thumbnail_url"`
+	DurationSec     *int                   `json:"duration_sec"`
+	TopicTags       []string               `json:"topic_tags"`
+	Metadata        map[string]interface{} `json:"metadata"`
+	PublishedAt     *string                `json:"published_at"`
 }
 
 type internalCreateContentItemResponse struct {
@@ -50,15 +51,16 @@ type internalCreateContentItemResponse struct {
 }
 
 type internalUpdateContentItemRequest struct {
-	Title       *string                `json:"title"`
-	BodyText    *string                `json:"body_text"`
-	Excerpt     *string                `json:"excerpt"`
-	Author      *string                `json:"author"`
-	SourceName  *string                `json:"source_name"`
-	SourceFeed  *string                `json:"source_feed_url"`
-	OriginalURL *string                `json:"original_url"`
-	PublishedAt *string                `json:"published_at"`
-	Metadata    map[string]interface{} `json:"metadata"`
+	Title           *string                `json:"title"`
+	BodyText        *string                `json:"body_text"`
+	Excerpt         *string                `json:"excerpt"`
+	ContentLanguage *string                `json:"content_language"`
+	Author          *string                `json:"author"`
+	SourceName      *string                `json:"source_name"`
+	SourceFeed      *string                `json:"source_feed_url"`
+	OriginalURL     *string                `json:"original_url"`
+	PublishedAt     *string                `json:"published_at"`
+	Metadata        map[string]interface{} `json:"metadata"`
 }
 
 // internalEnrichmentMetadataRequest is intentionally narrow: Enrichment owns
@@ -66,6 +68,17 @@ type internalUpdateContentItemRequest struct {
 // It must not receive a general metadata replacement capability.
 type internalEnrichmentMetadataRequest struct {
 	Fields map[string]interface{} `json:"fields"`
+}
+
+func normalizeContentLanguage(raw *string) *string {
+	if raw == nil {
+		return nil
+	}
+	value := strings.ToLower(strings.TrimSpace(*raw))
+	if value != "ar" && value != "en" {
+		return nil
+	}
+	return &value
 }
 
 func validEnrichmentMetadataField(key string, value interface{}) bool {
@@ -299,24 +312,25 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	item := models.ContentItem{
-		Type:           kind,
-		Format:         format,
-		Source:         models.SourceType(strings.ToUpper(req.Source)),
-		Status:         models.ContentStatus(strings.ToUpper(req.Status)),
-		IdempotencyKey: &idempotencyKey,
-		Title:          &req.Title,
-		BodyText:       req.BodyText,
-		Excerpt:        req.Excerpt,
-		Author:         req.Author,
-		SourceName:     &req.SourceName,
-		SourceFeedURL:  req.SourceFeedURL,
-		MediaURL:       req.MediaURL,
-		ThumbnailURL:   req.ThumbnailURL,
-		OriginalURL:    &req.OriginalURL,
-		DurationSec:    req.DurationSec,
-		TopicTags:      req.TopicTags,
-		Metadata:       datatypes.JSON(metadataJSON),
-		PublishedAt:    publishedAt,
+		Type:            kind,
+		Format:          format,
+		Source:          models.SourceType(strings.ToUpper(req.Source)),
+		Status:          models.ContentStatus(strings.ToUpper(req.Status)),
+		IdempotencyKey:  &idempotencyKey,
+		Title:           &req.Title,
+		BodyText:        req.BodyText,
+		Excerpt:         req.Excerpt,
+		ContentLanguage: normalizeContentLanguage(req.ContentLanguage),
+		Author:          req.Author,
+		SourceName:      &req.SourceName,
+		SourceFeedURL:   req.SourceFeedURL,
+		MediaURL:        req.MediaURL,
+		ThumbnailURL:    req.ThumbnailURL,
+		OriginalURL:     &req.OriginalURL,
+		DurationSec:     req.DurationSec,
+		TopicTags:       req.TopicTags,
+		Metadata:        datatypes.JSON(metadataJSON),
+		PublishedAt:     publishedAt,
 	}
 	if kind == models.ContentTypeVideo || kind == models.ContentTypePodcast {
 		waiting := "waiting_media"
@@ -368,6 +382,9 @@ func InternalUpdateContentItem(c *gin.Context) {
 	}
 	if req.Excerpt != nil {
 		item.Excerpt = req.Excerpt
+	}
+	if req.ContentLanguage != nil {
+		item.ContentLanguage = normalizeContentLanguage(req.ContentLanguage)
 	}
 	if req.Author != nil {
 		item.Author = req.Author
@@ -1293,6 +1310,7 @@ func InternalGetContentItem(c *gin.Context) {
 		"source_type":                  string(item.Source),
 		"title":                        item.Title,
 		"excerpt":                      item.Excerpt,
+		"content_language":             item.ContentLanguage,
 		"source_name":                  item.SourceName,
 		"published_at":                 publishedAt,
 		"media_url":                    item.MediaURL,

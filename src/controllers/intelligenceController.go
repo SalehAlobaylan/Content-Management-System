@@ -46,6 +46,15 @@ func UpdateRankingConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}
+	if req.ForYouCompletedRepeatDays == 0 {
+		req.ForYouCompletedRepeatDays = 90
+	}
+	if req.ForYouMeaningfulRepeatDays == 0 {
+		req.ForYouMeaningfulRepeatDays = 30
+	}
+	if req.ForYouSampleRepeatDays == 0 {
+		req.ForYouSampleRepeatDays = 7
+	}
 
 	// Validate weights sum ≈ 1.0 (tolerance ±0.05)
 	sum := req.FreshnessWeight + req.EngagementWeight + req.VelocityWeight +
@@ -64,6 +73,12 @@ func UpdateRankingConfig(c *gin.Context) {
 	for _, w := range weights {
 		if w < 0 || w > 1 {
 			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Each weight must be between 0 and 1", Code: "INVALID_WEIGHT"})
+			return
+		}
+	}
+	for _, window := range []int{req.ForYouCompletedRepeatDays, req.ForYouMeaningfulRepeatDays, req.ForYouSampleRepeatDays} {
+		if window < 1 || window > 365 {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "For You repetition windows must be between 1 and 365 days", Code: "INVALID_REPETITION_WINDOW"})
 			return
 		}
 	}
@@ -114,6 +129,9 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.RecirculationEnabled = req.RecirculationEnabled
 	existing.RecirculationMaxAgeDays = req.RecirculationMaxAgeDays
 	existing.ShowWatchedWhenUnseenExhausted = req.ShowWatchedWhenUnseenExhausted
+	existing.ForYouCompletedRepeatDays = req.ForYouCompletedRepeatDays
+	existing.ForYouMeaningfulRepeatDays = req.ForYouMeaningfulRepeatDays
+	existing.ForYouSampleRepeatDays = req.ForYouSampleRepeatDays
 	existing.EngagementNormalization = req.EngagementNormalization
 	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive

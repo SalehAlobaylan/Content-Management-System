@@ -13,12 +13,21 @@ type InteractionType string
 const (
 	InteractionTypeLike     InteractionType = "like"
 	InteractionTypeBookmark InteractionType = "bookmark"
-	InteractionTypeShare    InteractionType = "share"
-	InteractionTypeView     InteractionType = "view"
+	// InteractionTypeHide is an identity-scoped delivery exclusion. It is not
+	// an affinity signal and must never alter topic/source ranking preferences.
+	InteractionTypeHide  InteractionType = "hide"
+	InteractionTypeShare InteractionType = "share"
+	InteractionTypeView  InteractionType = "view"
 	// InteractionTypeProgress is a durable playback checkpoint. Position and
 	// accumulated played time live in Metadata so this remains append-only.
 	InteractionTypeProgress InteractionType = "progress"
-	InteractionTypeComplete InteractionType = "complete"
+	// Playback evidence is server-owned feed-suppression input. These are
+	// deliberately separate from progress checkpoints so a client cannot turn a
+	// seek into a stronger consumption signal.
+	InteractionTypeQuickSkip  InteractionType = "quick_skip"
+	InteractionTypeSampled    InteractionType = "sampled"
+	InteractionTypeMeaningful InteractionType = "meaningful"
+	InteractionTypeComplete   InteractionType = "complete"
 	// InteractionTypeComment stores the comment body in Metadata:
 	// {"text": "...", "author": "display name (optional)"}
 	InteractionTypeComment InteractionType = "comment"
@@ -39,6 +48,10 @@ type UserInteraction struct {
 	// Interaction details
 	Type     InteractionType `gorm:"type:varchar(50);not null" json:"interaction_type"`
 	Metadata datatypes.JSON  `gorm:"type:jsonb" json:"metadata,omitempty"`
+	// Only comment interactions use these fields. Review rows remain private
+	// until a moderator decides; legacy NULL comments are treated as allowed.
+	CommentModerationStatus *string `gorm:"type:varchar(16);index" json:"-"`
+	CommentModerationReason *string `gorm:"type:varchar(64)" json:"-"`
 
 	// Timestamp
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`

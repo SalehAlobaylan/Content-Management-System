@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -18,8 +19,10 @@ import (
 )
 
 const maxModerationDetailLength = 1_000
+const maxAnonymousReportsPerHour = 5
 
 var errModerationIdempotencyConflict = errors.New("moderation idempotency key reused")
+var errAnonymousModerationRateLimit = errors.New("anonymous moderation report rate limit reached")
 
 var moderationReasons = map[string]struct{}{
 	"harmful_inappropriate": {}, "misinformation": {}, "copyright": {},
@@ -43,17 +46,30 @@ func moderationRequestDigest(request createModerationReportRequest) string {
 	return fmt.Sprintf("%x", digest[:])
 }
 
+func moderationReporter(c *gin.Context) (string, *uuid.UUID, bool) {
+	if uid, ok := authedUserID(c); ok {
+		return "user:" + uid.String(), &uid, true
+	}
+	installationID, err := uuid.Parse(strings.TrimSpace(c.Query("installation_id")))
+	if err != nil {
+		return "", nil, false
+	}
+	return "installation:" + installationID.String(), nil, true
+}
+
+// Blocks remain an account-only control; an installation cannot block an
+// author globally because it has no durable account relationship.
 func moderationUser(c *gin.Context) (uuid.UUID, bool) {
 	return authedUserID(c)
 }
 
-// CreateModerationReport accepts exactly one authenticated reporter identity.
-// It deliberately does not expose report status to users or leak whether a
-// report changed moderator action.
+// CreateModerationReport accepts either a verified account or an opaque,
+// app-local installation UUID. It deliberately does not expose report status
+// to users or leak whether a report changed moderator action.
 func CreateModerationReport(c *gin.Context) {
-	uid, ok := moderationUser(c)
+	reporterScope, reporterID, ok := moderationReporter(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication required"})
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "A valid installation_id is required when unauthenticated"})
 		return
 	}
 	var req createModerationReportRequest
@@ -105,15 +121,28 @@ func CreateModerationReport(c *gin.Context) {
 		return
 	}
 	digest := moderationRequestDigest(req)
-	report := models.ModerationReport{TenantID: "default", ReporterID: uid, TargetType: req.TargetType, TargetID: targetID, Reason: req.Reason}
+	report := models.ModerationReport{TenantID: "default", ReporterID: reporterID, ReporterScope: reporterScope, TargetType: req.TargetType, TargetID: targetID, Reason: req.Reason}
 	if req.Detail != "" {
 		report.Detail = &req.Detail
 	}
 	created := false
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// Installation identity is deliberately bounded. The authenticated scope
+		// remains subject to normal account moderation controls instead.
+		if reporterID == nil {
+			var reportsInWindow int64
+			if err := tx.Model(&models.ModerationReport{}).
+				Where("tenant_id = ? AND reporter_scope = ? AND created_at >= ?", "default", reporterScope, time.Now().Add(-time.Hour)).
+				Count(&reportsInWindow).Error; err != nil {
+				return err
+			}
+			if reportsInWindow >= maxAnonymousReportsPerHour {
+				return errAnonymousModerationRateLimit
+			}
+		}
 		if key != "" {
 			var existing models.ConsumerModerationIdempotency
-			if err := tx.Where("reporter_id = ? AND endpoint = ? AND idempotency_key = ?", uid, "POST /api/v1/moderation/reports", key).First(&existing).Error; err == nil {
+			if err := tx.Where("reporter_scope = ? AND endpoint = ? AND idempotency_key = ?", reporterScope, "POST /api/v1/moderation/reports", key).First(&existing).Error; err == nil {
 				if existing.RequestDigest != digest {
 					return errModerationIdempotencyConflict
 				}
@@ -127,12 +156,16 @@ func CreateModerationReport(c *gin.Context) {
 		}
 		created = true
 		if key != "" {
-			return tx.Create(&models.ConsumerModerationIdempotency{ReporterID: uid, Endpoint: "POST /api/v1/moderation/reports", IdempotencyKey: key, RequestDigest: digest, ReportID: report.PublicID}).Error
+			return tx.Create(&models.ConsumerModerationIdempotency{ReporterScope: reporterScope, Endpoint: "POST /api/v1/moderation/reports", IdempotencyKey: key, RequestDigest: digest, ReportID: report.PublicID}).Error
 		}
 		return nil
 	})
 	if errors.Is(err, errModerationIdempotencyConflict) {
 		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Idempotency-Key was reused with a different request"})
+		return
+	}
+	if errors.Is(err, errAnonymousModerationRateLimit) {
+		c.JSON(http.StatusTooManyRequests, utils.HTTPError{Code: http.StatusTooManyRequests, Message: "Too many reports; please try again later"})
 		return
 	}
 	if err != nil {
@@ -204,6 +237,99 @@ type adminModerationReport struct {
 	models.ModerationReport
 	AuthorID        *uuid.UUID `json:"author_id,omitempty"`
 	AuthorSuspended bool       `json:"author_suspended"`
+}
+
+// adminCommentReview exposes only the policy evidence needed for a human
+// decision. It deliberately omits reporter identity and unrelated metadata.
+type adminCommentReview struct {
+	ID        uuid.UUID  `json:"id"`
+	ContentID uuid.UUID  `json:"content_id"`
+	Text      string     `json:"text"`
+	Reason    string     `json:"reason"`
+	AuthorID  *uuid.UUID `json:"author_id,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+func AdminListCommentReviews(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var comments []models.UserInteraction
+	if err := db.Model(&models.UserInteraction{}).
+		Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+		Where("content_items.tenant_id = ? AND user_interactions.type = ? AND user_interactions.comment_moderation_status = ?", principal.TenantID, models.InteractionTypeComment, string(commentPolicyReview)).
+		Order("created_at ASC").Limit(100).Find(&comments).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to load comment reviews"})
+		return
+	}
+	rows := make([]adminCommentReview, 0, len(comments))
+	for _, comment := range comments {
+		var meta commentMetadata
+		if json.Unmarshal(comment.Metadata, &meta) != nil || strings.TrimSpace(meta.Text) == "" {
+			continue
+		}
+		reason := "policy_review"
+		if comment.CommentModerationReason != nil {
+			reason = *comment.CommentModerationReason
+		}
+		rows = append(rows, adminCommentReview{
+			ID: comment.PublicID, ContentID: comment.ContentItemID, Text: meta.Text,
+			Reason: reason, AuthorID: comment.UserID, CreatedAt: comment.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows), "tenant_id": principal.TenantID})
+}
+
+func AdminResolveCommentReview(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	commentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid comment id"})
+		return
+	}
+	var body struct {
+		Status string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || (body.Status != string(commentPolicyAllow) && body.Status != "removed") {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "status must be allow or removed"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var comment models.UserInteraction
+		if err := tx.Model(&models.UserInteraction{}).
+			Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+			Where("content_items.tenant_id = ? AND user_interactions.public_id = ? AND user_interactions.type = ? AND user_interactions.comment_moderation_status = ?", principal.TenantID, commentID, models.InteractionTypeComment, string(commentPolicyReview)).
+			First(&comment).Error; err != nil {
+			return err
+		}
+		if body.Status == "removed" {
+			return tx.Delete(&comment).Error
+		}
+		status := string(commentPolicyAllow)
+		if err := tx.Model(&comment).Updates(map[string]any{
+			"comment_moderation_status": status,
+			"comment_moderation_reason": nil,
+		}).Error; err != nil {
+			return err
+		}
+		return updateEngagementCount(tx, comment.ContentItemID, models.InteractionTypeComment, 1)
+	})
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"message": "Comment review not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to resolve comment review"})
+		return
+	}
+	writeModerationAudit(db, principal, "moderation.comment."+body.Status, commentID.String(), nil)
+	c.JSON(http.StatusOK, gin.H{"message": "Comment review resolved"})
 }
 
 // AdminListModerationReports is a tenant-scoped operational queue. The queue
