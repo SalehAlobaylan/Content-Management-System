@@ -1,6 +1,11 @@
 -- Preference-setting domains are code policy shared by the CMS API and Console.
 -- Reconcile legacy values first; this migration is canonical and is not applied
 -- automatically to any shared or production database.
+
+-- Guard against schema drift (e.g. GORM AutoMigrate dropping columns).
+ALTER TABLE preference_settings ADD COLUMN IF NOT EXISTS w_foryou DOUBLE PRECISION NOT NULL DEFAULT 0.30;
+ALTER TABLE preference_settings ADD COLUMN IF NOT EXISTS w_news DOUBLE PRECISION NOT NULL DEFAULT 0.15;
+
 UPDATE preference_settings
 SET
     w_foryou = CASE WHEN w_foryou BETWEEN 0 AND 1 THEN w_foryou ELSE 0.30 END,

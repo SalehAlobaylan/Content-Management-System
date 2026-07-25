@@ -49,15 +49,16 @@ var legacyTransactionalMigrations = map[string]struct{}{
 
 func main() {
 	var (
-		applyAll = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
-		status   = flag.Bool("status", false, "print migration ledger status without applying files")
-		baseline = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
-		dir      = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
+		applyAll         = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
+		status           = flag.Bool("status", false, "print migration ledger status without applying files")
+		baseline         = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
+		allowDestructive = flag.Bool("allow-destructive", false, "allow migrations containing destructive SQL such as DROP TABLE, DROP COLUMN, TRUNCATE, or DELETE FROM")
+		dir              = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
 
-	if *status && (*applyAll || *baseline != "" || flag.NArg() > 0) {
-		log.Fatal("--status cannot be combined with --all, --baseline-through, or explicit migration files")
+	if *status && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
+		log.Fatal("--status cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
 	}
 	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
 		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
@@ -107,6 +108,9 @@ func main() {
 		log.Println("No migrations to apply.")
 		return
 	}
+	if err := requireDestructiveApproval(selected, *allowDestructive); err != nil {
+		log.Fatal(err)
+	}
 
 	for _, file := range selected {
 		if record, exists := applied[file.Version]; exists {
@@ -117,6 +121,25 @@ func main() {
 		}
 		log.Printf("Applied %s", file.Version)
 	}
+}
+
+var destructiveSQL = regexp.MustCompile(`(?im)^\s*(DROP\s+TABLE|ALTER\s+TABLE\b.*\bDROP\s+COLUMN|TRUNCATE\b|DELETE\s+FROM\b)`)
+
+func requireDestructiveApproval(files []migrationFile, allowed bool) error {
+	destructive := make([]string, 0)
+	for _, file := range files {
+		sql, err := os.ReadFile(file.Path)
+		if err != nil {
+			return err
+		}
+		if destructiveSQL.Match(sql) {
+			destructive = append(destructive, file.Version)
+		}
+	}
+	if len(destructive) > 0 && !allowed {
+		return fmt.Errorf("refusing destructive migration(s): %s; review them and re-run with --allow-destructive", strings.Join(destructive, ", "))
+	}
+	return nil
 }
 
 func verifyAppliedChecksums(files []migrationFile, applied map[string]migrationRecord) error {
@@ -141,7 +164,14 @@ func returnFatalApplied(file migrationFile, record migrationRecord) {
 }
 
 func ensureLedger(db *gorm.DB) error {
-	return db.Exec(ledgerTableDDL).Error
+	if err := db.Exec(ledgerTableDDL).Error; err != nil {
+		return err
+	}
+	return db.Exec(`
+ALTER TABLE cms_schema_migrations
+    ADD COLUMN IF NOT EXISTS checksum_sha256 varchar(64),
+    ADD COLUMN IF NOT EXISTS execution_mode varchar(32) NOT NULL DEFAULT 'legacy'
+`).Error
 }
 
 func listMigrationFiles(dir string) ([]migrationFile, error) {

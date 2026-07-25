@@ -3,7 +3,10 @@ package controllers
 import (
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func TestFrozenForYouSessionCursorRoundTrip(t *testing.T) {
@@ -40,5 +43,38 @@ func TestHasNewFrozenForYouCandidateOnlyReportsUnseenIDs(t *testing.T) {
 		[]ForYouItem{{ID: first}, {ID: second}},
 	) {
 		t.Fatal("unseen candidate must claim freshness")
+	}
+}
+
+func TestVisibleFrozenForYouPageQueriesContentItems(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	visibleID := uuid.New()
+	hiddenID := uuid.New()
+	mock.ExpectQuery(`SELECT .*public_id.*FROM "content_items"`).
+		WillReturnRows(sqlmock.NewRows([]string{"public_id"}).AddRow(visibleID))
+
+	page, nextOffset := visibleFrozenForYouPage(db, []ForYouItem{
+		{ID: visibleID},
+		{ID: hiddenID},
+	}, 0, 10)
+
+	if len(page) != 1 || page[0].ID != visibleID {
+		t.Fatalf("expected the visible content item, got %#v", page)
+	}
+	if nextOffset != 2 {
+		t.Fatalf("expected the snapshot to be consumed through offset 2, got %d", nextOffset)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

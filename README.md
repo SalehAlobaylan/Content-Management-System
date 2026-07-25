@@ -35,17 +35,17 @@ go build ./...
 docker build -t wahb-cms .
 ```
 
-CMS startup never mutates the schema. Apply pending canonical SQL migrations deliberately with the migration runner; the runner records immutable checksums in `cms_schema_migrations`.
+CMS startup never mutates the schema. Use the root migration script for deliberate CMS SQL migrations; the runner records immutable checksums in `cms_schema_migrations`.
 
 Inspect or apply canonical CMS SQL migrations explicitly:
 
 ```bash
-go run ./cmd/migrate --status
-go run ./cmd/migrate --all
-go run ./cmd/migrate 20260627000000_media_atomization.sql 20260627010000_media_atomization_operations.sql 20260627020000_media_atomization_manual_controls.sql 20260627030000_media_atomization_unique_index_repair.sql
+./scripts/cms-migrate.sh status
+./scripts/cms-migrate.sh apply
+./scripts/cms-migrate.sh apply --allow-destructive
 ```
 
-For an existing pre-ledger database, establish the historical boundary once with `--baseline-through <timestamped-file.sql>` before using `--all`. Set `AUTO_SQL_MIGRATE=true` only for a startup where pending migrations should be applied, then return it to `false`.
+For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. The script refuses destructive migrations unless `--allow-destructive` is supplied explicitly.
 
 ### Go API docs (terminal)
 
@@ -79,7 +79,6 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `ENRICHMENT_BASE_URL` | no | http://localhost:5050 | On-demand embed/translate/rerank/news-slide |
 | `ENRICHMENT_SERVICE_TOKEN` | no | falls back to `CMS_SERVICE_TOKEN` | Auth for Enrichment calls |
 | `REDIS_URL` | no | redis://localhost:6379 | Declared; caching is future-use |
-| `AUTO_SQL_MIGRATE` | no | false | Set `true` only for an explicitly approved startup migration run |
 
 ## Authentication
 

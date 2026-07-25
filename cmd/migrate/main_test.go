@@ -50,3 +50,18 @@ func TestVerifyAppliedChecksumsRejectsDrift(t *testing.T) {
 		t.Fatal("edited applied migration was accepted")
 	}
 }
+
+func TestRequireDestructiveApproval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260719020000_drop_table.sql")
+	if err := os.WriteFile(path, []byte("DROP TABLE legacy_event_topics;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := []migrationFile{{Version: filepath.Base(path), Path: path}}
+	if err := requireDestructiveApproval(files, false); err == nil {
+		t.Fatal("destructive migration was allowed without approval")
+	}
+	if err := requireDestructiveApproval(files, true); err != nil {
+		t.Fatalf("approved destructive migration was rejected: %v", err)
+	}
+}

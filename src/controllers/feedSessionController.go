@@ -125,7 +125,9 @@ func visibleFrozenForYouPage(db *gorm.DB, items []ForYouItem, offset, limit int)
 		ids = append(ids, item.ID)
 	}
 	var visibleIDs []uuid.UUID
-	_ = publicContentQuery(db).Where("content_items.public_id IN ?", ids).Pluck("content_items.public_id", &visibleIDs).Error
+	_ = publicContentQuery(db.Model(&models.ContentItem{})).
+		Where("content_items.public_id IN ?", ids).
+		Pluck("content_items.public_id", &visibleIDs).Error
 	visible := make(map[uuid.UUID]struct{}, len(visibleIDs))
 	for _, id := range visibleIDs {
 		visible[id] = struct{}{}
