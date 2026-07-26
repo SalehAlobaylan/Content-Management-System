@@ -431,6 +431,12 @@ func GetNewsFeed(c *gin.Context) {
 	slides, nextCursor, serveMeta := serveStoryNewsFeed(
 		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
 	)
+	// A story snapshot is shared across viewers, while like/bookmark state is
+	// identity-specific. Hydrate only the lead content IDs after assembly so a
+	// cached News slide never leaks another viewer's interaction state.
+	if sessionID != "" || userIDStr != "" {
+		hydrateStoryInteractionStatus(db, slides, sessionID, userIDStr)
+	}
 	if isFeedIntegritySynthetic(c) {
 		c.Header("X-Wahb-Feed-Source", serveMeta.Source)
 		c.Header("X-Wahb-Snapshot-Age-Ms", strconv.FormatInt(serveMeta.SnapshotAge.Milliseconds(), 10))
@@ -443,6 +449,32 @@ func GetNewsFeed(c *gin.Context) {
 		Cursor: nextCursor,
 		Slides: slides,
 	})
+}
+
+func hydrateStoryInteractionStatus(db *gorm.DB, slides []StorySlide, sessionID, userIDStr string) {
+	ids := make([]uuid.UUID, 0, len(slides)*4)
+	for _, slide := range slides {
+		ids = append(ids, slide.Featured.LeadID)
+		for _, related := range slide.Related {
+			ids = append(ids, related.LeadID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	var items []models.ContentItem
+	db.Select("public_id").Where("public_id IN ?", ids).Find(&items)
+	liked, bookmarked := getInteractionStatus(db, items, sessionID, userIDStr)
+	apply := func(summary *StorySummary) {
+		summary.IsLiked = liked[summary.LeadID]
+		summary.IsBookmarked = bookmarked[summary.LeadID]
+	}
+	for index := range slides {
+		apply(&slides[index].Featured.StorySummary)
+		for relatedIndex := range slides[index].Related {
+			apply(&slides[index].Related[relatedIndex])
+		}
+	}
 }
 
 // Helper functions

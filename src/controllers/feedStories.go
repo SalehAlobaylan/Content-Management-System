@@ -135,6 +135,10 @@ type StorySummary struct {
 	CommentCount int `json:"comment_count"`
 	ShareCount   int `json:"share_count"`
 	ViewCount    int `json:"view_count"`
+	// Interaction state is hydrated at serve time, after a cached slide has
+	// been selected. It must never become part of the shared story snapshot.
+	IsLiked      bool `json:"is_liked"`
+	IsBookmarked bool `json:"is_bookmarked"`
 }
 
 // StoryFeatured is the featured story of a slide: its summary plus its members.

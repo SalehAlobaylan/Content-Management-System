@@ -17,17 +17,23 @@ import (
 // fields that require an interactions join — the user can always tap
 // through to the full feed view if they want them.
 type MyContentItem struct {
-	ID           uuid.UUID `json:"id"`
-	Type         string    `json:"type"`
-	Status       string    `json:"status"`
-	Title        string    `json:"title,omitempty"`
-	Excerpt      string    `json:"excerpt,omitempty"`
-	MediaURL     string    `json:"media_url,omitempty"`
-	ThumbnailURL string    `json:"thumbnail_url,omitempty"`
-	DurationSec  int       `json:"duration_sec,omitempty"`
-	LikeCount    int       `json:"like_count"`
-	CommentCount int       `json:"comment_count"`
-	PublishedAt  string    `json:"published_at,omitempty"`
+	ID                   uuid.UUID `json:"id"`
+	Type                 string    `json:"type"`
+	Status               string    `json:"status"`
+	Title                string    `json:"title,omitempty"`
+	Excerpt              string    `json:"excerpt,omitempty"`
+	MediaURL             string    `json:"media_url,omitempty"`
+	PlaybackURL          string    `json:"playback_url,omitempty"`
+	PlaybackType         string    `json:"playback_type,omitempty"`
+	FallbackPlaybackURL  string    `json:"fallback_playback_url,omitempty"`
+	FallbackPlaybackType string    `json:"fallback_playback_type,omitempty"`
+	FallbackHasVideo     *bool     `json:"fallback_has_video,omitempty"`
+	HasVideo             *bool     `json:"has_video,omitempty"`
+	ThumbnailURL         string    `json:"thumbnail_url,omitempty"`
+	DurationSec          int       `json:"duration_sec,omitempty"`
+	LikeCount            int       `json:"like_count"`
+	CommentCount         int       `json:"comment_count"`
+	PublishedAt          string    `json:"published_at,omitempty"`
 }
 
 // MyContentResponse mirrors the For You/News cursor envelope.
@@ -143,6 +149,22 @@ func mapToMyContentItem(item models.ContentItem) MyContentItem {
 	if item.MediaURL != nil {
 		out.MediaURL = *item.MediaURL
 	}
+	if item.PlaybackURL != nil {
+		out.PlaybackURL = *item.PlaybackURL
+	} else if item.MediaURL != nil {
+		out.PlaybackURL = *item.MediaURL
+	}
+	if item.PlaybackType != nil {
+		out.PlaybackType = *item.PlaybackType
+	}
+	if item.FallbackPlaybackURL != nil {
+		out.FallbackPlaybackURL = *item.FallbackPlaybackURL
+	}
+	if fallbackType, fallbackHasVideo := typedFallbackMetadata(item); fallbackType != nil {
+		out.FallbackPlaybackType = *fallbackType
+		out.FallbackHasVideo = fallbackHasVideo
+	}
+	out.HasVideo = item.HasVideo
 	if item.ThumbnailURL != nil {
 		out.ThumbnailURL = *item.ThumbnailURL
 	}
