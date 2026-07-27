@@ -18,6 +18,7 @@ type TranscriptResponse struct {
 	FullText       string      `json:"full_text"`
 	Summary        *string     `json:"summary,omitempty"`
 	WordTimestamps interface{} `json:"word_timestamps,omitempty"`
+	Segments       interface{} `json:"segments,omitempty"`
 	Language       *string     `json:"language,omitempty"`
 	CreatedAt      string      `json:"created_at"`
 }
@@ -57,6 +58,10 @@ func GetTranscript(c *gin.Context) {
 	if transcript.WordTimestamps != nil {
 		_ = json.Unmarshal([]byte(transcript.WordTimestamps), &wordTimestamps)
 	}
+	var segments interface{}
+	if transcript.Segments != nil {
+		_ = json.Unmarshal([]byte(transcript.Segments), &segments)
+	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -67,6 +72,7 @@ func GetTranscript(c *gin.Context) {
 			FullText:       transcript.FullText,
 			Summary:        transcript.Summary,
 			WordTimestamps: wordTimestamps,
+			Segments:       segments,
 			Language:       transcript.Language,
 			CreatedAt:      transcript.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		},
