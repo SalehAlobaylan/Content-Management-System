@@ -484,7 +484,7 @@ const (
 func decideStudioChapterPath(primary string, codes []string, childDurationSec int) studioChapterPath {
 	single := len(codes) == 1
 	switch {
-	case primary == models.StudioReviewCodeShortUnmergeable && single && childDurationSec < forYouMinDurationSec:
+	case primary == models.StudioReviewCodeShortUnmergeable && single && childDurationSec < podsMinDurationSec:
 		return studioPathAutoReject
 	case primary == models.StudioReviewCodeMergedShort && single:
 		return studioPathAutoPublish
@@ -846,7 +846,7 @@ func (r *studioRunner) childTranscriptSlice(child *models.ContentItem) string {
 
 func (r *studioRunner) childDurationValid(child *models.ContentItem) bool {
 	return child != nil && child.DurationSec != nil &&
-		*child.DurationSec >= forYouMinDurationSec && *child.DurationSec <= forYouHardMaxDurationSec
+		*child.DurationSec >= podsMinDurationSec && *child.DurationSec <= podsHardMaxDurationSec
 }
 
 func (r *studioRunner) attachProposal(actionID uint, p studioProposal) {
@@ -1098,7 +1098,7 @@ func studioSTTGuardrail(reason string) string {
 // for an atomization-eligible parent whose transcript just improved (H1). In
 // Observe it only ledgers the intent (would_apply), no recommendation written.
 func (r *studioRunner) maybeEmitReatomize(item *models.ContentItem) {
-	if item.DurationSec == nil || *item.DurationSec <= forYouHardMaxDurationSec {
+	if item.DurationSec == nil || *item.DurationSec <= podsHardMaxDurationSec {
 		return // not an atomization-eligible parent
 	}
 	cid := item.PublicID

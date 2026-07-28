@@ -24,7 +24,7 @@ import (
 // into a single library headline. Intake scoring, evict aggregation, recommendation
 // generation, and execution belong to later slices. See docs/media-circulation-engine.md.
 
-// Duration buckets served by the For You feed, stored canonically with the "m"
+// Duration buckets served by the Pods feed, stored canonically with the "m"
 // suffix to match atomization child writes.
 var mediaCirculationBuckets = []string{"5m", "10m", "15m", "20m", "30m", "40m"}
 

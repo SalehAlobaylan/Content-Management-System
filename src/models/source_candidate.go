@@ -26,7 +26,7 @@ const (
 )
 
 // CategoryForCandidateKind maps a candidate kind to the discovery category that
-// owns it. YouTube/podcast candidates are media (For You); everything else is
+// owns it. YouTube/podcast candidates are media (Pods); everything else is
 // news. Used to keep media and news promotion graphs isolated — a candidate
 // only promotes against profiles in its own category.
 func CategoryForCandidateKind(kind string) string {

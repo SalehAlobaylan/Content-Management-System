@@ -33,7 +33,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 				"posts":         "/api/v1/posts",
 				"media":         "/api/v1/media",
 				"pages":         "/api/v1/pages",
-				"feed_foryou":   "/api/v1/feed/foryou",
+				"feed_pods":     "/api/v1/feed/pods",
 				"feed_news":     "/api/v1/feed/news",
 				"content":       "/api/v1/content/:id",
 				"interactions":  "/api/v1/interactions",
@@ -319,6 +319,9 @@ func main() {
 	controllers.StartSystemHealthAutopilotHeartbeat(db)
 	// Feed Integrity base system — deterministic CMS-edge verification, not an Autopilot.
 	controllers.StartFeedIntegrityHeartbeat(db)
+	// Retention Autopilot — persisted database-pressure sampling and shadow
+	// compact-News proposals. V1 cannot mutate canonical content.
+	controllers.StartRetentionHeartbeat(db)
 	// Real User Experience — Observe scheduler: rolls up closed telemetry buckets
 	// and evaluates deterministic surface verdicts for tenants that enabled it.
 	controllers.StartExperienceHeartbeat(db)

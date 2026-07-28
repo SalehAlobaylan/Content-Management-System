@@ -75,34 +75,34 @@ type feedIntegrityCheck struct {
 }
 
 var feedIntegrityChecks = []feedIntegrityCheck{
-	{"inv_fy_status_contract", "Archived item matches the For You serving predicate", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "content", "major"},
-	{"inv_fy_bounds", "Visible media duration outside 270-2400 seconds", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "media-studio", "major"},
-	{"inv_fy_parent_leak", "Long parent remains a visible raw feed unit", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "media-studio", "major"},
-	{"inv_fy_playback_missing", "Visible feed unit has no legal playback URL", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "storage", "major"},
-	{"inv_fy_thumb_missing", "Otherwise-servable feed unit has no thumbnail", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "media-circulation", "info"},
-	{"inv_fy_bucket_mismatch", "Duration bucket does not match duration", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "media-studio", "minor"},
-	{"inv_fy_renditions_malformed", "Media renditions are malformed", "inventory", "foryou", models.FeedIntegrityAxisReadiness, "storage", "minor"},
+	{"inv_pods_status_contract", "Archived item matches the Pods serving predicate", "inventory", "pods", models.FeedIntegrityAxisReadiness, "content", "major"},
+	{"inv_pods_bounds", "Visible media duration outside 270-2400 seconds", "inventory", "pods", models.FeedIntegrityAxisReadiness, "media-studio", "major"},
+	{"inv_pods_parent_leak", "Long parent remains a visible raw feed unit", "inventory", "pods", models.FeedIntegrityAxisReadiness, "media-studio", "major"},
+	{"inv_pods_playback_missing", "Visible feed unit has no legal playback URL", "inventory", "pods", models.FeedIntegrityAxisReadiness, "storage", "major"},
+	{"inv_pods_thumb_missing", "Otherwise-servable feed unit has no thumbnail", "inventory", "pods", models.FeedIntegrityAxisReadiness, "media-circulation", "info"},
+	{"inv_pods_bucket_mismatch", "Duration bucket does not match duration", "inventory", "pods", models.FeedIntegrityAxisReadiness, "media-studio", "minor"},
+	{"inv_pods_renditions_malformed", "Media renditions are malformed", "inventory", "pods", models.FeedIntegrityAxisReadiness, "storage", "minor"},
 	{"inv_news_related_dangling", "Story references a missing related story", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "minor"},
 	{"inv_news_empty_story", "Active story has no ready members", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "major"},
 	{"inv_news_unlabeled_stale", "Feed-eligible story remains unlabeled", "inventory", "news", models.FeedIntegrityAxisReadiness, "enrichment", "info"},
 	{"inv_news_cache_rebuild_debt", "News snapshot remains stale beyond cache ceiling", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "minor"},
-	{"edge_fy_http", "For You CMS endpoint is unavailable", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "critical"},
-	{"edge_fy_latency", "For You page exceeded its latency budget", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
-	{"edge_fy_empty", "For You page is empty despite eligible inventory", "edge", "foryou", models.FeedIntegrityAxisConsumer, "media-circulation", "critical"},
-	{"edge_fy_required_metadata", "Served For You item lacks required metadata", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
-	{"edge_fy_bounds_served", "Served For You item has invalid duration", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
-	{"edge_fy_playback_fields", "Served For You item has invalid playback fields", "edge", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
-	{"edge_fy_status_served", "Served For You item is archived", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
-	{"edge_fy_dup", "For You cursor walk repeats an item", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
-	{"edge_fy_family_dup", "For You cursor walk serves two members of one redundancy family", "edge", "foryou", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_http", "Pods CMS endpoint is unavailable", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "critical"},
+	{"edge_pods_latency", "Pods page exceeded its latency budget", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_empty", "Pods page is empty despite eligible inventory", "edge", "pods", models.FeedIntegrityAxisConsumer, "media-circulation", "critical"},
+	{"edge_pods_required_metadata", "Served Pods item lacks required metadata", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_bounds_served", "Served Pods item has invalid duration", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_playback_fields", "Served Pods item has invalid playback fields", "edge", "pods", models.FeedIntegrityAxisConsumer, "storage", "major"},
+	{"edge_pods_status_served", "Served Pods item is archived", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_dup", "Pods cursor walk repeats an item", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
+	{"edge_pods_family_dup", "Pods cursor walk serves two members of one redundancy family", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_news_http", "News CMS endpoint is unavailable", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "critical"},
 	{"edge_news_latency", "News page exceeded its latency budget", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_news_empty", "News page is empty despite active stories", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "critical"},
 	{"edge_news_shape", "News slide has an invalid shape", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
 	{"edge_news_dup", "News cursor walk repeats a story", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
 	{"edge_news_cache_stale", "News served a snapshot beyond its stale ceiling", "edge", "news", models.FeedIntegrityAxisConsumer, "news-circulation", "major"},
-	{"probe_url_dead", "Primary playback URL is unavailable", "probe", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
-	{"probe_hls_manifest", "HLS manifest is invalid", "probe", "foryou", models.FeedIntegrityAxisConsumer, "storage", "major"},
+	{"probe_url_dead", "Primary playback URL is unavailable", "probe", "pods", models.FeedIntegrityAxisConsumer, "storage", "major"},
+	{"probe_hls_manifest", "HLS manifest is invalid", "probe", "pods", models.FeedIntegrityAxisConsumer, "storage", "major"},
 	{"checker_unhealthy", "Feed Integrity checker repeatedly failed", "checker", "platform", models.FeedIntegrityAxisReadiness, "system-health", "major"},
 }
 
@@ -222,7 +222,7 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 
 	findings := make([]models.FeedIntegrityFinding, 0)
 	var findingsMu sync.Mutex
-	results := map[string]*integrityResult{"foryou": {Feed: "foryou", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}, "news": {Feed: "news", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}}
+	results := map[string]*integrityResult{"pods": {Feed: "pods", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}, "news": {Feed: "news", Variant: "all", ConsumerVerdict: models.FeedIntegrityVerdictHealthy, ReadinessVerdict: models.FeedIntegrityVerdictHealthy, ConsumerScore: 100, ReadinessScore: 100}}
 	laneResults := map[string]map[string]int{"inventory": {"executed": 1}, "edge": {"executed": 1}, "probe": {"executed": 0}}
 	add := func(key, lane, feed, variant, axis, severity, status, targetType, target string, candidates int, evidence interface{}) {
 		findingsMu.Lock()
@@ -385,28 +385,28 @@ func runFeedIntegrityInventory(db *gorm.DB, tenant string, add integrityAdd) {
 	base.Where("duration_sec IS NOT NULL").Find(&items)
 	for _, item := range items {
 		id := item.PublicID.String()
-		if item.Status == models.ContentStatusArchived && item.DurationSec != nil && *item.DurationSec >= forYouMinDurationSec && *item.DurationSec <= forYouHardMaxDurationSec && (item.PlaybackURL != nil || item.MediaURL != nil) && item.ThumbnailURL != nil {
-			add("inv_fy_status_contract", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, map[string]interface{}{"status": item.Status})
+		if item.Status == models.ContentStatusArchived && item.DurationSec != nil && *item.DurationSec >= podsMinDurationSec && *item.DurationSec <= podsHardMaxDurationSec && (item.PlaybackURL != nil || item.MediaURL != nil) && item.ThumbnailURL != nil {
+			add("inv_pods_status_contract", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, map[string]interface{}{"status": item.Status})
 		}
-		if item.DurationSec == nil || *item.DurationSec < forYouMinDurationSec || *item.DurationSec > forYouHardMaxDurationSec {
-			add("inv_fy_bounds", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, map[string]interface{}{"duration_sec": item.DurationSec})
+		if item.DurationSec == nil || *item.DurationSec < podsMinDurationSec || *item.DurationSec > podsHardMaxDurationSec {
+			add("inv_pods_bounds", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, map[string]interface{}{"duration_sec": item.DurationSec})
 		}
-		if item.ParentContentItemID == nil && item.DurationSec != nil && *item.DurationSec > forYouHardMaxDurationSec && item.Status == models.ContentStatusReady {
-			add("inv_fy_parent_leak", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, nil)
+		if item.ParentContentItemID == nil && item.DurationSec != nil && *item.DurationSec > podsHardMaxDurationSec && item.Status == models.ContentStatusReady {
+			add("inv_pods_parent_leak", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, nil)
 		}
-		if item.DurationSec != nil && *item.DurationSec >= forYouMinDurationSec && *item.DurationSec <= forYouHardMaxDurationSec && (item.PlaybackURL == nil || strings.TrimSpace(*item.PlaybackURL) == "") && (item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "") {
-			add("inv_fy_playback_missing", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, nil)
+		if item.DurationSec != nil && *item.DurationSec >= podsMinDurationSec && *item.DurationSec <= podsHardMaxDurationSec && (item.PlaybackURL == nil || strings.TrimSpace(*item.PlaybackURL) == "") && (item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "") {
+			add("inv_pods_playback_missing", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "major", "violation", "content_item", id, 1, nil)
 		}
-		if item.DurationSec != nil && *item.DurationSec >= forYouMinDurationSec && *item.DurationSec <= forYouHardMaxDurationSec && (item.PlaybackURL != nil || item.MediaURL != nil) && (item.ThumbnailURL == nil || strings.TrimSpace(*item.ThumbnailURL) == "") {
-			add("inv_fy_thumb_missing", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "info", "violation", "content_item", id, 1, nil)
+		if item.DurationSec != nil && *item.DurationSec >= podsMinDurationSec && *item.DurationSec <= podsHardMaxDurationSec && (item.PlaybackURL != nil || item.MediaURL != nil) && (item.ThumbnailURL == nil || strings.TrimSpace(*item.ThumbnailURL) == "") {
+			add("inv_pods_thumb_missing", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "info", "violation", "content_item", id, 1, nil)
 		}
 		if item.DurationSec != nil && item.DurationBucket != nil && *item.DurationBucket != durationBucketLabel(*item.DurationSec*1000) {
-			add("inv_fy_bucket_mismatch", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "minor", "violation", "content_item", id, 1, map[string]interface{}{"actual": *item.DurationBucket, "expected": durationBucketLabel(*item.DurationSec * 1000)})
+			add("inv_pods_bucket_mismatch", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "minor", "violation", "content_item", id, 1, map[string]interface{}{"actual": *item.DurationBucket, "expected": durationBucketLabel(*item.DurationSec * 1000)})
 		}
 		if len(item.MediaRenditions) > 0 {
 			var v []map[string]interface{}
 			if json.Unmarshal(item.MediaRenditions, &v) != nil {
-				add("inv_fy_renditions_malformed", "inventory", "foryou", "default", models.FeedIntegrityAxisReadiness, "minor", "violation", "content_item", id, 1, nil)
+				add("inv_pods_renditions_malformed", "inventory", "pods", "default", models.FeedIntegrityAxisReadiness, "minor", "violation", "content_item", id, 1, nil)
 			}
 		}
 	}
@@ -466,12 +466,12 @@ func feedIntegritySelfURL() string {
 }
 
 func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIntegrityPolicy, tier string, add integrityAdd) []string {
-	client := &http.Client{Timeout: time.Duration(policy.ForYouLatencyBudgetMS+1000) * time.Millisecond}
+	client := &http.Client{Timeout: time.Duration(policy.PodsLatencyBudgetMS+1000) * time.Millisecond}
 	urls := []string{}
 	variants := []string{"", "5", "10", "15", "20", "30", "40"}
 	for _, duration := range variants {
 		variant := "default"
-		path := "/api/v1/feed/foryou?limit=20"
+		path := "/api/v1/feed/pods?limit=20"
 		if duration != "" {
 			variant = "duration:" + duration + "m"
 			path += "&duration=" + duration
@@ -482,7 +482,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		resp, err := client.Do(req)
 		elapsed := time.Since(started)
 		if err != nil || resp.StatusCode != http.StatusOK {
-			add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "violation", "page", variant, 1, map[string]interface{}{"error": safeIntegrityError(err), "status": httpStatus(resp)})
+			add("edge_pods_http", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "critical", "violation", "page", variant, 1, map[string]interface{}{"error": safeIntegrityError(err), "status": httpStatus(resp)})
 			if resp != nil {
 				resp.Body.Close()
 			}
@@ -504,31 +504,31 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		err = json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&payload)
 		resp.Body.Close()
 		if err != nil {
-			add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"error": safeIntegrityError(err)})
+			add("edge_pods_http", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"error": safeIntegrityError(err)})
 			continue
 		}
-		if policy.ForYouLatencyBudgetMS > 0 && elapsed > time.Duration(policy.ForYouLatencyBudgetMS)*time.Millisecond {
-			add("edge_fy_latency", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, 1, map[string]interface{}{"latency_ms": elapsed.Milliseconds(), "budget_ms": policy.ForYouLatencyBudgetMS})
+		if policy.PodsLatencyBudgetMS > 0 && elapsed > time.Duration(policy.PodsLatencyBudgetMS)*time.Millisecond {
+			add("edge_pods_latency", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, 1, map[string]interface{}{"latency_ms": elapsed.Milliseconds(), "budget_ms": policy.PodsLatencyBudgetMS})
 		}
 		if len(payload.Items) == 0 {
 			var count int64
-			forYouEligibleMediaQuery(db, policy.TenantID, supportsAtomizedForYouSchema(db)).Count(&count)
+			podsEligibleMediaQuery(db, policy.TenantID, supportsAtomizedPodsSchema(db)).Count(&count)
 			sev := "critical"
-			if count < int64(policy.ExpectedMinForYouUnits) {
+			if count < int64(policy.ExpectedMinPodsUnits) {
 				sev = "info"
 			}
-			add("edge_fy_empty", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, sev, "violation", "page", variant, int(count), nil)
+			add("edge_pods_empty", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, sev, "violation", "page", variant, int(count), nil)
 		}
 		seen := map[string]bool{}
 		seenFamilies := map[uint]string{}
 		for _, item := range payload.Items {
 			if seen[item.ID] {
-				add("edge_fy_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
+				add("edge_pods_dup", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
 			}
 			seen[item.ID] = true
 			if familyID := activeRedundancyFamilyForContent(db, item.ID); familyID != 0 {
 				if prior := seenFamilies[familyID]; prior != "" && prior != item.ID {
-					add("edge_fy_family_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior})
+					add("edge_pods_family_dup", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior})
 				}
 				seenFamilies[familyID] = item.ID
 			}
@@ -537,18 +537,18 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			// only, no explicit type). Do not require playback_type here — that
 			// flagged every valid MP4 compatibility item as a major violation.
 			if item.ID == "" || (item.Type != "VIDEO" && item.Type != "PODCAST") || item.Title == "" || item.ThumbnailURL == "" || item.DurationSec <= 0 || item.PlaybackURL == "" {
-				add("edge_fy_required_metadata", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
+				add("edge_pods_required_metadata", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
 			}
-			if item.DurationSec < forYouMinDurationSec || item.DurationSec > forYouHardMaxDurationSec {
-				add("edge_fy_bounds_served", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"duration_sec": item.DurationSec})
+			if item.DurationSec < podsMinDurationSec || item.DurationSec > podsHardMaxDurationSec {
+				add("edge_pods_bounds_served", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"duration_sec": item.DurationSec})
 			}
 			// Only a NON-EMPTY, unrecognized playback_type is a contract
 			// violation. Empty type with a valid URL is the legacy fallback.
 			if item.PlaybackType != "" && item.PlaybackType != "hls" && item.PlaybackType != "mp4" && item.PlaybackType != "audio" {
-				add("edge_fy_playback_fields", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"playback_type": item.PlaybackType})
+				add("edge_pods_playback_fields", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"playback_type": item.PlaybackType})
 			}
 			if item.IsArchived {
-				add("edge_fy_status_served", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
+				add("edge_pods_status_served", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, nil)
 			}
 			if item.PlaybackURL != "" {
 				urls = append(urls, item.PlaybackURL)
@@ -560,7 +560,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			nextReq.Header.Set(feedIntegritySyntheticHdr, feedIntegrityCapability)
 			nextResp, nextErr := client.Do(nextReq)
 			if nextErr != nil || nextResp.StatusCode != http.StatusOK {
-				add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr), "status": httpStatus(nextResp)})
+				add("edge_pods_http", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr), "status": httpStatus(nextResp)})
 				if nextResp != nil {
 					nextResp.Body.Close()
 				}
@@ -577,22 +577,22 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			nextErr = json.NewDecoder(io.LimitReader(nextResp.Body, 2<<20)).Decode(&next)
 			nextResp.Body.Close()
 			if nextErr != nil {
-				add("edge_fy_http", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
+				add("edge_pods_http", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
 				break
 			}
 			for _, item := range next.Items {
 				if seen[item.ID] {
-					add("edge_fy_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1})
+					add("edge_pods_dup", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1})
 				}
 				seen[item.ID] = true
 				if familyID := activeRedundancyFamilyForContent(db, item.ID); familyID != 0 {
 					if prior := seenFamilies[familyID]; prior != "" && prior != item.ID {
-						add("edge_fy_family_dup", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior, "page": page + 1})
+						add("edge_pods_family_dup", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"family_id": familyID, "other_item_id": prior, "page": page + 1})
 					}
 					seenFamilies[familyID] = item.ID
 				}
-				if item.DurationSec < forYouMinDurationSec || item.DurationSec > forYouHardMaxDurationSec {
-					add("edge_fy_bounds_served", "edge", "foryou", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1, "duration_sec": item.DurationSec})
+				if item.DurationSec < podsMinDurationSec || item.DurationSec > podsHardMaxDurationSec {
+					add("edge_pods_bounds_served", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1, "duration_sec": item.DurationSec})
 				}
 				if item.PlaybackURL != "" {
 					urls = append(urls, item.PlaybackURL)
@@ -764,11 +764,11 @@ func runFeedIntegrityProbes(ctx context.Context, policy models.FeedIntegrityPoli
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			if err := probeIntegrityURL(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond); err != nil {
-				add("probe_url_dead", "probe", "foryou", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
+				add("probe_url_dead", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
 			}
 			if strings.Contains(strings.ToLower(strings.Split(raw, "?")[0]), ".m3u8") {
 				if err := probeIntegrityHLS(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond); err != nil {
-					add("probe_hls_manifest", "probe", "foryou", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
+					add("probe_hls_manifest", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
 				}
 			}
 		}()
@@ -1159,9 +1159,9 @@ type feedIntegrityPolicyPatch struct {
 	ProbeURLBudget       *int  `json:"probe_url_budget"`
 	ProbeConcurrency     *int  `json:"probe_concurrency"`
 	ProbeTimeoutMS       *int  `json:"probe_timeout_ms"`
-	ForYouLatencyMS      *int  `json:"foryou_latency_budget_ms"`
+	PodsLatencyMS      *int  `json:"pods_latency_budget_ms"`
 	NewsLatencyMS        *int  `json:"news_latency_budget_ms"`
-	ExpectedForYou       *int  `json:"expected_min_foryou_units"`
+	ExpectedPods       *int  `json:"expected_min_pods_units"`
 	ExpectedNews         *int  `json:"expected_min_news_slides"`
 }
 
@@ -1188,8 +1188,8 @@ func (p feedIntegrityPolicyPatch) updates() (map[string]interface{}, error) {
 		{"light_interval_minutes", p.LightIntervalMinutes, 1, 1440}, {"deep_interval_hours", p.DeepIntervalHours, 1, 720},
 		{"confirm_runs", p.ConfirmRuns, 1, 20}, {"resolve_runs", p.ResolveRuns, 1, 20}, {"edge_pages_per_feed", p.EdgePagesPerFeed, 1, 20},
 		{"probe_url_budget", p.ProbeURLBudget, 0, 500}, {"probe_concurrency", p.ProbeConcurrency, 1, 20}, {"probe_timeout_ms", p.ProbeTimeoutMS, 100, 60000},
-		{"foryou_latency_budget_ms", p.ForYouLatencyMS, 1, 60000}, {"news_latency_budget_ms", p.NewsLatencyMS, 1, 60000},
-		{"expected_min_foryou_units", p.ExpectedForYou, 0, 1000}, {"expected_min_news_slides", p.ExpectedNews, 0, 1000},
+		{"pods_latency_budget_ms", p.PodsLatencyMS, 1, 60000}, {"news_latency_budget_ms", p.NewsLatencyMS, 1, 60000},
+		{"expected_min_pods_units", p.ExpectedPods, 0, 1000}, {"expected_min_news_slides", p.ExpectedNews, 0, 1000},
 	} {
 		if err := bounded(rule.name, rule.value, rule.min, rule.max); err != nil {
 			return nil, err

@@ -482,10 +482,10 @@ func GetBookmarks(c *gin.Context) {
 	}
 
 	feedParam := c.DefaultQuery("feed", "all")
-	if feedParam != "all" && feedParam != "foryou" && feedParam != "news" {
+	if feedParam != "all" && feedParam != "pods" && feedParam != "news" {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{
 			Code:    http.StatusBadRequest,
-			Message: "feed must be all, foryou, or news",
+			Message: "feed must be all, pods, or news",
 		})
 		return
 	}
@@ -511,7 +511,7 @@ func GetBookmarks(c *gin.Context) {
 	}
 
 	switch feedParam {
-	case "foryou":
+	case "pods":
 		query = query.Where("content_items.type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast})
 	case "news":
 		query = query.Where("content_items.type IN ?", []models.ContentType{
@@ -595,13 +595,13 @@ func GetBookmarks(c *gin.Context) {
 		contentMap[item.PublicID] = item
 	}
 
-	items := make([]ForYouItem, 0, len(interactions))
+	items := make([]PodsItem, 0, len(interactions))
 	for _, interaction := range interactions {
 		item, ok := contentMap[interaction.ContentItemID]
 		if !ok {
 			continue
 		}
-		mapped := mapToForYouItem(item, false, true)
+		mapped := mapToPodsItem(item, false, true)
 		bookmarkedAt := interaction.CreatedAt
 		mapped.BookmarkedAt = &bookmarkedAt
 		items = append(items, mapped)
@@ -701,13 +701,13 @@ func GetLikes(c *gin.Context) {
 	userIDStr, sessionID := readIdentity(c)
 	_, bookmarkedMap := getInteractionStatus(db, contentItems, sessionID, userIDStr)
 
-	items := make([]ForYouItem, 0, len(interactions))
+	items := make([]PodsItem, 0, len(interactions))
 	for _, interaction := range interactions {
 		item, ok := contentMap[interaction.ContentItemID]
 		if !ok {
 			continue
 		}
-		items = append(items, mapToForYouItem(item, true, bookmarkedMap[item.PublicID]))
+		items = append(items, mapToPodsItem(item, true, bookmarkedMap[item.PublicID]))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1237,14 +1237,14 @@ func fetchSeenIDs(db *gorm.DB, sessionID, userIDStr string) []uuid.UUID {
 	return ids
 }
 
-// fetchForYouSuppressedIDs applies the canonical 90/30/7 day repetition
+// fetchPodsSuppressedIDs applies the canonical 90/30/7 day repetition
 // windows. A later, stronger classification naturally wins because each event
 // is tested against its own window. Legacy views use the short window so the
 // rollout does not immediately recycle recently shown inventory.
-func fetchForYouSuppressedIDs(db *gorm.DB, sessionID, userIDStr string, config models.RankingConfig, now time.Time) []uuid.UUID {
-	completedDays := clampRepeatWindow(config.ForYouCompletedRepeatDays, 90)
-	meaningfulDays := clampRepeatWindow(config.ForYouMeaningfulRepeatDays, 30)
-	sampleDays := clampRepeatWindow(config.ForYouSampleRepeatDays, 7)
+func fetchPodsSuppressedIDs(db *gorm.DB, sessionID, userIDStr string, config models.RankingConfig, now time.Time) []uuid.UUID {
+	completedDays := clampRepeatWindow(config.PodsCompletedRepeatDays, 90)
+	meaningfulDays := clampRepeatWindow(config.PodsMeaningfulRepeatDays, 30)
+	sampleDays := clampRepeatWindow(config.PodsSampleRepeatDays, 7)
 	query := db.Model(&models.UserInteraction{}).Select("DISTINCT content_item_id").Where(`
 		(type = ? AND created_at >= ?) OR
 		(type = ? AND created_at >= ?) OR

@@ -231,7 +231,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/intelligence/analytics/signal-health", perm("content", "read"), controllers.GetSignalHealth)
 
 	// Intelligence — Feed Preview
-	adminGroup.GET("/intelligence/preview/foryou", perm("content", "read"), controllers.PreviewForYouFeed)
+	adminGroup.GET("/intelligence/preview/pods", perm("content", "read"), controllers.PreviewPodsFeed)
 	adminGroup.GET("/intelligence/preview/news", perm("content", "read"), controllers.PreviewNewsFeed)
 
 	// Enrichment — On-demand enrichment management
@@ -375,6 +375,23 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/approve", perm("feed", "manage"), controllers.ApproveFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/reject", perm("feed", "manage"), controllers.RejectFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/breakers/:class/reset", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
+
+	// Retention Autopilot — database pressure, compact-News preview, and the
+	// human hold/approval ledger. V1 is observe-only and default-tenant scoped.
+	adminGroup.GET("/retention/status", perm("feed", "read"), controllers.GetRetentionStatus)
+	adminGroup.GET("/retention/policy", perm("feed", "read"), controllers.GetRetentionPolicy)
+	adminGroup.PUT("/retention/policy", perm("feed", "manage"), controllers.UpdateRetentionPolicy)
+	adminGroup.POST("/retention/run", perm("feed", "manage"), controllers.RunRetentionNow)
+	adminGroup.POST("/retention/pause", perm("feed", "manage"), controllers.PauseRetention)
+	adminGroup.GET("/retention/runs", perm("feed", "read"), controllers.ListRetentionRuns)
+	adminGroup.GET("/retention/runs/:id", perm("feed", "read"), controllers.GetRetentionRun)
+	adminGroup.GET("/retention/runs/:id/actions", perm("feed", "read"), controllers.ListRetentionRunActions)
+	adminGroup.POST("/retention/actions/:id/approve", perm("feed", "manage"), controllers.ApproveRetentionAction)
+	adminGroup.POST("/retention/actions/:id/reject", perm("feed", "manage"), controllers.RejectRetentionAction)
+	adminGroup.GET("/retention/months", perm("feed", "read"), controllers.ListRetentionMonths)
+	adminGroup.GET("/retention/holds", perm("feed", "read"), controllers.ListRetentionHolds)
+	adminGroup.POST("/retention/holds", perm("feed", "manage"), controllers.CreateRetentionHold)
+	adminGroup.DELETE("/retention/holds/:id", perm("feed", "manage"), controllers.DeleteRetentionHold)
 
 	// Embedding & Model Lifecycle System (stage 10) — vector-space custodian.
 	// Reads under content:read, policy/manual-audit under content:write, privileged

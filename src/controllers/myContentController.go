@@ -13,7 +13,7 @@ import (
 )
 
 // MyContentItem is a slim representation for the profile "My Audio" /
-// "My Writes" tabs. It mirrors ForYouItem but drops the engagement-state
+// "My Writes" tabs. It mirrors PodsItem but drops the engagement-state
 // fields that require an interactions join — the user can always tap
 // through to the full feed view if they want them.
 type MyContentItem struct {
@@ -36,7 +36,7 @@ type MyContentItem struct {
 	PublishedAt          string    `json:"published_at,omitempty"`
 }
 
-// MyContentResponse mirrors the For You/News cursor envelope.
+// MyContentResponse mirrors the Pods/News cursor envelope.
 type MyContentResponse struct {
 	Cursor *string         `json:"cursor"`
 	Items  []MyContentItem `json:"items"`

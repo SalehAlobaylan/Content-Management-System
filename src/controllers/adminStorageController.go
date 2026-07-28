@@ -365,7 +365,7 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 	if f.includeAtomizedParents {
 		atomizedParent := db.Where("parent_content_item_id IS NULL").
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-			Where("duration_sec IS NOT NULL AND duration_sec > ?", forYouHardMaxDurationSec).
+			Where("duration_sec IS NOT NULL AND duration_sec > ?", podsHardMaxDurationSec).
 			Where("EXISTS (SELECT 1 FROM content_items child WHERE child.parent_content_item_id = content_items.public_id AND child.status = ? AND child.is_feed_unit = TRUE)", models.ContentStatusReady)
 		eligibility = db.Where(eligibility).Or(atomizedParent)
 	}
@@ -380,7 +380,7 @@ func buildCandidateQuery(db *gorm.DB, f candidateFilter) *gorm.DB {
 		hasRecoveryPointer := db.Where("original_url IS NOT NULL").Or("source_feed_url IS NOT NULL").Or("source_episode_id IS NOT NULL").Or("idempotency_key IS NOT NULL")
 		atomizedParentDelete := db.Where("parent_content_item_id IS NULL").
 			Where("is_feed_unit = FALSE").
-			Where("duration_sec IS NOT NULL AND duration_sec > ?", forYouHardMaxDurationSec).
+			Where("duration_sec IS NOT NULL AND duration_sec > ?", podsHardMaxDurationSec).
 			Where("EXISTS (SELECT 1 FROM content_items child WHERE child.parent_content_item_id = content_items.public_id AND child.status = ? AND child.is_feed_unit = TRUE AND child.feed_visibility = 'visible' AND child.media_url IS NOT NULL)", models.ContentStatusReady)
 		failedNeverReady := db.Where("status = ?", models.ContentStatusFailed)
 		unsuitableHidden := db.Where("is_feed_unit = FALSE").
@@ -479,7 +479,7 @@ func storageRoleForContentItem(it models.ContentItem) (string, string) {
 	if it.MediaSuitability == models.MediaSuitabilityVisualDependent || it.MediaSuitability == models.MediaSuitabilityUnsuitable {
 		return storageRoleUnsuitableMedia, "unsuitable media has low storage protection"
 	}
-	if it.ParentContentItemID == nil && !it.IsFeedUnit && it.DurationSec != nil && *it.DurationSec > forYouHardMaxDurationSec {
+	if it.ParentContentItemID == nil && !it.IsFeedUnit && it.DurationSec != nil && *it.DurationSec > podsHardMaxDurationSec {
 		return storageRoleAtomizedParentSource, "parent source after atomization"
 	}
 	if it.IsFeedUnit && it.FeedVisibility == "visible" && it.Status == models.ContentStatusReady {

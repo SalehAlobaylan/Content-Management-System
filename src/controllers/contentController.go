@@ -64,7 +64,7 @@ func publicContentQuery(db *gorm.DB) *gorm.DB {
 			COALESCE(content_items.playback_url, content_items.media_url) IS NOT NULL AND
 			COALESCE(content_items.playback_url, content_items.media_url) <> '' AND
 			content_items.thumbnail_url IS NOT NULL AND content_items.thumbnail_url <> ''
-		)`, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, forYouMinDurationSec, forYouHardMaxDurationSec)
+		)`, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, podsMinDurationSec, podsHardMaxDurationSec)
 }
 
 // GetContentItem returns a single content item by ID

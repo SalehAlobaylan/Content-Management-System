@@ -10,7 +10,7 @@ import (
 )
 
 // Soft eviction (grilling Q10): an applied rank_down sets an engine-owned
-// demotion on the score row; the For You feed multiplies ordering scores by
+// demotion on the score row; the Pods feed multiplies ordering scores by
 // the half-life-decayed effective demotion; revert clears it. Deliberately
 // separate from the human-owned editorial ContentFlag — the stage-5 ledger
 // and the human-exceptions layer need engine and editorial decisions to stay
@@ -56,7 +56,7 @@ func (e Engine) ClearDemotion(itemID uuid.UUID) error {
 		}).Error
 }
 
-// FeedSignal is what the For You assembly needs per candidate: whether the
+// FeedSignal is what the Pods assembly needs per candidate: whether the
 // item is still exploring (feeds the injection slice + negative-decision
 // immunity) and the decayed demotion multiplier (soft eviction).
 type FeedSignal struct {

@@ -52,7 +52,7 @@ func sanitizePreferenceAutopilotPolicy(p models.PreferenceAutopilotPolicy) model
 	p.MaxMinedProposals = clampInt(p.MaxMinedProposals, 0, 500)
 	p.MaxCentroidRefresh = clampInt(p.MaxCentroidRefresh, 0, 200)
 	p.MaxPendingProposals = clampIntOrDefault(p.MaxPendingProposals, 1, 100000, 100)
-	p.CoverageFloorForyouPct = clampIntOrDefault(p.CoverageFloorForyouPct, 1, 100, 70)
+	p.CoverageFloorPodsPct = clampIntOrDefault(p.CoverageFloorPodsPct, 1, 100, 70)
 	p.CoverageFloorNewsPct = clampIntOrDefault(p.CoverageFloorNewsPct, 1, 100, 60)
 	p.CoverageFloorStoryPct = clampIntOrDefault(p.CoverageFloorStoryPct, 1, 100, 50)
 	p.FailureBreakerPct = clampIntOrDefault(p.FailureBreakerPct, 1, 100, 25)
@@ -272,7 +272,7 @@ type updatePreferenceAutopilotRequest struct {
 	MaxMinedProposals    *int     `json:"max_mined_proposals"`
 	MaxCentroidRefresh   *int     `json:"max_centroid_refresh"`
 	MaxPendingProposals  *int     `json:"max_pending_proposals"`
-	CoverageFloorForyou  *int     `json:"coverage_floor_foryou_pct"`
+	CoverageFloorPods  *int     `json:"coverage_floor_pods_pct"`
 	CoverageFloorNews    *int     `json:"coverage_floor_news_pct"`
 	CoverageFloorStory   *int     `json:"coverage_floor_story_pct"`
 	FailureBreakerPct    *int     `json:"failure_breaker_pct"`
@@ -319,7 +319,7 @@ func UpdatePreferenceAutopilotPolicy(c *gin.Context) {
 	setIntPtr(&policy.MaxMinedProposals, req.MaxMinedProposals)
 	setIntPtr(&policy.MaxCentroidRefresh, req.MaxCentroidRefresh)
 	setIntPtr(&policy.MaxPendingProposals, req.MaxPendingProposals)
-	setIntPtr(&policy.CoverageFloorForyouPct, req.CoverageFloorForyou)
+	setIntPtr(&policy.CoverageFloorPodsPct, req.CoverageFloorPods)
 	setIntPtr(&policy.CoverageFloorNewsPct, req.CoverageFloorNews)
 	setIntPtr(&policy.CoverageFloorStoryPct, req.CoverageFloorStory)
 	setIntPtr(&policy.FailureBreakerPct, req.FailureBreakerPct)

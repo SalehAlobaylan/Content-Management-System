@@ -46,14 +46,14 @@ func UpdateRankingConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request: " + err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}
-	if req.ForYouCompletedRepeatDays == 0 {
-		req.ForYouCompletedRepeatDays = 90
+	if req.PodsCompletedRepeatDays == 0 {
+		req.PodsCompletedRepeatDays = 90
 	}
-	if req.ForYouMeaningfulRepeatDays == 0 {
-		req.ForYouMeaningfulRepeatDays = 30
+	if req.PodsMeaningfulRepeatDays == 0 {
+		req.PodsMeaningfulRepeatDays = 30
 	}
-	if req.ForYouSampleRepeatDays == 0 {
-		req.ForYouSampleRepeatDays = 7
+	if req.PodsSampleRepeatDays == 0 {
+		req.PodsSampleRepeatDays = 7
 	}
 
 	// Validate weights sum ≈ 1.0 (tolerance ±0.05)
@@ -76,9 +76,9 @@ func UpdateRankingConfig(c *gin.Context) {
 			return
 		}
 	}
-	for _, window := range []int{req.ForYouCompletedRepeatDays, req.ForYouMeaningfulRepeatDays, req.ForYouSampleRepeatDays} {
+	for _, window := range []int{req.PodsCompletedRepeatDays, req.PodsMeaningfulRepeatDays, req.PodsSampleRepeatDays} {
 		if window < 1 || window > 365 {
-			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "For You repetition windows must be between 1 and 365 days", Code: "INVALID_REPETITION_WINDOW"})
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Pods repetition windows must be between 1 and 365 days", Code: "INVALID_REPETITION_WINDOW"})
 			return
 		}
 	}
@@ -129,9 +129,9 @@ func UpdateRankingConfig(c *gin.Context) {
 	existing.RecirculationEnabled = req.RecirculationEnabled
 	existing.RecirculationMaxAgeDays = req.RecirculationMaxAgeDays
 	existing.ShowWatchedWhenUnseenExhausted = req.ShowWatchedWhenUnseenExhausted
-	existing.ForYouCompletedRepeatDays = req.ForYouCompletedRepeatDays
-	existing.ForYouMeaningfulRepeatDays = req.ForYouMeaningfulRepeatDays
-	existing.ForYouSampleRepeatDays = req.ForYouSampleRepeatDays
+	existing.PodsCompletedRepeatDays = req.PodsCompletedRepeatDays
+	existing.PodsMeaningfulRepeatDays = req.PodsMeaningfulRepeatDays
+	existing.PodsSampleRepeatDays = req.PodsSampleRepeatDays
 	existing.EngagementNormalization = req.EngagementNormalization
 	existing.Mode = req.Mode
 	existing.IsActive = req.IsActive
@@ -929,8 +929,8 @@ type previewFeedResponse struct {
 	IsActive bool              `json:"is_active"`
 }
 
-// PreviewForYouFeed handles GET /admin/intelligence/preview/foryou
-func PreviewForYouFeed(c *gin.Context) {
+// PreviewPodsFeed handles GET /admin/intelligence/preview/pods
+func PreviewPodsFeed(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
 		return

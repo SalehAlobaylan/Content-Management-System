@@ -33,7 +33,7 @@ type DiscoveryConfig struct {
 	TwitterDiscoveryEnabled   bool `gorm:"default:false" json:"twitter_discovery_enabled"`
 	// X "who to follow" / قد يعجبك relatedness discovery (guest-accessible REST).
 	TwitterRecommendEnabled   bool `gorm:"default:false" json:"twitter_recommend_enabled"`
-	// Media (For You) discovery contributors — YouTube via InnerTube, podcasts via
+	// Media (Pods) discovery contributors — YouTube via InnerTube, podcasts via
 	// RSS/iTunes. The *_related flags gate the scraped owner-curated relation
 	// shelves (YT featured / Apple "Listeners Also Subscribed"), enabled only
 	// after a live probe confirms the endpoint shape.

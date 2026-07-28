@@ -32,7 +32,7 @@ func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, sco
 		return scored, len(mutedSources) > 0
 	}
 	cfg := loadPreferenceSettingsCached(db, tenantID)
-	if !cfg.ForYouEnabled {
+	if !cfg.PodsEnabled {
 		return scored, false
 	}
 	// From here the authenticated, enabled hook ran. It may legitimately find no
@@ -81,7 +81,7 @@ func applyPreferenceFeedHook(db *gorm.DB, tenantID string, userIDStr string, sco
 		if aff > 1 {
 			aff = 1
 		}
-		boost := cfg.WForYou * aff
+		boost := cfg.WPods * aff
 		scored[i].FinalScore *= 1 + boost
 		scored[i].ScoreBreakdown.Preference = boost
 		boosted++

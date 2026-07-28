@@ -76,7 +76,7 @@ type FeedIntegrityPolicy struct {
 	ConfirmRuns          int  `gorm:"not null;default:2" json:"confirm_runs"`
 	ResolveRuns          int  `gorm:"not null;default:3" json:"resolve_runs"`
 	// Column overrides: GORM's naming strategy derives "flap_cycles24h",
-	// "for_you_latency_budget_ms", and "expected_min_for_you_units" from these
+	// "pods_latency_budget_ms", and "expected_min_pods_units" from these
 	// field names, none of which match the migration's columns. Pin them
 	// explicitly so reads/writes round-trip instead of silently returning 0.
 	FlapCycles24h          int        `gorm:"column:flap_cycles_24h;not null;default:3" json:"flap_cycles_24h"`
@@ -84,10 +84,10 @@ type FeedIntegrityPolicy struct {
 	ProbeURLBudget         int        `gorm:"not null;default:40" json:"probe_url_budget"`
 	ProbeConcurrency       int        `gorm:"not null;default:2" json:"probe_concurrency"`
 	ProbeTimeoutMS         int        `gorm:"not null;default:5000" json:"probe_timeout_ms"`
-	ForYouLatencyBudgetMS  int        `gorm:"column:foryou_latency_budget_ms;not null;default:1500" json:"foryou_latency_budget_ms"`
+	PodsLatencyBudgetMS  int        `gorm:"column:pods_latency_budget_ms;not null;default:1500" json:"pods_latency_budget_ms"`
 	NewsLatencyBudgetMS    int        `gorm:"not null;default:2000" json:"news_latency_budget_ms"`
 	ThinSlideFloor         float64    `gorm:"not null;default:0.80" json:"thin_slide_floor"`
-	ExpectedMinForYouUnits int        `gorm:"column:expected_min_foryou_units;not null;default:1" json:"expected_min_foryou_units"`
+	ExpectedMinPodsUnits int        `gorm:"column:expected_min_pods_units;not null;default:1" json:"expected_min_pods_units"`
 	ExpectedMinNewsSlides  int        `gorm:"not null;default:1" json:"expected_min_news_slides"`
 	PausedUntil            *time.Time `gorm:"type:timestamp" json:"paused_until,omitempty"`
 	LastLightRunAt         *time.Time `gorm:"type:timestamp" json:"last_light_run_at,omitempty"`
@@ -112,7 +112,7 @@ type FeedIntegrityPolicy struct {
 func (FeedIntegrityPolicy) TableName() string { return "feed_integrity_policies" }
 
 func DefaultFeedIntegrityPolicy(tenantID string) FeedIntegrityPolicy {
-	return FeedIntegrityPolicy{TenantID: tenantID, LightIntervalMinutes: 15, DeepIntervalHours: 24, ConfirmRuns: 2, ResolveRuns: 3, FlapCycles24h: 3, EdgePagesPerFeed: 3, ProbeURLBudget: 40, ProbeConcurrency: 2, ProbeTimeoutMS: 5000, ForYouLatencyBudgetMS: 1500, NewsLatencyBudgetMS: 2000, ThinSlideFloor: 0.80, ExpectedMinForYouUnits: 1, ExpectedMinNewsSlides: 1, AutopilotMode: FeedIntegrityAutopilotModeObserve, AutopilotActionHourlyCap: 2, AutopilotDiagnosticHourlyCap: 4, AutopilotCooldownMinutes: 60, AutopilotEvidenceMaxAgeMinutes: 10, AutopilotRetryLimit: 1, AutopilotTrustMinDecisions: 20, AutopilotTrustMinAgreementPct: 95}
+	return FeedIntegrityPolicy{TenantID: tenantID, LightIntervalMinutes: 15, DeepIntervalHours: 24, ConfirmRuns: 2, ResolveRuns: 3, FlapCycles24h: 3, EdgePagesPerFeed: 3, ProbeURLBudget: 40, ProbeConcurrency: 2, ProbeTimeoutMS: 5000, PodsLatencyBudgetMS: 1500, NewsLatencyBudgetMS: 2000, ThinSlideFloor: 0.80, ExpectedMinPodsUnits: 1, ExpectedMinNewsSlides: 1, AutopilotMode: FeedIntegrityAutopilotModeObserve, AutopilotActionHourlyCap: 2, AutopilotDiagnosticHourlyCap: 4, AutopilotCooldownMinutes: 60, AutopilotEvidenceMaxAgeMinutes: 10, AutopilotRetryLimit: 1, AutopilotTrustMinDecisions: 20, AutopilotTrustMinAgreementPct: 95}
 }
 
 type FeedIntegrityRun struct {

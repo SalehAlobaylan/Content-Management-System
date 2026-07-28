@@ -1,6 +1,6 @@
 # Content-Management-System
 
-The system of record and read API for the Wahb platform. CMS owns content CRUD, the PostgreSQL + pgvector store, feed assembly (For You + News), media atomization workflow state, interactions, syndication output (RSS/Atom/JSON), and the full admin/intelligence/storage surface for Platform-Console.
+The system of record and read API for the Wahb platform. CMS owns content CRUD, the PostgreSQL + pgvector store, feed assembly (Pods + News), media atomization workflow state, interactions, syndication output (RSS/Atom/JSON), and the full admin/intelligence/storage surface for Platform-Console.
 
 It does **not** scrape sources, run FFmpeg, run ML models, or orchestrate the ingest pipeline — those belong to Aggregation, Enrichment, and Media. CMS calls Enrichment on demand and receives ingested content from Aggregation via `/internal/*`.
 
@@ -94,7 +94,7 @@ CMS **does not log anyone in** — IAM issues JWTs (HS256). Platform-Console and
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/feed/foryou` | For You feed (VIDEO + PODCAST feed units with playback metadata, optional duration preference, cursor-paginated) |
+| GET | `/feed/pods` | Pods feed (VIDEO + PODCAST feed units with playback metadata, optional duration preference, cursor-paginated) |
 | GET | `/feed/news` | News feed — story-slides (1 featured + up to 3 related) |
 | GET | `/feed/rss.xml` · `/feed/atom.xml` · `/feed/feed.json` | Syndication output (`type`, `topic`, `limit`) |
 | GET | `/feed/saved/:slug` | A saved named feed |
@@ -113,7 +113,7 @@ Grouped capabilities (see the full route list in [`../docs/content-management-sy
 - **Sources & discovery** — source CRUD, bulk/OPML import, `discover`/`preview`/`:id/run`; Feeds-Finding discovery profiles, suggestions (approve/reject/bulk), config, sweep-now, graph build + authorities.
 - **Content moderation** — list/filter, status updates, bulk delete/status/tags/topic, stats, status-counts, topics.
 - **Topics** — rename, delete, merge, reclassify, recluster, label-batch.
-- **Intelligence** — ranking config + modes, content flags (boost/suppress/pin/exclude), embeddings explorer (clusters/similar/stats), feed analytics (score-distribution, velocity, trending, source-performance, signal-health), feed preview (foryou/news with score breakdown), news-snapshot refresh.
+- **Intelligence** — ranking config + modes, content flags (boost/suppress/pin/exclude), embeddings explorer (clusters/similar/stats), feed analytics (score-distribution, velocity, trending, source-performance, signal-health), feed preview (pods/news with score breakdown), news-snapshot refresh.
 - **Media Studio, transcription, atomization** — per-item transcript/chapter editor, transcription config + jobs/batches, Media Atomization overview/pipeline/parents/chapters/runs/review/repair, quality.
 - **Enrichment** — stats, missing, trigger (single/batch/all), bulk-status, health.
 - **Storage** — stats, candidates, purge, restore, policy + overrides, sweep runs/preview, reconcile, operations.
@@ -126,13 +126,13 @@ Content write-back pipeline (`POST /content-items` → PATCH `…/artifacts` →
 
 ## Media Atomization Rules
 
-CMS is the source of truth for atomization policy, workflow state, source/episode overrides, manual queue validation, review state, repair, and For You visibility.
+CMS is the source of truth for atomization policy, workflow state, source/episode overrides, manual queue validation, review state, repair, and Pods visibility.
 
 - Atomization candidates must be parent media longer than 2400 seconds (>40m). Parent media at or under 40m normally remains a raw feed unit when otherwise eligible.
 - Policy precedence is episode override → source override → tenant default → code defaults. Admins can exclude a whole media source or a single parent episode; manual atomization still cannot override the >40m rule.
-- Visible For You media units must be 270-2400 seconds. 4:30-4:59 is valid and belongs to the `5m` bucket; anything below 4:30 must merge or stay hidden/review-only.
+- Visible Pods media units must be 270-2400 seconds. 4:30-4:59 is valid and belongs to the `5m` bucket; anything below 4:30 must merge or stay hidden/review-only.
 - Child chapters are first-class `content_items` linked to their parent. `chapters` remains the editorial/review marker table.
-- For You returns playback metadata (`playback_url`, `playback_type`, fallback/renditions), not an MP4-only contract.
+- Pods returns playback metadata (`playback_url`, `playback_type`, fallback/renditions), not an MP4-only contract.
 - Manual atomize/re-atomize APIs validate in CMS, record run state, then proxy queueing to Aggregation. Re-atomization must archive/replace prior child feed units so duplicates cannot remain visible.
 
 ## Testing

@@ -417,7 +417,7 @@ func ListSourceSuggestions(c *gin.Context) {
 			query = query.Where("profile_id = ?", *internalID)
 		}
 	}
-	// Category filter ('news' | 'media') so the For You hub fetches only media
+	// Category filter ('news' | 'media') so the Pods hub fetches only media
 	// suggestions instead of pulling a mixed page and dropping media client-side.
 	if cat := strings.TrimSpace(c.Query("category")); cat != "" && !strings.EqualFold(cat, "all") {
 		query = query.Where("category = ?", strings.ToLower(cat))
@@ -602,7 +602,7 @@ func ListNewsSources(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 
-	// Category-scoped: the News hub passes 'news' (default), the For You hub
+	// Category-scoped: the News hub passes 'news' (default), the Pods hub
 	// passes 'media'. A source belongs to exactly one hub by its category.
 	cat := strings.ToLower(strings.TrimSpace(c.Query("category")))
 	if cat != models.SourceCategoryMedia {
@@ -1804,7 +1804,7 @@ func defaultMediaAtomizationPolicy() map[string]interface{} {
 		"preserve_video":                 true,
 		"remove_sponsor_segments":        true,
 		"min_chapter_minutes":            5,
-		"min_feed_unit_seconds":          forYouMinDurationSec,
+		"min_feed_unit_seconds":          podsMinDurationSec,
 		"soft_max_chapter_minutes":       30,
 		"hard_max_chapter_minutes":       40,
 		"atomization_min_parent_seconds": atomizationMinParentDurationSec,

@@ -198,7 +198,7 @@ func SubmitUserContent(c *gin.Context) {
 	status := models.ContentStatusReady
 	if audioHeader != nil {
 		// Audio needs the aggregation pipeline to transcode + thumbnail
-		// before the For You feed filter (MP4 + thumbnail) will accept it.
+		// before the Pods feed filter (MP4 + thumbnail) will accept it.
 		status = models.ContentStatusPending
 	}
 

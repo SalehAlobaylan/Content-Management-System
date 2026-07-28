@@ -1,5 +1,5 @@
 // Package intelligence is the Ranking/Intelligence System — the shared media-value
-// pillar that Circulation, Storage, the For You feed hooks, and (at stage 5) the
+// pillar that Circulation, Storage, the Pods feed hooks, and (at stage 5) the
 // Autopilot consume for their decisions. It is stage 4 of the media roadmap.
 //
 // Design contract (locked via docs/ranking-intelligence-grilling.md, Q1–Q14):
@@ -83,7 +83,7 @@ const (
 	exploreImpressionTarget   = 50
 	legacyExposureViewFloor   = 25
 
-	// explorationSliceEvery: one slot in this many For You positions is reserved
+	// explorationSliceEvery: one slot in this many Pods positions is reserved
 	// for a still-exploring item (~10%). Default here; the feed hook reads the
 	// per-tenant tuning override. Consumed in controllers/feedIntelligenceHooks.go.
 	explorationSliceEvery = 10

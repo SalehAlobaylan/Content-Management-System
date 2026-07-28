@@ -21,15 +21,15 @@ import (
 const consumerFeedSessionLifetime = 6 * time.Hour
 const consumerFeedSnapshotLimit = 50
 
-type frozenForYouSessionResponse struct {
+type frozenPodsSessionResponse struct {
 	SessionID string       `json:"session_id"`
 	ExpiresAt time.Time    `json:"expires_at"`
 	Cursor    *string      `json:"cursor"`
-	Items     []ForYouItem `json:"items"`
+	Items     []PodsItem `json:"items"`
 	CaughtUp  bool         `json:"caught_up"`
 }
 
-type frozenForYouSessionFreshnessResponse struct {
+type frozenPodsSessionFreshnessResponse struct {
 	HasNewContent bool `json:"has_new_content"`
 }
 
@@ -78,11 +78,11 @@ func frozenSessionLimit(c *gin.Context) int {
 	return limit
 }
 
-// snapshotCurrentForYouFeed deliberately routes through the same controller
+// snapshotCurrentPodsFeed deliberately routes through the same controller
 // contract as the public feed. This keeps session creation aligned with active
 // ranking, preference, repetition, and playback eligibility policy while the
 // feed assembly code is progressively extracted into a dedicated service.
-func snapshotCurrentForYouFeed(c *gin.Context, db *gorm.DB) ([]ForYouItem, error) {
+func snapshotCurrentPodsFeed(c *gin.Context, db *gorm.DB) ([]PodsItem, error) {
 	recorder := httptest.NewRecorder()
 	snapshotContext, _ := gin.CreateTestContext(recorder)
 	request := c.Request.Clone(c.Request.Context())
@@ -100,11 +100,11 @@ func snapshotCurrentForYouFeed(c *gin.Context, db *gorm.DB) ([]ForYouItem, error
 		snapshotContext.Set("user_id", userID)
 	}
 
-	GetForYouFeed(snapshotContext)
+	GetPodsFeed(snapshotContext)
 	if recorder.Code != http.StatusOK {
 		return nil, strconv.ErrSyntax
 	}
-	var response ForYouResponse
+	var response PodsResponse
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		return nil, err
 	}
@@ -116,9 +116,9 @@ func cloneURL(source *url.URL) *url.URL {
 	return &copy
 }
 
-func visibleFrozenForYouPage(db *gorm.DB, items []ForYouItem, offset, limit int) ([]ForYouItem, int) {
+func visibleFrozenPodsPage(db *gorm.DB, items []PodsItem, offset, limit int) ([]PodsItem, int) {
 	if offset >= len(items) {
-		return []ForYouItem{}, len(items)
+		return []PodsItem{}, len(items)
 	}
 	ids := make([]uuid.UUID, 0, len(items)-offset)
 	for _, item := range items[offset:] {
@@ -133,7 +133,7 @@ func visibleFrozenForYouPage(db *gorm.DB, items []ForYouItem, offset, limit int)
 		visible[id] = struct{}{}
 	}
 
-	page := make([]ForYouItem, 0, limit)
+	page := make([]PodsItem, 0, limit)
 	index := offset
 	for ; index < len(items) && len(page) < limit; index += 1 {
 		if _, ok := visible[items[index].ID]; ok {
@@ -143,9 +143,9 @@ func visibleFrozenForYouPage(db *gorm.DB, items []ForYouItem, offset, limit int)
 	return page, index
 }
 
-// CreateForYouFeedSession freezes the current CMS-ranked response for the
+// CreatePodsFeedSession freezes the current CMS-ranked response for the
 // caller's six-hour active session.
-func CreateForYouFeedSession(c *gin.Context) {
+func CreatePodsFeedSession(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
@@ -153,35 +153,35 @@ func CreateForYouFeedSession(c *gin.Context) {
 		return
 	}
 
-	items, err := snapshotCurrentForYouFeed(c, db)
+	items, err := snapshotCurrentPodsFeed(c, db)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to create a stable For You session"})
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to create a stable Pods session"})
 		return
 	}
 	snapshot, err := json.Marshal(items)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to store a stable For You session"})
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to store a stable Pods session"})
 		return
 	}
 	now := time.Now().UTC()
 	session := models.ConsumerFeedSession{
 		ID:            uuid.New(),
 		IdentityScope: identityScope,
-		FeedType:      "foryou",
+		FeedType:      "pods",
 		Snapshot:      datatypes.JSON(snapshot),
 		ExpiresAt:     now.Add(consumerFeedSessionLifetime),
 	}
 	if err := db.Create(&session).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to create a stable For You session"})
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to create a stable Pods session"})
 		return
 	}
 
-	page, nextOffset := visibleFrozenForYouPage(db, items, 0, frozenSessionLimit(c))
-	c.JSON(http.StatusCreated, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: len(items) == 0})
+	page, nextOffset := visibleFrozenPodsPage(db, items, 0, frozenSessionLimit(c))
+	c.JSON(http.StatusCreated, frozenPodsSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: len(items) == 0})
 }
 
-// GetForYouFeedSessionPage serves only the persisted ordering for the session.
-func GetForYouFeedSessionPage(c *gin.Context) {
+// GetPodsFeedSessionPage serves only the persisted ordering for the session.
+func GetPodsFeedSessionPage(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
@@ -190,37 +190,37 @@ func GetForYouFeedSessionPage(c *gin.Context) {
 	}
 	sessionID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}
 	var session models.ConsumerFeedSession
-	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "foryou").First(&session).Error; err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "pods").First(&session).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
-		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "For You session has expired"})
+		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
 		return
 	}
 	offset, err := parseFrozenSessionCursor(c.Query("cursor"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid For You session cursor"})
+		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "Invalid Pods session cursor"})
 		return
 	}
-	var items []ForYouItem
+	var items []PodsItem
 	if err := json.Unmarshal(session.Snapshot, &items); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored For You session is invalid"})
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored Pods session is invalid"})
 		return
 	}
-	page, nextOffset := visibleFrozenForYouPage(db, items, offset, frozenSessionLimit(c))
-	c.JSON(http.StatusOK, frozenForYouSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: offset >= len(items)})
+	page, nextOffset := visibleFrozenPodsPage(db, items, offset, frozenSessionLimit(c))
+	c.JSON(http.StatusOK, frozenPodsSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: offset >= len(items)})
 }
 
-// GetForYouFeedSessionFreshness reports whether the current policy-selected
+// GetPodsFeedSessionFreshness reports whether the current policy-selected
 // candidate set contains content that was not in this frozen session. It never
 // alters the persisted order or returns ranked inventory; replacement remains a
 // deliberate client action through session creation.
-func GetForYouFeedSessionFreshness(c *gin.Context) {
+func GetPodsFeedSessionFreshness(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
@@ -229,34 +229,34 @@ func GetForYouFeedSessionFreshness(c *gin.Context) {
 	}
 	sessionID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}
 	var session models.ConsumerFeedSession
-	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "foryou").First(&session).Error; err != nil {
-		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "For You session not found"})
+	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "pods").First(&session).Error; err != nil {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
-		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "For You session has expired"})
+		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
 		return
 	}
-	var snapshot []ForYouItem
+	var snapshot []PodsItem
 	if err := json.Unmarshal(session.Snapshot, &snapshot); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored For You session is invalid"})
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored Pods session is invalid"})
 		return
 	}
-	candidates, err := snapshotCurrentForYouFeed(c, db)
+	candidates, err := snapshotCurrentPodsFeed(c, db)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to check For You freshness"})
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to check Pods freshness"})
 		return
 	}
-	c.JSON(http.StatusOK, frozenForYouSessionFreshnessResponse{
-		HasNewContent: hasNewFrozenForYouCandidate(snapshot, candidates),
+	c.JSON(http.StatusOK, frozenPodsSessionFreshnessResponse{
+		HasNewContent: hasNewFrozenPodsCandidate(snapshot, candidates),
 	})
 }
 
-func hasNewFrozenForYouCandidate(snapshot, candidates []ForYouItem) bool {
+func hasNewFrozenPodsCandidate(snapshot, candidates []PodsItem) bool {
 	known := make(map[uuid.UUID]struct{}, len(snapshot))
 	for _, item := range snapshot {
 		known[item.ID] = struct{}{}

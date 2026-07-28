@@ -97,7 +97,7 @@ func applyRecommendation(db *gorm.DB, tenantID, setBy, authorization string, rec
 	case mediaCircOutcomeRankedDown:
 		// Stage 4: rank_down is an engine-owned decaying demotion on the
 		// intelligence score row — not the editorial Suppress flag (that stays
-		// human-owned). The For You feed applies the half-life-decayed
+		// human-owned). The Pods feed applies the half-life-decayed
 		// multiplier; revert clears it.
 		if err := (intelligence.Engine{DB: db}).ApplyDemotion(tenantID, rec.SubjectID); err != nil {
 			return mediaCircOutcomeFailed, err

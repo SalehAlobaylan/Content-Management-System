@@ -10,7 +10,7 @@ import (
 )
 
 // The two Ranking/Intelligence feed hooks (stage 4, grilling Q7 + Q10) —
-// the only places the engine touches For You assembly:
+// the only places the engine touches Pods assembly:
 //
 //  1. Soft eviction: an applied rank_down decays the item's ordering score by
 //     the engine-owned demotion multiplier (half-life decay; revert clears it).
@@ -21,7 +21,7 @@ import (
 // Both hooks run on the RANKED path only — the chronological path is the
 // legacy fallback when ranking is disabled, and it stays untouched.
 // The feed's hard constraints (270–2400s, READY-only, eligibility) are all
-// enforced upstream in forYouEligibleMediaQuery; these hooks only reorder and
+// enforced upstream in podsEligibleMediaQuery; these hooks only reorder and
 // interleave already-eligible items, which is what keeps the characterization
 // tests green.
 

@@ -23,8 +23,8 @@ func SeedWahbData(db *gorm.DB) error {
 
 	log.Println("Seeding Wahb Platform data...")
 
-	// Seed VIDEO/PODCAST content for "For You" feed
-	forYouItems := []models.ContentItem{
+	// Seed VIDEO/PODCAST content for "Pods" feed
+	podsItems := []models.ContentItem{
 		createVideoContent("The Future of AI in 2026", "Thamanyah Podcast", "Radio Thamanyah", 185),
 		createVideoContent("Building Scalable Systems", "Tech Talk", "Ahmed Hassan", 240),
 		createVideoContent("Startup Related: From Zero to IPO", "Entrepreneurship Weekly", "Sarah Al-Rashid", 320),
@@ -101,7 +101,7 @@ func SeedWahbData(db *gorm.DB) error {
 	}
 
 	// Insert all items
-	allItems := append(append(forYouItems, articleItems...), relatedItems...)
+	allItems := append(append(podsItems, articleItems...), relatedItems...)
 	for i := range allItems {
 		if err := db.Create(&allItems[i]).Error; err != nil {
 			log.Printf("Failed to seed content item: %v", err)

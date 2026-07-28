@@ -453,5 +453,5 @@ func summarizeVerdicts(verdicts map[string]any) string {
 
 func enabledSurfaces(policy models.ExperiencePolicy) []string {
 	// V1 fixed set; enabled_surfaces string could narrow it later.
-	return []string{"foryou", "news"}
+	return []string{"pods", "news"}
 }

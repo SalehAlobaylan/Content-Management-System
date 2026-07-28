@@ -58,13 +58,13 @@ func TestRollup_TerminalOutcomeCounting_And_Idempotency(t *testing.T) {
 	dur := 800
 
 	for i := 0; i < 60; i++ {
-		insertEvent(t, db, within, "playback_started", "foryou", "r1", nil, &dur)
+		insertEvent(t, db, within, "playback_started", "pods", "r1", nil, &dur)
 	}
 	for i := 0; i < 40; i++ {
-		insertEvent(t, db, within, "playback_failed", "foryou", "r1", &fatal, nil)
+		insertEvent(t, db, within, "playback_failed", "pods", "r1", &fatal, nil)
 	}
 	for i := 0; i < 10; i++ {
-		insertEvent(t, db, within, "playback_failed", "foryou", "r1", &autoplay, nil)
+		insertEvent(t, db, within, "playback_failed", "pods", "r1", &autoplay, nil)
 	}
 
 	kept := map[string]bool{"r1": true}
@@ -72,15 +72,15 @@ func TestRollup_TerminalOutcomeCounting_And_Idempotency(t *testing.T) {
 		t.Fatalf("rollup: %v", err)
 	}
 
-	start := loadRollupRow(t, db, mPlaybackStartSuccess, "foryou", bucket)
+	start := loadRollupRow(t, db, mPlaybackStartSuccess, "pods", bucket)
 	if start.Numerator != 60 || start.Denominator != 100 {
 		t.Errorf("start success: want 60/100, got %d/%d", start.Numerator, start.Denominator)
 	}
-	fatalRow := loadRollupRow(t, db, mPlaybackFatalRate, "foryou", bucket)
+	fatalRow := loadRollupRow(t, db, mPlaybackFatalRate, "pods", bucket)
 	if fatalRow.Numerator != 40 || fatalRow.Denominator != 100 {
 		t.Errorf("fatal rate: want 40/100, got %d/%d", fatalRow.Numerator, fatalRow.Denominator)
 	}
-	autoRow := loadRollupRow(t, db, mAutoplayBlockedRate, "foryou", bucket)
+	autoRow := loadRollupRow(t, db, mAutoplayBlockedRate, "pods", bucket)
 	if autoRow.Numerator != 10 || autoRow.Denominator != 110 {
 		t.Errorf("autoplay rate: want 10/110, got %d/%d", autoRow.Numerator, autoRow.Denominator)
 	}
@@ -89,7 +89,7 @@ func TestRollup_TerminalOutcomeCounting_And_Idempotency(t *testing.T) {
 	if _, err := rollupBucket(db, "default", bucket, kept, 100000); err != nil {
 		t.Fatalf("rollup rerun: %v", err)
 	}
-	start2 := loadRollupRow(t, db, mPlaybackStartSuccess, "foryou", bucket)
+	start2 := loadRollupRow(t, db, mPlaybackStartSuccess, "pods", bucket)
 	if start2.Numerator != 60 || start2.Denominator != 100 {
 		t.Errorf("idempotency broken: want 60/100, got %d/%d", start2.Numerator, start2.Denominator)
 	}
@@ -103,7 +103,7 @@ func TestRetention_DeletesRawKeepsRollups(t *testing.T) {
 	old := oldBucket.Add(5 * time.Minute)
 	dur := 500
 	for i := 0; i < 55; i++ {
-		insertEvent(t, db, old, "feed_rendered", "foryou", "r1", nil, &dur)
+		insertEvent(t, db, old, "feed_rendered", "pods", "r1", nil, &dur)
 	}
 	if _, err := rollupBucket(db, "default", oldBucket, map[string]bool{"r1": true}, 100000); err != nil {
 		t.Fatalf("rollup: %v", err)
@@ -117,7 +117,7 @@ func TestRetention_DeletesRawKeepsRollups(t *testing.T) {
 		t.Errorf("expected old raw events swept, %d remain", rawCount)
 	}
 	// The rollup for that bucket must survive (aggregate history is durable).
-	row := loadRollupRow(t, db, mFeedRenderSuccess, "foryou", oldBucket)
+	row := loadRollupRow(t, db, mFeedRenderSuccess, "pods", oldBucket)
 	if row.Numerator != 55 {
 		t.Errorf("rollup must survive retention, got numerator %d", row.Numerator)
 	}

@@ -161,9 +161,9 @@ func (UserCategoryAffinity) TableName() string { return "user_category_affinity"
 type PreferenceSettings struct {
 	ID                uint      `gorm:"primaryKey" json:"-"`
 	TenantID          string    `gorm:"type:varchar(64);not null;uniqueIndex:idx_preference_settings_tenant" json:"tenant_id"`
-	ForYouEnabled     bool      `gorm:"not null;default:false" json:"foryou_enabled"`
+	PodsEnabled     bool      `gorm:"not null;default:false" json:"pods_enabled"`
 	NewsEnabled       bool      `gorm:"not null;default:false" json:"news_enabled"`
-	WForYou           float64   `gorm:"type:double precision;not null;default:0.30" json:"w_foryou"`
+	WPods           float64   `gorm:"type:double precision;not null;default:0.30" json:"w_pods"`
 	WNews             float64   `gorm:"type:double precision;not null;default:0.15" json:"w_news"`
 	WeightComplete    float64   `gorm:"type:double precision;not null;default:1.0" json:"weight_complete"`
 	WeightBookmark    float64   `gorm:"type:double precision;not null;default:0.9" json:"weight_bookmark"`

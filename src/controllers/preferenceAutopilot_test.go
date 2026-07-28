@@ -90,7 +90,7 @@ func TestBuildFlipGate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			g := buildFlipGate("foryou_enabled", tc.enabled, tc.coverage, tc.floor, tc.boost)
+			g := buildFlipGate("pods_enabled", tc.enabled, tc.coverage, tc.floor, tc.boost)
 			if g.State != tc.want {
 				t.Fatalf("state = %q, want %q", g.State, tc.want)
 			}
@@ -98,9 +98,9 @@ func TestBuildFlipGate(t *testing.T) {
 	}
 }
 
-func gates(foryouEnabled bool, foryouCov float64, newsEnabled bool, newsCov float64) map[string]preferenceFlipGate {
+func gates(podsEnabled bool, podsCov float64, newsEnabled bool, newsCov float64) map[string]preferenceFlipGate {
 	return map[string]preferenceFlipGate{
-		"foryou_enabled": buildFlipGate("foryou_enabled", foryouEnabled, foryouCov, 70, "ok"),
+		"pods_enabled": buildFlipGate("pods_enabled", podsEnabled, podsCov, 70, "ok"),
 		"news_enabled":   buildFlipGate("news_enabled", newsEnabled, newsCov, 60, "ok"),
 	}
 }

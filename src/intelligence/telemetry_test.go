@@ -11,7 +11,7 @@ func TestBucketLabelForDuration(t *testing.T) {
 		durationSec int
 		want        string
 	}{
-		{271, "5m"},    // just over the For You floor
+		{271, "5m"},    // just over the Pods floor
 		{300, "5m"},    // exactly 5m
 		{450, "5m"},    // 7.5m rounds down on tie-break to the smaller bucket
 		{960, "15m"},   // 16m → 15m

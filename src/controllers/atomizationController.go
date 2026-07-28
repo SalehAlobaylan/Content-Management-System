@@ -77,7 +77,7 @@ type atomizationPolicy struct {
 }
 
 const (
-	atomizationMinParentDurationSec = forYouHardMaxDurationSec
+	atomizationMinParentDurationSec = podsHardMaxDurationSec
 )
 
 func defaultAtomizationPolicy() atomizationPolicy {
@@ -88,7 +88,7 @@ func defaultAtomizationPolicy() atomizationPolicy {
 		PreserveVideo:               true,
 		RemoveSponsorSegments:       true,
 		MinChapterMinutes:           5,
-		MinFeedUnitSeconds:          forYouMinDurationSec,
+		MinFeedUnitSeconds:          podsMinDurationSec,
 		SoftMaxChapterMinutes:       30,
 		HardMaxChapterMinutes:       40,
 		AtomizationMinParentSeconds: atomizationMinParentDurationSec,
@@ -183,14 +183,14 @@ func atomizationPolicyToMap(p atomizationPolicy) map[string]interface{} {
 }
 
 func validateAtomizationPolicy(p atomizationPolicy) atomizationPolicy {
-	if p.MinFeedUnitSeconds < forYouMinDurationSec {
-		p.MinFeedUnitSeconds = forYouMinDurationSec
+	if p.MinFeedUnitSeconds < podsMinDurationSec {
+		p.MinFeedUnitSeconds = podsMinDurationSec
 	}
 	if p.AtomizationMinParentSeconds < atomizationMinParentDurationSec {
 		p.AtomizationMinParentSeconds = atomizationMinParentDurationSec
 	}
-	if p.HardMaxChapterMinutes <= 0 || p.HardMaxChapterMinutes*60 > forYouHardMaxDurationSec {
-		p.HardMaxChapterMinutes = forYouHardMaxDurationSec / 60
+	if p.HardMaxChapterMinutes <= 0 || p.HardMaxChapterMinutes*60 > podsHardMaxDurationSec {
+		p.HardMaxChapterMinutes = podsHardMaxDurationSec / 60
 	}
 	if p.SoftMaxChapterMinutes <= 0 || p.SoftMaxChapterMinutes > p.HardMaxChapterMinutes {
 		p.SoftMaxChapterMinutes = 30
@@ -279,7 +279,7 @@ func durationBucketLabel(ms int) string {
 func minFeedUnitMs(policy atomizationPolicy) int {
 	seconds := policy.MinFeedUnitSeconds
 	if seconds <= 0 {
-		seconds = forYouMinDurationSec
+		seconds = podsMinDurationSec
 	}
 	return seconds * 1000
 }
@@ -1477,12 +1477,12 @@ func countMediaPublicationPath(db *gorm.DB, tenantID, path string) (int64, error
 	case mediaPublicationPathBlockedTranscript:
 		query = query.Where("parent_content_item_id IS NULL").
 			Where("transcript_id IS NULL").
-			Where("duration_sec > ?", forYouHardMaxDurationSec).
+			Where("duration_sec > ?", podsHardMaxDurationSec).
 			Where("NOT (is_feed_unit = TRUE AND feed_visibility = ?)", feedVisibilityVisible).
 			Where("status <> ?", models.ContentStatusArchived)
 	case "hidden_long_parent":
 		query = query.Where("parent_content_item_id IS NULL").
-			Where("duration_sec > ?", forYouHardMaxDurationSec).
+			Where("duration_sec > ?", podsHardMaxDurationSec).
 			Where("(feed_visibility = ? OR is_feed_unit = FALSE)", feedVisibilityHidden).
 			Where("status <> ?", models.ContentStatusArchived)
 	case mediaPublicationPathInvalid:
@@ -1728,7 +1728,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 		Where("tenant_id = ?", principal.TenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
-		Where("(duration_sec IS NULL OR duration_sec < ?)", forYouMinDurationSec).
+		Where("(duration_sec IS NULL OR duration_sec < ?)", podsMinDurationSec).
 		Count(&visibleUnderFloorCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
@@ -1737,7 +1737,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 		Where("tenant_id = ?", principal.TenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
-		Where("duration_sec > ?", forYouHardMaxDurationSec).
+		Where("duration_sec > ?", podsHardMaxDurationSec).
 		Count(&visibleOverHardMaxCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
@@ -1760,7 +1760,7 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 			LEFT JOIN content_items c ON c.public_id = ch.child_content_item_id AND c.tenant_id = ch.tenant_id
 			WHERE ch.tenant_id = ?
 				AND COALESCE(ch.end_ms - ch.start_ms, COALESCE(c.duration_sec, 0) * 1000, 0) < ?
-				AND (ch.status = 'needs_review' OR c.feed_visibility = 'review')`, principal.TenantID, forYouMinDurationSec*1000).Scan(&shortChapterReviewCount).Error; err != nil {
+				AND (ch.status = 'needs_review' OR c.feed_visibility = 'review')`, principal.TenantID, podsMinDurationSec*1000).Scan(&shortChapterReviewCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -1861,9 +1861,9 @@ func AdminGetMediaAtomizationOverview(c *gin.Context) {
 			"short_chapters_awaiting_review":   shortChapterReviewCount,
 		},
 		"policy": gin.H{
-			"min_feed_unit_seconds":          forYouMinDurationSec,
+			"min_feed_unit_seconds":          podsMinDurationSec,
 			"atomization_min_parent_seconds": atomizationMinParentDurationSec,
-			"hard_max_feed_unit_seconds":     forYouHardMaxDurationSec,
+			"hard_max_feed_unit_seconds":     podsHardMaxDurationSec,
 		},
 		"average_chapters_per_parent": avgChaptersPerParent,
 		"average_processing_seconds":  avgRow.AvgProcessingSeconds,
@@ -2239,11 +2239,11 @@ func AdminListMediaAtomizationFeedUnits(c *gin.Context) {
 	limit := boundedLimit(c.Query("limit"), 80, 200)
 	args = append(args, limit)
 	rawArgs := []interface{}{
-		forYouMinDurationSec, forYouHardMaxDurationSec, atomizationMinParentDurationSec,
-		forYouMinDurationSec, forYouHardMaxDurationSec,
-		forYouMinDurationSec, forYouHardMaxDurationSec,
-		forYouMinDurationSec, forYouHardMaxDurationSec,
-		forYouHardMaxDurationSec,
+		podsMinDurationSec, podsHardMaxDurationSec, atomizationMinParentDurationSec,
+		podsMinDurationSec, podsHardMaxDurationSec,
+		podsMinDurationSec, podsHardMaxDurationSec,
+		podsMinDurationSec, podsHardMaxDurationSec,
+		podsHardMaxDurationSec,
 	}
 	rawArgs = append(rawArgs, args...)
 
@@ -2812,8 +2812,8 @@ func adminGetMediaAtomizationOverviewCompat(c *gin.Context, db *gorm.DB, tenantI
 			tenantID,
 			[]models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast},
 			models.ContentStatusReady,
-			forYouMinDurationSec,
-			forYouHardMaxDurationSec,
+			podsMinDurationSec,
+			podsHardMaxDurationSec,
 		).Count(&durationViolationCount).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
 		return
@@ -2854,9 +2854,9 @@ func adminGetMediaAtomizationOverviewCompat(c *gin.Context, db *gorm.DB, tenantI
 			"short_chapters_awaiting_review":   0,
 		},
 		"policy": gin.H{
-			"min_feed_unit_seconds":          forYouMinDurationSec,
+			"min_feed_unit_seconds":          podsMinDurationSec,
 			"atomization_min_parent_seconds": atomizationMinParentDurationSec,
-			"hard_max_feed_unit_seconds":     forYouHardMaxDurationSec,
+			"hard_max_feed_unit_seconds":     podsHardMaxDurationSec,
 		},
 		"average_chapters_per_parent": 0,
 		"average_processing_seconds":  nil,
@@ -2915,10 +2915,10 @@ func adminListMediaAtomizationParentsCompat(c *gin.Context, db *gorm.DB, tenantI
 	}
 
 	schemaMessage := schema.Message
-	longMessage := "Over the 40-minute feed ceiling. Suppressed from For You by the compatibility hard cap until atomized."
+	longMessage := "Over the 40-minute feed ceiling. Suppressed from Pods by the compatibility hard cap until atomized."
 	for i := range rows {
 		msg := schemaMessage
-		if rows[i].DurationSec != nil && *rows[i].DurationSec > forYouHardMaxDurationSec {
+		if rows[i].DurationSec != nil && *rows[i].DurationSec > podsHardMaxDurationSec {
 			msg = longMessage + " " + schemaMessage
 		}
 		rows[i].LatestError = &msg
@@ -2935,7 +2935,7 @@ func visibleLongParentLeakQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("is_feed_unit = TRUE").
 		Where("feed_visibility = ?", feedVisibilityVisible).
 		Where("status = ?", models.ContentStatusReady).
-		Where("duration_sec > ?", forYouHardMaxDurationSec)
+		Where("duration_sec > ?", podsHardMaxDurationSec)
 }
 
 func visibleFeedDurationViolationQuery(db *gorm.DB, tenantID string) *gorm.DB {
@@ -2945,7 +2945,7 @@ func visibleFeedDurationViolationQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("is_feed_unit = TRUE").
 		Where("feed_visibility = ?", feedVisibilityVisible).
 		Where("status = ?", models.ContentStatusReady).
-		Where("(duration_sec IS NULL OR duration_sec < ? OR duration_sec > ?)", forYouMinDurationSec, forYouHardMaxDurationSec)
+		Where("(duration_sec IS NULL OR duration_sec < ? OR duration_sec > ?)", podsMinDurationSec, podsHardMaxDurationSec)
 }
 
 func validParentFeedUnitQuery(db *gorm.DB, tenantID string) *gorm.DB {
@@ -2953,7 +2953,7 @@ func validParentFeedUnitQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("parent_content_item_id IS NULL").
-		Where("duration_sec BETWEEN ? AND ?", forYouMinDurationSec, atomizationMinParentDurationSec).
+		Where("duration_sec BETWEEN ? AND ?", podsMinDurationSec, atomizationMinParentDurationSec).
 		Where("status = ?", models.ContentStatusReady)
 }
 
@@ -3007,9 +3007,9 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 		"feed_visibility": feedVisibilityHidden,
 		"chaptering_status": gorm.Expr(
 			"CASE WHEN duration_sec > ? AND transcript_id IS NULL THEN ? WHEN duration_sec > ? THEN ? WHEN duration_sec IS NULL THEN ? ELSE ? END",
-			forYouHardMaxDurationSec,
+			podsHardMaxDurationSec,
 			"waiting_transcript",
-			forYouHardMaxDurationSec,
+			podsHardMaxDurationSec,
 			"transcript_ready",
 			"duration_missing",
 			"duration_invalid",
@@ -3039,7 +3039,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("parent_content_item_id IS NOT NULL").
-		Where("duration_sec BETWEEN ? AND ?", forYouMinDurationSec, (5*60)-1).
+		Where("duration_sec BETWEEN ? AND ?", podsMinDurationSec, (5*60)-1).
 		Where("status = ?", models.ContentStatusReady).
 		Where("(chaptering_status = ? OR chaptering_status IS NULL)", chapterStatusPublished).
 		Where("EXISTS (SELECT 1 FROM content_items p WHERE p.public_id = content_items.parent_content_item_id AND p.tenant_id = content_items.tenant_id AND p.duration_sec > ?)", atomizationMinParentDurationSec)
@@ -3062,7 +3062,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
-		Where("(duration_sec IS NULL OR duration_sec < ?)", forYouMinDurationSec).
+		Where("(duration_sec IS NULL OR duration_sec < ?)", podsMinDurationSec).
 		Count(&out.RemainingVisibleUnderFloorCount).Error; err != nil {
 		return out, err
 	}
@@ -3070,7 +3070,7 @@ func repairMediaAtomizationDurationLeaks(db *gorm.DB, tenantID string) (mediaAto
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("is_feed_unit = TRUE AND feed_visibility = ? AND status = ?", feedVisibilityVisible, models.ContentStatusReady).
-		Where("duration_sec > ?", forYouHardMaxDurationSec).
+		Where("duration_sec > ?", podsHardMaxDurationSec).
 		Count(&out.RemainingVisibleOverHardMaxCount).Error; err != nil {
 		return out, err
 	}
@@ -3226,10 +3226,10 @@ func applyAtomizedChapterReviewWithOptions(db *gorm.DB, tenantID string, chapter
 	// publish (§5): the endpoint hard-check is the last line of defense and must
 	// never be bypassed, autopilot or human.
 	if approve {
-		if child.DurationSec == nil || *child.DurationSec < forYouMinDurationSec {
+		if child.DurationSec == nil || *child.DurationSec < podsMinDurationSec {
 			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrInvalidDuration, "Cannot publish a chapter shorter than 4:30"}
 		}
-		if *child.DurationSec > forYouHardMaxDurationSec {
+		if *child.DurationSec > podsHardMaxDurationSec {
 			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrInvalidDuration, "Cannot publish a chapter longer than 40 minutes"}
 		}
 	}
@@ -3268,10 +3268,10 @@ func applyAtomizedChapterReviewWithOptions(db *gorm.DB, tenantID string, chapter
 		if child.Status == models.ContentStatusArchived {
 			return errChapterReviewStale
 		}
-		if approve && (child.DurationSec == nil || *child.DurationSec < forYouMinDurationSec || *child.DurationSec > forYouHardMaxDurationSec) {
+		if approve && (child.DurationSec == nil || *child.DurationSec < podsMinDurationSec || *child.DurationSec > podsHardMaxDurationSec) {
 			return errChapterReviewInvalidDuration
 		}
-		if !approve && len(opts.ExpectedReviewCodes) > 0 && (child.DurationSec == nil || *child.DurationSec >= forYouMinDurationSec) {
+		if !approve && len(opts.ExpectedReviewCodes) > 0 && (child.DurationSec == nil || *child.DurationSec >= podsMinDurationSec) {
 			return errChapterReviewInvalidDuration
 		}
 		if len(opts.ExpectedReviewCodes) > 0 && !sameStudioReviewCodeSet(chapter.NeedsReviewCodes, opts.ExpectedReviewCodes) {

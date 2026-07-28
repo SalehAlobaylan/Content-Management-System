@@ -14,11 +14,11 @@ func SetupFeedRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// token rather than a spoofable ?user_id query param.
 	auth := controllers.OptionalUserAuthMiddleware()
 
-	// For You feed - audio/video content
-	group.GET("/feed/foryou", auth, controllers.GetForYouFeed)
-	group.POST("/feed/foryou/sessions", auth, controllers.CreateForYouFeedSession)
-	group.GET("/feed/foryou/sessions/:id/freshness", auth, controllers.GetForYouFeedSessionFreshness)
-	group.GET("/feed/foryou/sessions/:id", auth, controllers.GetForYouFeedSessionPage)
+	// Pods feed - audio/video content
+	group.GET("/feed/pods", auth, controllers.GetPodsFeed)
+	group.POST("/feed/pods/sessions", auth, controllers.CreatePodsFeedSession)
+	group.GET("/feed/pods/sessions/:id/freshness", auth, controllers.GetPodsFeedSessionFreshness)
+	group.GET("/feed/pods/sessions/:id", auth, controllers.GetPodsFeedSessionPage)
 
 	// News feed - magazine-style slides
 	group.GET("/feed/news", auth, controllers.GetNewsFeed)

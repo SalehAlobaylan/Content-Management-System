@@ -235,7 +235,7 @@ func rollupBucket(db *gorm.DB, tenantID string, bucketStart time.Time, keptRelea
 }
 
 func addErrorFreeSessions(db *gorm.DB, tenantID string, start, end time.Time, aggs map[rollupKey]*rollupAgg) {
-	for _, surface := range []string{"foryou", "news"} {
+	for _, surface := range []string{"pods", "news"} {
 		var total int64
 		db.Model(&models.ExperienceEvent{}).
 			Where("tenant_id = ? AND received_at >= ? AND received_at < ? AND surface = ? AND event_type = ?",

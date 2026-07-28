@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestFrozenForYouSessionCursorRoundTrip(t *testing.T) {
+func TestFrozenPodsSessionCursorRoundTrip(t *testing.T) {
 	cursor := frozenSessionCursor(20, 50)
 	if cursor == nil {
 		t.Fatal("expected a cursor before the frozen snapshot is exhausted")
@@ -23,30 +23,30 @@ func TestFrozenForYouSessionCursorRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFrozenForYouSessionCursorRejectsMalformedValues(t *testing.T) {
+func TestFrozenPodsSessionCursorRejectsMalformedValues(t *testing.T) {
 	if _, err := parseFrozenSessionCursor("not-a-cursor"); err == nil {
 		t.Fatal("expected malformed cursor to be rejected")
 	}
 }
 
-func TestHasNewFrozenForYouCandidateOnlyReportsUnseenIDs(t *testing.T) {
+func TestHasNewFrozenPodsCandidateOnlyReportsUnseenIDs(t *testing.T) {
 	first := uuid.New()
 	second := uuid.New()
-	if hasNewFrozenForYouCandidate(
-		[]ForYouItem{{ID: first}},
-		[]ForYouItem{{ID: first}},
+	if hasNewFrozenPodsCandidate(
+		[]PodsItem{{ID: first}},
+		[]PodsItem{{ID: first}},
 	) {
 		t.Fatal("existing candidate must not claim freshness")
 	}
-	if !hasNewFrozenForYouCandidate(
-		[]ForYouItem{{ID: first}},
-		[]ForYouItem{{ID: first}, {ID: second}},
+	if !hasNewFrozenPodsCandidate(
+		[]PodsItem{{ID: first}},
+		[]PodsItem{{ID: first}, {ID: second}},
 	) {
 		t.Fatal("unseen candidate must claim freshness")
 	}
 }
 
-func TestVisibleFrozenForYouPageQueriesContentItems(t *testing.T) {
+func TestVisibleFrozenPodsPageQueriesContentItems(t *testing.T) {
 	sqlDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestVisibleFrozenForYouPageQueriesContentItems(t *testing.T) {
 	mock.ExpectQuery(`SELECT .*public_id.*FROM "content_items"`).
 		WillReturnRows(sqlmock.NewRows([]string{"public_id"}).AddRow(visibleID))
 
-	page, nextOffset := visibleFrozenForYouPage(db, []ForYouItem{
+	page, nextOffset := visibleFrozenPodsPage(db, []PodsItem{
 		{ID: visibleID},
 		{ID: hiddenID},
 	}, 0, 10)

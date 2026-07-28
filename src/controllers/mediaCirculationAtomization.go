@@ -161,7 +161,7 @@ func computeAtomizationLeakRecommendations(db *gorm.DB, tenantID string, overrid
 		}
 		reason := "Atomization leak detected; parent needs admin review."
 		if row.LeakReason == "long_parent_visible" {
-			reason = "Parent is visible raw in For You while over the 40-minute ceiling."
+			reason = "Parent is visible raw in Pods while over the 40-minute ceiling."
 		}
 		out = append(out, circulationRecInput{
 			SubjectID:   row.PublicID,

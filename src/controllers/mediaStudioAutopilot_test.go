@@ -218,8 +218,8 @@ func TestSanitizeMediaStudioAutopilotPolicy_Clamps(t *testing.T) {
 // ----------------------------------------------------------------
 
 func TestDecideStudioChapterPath(t *testing.T) {
-	const shortDur = forYouMinDurationSec - 1
-	const okDur = forYouMinDurationSec + 60
+	const shortDur = podsMinDurationSec - 1
+	const okDur = podsMinDurationSec + 60
 
 	cases := []struct {
 		name    string

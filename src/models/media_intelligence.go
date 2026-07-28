@@ -48,7 +48,7 @@ func (MediaIntelligenceScore) TableName() string {
 	return "media_intelligence_scores"
 }
 
-// MediaDemandStat is one serve-side demand-telemetry window: what the For You
+// MediaDemandStat is one serve-side demand-telemetry window: what the Pods
 // feed actually served (and failed to serve) for one tenant × duration bucket ×
 // hour. Written in batch at feed-assembly time (slice 2), read by the Demand
 // surface (slice 3). The topic axis (slice 6) uses the same shape with a topic

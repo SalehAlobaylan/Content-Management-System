@@ -18,7 +18,7 @@ const RuxSchemaVersion = 1
 
 // ── Allowlisted enums (mirror src/lib/experience/types.ts) ───────────────────
 
-var RuxSurfaces = map[string]bool{"foryou": true, "news": true}
+var RuxSurfaces = map[string]bool{"pods": true, "news": true}
 
 var RuxEventTypes = map[string]bool{
 	"session_started":       true,
@@ -162,7 +162,7 @@ type ExperiencePolicy struct {
 	TenantID                   string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_experience_policies_tenant" json:"tenant_id"`
 	IngestEnabled              bool           `gorm:"not null;default:true" json:"ingest_enabled"`
 	EvaluationEnabled          bool           `gorm:"not null;default:false" json:"evaluation_enabled"`
-	EnabledSurfaces            string         `gorm:"type:varchar(64);not null;default:foryou,news" json:"enabled_surfaces"`
+	EnabledSurfaces            string         `gorm:"type:varchar(64);not null;default:pods,news" json:"enabled_surfaces"`
 	MinSampleFloor             int            `gorm:"not null;default:50" json:"min_sample_floor"`
 	ConfirmWindows             int            `gorm:"not null;default:2" json:"confirm_windows"`
 	ResolveWindows             int            `gorm:"not null;default:3" json:"resolve_windows"`
@@ -184,7 +184,7 @@ func (ExperiencePolicy) TableName() string { return "experience_policies" }
 func DefaultExperiencePolicy(tenantID string) ExperiencePolicy {
 	return ExperiencePolicy{
 		TenantID: tenantID, IngestEnabled: true, EvaluationEnabled: false,
-		EnabledSurfaces: "foryou,news", MinSampleFloor: 50, ConfirmWindows: 2, ResolveWindows: 3,
+		EnabledSurfaces: "pods,news", MinSampleFloor: 50, ConfirmWindows: 2, ResolveWindows: 3,
 		TelemetryFreshnessMinutes: 15, RollupMaxBucketsPerPass: 180, RawRetentionDays: 7,
 		MinuteRollupRetentionHours: 48, HourRollupRetentionDays: 400, MaxReleaseCohorts: 4,
 	}

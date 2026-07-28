@@ -59,6 +59,16 @@ type Story struct {
 	// classified by the same LLM digest call. "general"/unknown render no chip.
 	Category *string `gorm:"type:text" json:"category,omitempty"`
 
+	// Retention freezes a compact story's display membership without changing
+	// the canonical story or content UUIDs.
+	NewsRetentionState    string     `gorm:"type:varchar(24);not null;default:'full'" json:"news_retention_state"`
+	NewsCompactedAt       *time.Time `gorm:"type:timestamp" json:"news_compacted_at,omitempty"`
+	RetainedLeadContentID *uuid.UUID `gorm:"type:uuid" json:"retained_lead_content_id,omitempty"`
+	OriginalMemberCount   int        `gorm:"not null;default:0" json:"original_member_count"`
+	RetainedMemberCount   int        `gorm:"not null;default:0" json:"retained_member_count"`
+	OriginalSourceCount   int        `gorm:"not null;default:0" json:"original_source_count"`
+	RetainedSourceCount   int        `gorm:"not null;default:0" json:"retained_source_count"`
+
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }

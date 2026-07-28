@@ -375,7 +375,7 @@ func assembleStoryNewsFeed(
 	// 3b. Drop already-seen slides (the client reports views against the slide's
 	//     lead member id = the story's newest member). When the session has
 	//     seen EVERYTHING, recycle on a fresh load instead of serving an empty
-	//     feed (mirrors the For You ShowWatchedWhenUnseenExhausted behavior) —
+	//     feed (mirrors the Pods ShowWatchedWhenUnseenExhausted behavior) —
 	//     a blank News tab is never the right answer.
 	if len(seenIDs) > 0 {
 		seenSet := make(map[uuid.UUID]bool, len(seenIDs))

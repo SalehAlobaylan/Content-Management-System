@@ -170,7 +170,7 @@ func ListExperienceRuns(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": runs})
 }
 
-// GET /admin/experience/metrics?surface=foryou — latest per-SLI values + verdict
+// GET /admin/experience/metrics?surface=pods — latest per-SLI values + verdict
 // for the last closed bucket (drives the cockpit's "is it healthy" section).
 func GetExperienceMetrics(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)

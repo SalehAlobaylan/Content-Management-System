@@ -96,7 +96,7 @@ func studioPolicyFixture(t *testing.T, db *gorm.DB, tenantID string, sourcePolic
 	if err := db.Create(&parent).Error; err != nil {
 		t.Fatal(err)
 	}
-	duration := forYouMinDurationSec
+	duration := podsMinDurationSec
 	child := models.ContentItem{TenantID: tenantID, Type: models.ContentTypePodcast, Source: models.SourceTypePodcast, ParentContentItemID: &parent.PublicID, DurationSec: &duration, FeedVisibility: feedVisibilityReview, Status: models.ContentStatusPending}
 	if err := db.Create(&child).Error; err != nil {
 		t.Fatal(err)

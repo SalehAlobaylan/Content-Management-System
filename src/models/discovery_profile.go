@@ -25,7 +25,7 @@ type DiscoveryProfile struct {
 	// Category ('news' | 'media') scopes the profile to a discovery hub. News
 	// profiles only ever match news candidates (RSS/Telegram/X); media profiles
 	// only match media candidates (YouTube/podcast) — promotion is category-
-	// isolated so authority never bleeds across the two For-You/News graphs.
+	// isolated so authority never bleeds across the two Pods/News graphs.
 	Category string `gorm:"type:varchar(16);not null;default:news" json:"category"`
 
 	Enabled              bool       `gorm:"default:true" json:"enabled"`

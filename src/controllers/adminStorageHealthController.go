@@ -368,7 +368,7 @@ func atomizedParentSourceQuery(db *gorm.DB, tenantID string) *gorm.DB {
 		Where("tenant_id = ?", tenantID).
 		Where("parent_content_item_id IS NULL").
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("duration_sec IS NOT NULL AND duration_sec > ?", forYouHardMaxDurationSec).
+		Where("duration_sec IS NOT NULL AND duration_sec > ?", podsHardMaxDurationSec).
 		Where("(storage_tier IS NULL OR storage_tier != 'cold')").
 		Where("COALESCE(file_size_bytes, 0) > 0").
 		Where("EXISTS (SELECT 1 FROM content_items child WHERE child.parent_content_item_id = content_items.public_id AND child.status = ? AND child.is_feed_unit = TRUE)", models.ContentStatusReady).

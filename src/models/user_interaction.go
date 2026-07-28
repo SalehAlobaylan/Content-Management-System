@@ -74,7 +74,7 @@ func (ConsumerRequestIdempotency) TableName() string {
 	return "consumer_request_idempotency"
 }
 
-// ConsumerFeedSession is a short-lived, server-owned frozen For You ordering.
+// ConsumerFeedSession is a short-lived, server-owned frozen Pods ordering.
 // The snapshot is intentionally a CMS concern; mobile stores a local recovery
 // ledger but must not invent ranking continuity by itself.
 type ConsumerFeedSession struct {

@@ -103,7 +103,7 @@ func studioChainAvailable(db *gorm.DB, tenantID string, lastRun *time.Time) bool
 // never atomizes; it asks the lead, whose gates decide). No-op if the parent is
 // ineligible or already has a pending atomize_now recommendation.
 func emitReatomizeRecommendation(db *gorm.DB, tenantID string, parent *models.ContentItem) *models.MediaCirculationRecommendation {
-	if parent == nil || parent.DurationSec == nil || *parent.DurationSec <= forYouHardMaxDurationSec {
+	if parent == nil || parent.DurationSec == nil || *parent.DurationSec <= podsHardMaxDurationSec {
 		return nil // only >40m parents are atomization-eligible
 	}
 	var existing int64

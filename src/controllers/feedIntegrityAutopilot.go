@@ -48,15 +48,15 @@ func feedIntegrityActionSpecFor(f models.FeedIntegrityFinding) feedIntegrityActi
 		spec.Owner, spec.ActionClass, spec.DeepLink = "news-circulation", "news_snapshot.inspect", "/platform/news/circulation"
 	case "inv_news_unlabeled_stale":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "enrichment", "enrichment.review", "/platform/enrichment"
-	case "inv_fy_bounds", "inv_fy_parent_leak", "inv_fy_bucket_mismatch":
+	case "inv_pods_bounds", "inv_pods_parent_leak", "inv_pods_bucket_mismatch":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "media-studio", "media_studio.inspect", "/platform/media/atomization?tab=studio"
-	case "inv_fy_playback_missing", "inv_fy_renditions_malformed", "edge_fy_playback_fields", "probe_url_dead", "probe_hls_manifest":
+	case "inv_pods_playback_missing", "inv_pods_renditions_malformed", "edge_pods_playback_fields", "probe_url_dead", "probe_hls_manifest":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "storage", "storage.inspect", "/platform/storage"
-	case "edge_fy_empty":
+	case "edge_pods_empty":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "media-circulation", "media_circulation.inspect", "/platform/media/circulation"
 	case "edge_news_empty", "edge_news_shape", "edge_news_dup":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "news-circulation", "news_circulation.inspect", "/platform/news/circulation"
-	case "edge_fy_http", "edge_news_http":
+	case "edge_pods_http", "edge_news_http":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "system-health", "system_health.inspect", "/platform/system-health"
 	default:
 		spec.ActionClass = models.FeedIntegrityActionConfirm

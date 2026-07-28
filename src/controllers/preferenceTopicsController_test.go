@@ -12,9 +12,9 @@ func TestPreferenceSettingDomains(t *testing.T) {
 		value float64
 		valid bool
 	}{
-		{"zero disables boost", "w_foryou", 0, true},
-		{"max boost", "w_foryou", 1, true},
-		{"unsafe boost", "w_foryou", 1.01, false},
+		{"zero disables boost", "w_pods", 0, true},
+		{"max boost", "w_pods", 1, true},
+		{"unsafe boost", "w_pods", 1.01, false},
 		{"half life default", "decay_half_life_days", 30, true},
 		{"zero half life", "decay_half_life_days", 0, false},
 		{"negative weight", "weight_like", -0.1, false},

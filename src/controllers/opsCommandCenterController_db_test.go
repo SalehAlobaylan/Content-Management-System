@@ -25,6 +25,7 @@ func opsTestDB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(
 		&models.SystemAutopilotPolicy{}, &models.SystemIncidentEpisode{},
 		&models.FeedIntegrityPolicy{}, &models.FeedIntegrityEpisode{}, &models.FeedIntegrityAction{},
+		&models.RetentionPolicy{}, &models.RetentionRun{}, &models.RetentionAction{},
 		&models.ExperiencePolicy{}, &models.ExperienceEvaluationRun{}, &models.ExperienceIncident{},
 		&models.PipelineAutopilotPolicy{}, &models.EnrichmentAutopilotPolicy{},
 		&models.MediaCirculationPolicy{}, &models.MediaCirculationRecommendation{}, &models.MediaCirculationAction{},

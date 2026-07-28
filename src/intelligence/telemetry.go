@@ -12,7 +12,7 @@ import (
 
 // Serve-side telemetry (grilling Q5 + Q6) — the feed's instrumentation point.
 //
-// Impressions: every item in a For You response counts as one impression.
+// Impressions: every item in a Pods response counts as one impression.
 // This is the interim serve-side proxy; Wahb-Platform viewport events are the
 // planned upgrade (the counter doesn't care where the increment comes from).
 //
@@ -31,7 +31,7 @@ const (
 	demandBucketAll = "all"
 )
 
-// ServeRecord captures one For You response for telemetry purposes.
+// ServeRecord captures one Pods response for telemetry purposes.
 type ServeRecord struct {
 	TenantID       string
 	Items          []models.ContentItem
@@ -182,7 +182,7 @@ func itemBucketLabel(item models.ContentItem) string {
 	return BucketLabelForDuration(*item.DurationSec)
 }
 
-// BucketLabelForDuration maps a duration to the nearest canonical For You
+// BucketLabelForDuration maps a duration to the nearest canonical Pods
 // bucket label.
 func BucketLabelForDuration(durationSec int) string {
 	buckets := []int{5, 10, 15, 20, 30, 40}

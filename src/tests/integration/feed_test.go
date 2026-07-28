@@ -18,13 +18,13 @@ func TestFeedIntegration(t *testing.T) {
 	clearWahbTables()
 	seedTestContent()
 
-	t.Run("Get ForYou Feed", func(t *testing.T) {
-		fmt.Println("  📺 Testing ForYou feed...")
-		req := httptest.NewRequest("GET", "/api/v1/feed/foryou?limit=5", nil)
+	t.Run("Get Pods Feed", func(t *testing.T) {
+		fmt.Println("  📺 Testing Pods feed...")
+		req := httptest.NewRequest("GET", "/api/v1/feed/pods?limit=5", nil)
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
-		fmt.Printf("  📊 ForYou feed response: %d\n", w.Code)
+		fmt.Printf("  📊 Pods feed response: %d\n", w.Code)
 		if w.Code != http.StatusOK {
 			t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
 		}
@@ -43,9 +43,9 @@ func TestFeedIntegration(t *testing.T) {
 			t.Fatalf("unmarshal response: %v", err)
 		}
 
-		fmt.Printf("  📊 Found %d items in ForYou feed\n", len(response.Items))
+		fmt.Printf("  📊 Found %d items in Pods feed\n", len(response.Items))
 		if len(response.Items) == 0 {
-			t.Fatalf("expected at least one item in ForYou feed")
+			t.Fatalf("expected at least one item in Pods feed")
 		}
 
 		// Verify items are VIDEO type
@@ -54,7 +54,7 @@ func TestFeedIntegration(t *testing.T) {
 				t.Fatalf("expected VIDEO or PODCAST type, got %s", item.Type)
 			}
 		}
-		fmt.Println("  ✅ ForYou feed test passed")
+		fmt.Println("  ✅ Pods feed test passed")
 	})
 
 	t.Run("Get News Feed", func(t *testing.T) {
@@ -112,11 +112,11 @@ func TestFeedIntegration(t *testing.T) {
 		fmt.Println("  ✅ News feed test passed")
 	})
 
-	t.Run("ForYou Cursor Pagination", func(t *testing.T) {
+	t.Run("Pods Cursor Pagination", func(t *testing.T) {
 		fmt.Println("  📄 Testing cursor pagination...")
 
 		// First request
-		req1 := httptest.NewRequest("GET", "/api/v1/feed/foryou?limit=2", nil)
+		req1 := httptest.NewRequest("GET", "/api/v1/feed/pods?limit=2", nil)
 		w1 := httptest.NewRecorder()
 		router.ServeHTTP(w1, req1)
 
@@ -134,7 +134,7 @@ func TestFeedIntegration(t *testing.T) {
 		}
 
 		// Second request with cursor
-		req2 := httptest.NewRequest("GET", "/api/v1/feed/foryou?limit=2&cursor="+*resp1.Cursor, nil)
+		req2 := httptest.NewRequest("GET", "/api/v1/feed/pods?limit=2&cursor="+*resp1.Cursor, nil)
 		w2 := httptest.NewRecorder()
 		router.ServeHTTP(w2, req2)
 

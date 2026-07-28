@@ -19,7 +19,7 @@ func validRuxEvent() incomingRuxEvent {
 		PageLoadID:    uuid.NewString(),
 		Sequence:      3,
 		Release:       "2026.07.11.1",
-		Surface:       "foryou",
+		Surface:       "pods",
 	}
 	in.Client.BrowserFamily = "safari"
 	in.Client.BrowserMajor = 18
@@ -34,7 +34,7 @@ func TestValidateRuxEvent_HappyPath(t *testing.T) {
 	if !ok {
 		t.Fatal("expected valid event to pass")
 	}
-	if out.EventType != "playback_started" || out.Surface != "foryou" {
+	if out.EventType != "playback_started" || out.Surface != "pods" {
 		t.Fatalf("unexpected normalization: %+v", out)
 	}
 	if out.BrowserFamily != "safari" || out.BrowserMajor != 18 {

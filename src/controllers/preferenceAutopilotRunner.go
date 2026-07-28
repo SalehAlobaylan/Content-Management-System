@@ -94,7 +94,7 @@ type preferenceSnapshot struct {
 	OldestPendingAgeHours float64 `json:"oldest_pending_age_hours"`
 	HighConfidencePending int     `json:"high_confidence_pending"`
 
-	ForyouCoveragePct float64 `json:"foryou_coverage_pct"`
+	PodsCoveragePct float64 `json:"pods_coverage_pct"`
 	NewsCoveragePct   float64 `json:"news_coverage_pct"`
 	StoryCoveragePct  float64 `json:"story_coverage_pct"`
 	UnmappedBacklog   int64   `json:"unmapped_backlog"`
@@ -142,7 +142,7 @@ func computePreferenceSnapshot(db *gorm.DB, tenantID string, policy models.Prefe
 	// Coverage — mapped subjects over their eligible base. Each closure builds a
 	// FRESH scoped query so the base + mapped counts never share a finished
 	// statement (a fragile GORM reuse trap).
-	snap.ForyouCoveragePct = coveragePct(
+	snap.PodsCoveragePct = coveragePct(
 		func() *gorm.DB {
 			return db.Model(&models.ContentItem{}).Where("tenant_id = ? AND status = ? AND is_feed_unit = ? AND feed_visibility = ? AND type IN ?",
 				tenantID, models.ContentStatusReady, true, "visible", []string{"VIDEO", "PODCAST"})
@@ -195,7 +195,7 @@ func computePreferenceSnapshot(db *gorm.DB, tenantID string, policy models.Prefe
 	}
 
 	settings := loadPreferenceSettings(db, tenantID)
-	snap.FlipGates["foryou_enabled"] = buildFlipGate("foryou_enabled", settings.ForYouEnabled, snap.ForyouCoveragePct, policy.CoverageFloorForyouPct, snap.BoostSanity)
+	snap.FlipGates["pods_enabled"] = buildFlipGate("pods_enabled", settings.PodsEnabled, snap.PodsCoveragePct, policy.CoverageFloorPodsPct, snap.BoostSanity)
 	snap.FlipGates["news_enabled"] = buildFlipGate("news_enabled", settings.NewsEnabled, snap.NewsCoveragePct, policy.CoverageFloorNewsPct, snap.BoostSanity)
 	return snap
 }
@@ -980,11 +980,11 @@ func computePreferenceVerdict(snap preferenceSnapshot, scored []proposalScore, r
 		snap.HighConfidencePending = c
 	}
 
-	foryou := snap.FlipGates["foryou_enabled"]
+	pods := snap.FlipGates["pods_enabled"]
 	news := snap.FlipGates["news_enabled"]
-	coverageGap := (foryou.Enabled && foryou.CoveragePct < float64(foryou.FloorPct)) ||
+	coverageGap := (pods.Enabled && pods.CoveragePct < float64(pods.FloorPct)) ||
 		(news.Enabled && news.CoveragePct < float64(news.FloorPct))
-	flipEligible := (!foryou.Enabled && foryou.State == "green") || (!news.Enabled && news.State == "green")
+	flipEligible := (!pods.Enabled && pods.State == "green") || (!news.Enabled && news.State == "green")
 	backlog := snap.PendingProposals > int64(policy.MaxPendingProposals) || snap.OldestPendingAgeHours > 168
 
 	switch {
@@ -1005,14 +1005,14 @@ func computePreferenceVerdict(snap preferenceSnapshot, scored []proposalScore, r
 		recommended = fmt.Sprintf("Review %d ranked proposal(s) (%d high-confidence).", snap.PendingProposals, snap.HighConfidencePending)
 	case flipEligible:
 		headline = models.PreferenceAutopilotHeadlineFlipEligible
-		recommended = flipRecommendation(foryou, news)
+		recommended = flipRecommendation(pods, news)
 	default:
 		headline = models.PreferenceAutopilotHeadlineCurationCurrent
 		recommended = "Nothing needed — catalog current, coverage healthy."
 	}
 
-	summary = fmt.Sprintf("For You coverage %.0f%% (%s), News %.0f%% (%s); %d pending (%d high-conf); %d dead, %d null-centroid, %d dup pairs.",
-		snap.ForyouCoveragePct, foryou.State, snap.NewsCoveragePct, news.State,
+	summary = fmt.Sprintf("Pods coverage %.0f%% (%s), News %.0f%% (%s); %d pending (%d high-conf); %d dead, %d null-centroid, %d dup pairs.",
+		snap.PodsCoveragePct, pods.State, snap.NewsCoveragePct, news.State,
 		snap.PendingProposals, snap.HighConfidencePending, snap.DeadTopics, snap.NullCentroidTopics, snap.NearDuplicatePairs)
 	return headline, summary, recommended
 }
@@ -1026,9 +1026,9 @@ func integrityRecommendation(snap preferenceSnapshot) string {
 	}
 }
 
-func flipRecommendation(foryou, news preferenceFlipGate) string {
-	if !foryou.Enabled && foryou.State == "green" {
-		return "Flip foryou_enabled — mapping coverage clears the floor."
+func flipRecommendation(pods, news preferenceFlipGate) string {
+	if !pods.Enabled && pods.State == "green" {
+		return "Flip pods_enabled — mapping coverage clears the floor."
 	}
 	if !news.Enabled && news.State == "green" {
 		return "Flip news_enabled — mapping coverage clears the floor."

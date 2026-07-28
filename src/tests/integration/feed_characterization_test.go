@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 )
 
-type characterizationForYouResponse struct {
+type characterizationPodsResponse struct {
 	Cursor *string `json:"cursor"`
 	Items  []struct {
 		ID          string `json:"id"`
@@ -23,15 +23,15 @@ type characterizationForYouResponse struct {
 	} `json:"items"`
 }
 
-func TestForYouFeed_OnlyReadyItems(t *testing.T) {
-	fmt.Println("📺 Characterizing ForYou READY filtering")
+func TestPodsFeed_OnlyReadyItems(t *testing.T) {
+	fmt.Println("📺 Characterizing Pods READY filtering")
 	clearWahbTables()
 
-	readyOne := seedCharacterizationMediaItem(t, "Ready ForYou One", models.ContentStatusReady, 300, time.Now())
-	readyTwo := seedCharacterizationMediaItem(t, "Ready ForYou Two", models.ContentStatusReady, 420, time.Now().Add(-time.Minute))
-	processing := seedCharacterizationMediaItem(t, "Processing ForYou", models.ContentStatusProcessing, 360, time.Now().Add(-2*time.Minute))
+	readyOne := seedCharacterizationMediaItem(t, "Ready Pods One", models.ContentStatusReady, 300, time.Now())
+	readyTwo := seedCharacterizationMediaItem(t, "Ready Pods Two", models.ContentStatusReady, 420, time.Now().Add(-time.Minute))
+	processing := seedCharacterizationMediaItem(t, "Processing Pods", models.ContentStatusProcessing, 360, time.Now().Add(-2*time.Minute))
 
-	response := getCharacterizationForYouFeed(t, "/api/v1/feed/foryou?limit=10")
+	response := getCharacterizationPodsFeed(t, "/api/v1/feed/pods?limit=10")
 	ids := characterizationIDs(response.Items)
 
 	if !ids[readyOne.PublicID.String()] || !ids[readyTwo.PublicID.String()] {
@@ -42,15 +42,15 @@ func TestForYouFeed_OnlyReadyItems(t *testing.T) {
 	}
 }
 
-func TestForYouFeed_DurationBounds(t *testing.T) {
-	fmt.Println("⏱️  Characterizing ForYou duration bounds")
+func TestPodsFeed_DurationBounds(t *testing.T) {
+	fmt.Println("⏱️  Characterizing Pods duration bounds")
 	clearWahbTables()
 
-	tooShort := seedCharacterizationMediaItem(t, "Too Short ForYou", models.ContentStatusReady, 200, time.Now())
-	valid := seedCharacterizationMediaItem(t, "Valid ForYou", models.ContentStatusReady, 300, time.Now().Add(-time.Minute))
-	tooLong := seedCharacterizationMediaItem(t, "Too Long ForYou", models.ContentStatusReady, 2500, time.Now().Add(-2*time.Minute))
+	tooShort := seedCharacterizationMediaItem(t, "Too Short Pods", models.ContentStatusReady, 200, time.Now())
+	valid := seedCharacterizationMediaItem(t, "Valid Pods", models.ContentStatusReady, 300, time.Now().Add(-time.Minute))
+	tooLong := seedCharacterizationMediaItem(t, "Too Long Pods", models.ContentStatusReady, 2500, time.Now().Add(-2*time.Minute))
 
-	response := getCharacterizationForYouFeed(t, "/api/v1/feed/foryou?limit=10")
+	response := getCharacterizationPodsFeed(t, "/api/v1/feed/pods?limit=10")
 	ids := characterizationIDs(response.Items)
 
 	if !ids[valid.PublicID.String()] {
@@ -64,8 +64,8 @@ func TestForYouFeed_DurationBounds(t *testing.T) {
 	}
 }
 
-func TestForYouFeed_CursorPaginationNoDuplicates(t *testing.T) {
-	fmt.Println("📄 Characterizing ForYou cursor pagination")
+func TestPodsFeed_CursorPaginationNoDuplicates(t *testing.T) {
+	fmt.Println("📄 Characterizing Pods cursor pagination")
 	clearWahbTables()
 
 	expected := make(map[string]bool)
@@ -73,7 +73,7 @@ func TestForYouFeed_CursorPaginationNoDuplicates(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		item := seedCharacterizationMediaItem(
 			t,
-			fmt.Sprintf("Paged ForYou %d", i+1),
+			fmt.Sprintf("Paged Pods %d", i+1),
 			models.ContentStatusReady,
 			300+i,
 			now.Add(-time.Duration(i)*time.Minute),
@@ -83,9 +83,9 @@ func TestForYouFeed_CursorPaginationNoDuplicates(t *testing.T) {
 
 	seen := make(map[string]bool)
 	var previousPublishedAt time.Time
-	path := "/api/v1/feed/foryou?limit=2"
+	path := "/api/v1/feed/pods?limit=2"
 	for path != "" {
-		response := getCharacterizationForYouFeed(t, path)
+		response := getCharacterizationPodsFeed(t, path)
 		for _, item := range response.Items {
 			if seen[item.ID] {
 				t.Fatalf("cursor pagination returned duplicate ID: %s", item.ID)
@@ -105,7 +105,7 @@ func TestForYouFeed_CursorPaginationNoDuplicates(t *testing.T) {
 		if response.Cursor == nil {
 			path = ""
 		} else {
-			path = "/api/v1/feed/foryou?limit=2&cursor=" + *response.Cursor
+			path = "/api/v1/feed/pods?limit=2&cursor=" + *response.Cursor
 		}
 	}
 
@@ -231,7 +231,7 @@ func seedCharacterizationNewsStory(t *testing.T, label string, count int, latest
 	}
 }
 
-func getCharacterizationForYouFeed(t *testing.T, path string) characterizationForYouResponse {
+func getCharacterizationPodsFeed(t *testing.T, path string) characterizationPodsResponse {
 	t.Helper()
 
 	req := httptest.NewRequest("GET", path, nil)
@@ -242,7 +242,7 @@ func getCharacterizationForYouFeed(t *testing.T, path string) characterizationFo
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var response characterizationForYouResponse
+	var response characterizationPodsResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}

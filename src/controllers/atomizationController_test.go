@@ -206,7 +206,7 @@ func TestSpaceSiblingChaptersAvoidsAdjacentSiblingsWhenPossible(t *testing.T) {
 	}
 }
 
-func TestForYouEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T) {
+func TestPodsEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T) {
 	sqlDB, _, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("open sqlmock: %v", err)
@@ -218,7 +218,7 @@ func TestForYouEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T
 		t.Fatalf("open gorm: %v", err)
 	}
 
-	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", false).Find(&[]models.ContentItem{})
+	query := podsEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", false).Find(&[]models.ContentItem{})
 	sql := query.Statement.SQL.String()
 	if ok, err := regexp.MatchString(`duration_sec IS NOT NULL AND duration_sec BETWEEN \$[0-9]+ AND \$[0-9]+`, sql); err != nil || !ok {
 		t.Fatalf("query does not enforce duration floor and ceiling: %s", sql)
@@ -230,20 +230,20 @@ func TestForYouEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T
 	foundMax := false
 	for _, v := range query.Statement.Vars {
 		if n, ok := v.(int); ok {
-			if n == forYouMinDurationSec {
+			if n == podsMinDurationSec {
 				foundMin = true
 			}
-			if n == forYouHardMaxDurationSec {
+			if n == podsHardMaxDurationSec {
 				foundMax = true
 			}
 		}
 	}
 	if !foundMin || !foundMax {
-		t.Fatalf("query vars %v do not include min %d and hard max %d", query.Statement.Vars, forYouMinDurationSec, forYouHardMaxDurationSec)
+		t.Fatalf("query vars %v do not include min %d and hard max %d", query.Statement.Vars, podsMinDurationSec, podsHardMaxDurationSec)
 	}
 }
 
-func TestForYouEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testing.T) {
+func TestPodsEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testing.T) {
 	sqlDB, _, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("open sqlmock: %v", err)
@@ -255,7 +255,7 @@ func TestForYouEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testin
 		t.Fatalf("open gorm: %v", err)
 	}
 
-	query := forYouEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", true).Find(&[]models.ContentItem{})
+	query := podsEligibleMediaQuery(db.Session(&gorm.Session{DryRun: true}), "default", true).Find(&[]models.ContentItem{})
 	sql := query.Statement.SQL.String()
 	if !strings.Contains(sql, "is_feed_unit = TRUE") || !strings.Contains(sql, "feed_visibility =") {
 		t.Fatalf("atomized query does not require visible feed units: %s", sql)
@@ -264,16 +264,16 @@ func TestForYouEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testin
 	foundHard := false
 	for _, v := range query.Statement.Vars {
 		if n, ok := v.(int); ok {
-			if n == forYouMinDurationSec {
+			if n == podsMinDurationSec {
 				foundMin = true
 			}
-			if n == forYouHardMaxDurationSec {
+			if n == podsHardMaxDurationSec {
 				foundHard = true
 			}
 		}
 	}
 	if !foundMin || !foundHard {
-		t.Fatalf("atomized query vars %v do not include min %d and hard max %d", query.Statement.Vars, forYouMinDurationSec, forYouHardMaxDurationSec)
+		t.Fatalf("atomized query vars %v do not include min %d and hard max %d", query.Statement.Vars, podsMinDurationSec, podsHardMaxDurationSec)
 	}
 }
 
@@ -304,13 +304,13 @@ func TestVisibleLongParentLeakQueryTargetsOnlyVisibleLongParents(t *testing.T) {
 	}
 	foundHardMax := false
 	for _, v := range query.Statement.Vars {
-		if n, ok := v.(int); ok && n == forYouHardMaxDurationSec {
+		if n, ok := v.(int); ok && n == podsHardMaxDurationSec {
 			foundHardMax = true
 			break
 		}
 	}
 	if !foundHardMax {
-		t.Fatalf("query vars %v do not include hard max %d", query.Statement.Vars, forYouHardMaxDurationSec)
+		t.Fatalf("query vars %v do not include hard max %d", query.Statement.Vars, podsHardMaxDurationSec)
 	}
 }
 
@@ -345,7 +345,7 @@ func TestValidParentFeedUnitQueryDoesNotRequireTranscript(t *testing.T) {
 	foundAtomizationMax := false
 	for _, v := range query.Statement.Vars {
 		if n, ok := v.(int); ok {
-			if n == forYouMinDurationSec {
+			if n == podsMinDurationSec {
 				foundMin = true
 			}
 			if n == atomizationMinParentDurationSec {
@@ -354,6 +354,6 @@ func TestValidParentFeedUnitQueryDoesNotRequireTranscript(t *testing.T) {
 		}
 	}
 	if !foundMin || !foundAtomizationMax {
-		t.Fatalf("query vars %v do not include feed floor %d and atomization max %d", query.Statement.Vars, forYouMinDurationSec, atomizationMinParentDurationSec)
+		t.Fatalf("query vars %v do not include feed floor %d and atomization max %d", query.Statement.Vars, podsMinDurationSec, atomizationMinParentDurationSec)
 	}
 }

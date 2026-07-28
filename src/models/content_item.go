@@ -7,6 +7,7 @@ import (
 	"github.com/lib/pq"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 // ContentType enum
@@ -15,7 +16,7 @@ type ContentType string
 const (
 	// ContentTypeNews is the primary news-feed kind. NEWS items carry a Format
 	// sub-classification (ARTICLE/TWEET/COMMENT) describing the original content
-	// shape. VIDEO/PODCAST are the For-You media kinds.
+	// shape. VIDEO/PODCAST are the Pods media kinds.
 	ContentTypeNews    ContentType = "NEWS"
 	ContentTypeVideo   ContentType = "VIDEO"
 	ContentTypePodcast ContentType = "PODCAST"
@@ -57,7 +58,7 @@ const (
 )
 
 // DefaultCategoryForType picks a source's category from its type. YOUTUBE and
-// PODCAST are media (For You); everything else defaults to news. TELEGRAM is
+// PODCAST are media (Pods); everything else defaults to news. TELEGRAM is
 // genuinely dual — it defaults to news but is meant to be set explicitly.
 func DefaultCategoryForType(t SourceType) string {
 	switch t {
@@ -161,6 +162,15 @@ type ContentItem struct {
 	// (Enrichment LLM label + embedding centroid). NULL until classified.
 	// Distinct from the legacy free-form TopicTags above.
 	StoryID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_story_id" json:"story_id,omitempty"`
+	// News retention preserves canonical UUIDs while allowing old story
+	// membership to become a bounded, readable anchor set. These fields are
+	// NULL for Pods media.
+	NewsRetentionState        *string    `gorm:"type:varchar(24);index:idx_content_items_news_retention_state" json:"news_retention_state,omitempty"`
+	NewsFeedRole              *string    `gorm:"type:varchar(24);index:idx_content_items_news_feed_role" json:"news_feed_role,omitempty"`
+	NewsRepresentativeOrdinal *int16     `gorm:"type:smallint" json:"news_representative_ordinal,omitempty"`
+	NewsCompactedAt           *time.Time `gorm:"type:timestamp" json:"news_compacted_at,omitempty"`
+	NewsRetentionExpiresAt    *time.Time `gorm:"type:timestamp" json:"news_retention_expires_at,omitempty"`
+	NewsCompactionHash        *string    `gorm:"type:char(64)" json:"news_compaction_hash,omitempty"`
 	// Embedding is the Qwen/Qwen3-Embedding-0.6B dense text vector (1024-dim),
 	// populated by Enrichment-Service. Multilingual — strong on Arabic + English.
 	// (Replaced BGE-M3; semantic similarity is dense cosine only.)
@@ -214,7 +224,7 @@ type ContentItem struct {
 	ViewCount    int `gorm:"default:0" json:"view_count"`
 
 	// Exposure telemetry (Ranking/Intelligence, stage 4). Impressions are
-	// counted serve-side today (every item in a For You response = 1
+	// counted serve-side today (every item in a Pods response = 1
 	// impression, batched increment at feed assembly) — an interim proxy until
 	// Wahb-Platform fires real viewport-entry impression events. The value
 	// model's exposure-normalized signals and the exploration state both read
@@ -263,4 +273,21 @@ type ContentItem struct {
 // TableName returns the table name for ContentItem
 func (ContentItem) TableName() string {
 	return "content_items"
+}
+
+// BeforeCreate makes the News retention identity explicit at the CMS ingest
+// boundary. Media rows stay NULL and therefore cannot accidentally enter News
+// retention selectors.
+func (item *ContentItem) BeforeCreate(_ *gorm.DB) error {
+	if item.Type == ContentTypeNews {
+		if item.NewsRetentionState == nil {
+			state := "full"
+			item.NewsRetentionState = &state
+		}
+		if item.NewsFeedRole == nil {
+			role := "full_member"
+			item.NewsFeedRole = &role
+		}
+	}
+	return nil
 }

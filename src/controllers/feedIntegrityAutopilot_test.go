@@ -42,7 +42,7 @@ func TestFeedIntegrityActionModeNeverElevates(t *testing.T) {
 }
 
 func TestFeedIntegrityScopeAndFingerprintAreStable(t *testing.T) {
-	f := models.FeedIntegrityFinding{CheckKey: "probe_url_dead", Feed: "foryou", Variant: "default", TargetType: "content_item", TargetRef: "item-1", Evidence: []byte(`{"url":"https://cdn.example/a.mp4?token=one"}`)}
+	f := models.FeedIntegrityFinding{CheckKey: "probe_url_dead", Feed: "pods", Variant: "default", TargetType: "content_item", TargetRef: "item-1", Evidence: []byte(`{"url":"https://cdn.example/a.mp4?token=one"}`)}
 	first := feedIntegrityFingerprint(f)
 	f.Evidence = []byte(`{"url":"https://cdn.example/a.mp4?token=two"}`)
 	if got := feedIntegrityFingerprint(f); got != first {
@@ -54,7 +54,7 @@ func TestFeedIntegrityScopeAndFingerprintAreStable(t *testing.T) {
 }
 
 func TestFeedIntegrityRegistryKeepsMutationClassesHumanOwned(t *testing.T) {
-	playback := feedIntegrityActionSpecFor(models.FeedIntegrityFinding{CheckKey: "probe_url_dead", Feed: "foryou", Variant: "default", TargetType: "content_item", TargetRef: "item-1"})
+	playback := feedIntegrityActionSpecFor(models.FeedIntegrityFinding{CheckKey: "probe_url_dead", Feed: "pods", Variant: "default", TargetType: "content_item", TargetRef: "item-1"})
 	if playback.AutoEligible || playback.ActionClass != "storage.inspect" {
 		t.Fatalf("playback damage must remain human-owned: %+v", playback)
 	}

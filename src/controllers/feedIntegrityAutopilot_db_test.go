@@ -193,19 +193,19 @@ func TestFeedIntegrityDBOverflowCreatesAggregateBacklogEpisode(t *testing.T) {
 	}
 	findings := make([]models.FeedIntegrityFinding, 0, 25)
 	for i := 0; i < 25; i++ {
-		findings = append(findings, models.FeedIntegrityFinding{RunID: run.ID, TenantID: "tenant-a", Lane: "edge", CheckKey: "edge_fy_bounds_served", Axis: models.FeedIntegrityAxisConsumer, Feed: "foryou", Variant: "default", TargetType: "content_item", TargetRef: "item-" + string(rune('a'+i)), CandidateCount: 1, Status: "violation", Severity: "major"})
+		findings = append(findings, models.FeedIntegrityFinding{RunID: run.ID, TenantID: "tenant-a", Lane: "edge", CheckKey: "edge_pods_bounds_served", Axis: models.FeedIntegrityAxisConsumer, Feed: "pods", Variant: "default", TargetType: "content_item", TargetRef: "item-" + string(rune('a'+i)), CandidateCount: 1, Status: "violation", Severity: "major"})
 	}
 	if err := db.Create(&findings).Error; err != nil {
 		t.Fatal(err)
 	}
 	updateFeedIntegrityEpisodes(db, "tenant-a", policy, run, findings)
 	var regular int64
-	db.Model(&models.FeedIntegrityEpisode{}).Where("tenant_id=? AND check_key=? AND scope NOT LIKE ?", "tenant-a", "edge_fy_bounds_served", "aggregate:%").Count(&regular)
+	db.Model(&models.FeedIntegrityEpisode{}).Where("tenant_id=? AND check_key=? AND scope NOT LIKE ?", "tenant-a", "edge_pods_bounds_served", "aggregate:%").Count(&regular)
 	if regular != 20 {
 		t.Fatalf("expected 20 individual episodes, got %d", regular)
 	}
 	var aggregate models.FeedIntegrityEpisode
-	if err := db.Where("tenant_id=? AND check_key=? AND scope LIKE ?", "tenant-a", "edge_fy_bounds_served", "aggregate:%").First(&aggregate).Error; err != nil {
+	if err := db.Where("tenant_id=? AND check_key=? AND scope LIKE ?", "tenant-a", "edge_pods_bounds_served", "aggregate:%").First(&aggregate).Error; err != nil {
 		t.Fatalf("expected aggregate overflow episode: %v", err)
 	}
 	var evidence struct {

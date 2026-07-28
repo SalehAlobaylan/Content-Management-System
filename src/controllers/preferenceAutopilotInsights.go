@@ -94,7 +94,7 @@ type prefRunHistoryEntry struct {
 
 type prefCoveragePoint struct {
 	StartedAt       time.Time `json:"started_at"`
-	ForyouPct       float64   `json:"foryou_pct"`
+	PodsPct       float64   `json:"pods_pct"`
 	NewsPct         float64   `json:"news_pct"`
 	StoryPct        float64   `json:"story_pct"`
 	UnmappedBacklog int64     `json:"unmapped_backlog"`
@@ -200,13 +200,13 @@ func GetPreferenceAutopilotInsights(c *gin.Context) {
 			entry.Buckets = *b
 		}
 		if before, ok := parsePreferenceSnapshotJSON(r.StatsBefore); ok {
-			entry.CoverageBefore = before.ForyouCoveragePct
+			entry.CoverageBefore = before.PodsCoveragePct
 		}
 		if after, ok := parsePreferenceSnapshotJSON(r.StatsAfter); ok {
-			entry.CoverageAfter = after.ForyouCoveragePct
+			entry.CoverageAfter = after.PodsCoveragePct
 			series = append(series, prefCoveragePoint{
 				StartedAt: r.StartedAt,
-				ForyouPct: after.ForyouCoveragePct, NewsPct: after.NewsCoveragePct, StoryPct: after.StoryCoveragePct,
+				PodsPct: after.PodsCoveragePct, NewsPct: after.NewsCoveragePct, StoryPct: after.StoryCoveragePct,
 				UnmappedBacklog: after.UnmappedBacklog, Pending: after.PendingProposals, QueueDepth: after.RecomputeQueueDepth,
 			})
 		}
@@ -279,7 +279,7 @@ func GetPreferenceAutopilotInsights(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"run_history":      history,
 		"coverage_series":  series,
-		"coverage_floors":  gin.H{"foryou": policy.CoverageFloorForyouPct, "news": policy.CoverageFloorNewsPct, "story": policy.CoverageFloorStoryPct},
+		"coverage_floors":  gin.H{"pods": policy.CoverageFloorPodsPct, "news": policy.CoverageFloorNewsPct, "story": policy.CoverageFloorStoryPct},
 		"guardrail_totals": guardrailTotals,
 		"outcome_totals":   outcomeTotals,
 		"latest_flow":      latest,
@@ -299,7 +299,7 @@ func parsePreferenceSnapshotJSON(raw []byte) (preferenceSnapshot, bool) {
 	}
 	// A legacy/foreign payload that unmarshals but carries no coverage keys shows
 	// as all-zero with no flip gates — treat as unparseable.
-	if snap.FlipGates == nil && snap.ForyouCoveragePct == 0 && snap.ActiveTopics == 0 {
+	if snap.FlipGates == nil && snap.PodsCoveragePct == 0 && snap.ActiveTopics == 0 {
 		return snap, false
 	}
 	return snap, true

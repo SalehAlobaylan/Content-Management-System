@@ -76,7 +76,7 @@ type preferenceSettingDomain struct {
 // a weight/discount/prior; half-life stays strictly positive so decay math is
 // always defined. Keep this table aligned with the Console and migration.
 var preferenceSettingDomains = map[string]preferenceSettingDomain{
-	"w_foryou":             {Min: 0, Max: 1},
+	"w_pods":             {Min: 0, Max: 1},
 	"w_news":               {Min: 0, Max: 1},
 	"weight_complete":      {Min: 0, Max: 5},
 	"weight_bookmark":      {Min: 0, Max: 5},
@@ -92,7 +92,7 @@ var preferenceSettingDomains = map[string]preferenceSettingDomain{
 func defaultPreferenceSettings(tenantID string) models.PreferenceSettings {
 	return models.PreferenceSettings{
 		TenantID:          tenantID,
-		WForYou:           0.30,
+		WPods:           0.30,
 		WNews:             0.15,
 		WeightComplete:    1.0,
 		WeightBookmark:    0.9,
@@ -1275,7 +1275,7 @@ func UpdatePreferenceSettings(c *gin.Context) {
 	}
 	delete(patch, "tenant_id")
 	for key, value := range patch {
-		if key == "foryou_enabled" || key == "news_enabled" {
+		if key == "pods_enabled" || key == "news_enabled" {
 			if _, ok := value.(bool); !ok {
 				c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Boolean setting required: " + key, Code: "INVALID_SETTING_VALUE"})
 				return

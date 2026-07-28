@@ -14,15 +14,15 @@ import (
 	"gorm.io/gorm"
 )
 
-// ForYouResponse is the API response for the For You feed
-type ForYouResponse struct {
+// PodsResponse is the API response for the Pods feed
+type PodsResponse struct {
 	Cursor   *string      `json:"cursor"`
-	Items    []ForYouItem `json:"items"`
+	Items    []PodsItem `json:"items"`
 	CaughtUp bool         `json:"caught_up"`
 }
 
-// ForYouItem represents a single item in the For You feed
-type ForYouItem struct {
+// PodsItem represents a single item in the Pods feed
+type PodsItem struct {
 	ID                   uuid.UUID  `json:"id"`
 	Type                 string     `json:"type"`
 	Title                string     `json:"title"`
@@ -55,18 +55,18 @@ type ForYouItem struct {
 }
 
 const (
-	forYouMinDurationSec     = 4*60 + 30
-	forYouSoftMaxDurationSec = 30 * 60
-	forYouHardMaxDurationSec = 40 * 60
+	podsMinDurationSec     = 4*60 + 30
+	podsSoftMaxDurationSec = 30 * 60
+	podsHardMaxDurationSec = 40 * 60
 )
 
 func hasCursor(pagination *utils.CursorPagination) bool {
 	return pagination != nil && pagination.Cursor != ""
 }
 
-// GetForYouFeed returns the For You feed with cursor-based pagination
-// GET /api/v1/feed/foryou?cursor=xxx&limit=20
-func GetForYouFeed(c *gin.Context) {
+// GetPodsFeed returns the Pods feed with cursor-based pagination
+// GET /api/v1/feed/pods?cursor=xxx&limit=20
+func GetPodsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	deliveryLanguage, ok := parseDeliveryLanguage(c.Query("content_language"))
 	if !ok {
@@ -91,22 +91,22 @@ func GetForYouFeed(c *gin.Context) {
 	userIDStr, sessionID := readIdentity(c)
 	// Repetition suppression is always applied while an identity is present.
 	// The old opt-in exclude_seen query parameter is intentionally ignored for
-	// For You: mobile sessions must not accidentally recycle watched inventory.
+	// Pods: mobile sessions must not accidentally recycle watched inventory.
 	var seenIDs []uuid.UUID
 	if sessionID != "" || userIDStr != "" {
-		seenIDs = fetchForYouSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, "default"), time.Now().UTC())
+		seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, "default"), time.Now().UTC())
 	}
 
 	// Load ranking config (uses "default" tenant for public feeds)
 	config := loadTenantConfig(db, "default")
 	durationTargetMinutes := parseDurationPreference(c.Query("duration"))
-	atomizedFeedSchema := supportsAtomizedForYouSchema(db)
+	atomizedFeedSchema := supportsAtomizedPodsSchema(db)
 
 	// ------ Ranked path (when intelligence is active) ------
 	if config.IsActive {
 		// Fetch items for ranking — try time window first, then fall back to all
 		var allItems []models.ContentItem
-		baseQuery := forYouEligibleMediaQuery(db, "default", atomizedFeedSchema)
+		baseQuery := podsEligibleMediaQuery(db, "default", atomizedFeedSchema)
 		baseQuery = applyDeliveryLanguage(baseQuery, deliveryLanguage)
 		baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
 
@@ -216,14 +216,14 @@ func GetForYouFeed(c *gin.Context) {
 			likedMap, bookmarkedMap = getInteractionStatus(db, items, sessionID, userIDStr)
 		}
 
-		responseItems := make([]ForYouItem, len(items))
+		responseItems := make([]PodsItem, len(items))
 		for i, item := range items {
-			responseItems[i] = mapToForYouItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
+			responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
 		}
 
-		c.JSON(http.StatusOK, ForYouResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination)})
+		c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination)})
 		if !isFeedIntegritySynthetic(c) {
-			recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+			recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
 		}
 		boosted := int64(0)
 		for _, item := range pageItems {
@@ -242,7 +242,7 @@ func GetForYouFeed(c *gin.Context) {
 	// Query for VIDEO and PODCAST content with a valid media URL.
 	// Use COALESCE(published_at, created_at) so items with NULL published_at
 	// are still ordered and reachable by cursor pagination.
-	query := applyDeliveryLanguage(forYouEligibleMediaQuery(db, "default", atomizedFeedSchema), deliveryLanguage).
+	query := applyDeliveryLanguage(podsEligibleMediaQuery(db, "default", atomizedFeedSchema), deliveryLanguage).
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 	query = applyDurationPreference(query, durationTargetMinutes)
 
@@ -306,25 +306,25 @@ func GetForYouFeed(c *gin.Context) {
 	}
 
 	// Map to response
-	responseItems := make([]ForYouItem, len(items))
+	responseItems := make([]PodsItem, len(items))
 	for i, item := range items {
-		responseItems[i] = mapToForYouItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
+		responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
 	}
 
-	c.JSON(http.StatusOK, ForYouResponse{
+	c.JSON(http.StatusOK, PodsResponse{
 		Cursor:   nextCursor,
 		Items:    responseItems,
 		CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
 	})
 	if !isFeedIntegritySynthetic(c) {
-		recordForYouServe(db, items, pagination.Limit, durationTargetMinutes)
+		recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
 		recordPreferenceServes(db, "default", preferenceEligible, int64(boosted), int64(len(items)))
 	}
 }
 
 // excludeCollapsedRedundancyMembers is deliberately an inventory filter, not
 // cursor/session state: once a human confirms a family, only its canonical
-// member may enter For You until the family is dissolved or collapse is off.
+// member may enter Pods until the family is dissolved or collapse is off.
 func excludeCollapsedRedundancyMembers(db *gorm.DB, tenantID string, items []models.ContentItem) []models.ContentItem {
 	if len(items) == 0 {
 		return items
@@ -355,11 +355,11 @@ func excludeCollapsedRedundancyMembers(db *gorm.DB, tenantID string, items []mod
 	return filtered
 }
 
-// recordForYouServe fires the Ranking/Intelligence serve-side telemetry
-// (impressions + demand stats) for one For You response. Runs after the
+// recordPodsServe fires the Ranking/Intelligence serve-side telemetry
+// (impressions + demand stats) for one Pods response. Runs after the
 // response is written and in its own goroutine — the serve path never waits
 // on telemetry.
-func recordForYouServe(db *gorm.DB, items []models.ContentItem, requestedLimit, durationTargetMinutes int) {
+func recordPodsServe(db *gorm.DB, items []models.ContentItem, requestedLimit, durationTargetMinutes int) {
 	served := make([]models.ContentItem, len(items))
 	copy(served, items)
 	durationBucket := ""
@@ -551,16 +551,16 @@ func applyDurationPreference(query *gorm.DB, targetMinutes int) *gorm.DB {
 	targetSec := targetMinutes * 60
 	minSec := int(float64(targetSec) * 0.6)
 	maxSec := int(float64(targetSec) * 1.6)
-	if minSec < forYouMinDurationSec {
-		minSec = forYouMinDurationSec
+	if minSec < podsMinDurationSec {
+		minSec = podsMinDurationSec
 	}
-	if maxSec > forYouHardMaxDurationSec {
-		maxSec = forYouHardMaxDurationSec
+	if maxSec > podsHardMaxDurationSec {
+		maxSec = podsHardMaxDurationSec
 	}
 	return query.Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", minSec, maxSec)
 }
 
-func supportsAtomizedForYouSchema(db *gorm.DB) bool {
+func supportsAtomizedPodsSchema(db *gorm.DB) bool {
 	return db.Migrator().HasColumn(&models.ContentItem{}, "is_feed_unit") &&
 		db.Migrator().HasColumn(&models.ContentItem{}, "feed_visibility") &&
 		db.Migrator().HasColumn(&models.ContentItem{}, "playback_url")
@@ -570,7 +570,7 @@ func supportsStorageStateSchema(db *gorm.DB) bool {
 	return db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
 }
 
-func forYouEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema bool) *gorm.DB {
+func podsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema bool) *gorm.DB {
 	storageUnavailableStates := []string{
 		models.StorageStateRecoverableDeleted,
 		models.StorageStateMissing,
@@ -582,7 +582,7 @@ func forYouEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema b
 			Where("tenant_id = ?", tenantID).
 			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-			Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).
+			Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", podsMinDurationSec, podsHardMaxDurationSec).
 			Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
 		if supportsStorageStateSchema(db) {
 			q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
@@ -594,7 +594,7 @@ func forYouEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema b
 		Where("tenant_id = ?", tenantID).
 		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
 		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-		Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", forYouMinDurationSec, forYouHardMaxDurationSec).
+		Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", podsMinDurationSec, podsHardMaxDurationSec).
 		Where("is_feed_unit = TRUE AND feed_visibility = ?", feedVisibilityVisible).
 		Where("COALESCE(playback_url, media_url) IS NOT NULL AND COALESCE(playback_url, media_url) != '' AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
 	if supportsStorageStateSchema(db) {
@@ -656,8 +656,8 @@ func spaceScoredSiblingChapters(items []ScoredItem) []ScoredItem {
 	return out
 }
 
-func mapToForYouItem(item models.ContentItem, isLiked, isBookmarked bool) ForYouItem {
-	result := ForYouItem{
+func mapToPodsItem(item models.ContentItem, isLiked, isBookmarked bool) PodsItem {
+	result := PodsItem{
 		ID:           item.PublicID,
 		Type:         string(item.Type),
 		LikeCount:    item.LikeCount,
