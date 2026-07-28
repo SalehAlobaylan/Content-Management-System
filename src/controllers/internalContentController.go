@@ -47,6 +47,7 @@ type internalCreateContentItemResponse struct {
 	ID        string `json:"id"`
 	Status    string `json:"status"`
 	Created   bool   `json:"created"`
+	Retired   bool   `json:"retired,omitempty"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -309,6 +310,24 @@ func InternalCreateContentItem(c *gin.Context) {
 			format = &f
 		}
 		kind = models.ContentTypeNews
+	}
+	if kind == models.ContentTypeNews {
+		identity, identityErr := retentionTombstoneIdentityForIngest(retentionV1Tenant, idempotencyKey, req.OriginalURL)
+		if identityErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid News ingest identity"})
+			return
+		}
+		var tombstone models.NewsIngestTombstone
+		if err := db.Where("tenant_id = ? AND identity_hash = ?", retentionV1Tenant, identity).First(&tombstone).Error; err == nil {
+			c.JSON(http.StatusOK, internalCreateContentItemResponse{
+				ID: tombstone.OriginalContentID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true,
+				CreatedAt: tombstone.CreatedAt.UTC().Format(time.RFC3339),
+			})
+			return
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check retired News identity"})
+			return
+		}
 	}
 
 	item := models.ContentItem{
@@ -1039,6 +1058,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 	// re-embedded so the corpus converges on the current embedder.
 	if err := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).
+		Where("type <> ? OR COALESCE(news_retention_state, 'full') = 'full'", models.ContentTypeNews).
 		Where("embedding IS NULL OR embedding_model IS NULL").
 		Order("created_at ASC").
 		Limit(limit).
@@ -1079,6 +1099,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string) []internalKNNHit {
 	q := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).
+		Where("type <> ? OR COALESCE(news_retention_state, 'full') = 'full'", models.ContentTypeNews).
 		Where(column + " IS NOT NULL")
 	if column == "embedding" {
 		q = q.Where("embedding_space_id = ?", spaceID)

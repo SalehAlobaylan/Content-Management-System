@@ -56,13 +56,16 @@ const (
 const storyFeedColumns = "id, public_id, tenant_id, type, format, source, status, " +
 	"title, LEFT(body_text, 600) AS body_text, excerpt, author, source_name, " +
 	"thumbnail_url, duration_sec, topic_tags, story_id, transcript_id, source_feed_url, " +
-	"like_count, comment_count, share_count, view_count, published_at, created_at"
+	"like_count, comment_count, share_count, view_count, news_retention_state, news_feed_role, " +
+	"news_representative_ordinal, published_at, created_at"
 
 // topicMetaColumns omits the topic centroid (vector(1024) ≈ 12KB wire text per
 // row) — feed reads need labels/counts/related_ids only; the kNN fallback
 // fetches the one centroid it needs on demand.
 const topicMetaColumns = "id, public_id, tenant_id, label, article_count, " +
-	"labeled, last_member_at, related_ids, summary, bullets, summary_built_at, category, created_at, updated_at"
+	"labeled, last_member_at, related_ids, summary, bullets, summary_built_at, category, " +
+	"news_retention_state, retained_lead_content_id, original_member_count, retained_member_count, " +
+	"original_source_count, retained_source_count, created_at, updated_at"
 
 // storyScoreColumns is the SCORING projection: the 1000-row candidate pool
 // only feeds ScoreItems + story aggregation, so it carries no display text at
@@ -71,7 +74,13 @@ const topicMetaColumns = "id, public_id, tenant_id, label, article_count, " +
 // stay: the ranking engine reads them as quality/diversity signals.
 const storyScoreColumns = "public_id, tenant_id, type, source, status, story_id, " +
 	"topic_tags, transcript_id, duration_sec, source_name, thumbnail_url, " +
-	"like_count, comment_count, share_count, view_count, published_at, created_at"
+	"like_count, comment_count, share_count, view_count, news_retention_state, news_feed_role, " +
+	"published_at, created_at"
+
+// News compact anchors are public only when they are the frozen lead or one
+// of the bounded representatives. protected_only rows stay addressable for
+// their owner but must never leak through scoring, hydration, or related cards.
+const newsRetentionFeedPredicate = "(COALESCE(news_retention_state, 'full') = 'full' OR news_feed_role IN ('lead', 'representative'))"
 
 // StoryMember is one post (NEWS item) inside a story.
 type StoryMember struct {
@@ -232,6 +241,7 @@ func assembleStoryNewsFeed(
 	db.Select(storyScoreColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IS NOT NULL",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady).
+		Where(newsRetentionFeedPredicate).
 		Where("COALESCE(published_at, created_at) > ?", windowStart).
 		Order("COALESCE(published_at, created_at) DESC").
 		Limit(storyMemberPoolLimit).
@@ -240,6 +250,10 @@ func assembleStoryNewsFeed(
 	if len(members) == 0 {
 		return []StorySlide{}, nil
 	}
+	// Retention state is part of the story read contract. Fetch it before any
+	// window/seen filtering so compact stories use their frozen lead identity
+	// and original last-member cursor, not the newest retained row.
+	topicByID := <-topicsCh
 
 	contentIDs := extractPublicIDs(members)
 	flagMap := LoadContentFlags(db, tenantID, contentIDs)
@@ -268,6 +282,21 @@ func assembleStoryNewsFeed(
 		if t := itemTime(s.Item); t.After(a.newest) {
 			a.newest = t
 			a.newestID = s.Item.PublicID
+		}
+	}
+	for _, a := range order {
+		topic, ok := topicByID[a.storyID]
+		if !ok || topic.NewsRetentionState == "full" {
+			continue
+		}
+		if topic.LastMemberAt != nil {
+			a.newest = *topic.LastMemberAt
+		}
+		for _, member := range a.members {
+			if derefStr(member.NewsFeedRole) == "lead" {
+				a.newestID = member.PublicID
+				break
+			}
 		}
 	}
 
@@ -408,7 +437,6 @@ func assembleStoryNewsFeed(
 	//     up gracefully (don't bury content). Uses the stored related sets —
 	//     no extra queries. topicByID arrives here (fetched concurrently with
 	//     the pool).
-	topicByID := <-topicsCh
 	if len(order) > 2 {
 		siblingSets := make(map[uuid.UUID]map[uuid.UUID]bool, len(order))
 		siblings := func(id uuid.UUID) map[uuid.UUID]bool {
@@ -504,6 +532,7 @@ func assembleStoryNewsFeed(
 	db.Select(storyFeedColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IN ?",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady, pageStoryIDs).
+		Where(newsRetentionFeedPredicate).
 		Where("COALESCE(published_at, created_at) > ?", windowStart).
 		Order("COALESCE(published_at, created_at) DESC").
 		Limit(maxHydrate).
@@ -597,10 +626,21 @@ func buildStoryFeatured(topic models.Story, ag *storyAgg, members []models.Conte
 	})
 
 	top := topMember(members)
+	if topic.NewsRetentionState != "full" {
+		for _, member := range members {
+			if derefStr(member.NewsFeedRole) == "lead" {
+				top = member
+				break
+			}
+		}
+	}
 	// Story size = the topic's all-time member count (matches the related-story
 	// cards); fall back to the recent members on hand when the centroid count
 	// lags a fresh burst.
 	memberCount := topic.ArticleCount
+	if topic.NewsRetentionState != "full" && topic.RetainedMemberCount > 0 {
+		memberCount = topic.RetainedMemberCount
+	}
 	if memberCount < len(members) {
 		memberCount = len(members)
 	}
@@ -900,8 +940,8 @@ func leadSummariesByStory(
 	var leads []models.ContentItem
 	db.Raw(
 		"SELECT DISTINCT ON (story_id) "+storyFeedColumns+
-			" FROM content_items WHERE tenant_id = ? AND story_id IN ? AND status = ?"+
-			" ORDER BY story_id, like_count*3 + share_count*5 + comment_count*2 DESC",
+			" FROM content_items WHERE tenant_id = ? AND story_id IN ? AND status = ? AND "+newsRetentionFeedPredicate+
+			" ORDER BY story_id, CASE WHEN COALESCE(news_retention_state, 'full') <> 'full' AND news_feed_role = 'lead' THEN 0 ELSE 1 END, like_count*3 + share_count*5 + comment_count*2 DESC",
 		tenantID, storyIDs, models.ContentStatusReady,
 	).Scan(&leads)
 	sourceImageByFeedURL := loadSourceImagesByFeedURL(db, tenantID, leads)
@@ -983,6 +1023,10 @@ func buildRelatedStories(
 func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error) {
 	config := loadTenantConfig(db, tenantID)
 	circ := circulationContextFor(db, tenantID, window, time.Now())
+	generation, err := ensureNewsSnapshotGeneration(db, tenantID, circ.Window.Name)
+	if err != nil {
+		return 0, err
+	}
 	slides, _ := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "", false)
 	if slides == nil {
 		slides = []StorySlide{}
@@ -1001,18 +1045,19 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error)
 		Slides:     datatypes.JSON(data),
 		SlideCount: len(slides),
 		Dirty:      false,
+		Generation: generation,
 		BuiltAt:    time.Now().Truncate(time.Microsecond),
 	}
 	err = db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "window"}},
-		DoUpdates: clause.AssignmentColumns([]string{"slides", "slide_count", "dirty", "built_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"slides", "slide_count", "dirty", "generation", "built_at"}),
 	}).Create(&snap).Error
 	if err != nil {
 		return 0, err
 	}
 	// Seed process memory directly — the next read serves without re-pulling
 	// the JSON it just wrote.
-	newsSnapshotMem.Store(snapshotMemKey(tenantID, circ.Window.Name), &memCachedSnapshot{tenantID: tenantID, window: circ.Window.Name, slides: slides, builtAt: snap.BuiltAt})
+	newsSnapshotMem.Store(snapshotMemKey(tenantID, circ.Window.Name), &memCachedSnapshot{tenantID: tenantID, window: circ.Window.Name, slides: slides, builtAt: snap.BuiltAt, generation: generation})
 	return len(slides), nil
 }
 
@@ -1036,10 +1081,11 @@ const newsSnapshotMaxStale = 15 * time.Minute
 // on every request. The hot path validates with one tiny (dirty, built_at)
 // header query and serves from memory when built_at matches.
 type memCachedSnapshot struct {
-	tenantID string
-	window   string
-	slides   []StorySlide
-	builtAt  time.Time
+	tenantID   string
+	window     string
+	slides     []StorySlide
+	builtAt    time.Time
+	generation int64
 }
 
 var newsSnapshotMem sync.Map
@@ -1049,34 +1095,84 @@ func snapshotMemKey(tenantID, window string) string {
 }
 
 // loadCachedSnapshot returns the cached slides plus their freshness header,
-// preferring process memory (one tiny header query on the hot path). ok=false
-// → no usable cache row at all.
+// preferring process memory after a small shared-generation header query on
+// the hot path. ok=false means there is no usable cache row at all.
+func ensureNewsSnapshotGeneration(db *gorm.DB, tenantID, window string) (int64, error) {
+	window = normalizeNewsWindow(window)
+	row := models.NewsSnapshotGeneration{TenantID: tenantID, Window: window, Generation: 1}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+		return 0, err
+	}
+	if err := db.Select("generation").Where("tenant_id = ? AND \"window\" = ?", tenantID, window).First(&row).Error; err != nil {
+		return 0, err
+	}
+	return row.Generation, nil
+}
+
+// hardInvalidateNewsSnapshots advances a shared DB generation before deleting
+// persisted payloads. Every replica checks this head on every cache read, so a
+// local in-memory value from a prior generation cannot be served elsewhere.
+func hardInvalidateNewsSnapshots(db *gorm.DB, tenantID string) error {
+	windows := []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		for _, window := range windows {
+			if err := tx.Exec(`INSERT INTO news_snapshot_generations (tenant_id, "window", generation, updated_at)
+                VALUES (?, ?, 2, NOW())
+                ON CONFLICT (tenant_id, "window") DO UPDATE
+                SET generation = news_snapshot_generations.generation + 1, updated_at = NOW()`, tenantID, window).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("tenant_id = ? AND \"window\" = ?", tenantID, window).Delete(&models.NewsSnapshot{}).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		evictLocalNewsSnapshots(tenantID)
+	}
+	return err
+}
+
+func evictLocalNewsSnapshots(tenantID string) {
+	for _, window := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
+		newsSnapshotMem.Delete(snapshotMemKey(tenantID, window))
+	}
+}
+
 func loadCachedSnapshot(db *gorm.DB, tenantID string, window string) (slides []StorySlide, builtAt time.Time, dirty bool, ok bool) {
 	window = normalizeNewsWindow(window)
 	var head struct {
-		Dirty   bool
-		BuiltAt time.Time
+		Dirty             bool
+		BuiltAt           time.Time
+		Generation        int64
+		CurrentGeneration int64
 	}
-	if err := db.Model(&models.NewsSnapshot{}).
-		Select("dirty, built_at").
-		Where("tenant_id = ? AND \"window\" = ?", tenantID, window).
+	if err := db.Table("news_snapshots snapshot").
+		Select("snapshot.dirty, snapshot.built_at, snapshot.generation, generation.generation AS current_generation").
+		Joins("JOIN news_snapshot_generations generation ON generation.tenant_id = snapshot.tenant_id AND generation.\"window\" = snapshot.\"window\"").
+		Where("snapshot.tenant_id = ? AND snapshot.\"window\" = ?", tenantID, window).
 		Scan(&head).Error; err != nil || head.BuiltAt.IsZero() {
 		return nil, time.Time{}, false, false
 	}
+	if head.Generation != head.CurrentGeneration {
+		newsSnapshotMem.Delete(snapshotMemKey(tenantID, window))
+		return nil, time.Time{}, false, false
+	}
 	if raw, exists := newsSnapshotMem.Load(snapshotMemKey(tenantID, window)); exists {
-		if mem, ok := raw.(*memCachedSnapshot); ok && mem.tenantID == tenantID && mem.window == window && mem.builtAt.Equal(head.BuiltAt) {
+		if mem, ok := raw.(*memCachedSnapshot); ok && mem.tenantID == tenantID && mem.window == window && mem.builtAt.Equal(head.BuiltAt) && mem.generation == head.CurrentGeneration {
 			return mem.slides, head.BuiltAt, head.Dirty, true
 		}
 	}
 	var snap models.NewsSnapshot
-	if err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, window).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
+	if err := db.Where("tenant_id = ? AND \"window\" = ? AND generation = ?", tenantID, window, head.CurrentGeneration).First(&snap).Error; err != nil || len(snap.Slides) == 0 {
 		return nil, time.Time{}, false, false
 	}
 	var all []StorySlide
 	if json.Unmarshal(snap.Slides, &all) != nil || len(all) == 0 {
 		return nil, time.Time{}, false, false
 	}
-	newsSnapshotMem.Store(snapshotMemKey(tenantID, window), &memCachedSnapshot{tenantID: tenantID, window: window, slides: all, builtAt: snap.BuiltAt})
+	newsSnapshotMem.Store(snapshotMemKey(tenantID, window), &memCachedSnapshot{tenantID: tenantID, window: window, slides: all, builtAt: snap.BuiltAt, generation: head.CurrentGeneration})
 	return all, snap.BuiltAt, snap.Dirty, true
 }
 
@@ -1179,20 +1275,15 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 // Lazily builds the cache on first read if it's missing/empty, and kicks a
 // background rebuild when stale — even the escape hatch never fossilizes.
 func serveNewsSnapshot(db *gorm.DB, tenantID string, circ circulationContext, lastTimestamp time.Time, lastID uuid.UUID, slideLimit int, seenIDs []uuid.UUID) ([]StorySlide, *string) {
-	var snap models.NewsSnapshot
-	err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, circ.Window.Name).First(&snap).Error
-	if err != nil || len(snap.Slides) == 0 {
+	all, builtAt, dirty, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
+	if !ok || len(all) == 0 {
 		_, _ = buildNewsSnapshot(db, tenantID, circ.Window.Name)
-		if err := db.Where("tenant_id = ? AND \"window\" = ?", tenantID, circ.Window.Name).First(&snap).Error; err != nil {
+		all, builtAt, dirty, ok = loadCachedSnapshot(db, tenantID, circ.Window.Name)
+		if !ok {
 			return []StorySlide{}, nil
 		}
-	} else if snap.Dirty || time.Since(snap.BuiltAt) > newsSnapshotTTL {
+	} else if dirty || time.Since(builtAt) > newsSnapshotTTL {
 		startSnapshotRebuild(db, tenantID, circ.Window.Name)
-	}
-
-	var all []StorySlide
-	if len(snap.Slides) == 0 || json.Unmarshal(snap.Slides, &all) != nil {
-		return []StorySlide{}, nil
 	}
 	return paginateStorySlides(all, lastTimestamp, lastID, slideLimit, seenIDs)
 }

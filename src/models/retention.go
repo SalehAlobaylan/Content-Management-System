@@ -201,6 +201,84 @@ type RetentionAction struct {
 
 func (RetentionAction) TableName() string { return "retention_actions" }
 
+// RetentionCompactionManifest freezes a small, tenant-scoped set of News
+// identities before a human can approve a future compaction executor. It has
+// no cascading content relationship so audit evidence survives retirement.
+type RetentionCompactionManifest struct {
+	ID                  uint           `gorm:"primaryKey" json:"-"`
+	PublicID            uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	RunID               uint           `gorm:"not null;index" json:"-"`
+	ActionID            *uint          `gorm:"uniqueIndex" json:"-"`
+	TenantID            string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	PolicyVersion       int            `gorm:"not null" json:"policy_version"`
+	Timezone            string         `gorm:"type:varchar(64);not null" json:"timezone"`
+	ManifestHash        string         `gorm:"type:char(64);not null;uniqueIndex" json:"manifest_hash"`
+	State               string         `gorm:"type:varchar(24);not null;default:'prepared'" json:"state"`
+	StoryIDs            datatypes.JSON `gorm:"type:jsonb;not null" json:"story_ids"`
+	AnchorContentIDs    datatypes.JSON `gorm:"type:jsonb;not null" json:"anchor_content_ids"`
+	ProtectedContentIDs datatypes.JSON `gorm:"type:jsonb;not null" json:"protected_content_ids"`
+	RetireContentIDs    datatypes.JSON `gorm:"type:jsonb;not null" json:"retire_content_ids"`
+	Evidence            datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	StoryCount          int            `gorm:"not null" json:"story_count"`
+	AnchorCount         int            `gorm:"not null" json:"anchor_count"`
+	ProtectedCount      int            `gorm:"not null" json:"protected_count"`
+	RetireCount         int            `gorm:"not null" json:"retire_count"`
+	EstimatedBytes      int64          `gorm:"not null" json:"estimated_bytes"`
+	ExpiresAt           time.Time      `gorm:"not null;index" json:"expires_at"`
+	ApprovedAt          *time.Time     `json:"approved_at,omitempty"`
+	ApprovedBy          string         `gorm:"type:varchar(255)" json:"approved_by,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+}
+
+func (RetentionCompactionManifest) TableName() string { return "retention_compaction_manifests" }
+
+// RetentionCompactionBatch makes the exact one-batch V1 mutation durable. A
+// later multi-batch executor will append indexes rather than rediscovering or
+// widening the manifest.
+type RetentionCompactionBatch struct {
+	ID             uint           `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID       uint           `gorm:"not null;uniqueIndex:idx_retention_compaction_batch_action,priority:1" json:"-"`
+	ManifestID     uint           `gorm:"not null" json:"-"`
+	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	BatchIndex     int            `gorm:"not null;uniqueIndex:idx_retention_compaction_batch_action,priority:2" json:"batch_index"`
+	State          string         `gorm:"type:varchar(32);not null" json:"state"`
+	TargetHash     string         `gorm:"type:char(64);not null" json:"target_hash"`
+	TargetIDs      datatypes.JSON `gorm:"type:jsonb;not null" json:"target_ids"`
+	TargetCount    int            `gorm:"not null" json:"target_count"`
+	EstimatedBytes int64          `gorm:"not null" json:"estimated_bytes"`
+	BeforeEvidence datatypes.JSON `gorm:"type:jsonb" json:"before_evidence,omitempty"`
+	AfterEvidence  datatypes.JSON `gorm:"type:jsonb" json:"after_evidence,omitempty"`
+	Error          string         `gorm:"type:text" json:"error,omitempty"`
+	StartedAt      *time.Time     `json:"started_at,omitempty"`
+	FinishedAt     *time.Time     `json:"finished_at,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+}
+
+func (RetentionCompactionBatch) TableName() string { return "retention_compaction_batches" }
+
+// NewsIngestTombstone retains only irreversibly hashed identity evidence. It
+// never references sources, and its original content UUID is a value so the
+// retention deletion cannot erase the reason a later crawler was rejected.
+type NewsIngestTombstone struct {
+	ID                 uint       `gorm:"primaryKey" json:"-"`
+	PublicID           uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID           string     `gorm:"type:varchar(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:1" json:"tenant_id"`
+	IdentityHash       string     `gorm:"type:char(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:2" json:"identity_hash"`
+	SourceIdentityHash string     `gorm:"type:char(64);not null" json:"source_identity_hash"`
+	OriginalURLHash    string     `gorm:"type:char(64);not null;index" json:"original_url_hash"`
+	OriginalContentID  uuid.UUID  `gorm:"type:uuid;not null" json:"original_content_id"`
+	ManifestHash       string     `gorm:"type:char(64);not null" json:"manifest_hash"`
+	RetirementActionID uint       `gorm:"not null" json:"-"`
+	Reason             string     `gorm:"type:varchar(64);not null" json:"reason"`
+	ReplayConsumedAt   *time.Time `json:"replay_consumed_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}
+
+func (NewsIngestTombstone) TableName() string { return "news_ingest_tombstones" }
+
 type RetentionHold struct {
 	ID            uint       `gorm:"primaryKey" json:"-"`
 	PublicID      uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`

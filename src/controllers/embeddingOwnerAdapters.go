@@ -63,7 +63,7 @@ func advanceCampaignVerification(db *gorm.DB, c *models.EmbeddingCampaign) {
 		StartClassificationBackfill(db)
 		var heldNews, dirtyTopics int64
 		db.Model(&models.ContentItem{}).
-			Where("type = ? AND status = ? AND embedding_space_id = ? AND story_id IS NULL",
+			Where("type = ? AND status = ? AND embedding_space_id = ? AND story_id IS NULL AND COALESCE(news_retention_state, 'full') = 'full'",
 				models.ContentTypeNews, models.ContentStatusReady, es.SpaceID).
 			Count(&heldNews)
 		db.Model(&models.Topic{}).Where("active = ? AND needs_remap = ?", true, true).Count(&dirtyTopics)
@@ -158,7 +158,7 @@ func rebuildStoryCentroid(db *gorm.DB, storyPublicID string, es expectedSpace) (
 	if e := db.Raw(
 		`SELECT COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS total,
 		        COUNT(*) FILTER (WHERE embedding IS NOT NULL AND embedding_space_id = ?) AS current
-		 FROM content_items WHERE story_id = ?`, es.SpaceID, storyPublicID).Scan(&counts).Error; e != nil {
+		 FROM content_items WHERE story_id = ? AND COALESCE(news_retention_state, 'full') = 'full'`, es.SpaceID, storyPublicID).Scan(&counts).Error; e != nil {
 		return "", e
 	}
 	if counts.Total == 0 {
@@ -175,7 +175,7 @@ func rebuildStoryCentroid(db *gorm.DB, storyPublicID string, es expectedSpace) (
 	}
 	if e := db.Raw(
 		`SELECT embedding FROM content_items
-		 WHERE story_id = ? AND embedding IS NOT NULL AND embedding_space_id = ?`,
+		 WHERE story_id = ? AND embedding IS NOT NULL AND embedding_space_id = ? AND COALESCE(news_retention_state, 'full') = 'full'`,
 		storyPublicID, es.SpaceID).Scan(&rows).Error; e != nil {
 		return "", e
 	}

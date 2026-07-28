@@ -23,6 +23,9 @@ type NewsSnapshot struct {
 	// classified into a story (event-driven invalidation). Reads then assemble
 	// live and refresh the cache in the background.
 	Dirty bool `gorm:"default:false" json:"dirty"`
+	// Generation must match the tenant/window generation head before a snapshot
+	// can be served. Retention advances that head before any destructive step.
+	Generation int64 `gorm:"not null;default:1" json:"generation"`
 	// BuiltAt is set EXPLICITLY by buildNewsSnapshot (µs-truncated so the
 	// in-process copy compares Equal to what Postgres returns). No
 	// autoUpdateTime — GORM would overwrite the explicit value on upsert and
@@ -33,3 +36,12 @@ type NewsSnapshot struct {
 func (NewsSnapshot) TableName() string {
 	return "news_snapshots"
 }
+
+type NewsSnapshotGeneration struct {
+	TenantID   string    `gorm:"type:varchar(64);primaryKey" json:"tenant_id"`
+	Window     string    `gorm:"type:varchar(16);primaryKey" json:"window"`
+	Generation int64     `gorm:"not null;default:1" json:"generation"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func (NewsSnapshotGeneration) TableName() string { return "news_snapshot_generations" }

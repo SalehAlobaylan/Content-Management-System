@@ -377,17 +377,20 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/feed-integrity/autopilot/actions/breakers/:class/reset", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
 
 	// Retention Autopilot — database pressure, compact-News preview, and the
-	// human hold/approval ledger. V1 is observe-only and default-tenant scoped.
+	// human hold/approval ledger. Compaction is explicit Assist-only execution
+	// against an already approved, immutable manifest.
 	adminGroup.GET("/retention/status", perm("feed", "read"), controllers.GetRetentionStatus)
 	adminGroup.GET("/retention/policy", perm("feed", "read"), controllers.GetRetentionPolicy)
 	adminGroup.PUT("/retention/policy", perm("feed", "manage"), controllers.UpdateRetentionPolicy)
 	adminGroup.POST("/retention/run", perm("feed", "manage"), controllers.RunRetentionNow)
+	adminGroup.POST("/retention/compaction/prepare", perm("feed", "manage"), controllers.PrepareRetentionCompaction)
 	adminGroup.POST("/retention/pause", perm("feed", "manage"), controllers.PauseRetention)
 	adminGroup.GET("/retention/runs", perm("feed", "read"), controllers.ListRetentionRuns)
 	adminGroup.GET("/retention/runs/:id", perm("feed", "read"), controllers.GetRetentionRun)
 	adminGroup.GET("/retention/runs/:id/actions", perm("feed", "read"), controllers.ListRetentionRunActions)
 	adminGroup.POST("/retention/actions/:id/approve", perm("feed", "manage"), controllers.ApproveRetentionAction)
 	adminGroup.POST("/retention/actions/:id/reject", perm("feed", "manage"), controllers.RejectRetentionAction)
+	adminGroup.POST("/retention/actions/:id/execute", perm("feed", "manage"), controllers.ExecuteRetentionCompaction)
 	adminGroup.GET("/retention/months", perm("feed", "read"), controllers.ListRetentionMonths)
 	adminGroup.GET("/retention/holds", perm("feed", "read"), controllers.ListRetentionHolds)
 	adminGroup.POST("/retention/holds", perm("feed", "manage"), controllers.CreateRetentionHold)
