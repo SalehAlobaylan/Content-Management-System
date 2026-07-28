@@ -5,7 +5,10 @@ package controllers
 // batch; it never discovers targets, widens scope, or touches sources.
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +28,9 @@ import (
 )
 
 const retentionActionExecuteNewsCompaction = "news_database.compact_story"
+
+const retentionRecoveryArtifactTTL = 30 * 24 * time.Hour
+const retentionRecoveryArtifactMaxBytes = 32 * 1024 * 1024
 
 var (
 	errRetentionManifestExpired = errors.New("compaction manifest has expired")
@@ -156,6 +162,103 @@ func createRetentionTombstones(tx *gorm.DB, tenant string, action models.Retenti
 func retentionBatchTargetHash(ids []uuid.UUID) string {
 	raw := idsJSON(uniqueUUIDs(ids))
 	return sha256Hex(string(raw))
+}
+
+// retentionRecoveryPayload deliberately excludes embeddings, media copies and
+// source configuration. It is only the minimum logical News record needed to
+// diagnose or restore an approved, bounded retirement batch.
+type retentionRecoveryPayload struct {
+	Version      int                     `json:"version"`
+	TenantID     string                  `json:"tenant_id"`
+	ManifestHash string                  `json:"manifest_hash"`
+	CreatedAt    time.Time               `json:"created_at"`
+	Items        []retentionRecoveryItem `json:"items"`
+}
+
+type retentionRecoveryItem struct {
+	PublicID       uuid.UUID            `json:"id"`
+	Type           models.ContentType   `json:"type"`
+	Format         *string              `json:"format,omitempty"`
+	Source         models.SourceType    `json:"source"`
+	Status         models.ContentStatus `json:"status"`
+	IdempotencyKey *string              `json:"idempotency_key,omitempty"`
+	Title          *string              `json:"title,omitempty"`
+	BodyText       *string              `json:"body_text,omitempty"`
+	Excerpt        *string              `json:"excerpt,omitempty"`
+	Author         *string              `json:"author,omitempty"`
+	SourceName     *string              `json:"source_name,omitempty"`
+	OriginalURL    *string              `json:"original_url,omitempty"`
+	TopicTags      []string             `json:"topic_tags,omitempty"`
+	Metadata       datatypes.JSON       `json:"metadata,omitempty"`
+	StoryID        *uuid.UUID           `json:"story_id,omitempty"`
+	PublishedAt    *time.Time           `json:"published_at,omitempty"`
+	CreatedAt      time.Time            `json:"created_at"`
+}
+
+func prepareRecoveryArtifact(tenant string, action models.RetentionAction, manifest models.RetentionCompactionManifest, members []models.ContentItem, retireIDs []uuid.UUID, now time.Time) (models.RetentionRecoveryArtifact, error) {
+	retireSet := map[uuid.UUID]bool{}
+	for _, id := range retireIDs {
+		retireSet[id] = true
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].PublicID.String() < members[j].PublicID.String() })
+	// Manifest creation time, rather than execution time, keeps a retry's
+	// checksum/key stable if the database transaction rolls back after upload.
+	payload := retentionRecoveryPayload{Version: 1, TenantID: tenant, ManifestHash: manifest.ManifestHash, CreatedAt: manifest.CreatedAt}
+	for _, item := range members {
+		if !retireSet[item.PublicID] {
+			continue
+		}
+		payload.Items = append(payload.Items, retentionRecoveryItem{PublicID: item.PublicID, Type: item.Type, Format: item.Format, Source: item.Source, Status: item.Status, IdempotencyKey: item.IdempotencyKey, Title: item.Title, BodyText: item.BodyText, Excerpt: item.Excerpt, Author: item.Author, SourceName: item.SourceName, OriginalURL: item.OriginalURL, TopicTags: []string(item.TopicTags), Metadata: item.Metadata, StoryID: item.StoryID, PublishedAt: item.PublishedAt, CreatedAt: item.CreatedAt})
+	}
+	if len(payload.Items) != len(retireIDs) {
+		return models.RetentionRecoveryArtifact{}, errRetentionManifestStale
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return models.RetentionRecoveryArtifact{}, fmt.Errorf("encode recovery artifact: %w", err)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err = writer.Write(raw); err != nil {
+		return models.RetentionRecoveryArtifact{}, err
+	}
+	if err = writer.Close(); err != nil {
+		return models.RetentionRecoveryArtifact{}, err
+	}
+	if compressed.Len() > retentionRecoveryArtifactMaxBytes {
+		return models.RetentionRecoveryArtifact{}, errors.New("recovery artifact exceeds the 32 MiB storage preflight cap")
+	}
+	sum := sha256.Sum256(compressed.Bytes())
+	checksum := hex.EncodeToString(sum[:])
+	key := fmt.Sprintf("system/recovery/%s/%s/%s.json.gz", tenant, manifest.PublicID.String(), checksum)
+	request := map[string]string{"key": key, "sha256": checksum, "payload_base64": base64.StdEncoding.EncodeToString(compressed.Bytes())}
+	_, status, err := callAggregationInternal(http.MethodPost, "/internal/recovery-artifacts", request)
+	if err != nil {
+		return models.RetentionRecoveryArtifact{}, fmt.Errorf("recovery storage preflight: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return models.RetentionRecoveryArtifact{}, fmt.Errorf("recovery storage preflight returned %d", status)
+	}
+	_, verifyStatus, err := callAggregationInternal(http.MethodPost, "/internal/recovery-artifacts/verify", map[string]string{"key": key, "sha256": checksum})
+	if err != nil || verifyStatus < 200 || verifyStatus >= 300 {
+		return models.RetentionRecoveryArtifact{}, fmt.Errorf("recovery artifact readback verification failed")
+	}
+	expiresAt := now.Add(retentionRecoveryArtifactTTL)
+	return models.RetentionRecoveryArtifact{ActionID: action.ID, ManifestID: manifest.ID, TenantID: tenant, ArtifactKey: key, SHA256: checksum, CompressedBytes: int64(compressed.Len()), UncompressedBytes: int64(len(raw)), State: "verified", ExpiresAt: expiresAt, VerifiedAt: &now}, nil
+}
+
+func deleteRecoveryArtifact(key string) error {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	_, status, err := callAggregationInternal(http.MethodDelete, "/internal/recovery-artifacts", map[string]string{"key": key})
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("recovery artifact delete returned %d", status)
+	}
+	return nil
 }
 
 func markRetentionCompactionBlocked(db *gorm.DB, action models.RetentionAction, manifest models.RetentionCompactionManifest, cause error) {
@@ -325,10 +428,31 @@ func advanceNewsSnapshotGenerations(tx *gorm.DB, tenantID string) error {
 	return nil
 }
 
+func recordCompactionMonthlyRollup(tx *gorm.DB, tenant, timezone string, now time.Time) error {
+	if err := ensureCurrentRetentionMonth(tx, tenant, timezone, now); err != nil {
+		return err
+	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		location = time.FixedZone("Asia/Riyadh", 3*60*60)
+	}
+	local := now.In(location)
+	monthStart := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, time.UTC)
+	var stories, retained int64
+	if err := tx.Model(&models.Story{}).Where("tenant_id = ? AND news_retention_state = ? AND news_compacted_at >= ?", tenant, "compact", monthStart).Count(&stories).Error; err != nil {
+		return err
+	}
+	if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND news_retention_state = ? AND news_compacted_at >= ?", tenant, "compact", monthStart).Count(&retained).Error; err != nil {
+		return err
+	}
+	return tx.Model(&models.RetentionMonth{}).Where("tenant_id = ? AND month_start = ?", tenant, monthStart).Updates(map[string]interface{}{"state": "compacting", "state_reason": "bounded compaction executed", "compacted_story_count": stories, "retained_content_count": retained}).Error
+}
+
 func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUID, policy models.RetentionPolicy) (models.RetentionAction, models.RetentionCompactionManifest, retentionManifestPayload, error) {
 	var action models.RetentionAction
 	var manifest models.RetentionCompactionManifest
 	var payload retentionManifestPayload
+	var externalArtifactKey string
 	now := time.Now().UTC()
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -361,6 +485,19 @@ func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUI
 		if err := tx.Create(&batch).Error; err != nil {
 			return fmt.Errorf("create compaction batch: %w", err)
 		}
+		if len(retireIDs) > 0 {
+			artifact, err := prepareRecoveryArtifact(tenant, action, manifest, members, retireIDs, now)
+			if err != nil {
+				return err
+			}
+			externalArtifactKey = artifact.ArtifactKey
+			if err := tx.Create(&artifact).Error; err != nil {
+				return fmt.Errorf("record recovery artifact: %w", err)
+			}
+			if err := tx.Model(&models.RetentionCompactionBatch{}).Where("id = ?", batch.ID).Update("before_evidence", retentionActionEvidence(map[string]interface{}{"manifest_hash": manifest.ManifestHash, "target_count": len(retireIDs), "recovery_ref": artifact.ArtifactKey, "recovery_sha256": artifact.SHA256, "recovery_expires_at": artifact.ExpiresAt})).Error; err != nil {
+				return err
+			}
+		}
 		if err := createRetentionTombstones(tx, tenant, action, manifest, members, retireIDs); err != nil {
 			return err
 		}
@@ -382,6 +519,9 @@ func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUI
 		if err := advanceNewsSnapshotGenerations(tx, tenant); err != nil {
 			return err
 		}
+		if err := recordCompactionMonthlyRollup(tx, tenant, policy.NewsTimezone, now); err != nil {
+			return err
+		}
 		if err := tx.Model(&models.RetentionCompactionManifest{}).Where("id = ?", manifest.ID).Updates(map[string]interface{}{"state": "executed", "updated_at": now}).Error; err != nil {
 			return err
 		}
@@ -393,9 +533,12 @@ func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUI
 		}
 		return tx.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{
 			"action_class": retentionActionExecuteNewsCompaction, "outcome": models.RetentionActionToolSucceeded, "started_at": now, "finished_at": now,
-			"guardrail": "human_approved_exact_manifest_bounded_transaction", "claim_token": nil, "claim_expires_at": nil,
+			"guardrail": "human_approved_exact_manifest_recovery_gated_bounded_transaction", "claim_token": nil, "claim_expires_at": nil, "recovery_ref": externalArtifactKey,
 		}).Error
 	})
+	if err != nil && externalArtifactKey != "" {
+		_ = deleteRecoveryArtifact(externalArtifactKey)
+	}
 	if err == nil {
 		evictLocalNewsSnapshots(tenant)
 		action.ActionClass = retentionActionExecuteNewsCompaction
@@ -429,7 +572,7 @@ func snapshotContainsRetiredID(snapshot models.NewsSnapshot, retired map[uuid.UU
 }
 
 func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.RetentionCompactionManifest, payload retentionManifestPayload) (datatypes.JSON, error) {
-	_, _, _, retireIDs := compactManifestIDs(payload)
+	_, anchors, protected, retireIDs := compactManifestIDs(payload)
 	retired := map[uuid.UUID]bool{}
 	for _, id := range retireIDs {
 		retired[id] = true
@@ -466,6 +609,25 @@ func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.Retent
 	if liveRetirees != 0 {
 		return nil, fmt.Errorf("%d selected retire rows remain", liveRetirees)
 	}
+	retainedIDs := uniqueUUIDs(append(anchors, protected...))
+	var readableAnchors int64
+	if err := db.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id IN ? AND type = ? AND status = ? AND story_id IS NOT NULL", tenant, retainedIDs, models.ContentTypeNews, models.ContentStatusReady).Count(&readableAnchors).Error; err != nil {
+		return nil, err
+	}
+	if readableAnchors != int64(len(retainedIDs)) {
+		return nil, fmt.Errorf("%d retained News detail records are not readable", int64(len(retainedIDs))-readableAnchors)
+	}
+	var retiredInteractions int64
+	if len(retireIDs) > 0 {
+		if err := db.Model(&models.UserInteraction{}).Where("content_item_id IN ?", retireIDs).Count(&retiredInteractions).Error; err != nil {
+			return nil, err
+		}
+	}
+	if retiredInteractions != 0 {
+		return nil, fmt.Errorf("%d interactions still reference retired content", retiredInteractions)
+	}
+	result["retained_detail_count"] = readableAnchors
+	result["retired_interaction_count"] = retiredInteractions
 	var retentionRun models.RetentionRun
 	if err := db.Where("id = ? AND tenant_id = ?", manifest.RunID, tenant).First(&retentionRun).Error; err != nil {
 		return nil, fmt.Errorf("load correlated retention run: %w", err)
@@ -504,7 +666,25 @@ func finalizeCompactionVerification(db *gorm.DB, tenant string, action models.Re
 		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": err.Error(), "finished_at": time.Now().UTC()}).Error
 		return action, err
 	}
-	if err := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerified, "finished_at": time.Now().UTC(), "verification": verification}).Error; err != nil {
+	if err := db.Exec("VACUUM (ANALYZE) content_items").Error; err != nil {
+		maintenanceErr := fmt.Errorf("post-compaction vacuum/analyze: %w", err)
+		_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "maintenance", "error": maintenanceErr.Error()})}).Error
+		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": maintenanceErr.Error(), "finished_at": time.Now().UTC()}).Error
+		return action, maintenanceErr
+	}
+	afterSample, err := collectRetentionDBSample(db, tenant)
+	if err != nil {
+		measurementErr := fmt.Errorf("post-compaction database measurement: %w", err)
+		_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "measurement", "error": measurementErr.Error()})}).Error
+		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": measurementErr.Error(), "finished_at": time.Now().UTC()}).Error
+		return action, measurementErr
+	}
+	var verificationMap map[string]interface{}
+	_ = json.Unmarshal(verification, &verificationMap)
+	verificationMap["maintenance"] = "VACUUM (ANALYZE) content_items"
+	verificationMap["after_database_bytes"] = afterSample.DatabaseBytes
+	verification = retentionActionEvidence(verificationMap)
+	if err := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerified, "finished_at": time.Now().UTC(), "verification": verification, "after_bytes": afterSample.DatabaseBytes}).Error; err != nil {
 		return action, err
 	}
 	_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_passed", "finished_at": time.Now().UTC(), "after_evidence": verification}).Error
@@ -557,6 +737,15 @@ func ExecuteRetentionCompaction(c *gin.Context) {
 	}
 	if !policy.Enabled || policy.Mode != models.RetentionModeAssist {
 		c.JSON(http.StatusConflict, gin.H{"error": "compaction execution requires an enabled Assist-mode retention policy"})
+		return
+	}
+	beforeSample, sampleErr := collectRetentionDBSample(db, principal.TenantID)
+	if sampleErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "pre-compaction database measurement: " + sampleErr.Error()})
+		return
+	}
+	if err := db.Model(&models.RetentionAction{}).Where("id = ?", existing.ID).Update("before_bytes", beforeSample.DatabaseBytes).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "record pre-compaction measurement: " + err.Error()})
 		return
 	}
 

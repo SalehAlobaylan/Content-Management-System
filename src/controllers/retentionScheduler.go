@@ -23,6 +23,7 @@ func StartRetentionHeartbeat(db *gorm.DB) {
 }
 
 func runRetentionDue(db *gorm.DB) {
+	sweepExpiredRetentionRecoveryArtifacts(db)
 	var policies []models.RetentionPolicy
 	if err := db.Where("enabled = TRUE").
 		Order("tenant_id ASC").Limit(100).Find(&policies).Error; err != nil {

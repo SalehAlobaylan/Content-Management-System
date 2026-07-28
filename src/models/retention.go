@@ -259,6 +259,31 @@ type RetentionCompactionBatch struct {
 
 func (RetentionCompactionBatch) TableName() string { return "retention_compaction_batches" }
 
+// RetentionRecoveryArtifact is the CMS ledger for a bounded object owned by
+// Aggregation's storage adapter. It stores only the pointer,
+// checksum, expiry and lifecycle evidence; no duplicate payload is kept in the
+// database that the compaction is trying to reduce.
+type RetentionRecoveryArtifact struct {
+	ID                uint       `gorm:"primaryKey" json:"-"`
+	PublicID          uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID          uint       `gorm:"not null;uniqueIndex" json:"-"`
+	ManifestID        uint       `gorm:"not null;uniqueIndex" json:"-"`
+	TenantID          string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ArtifactKey       string     `gorm:"type:text;not null;uniqueIndex" json:"artifact_key"`
+	SHA256            string     `gorm:"type:char(64);not null" json:"sha256"`
+	CompressedBytes   int64      `gorm:"not null" json:"compressed_bytes"`
+	UncompressedBytes int64      `gorm:"not null" json:"uncompressed_bytes"`
+	State             string     `gorm:"type:varchar(24);not null;index" json:"state"`
+	ExpiresAt         time.Time  `gorm:"not null;index" json:"expires_at"`
+	VerifiedAt        *time.Time `json:"verified_at,omitempty"`
+	DeletedAt         *time.Time `json:"deleted_at,omitempty"`
+	LastError         string     `gorm:"type:text" json:"last_error,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+func (RetentionRecoveryArtifact) TableName() string { return "retention_recovery_artifacts" }
+
 // NewsIngestTombstone retains only irreversibly hashed identity evidence. It
 // never references sources, and its original content UUID is a value so the
 // retention deletion cannot erase the reason a later crawler was rejected.
