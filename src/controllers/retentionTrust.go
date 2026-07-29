@@ -127,9 +127,13 @@ func retentionTrust(db *gorm.DB, tenant, actionClass string, policy models.Reten
 	}
 	stat.FailureWindowEnds = failureSince.Add(24 * time.Hour).UTC().Format(time.RFC3339)
 	db.Model(&models.RetentionAction{}).Where("tenant_id=? AND action_class=? AND mode=? AND outcome=?", tenant, actionClass, models.RetentionModeObserve, models.RetentionActionWouldExecute).Count(&stat.ShadowRuns)
-	db.Model(&models.RetentionAction{}).Where("tenant_id=? AND action_class=? AND mode=? AND outcome IN ?", tenant, actionClass, models.RetentionModeAssist, []string{models.RetentionActionApproved, models.RetentionActionRejected}).Count(&stat.AssistDecisions)
-	db.Model(&models.RetentionAction{}).Where("tenant_id=? AND action_class=? AND mode=? AND outcome=?", tenant, actionClass, models.RetentionModeAssist, models.RetentionActionApproved).Count(&stat.Agreed)
-	db.Model(&models.RetentionAction{}).Where("tenant_id=? AND action_class=? AND mode=? AND outcome=?", tenant, actionClass, models.RetentionModeAssist, models.RetentionActionRejected).Count(&stat.Disagreed)
+	// Decisions are immutable evidence. Execution outcomes intentionally do not
+	// participate here: an approved action may later become running,
+	// verification_failed, or verification_passed without erasing the human
+	// agreement that earned (or failed to earn) trust.
+	db.Model(&models.RetentionActionDecision{}).Where("tenant_id=? AND action_class=? AND mode=? AND decision IN ?", tenant, actionClass, models.RetentionModeAssist, []string{"approved", "rejected"}).Count(&stat.AssistDecisions)
+	db.Model(&models.RetentionActionDecision{}).Where("tenant_id=? AND action_class=? AND mode=? AND decision=?", tenant, actionClass, models.RetentionModeAssist, "approved").Count(&stat.Agreed)
+	db.Model(&models.RetentionActionDecision{}).Where("tenant_id=? AND action_class=? AND mode=? AND decision=?", tenant, actionClass, models.RetentionModeAssist, "rejected").Count(&stat.Disagreed)
 	db.Model(&models.RetentionAction{}).Where("tenant_id=? AND action_class=? AND outcome IN ? AND updated_at > ?", tenant, actionClass, []string{models.RetentionActionToolFailed, models.RetentionActionVerifyFailed}, failureSince).Count(&stat.Failures)
 	if stat.AssistDecisions > 0 {
 		stat.AgreementPct = float64(stat.Agreed) * 100 / float64(stat.AssistDecisions)

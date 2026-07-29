@@ -131,3 +131,40 @@ func TestSelectCompactMembersUsesStableUUIDTieBreak(t *testing.T) {
 		t.Fatalf("tie lead = %s, want lexically smallest UUID", lead.PublicID)
 	}
 }
+
+func TestRetentionStoryCursorRoundTripAndRejectsTampering(t *testing.T) {
+	candidate := retentionStoryCandidate{
+		StoryID:      uuid.MustParse("00000000-0000-0000-0000-0000000000aa"),
+		LastMemberAt: time.Date(2026, 7, 28, 12, 34, 56, 0, time.FixedZone("Riyadh", 3*60*60)),
+	}
+	raw := encodeRetentionStoryCursor(candidate)
+	decoded, err := decodeRetentionStoryCursor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.StoryID != candidate.StoryID || !decoded.LastMemberAt.Equal(candidate.LastMemberAt.UTC()) {
+		t.Fatalf("decoded cursor = %#v, want %#v", decoded, candidate)
+	}
+	if _, err := decodeRetentionStoryCursor(raw + "tampered"); err == nil {
+		t.Fatal("tampered retention cursor was accepted")
+	}
+	if _, err := decodeRetentionStoryCursor("not-a-cursor"); err == nil {
+		t.Fatal("malformed retention cursor was accepted")
+	}
+}
+
+func TestHistoricalCursorRoundTripAndRejectsTampering(t *testing.T) {
+	published := time.Date(2026, 6, 30, 23, 59, 0, 0, time.UTC)
+	item := models.ContentItem{PublicID: uuid.MustParse("00000000-0000-0000-0000-0000000000bb"), PublishedAt: &published, CreatedAt: published.Add(-time.Hour)}
+	raw := encodeHistoricalCursor(item)
+	decoded, err := decodeHistoricalCursor(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ContentID != item.PublicID || !decoded.OrderedAt.Equal(published) {
+		t.Fatalf("decoded historical cursor = %#v", decoded)
+	}
+	if _, err := decodeHistoricalCursor(raw + "tampered"); err == nil {
+		t.Fatal("tampered historical cursor was accepted")
+	}
+}

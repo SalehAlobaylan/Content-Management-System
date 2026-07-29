@@ -52,18 +52,63 @@ type retentionPreview struct {
 }
 
 type retentionStatus struct {
-	Policy       models.RetentionPolicy    `json:"policy"`
-	LatestSample *models.RetentionDBSample `json:"latest_sample,omitempty"`
-	LatestRun    *models.RetentionRun      `json:"latest_run,omitempty"`
-	Forecast     retentionForecast         `json:"forecast"`
-	Verdict      string                    `json:"verdict"`
-	Preview      retentionPreview          `json:"preview"`
-	Paused       bool                      `json:"paused"`
-	ObserveOnly  bool                      `json:"observe_only"`
-	Promotion    retentionPromotionStatus  `json:"promotion"`
-	Trust        []retentionTrustStat      `json:"trust"`
-	Satellite    retentionSatelliteStatus  `json:"satellite_evaluation"`
-	Guarantees   map[string]interface{}    `json:"guarantees"`
+	Policy       models.RetentionPolicy             `json:"policy"`
+	LatestSample *models.RetentionDBSample          `json:"latest_sample,omitempty"`
+	LatestRun    *models.RetentionRun               `json:"latest_run,omitempty"`
+	Forecast     retentionForecast                  `json:"forecast"`
+	Verdict      string                             `json:"verdict"`
+	Preview      retentionPreview                   `json:"preview"`
+	Historical   map[string]interface{}             `json:"historical"`
+	Maintenance  *models.RetentionMaintenanceReport `json:"latest_maintenance,omitempty"`
+	Execution    models.RetentionExecutionControl   `json:"execution_controls"`
+	Paused       bool                               `json:"paused"`
+	ObserveOnly  bool                               `json:"observe_only"`
+	Promotion    retentionPromotionStatus           `json:"promotion"`
+	Trust        []retentionTrustStat               `json:"trust"`
+	Satellite    retentionSatelliteStatus           `json:"satellite_evaluation"`
+	Guarantees   map[string]interface{}             `json:"guarantees"`
+}
+
+const (
+	retentionCapabilityCanonicalCompaction = "canonical_compaction"
+	retentionCapabilityHistorical          = "historical_retirement"
+	retentionCapabilityOwnerRuns           = "owner_runs"
+	retentionCapabilityRecoveryRotate      = "feed_recovery_rotate"
+	retentionCapabilityRecoveryPurge       = "feed_recovery_purge_reseed"
+)
+
+func retentionCapabilityEnabled(control models.RetentionExecutionControl, capability string) bool {
+	switch capability {
+	case retentionCapabilityCanonicalCompaction:
+		return control.CanonicalCompactionEnabled
+	case retentionCapabilityHistorical:
+		return control.HistoricalEnabled
+	case retentionCapabilityOwnerRuns:
+		return control.OwnerRunsEnabled
+	case retentionCapabilityRecoveryRotate:
+		return control.FeedRecoveryRotateEnabled
+	case retentionCapabilityRecoveryPurge:
+		return control.FeedRecoveryPurgeEnabled
+	default:
+		return false
+	}
+}
+
+func requireRetentionCapability(db *gorm.DB, tenant, capability string) error {
+	var control models.RetentionExecutionControl
+	if err := db.Where("tenant_id = ?", tenant).First(&control).Error; err != nil {
+		return fmt.Errorf("safety_remediation_required: execution control is unavailable")
+	}
+	if !retentionCapabilityEnabled(control, capability) {
+		return fmt.Errorf("safety_remediation_required: %s execution is disabled until rollout validation completes", capability)
+	}
+	return nil
+}
+
+func retentionExecutionControlFor(db *gorm.DB, tenant string) models.RetentionExecutionControl {
+	var control models.RetentionExecutionControl
+	_ = db.Where("tenant_id = ?", tenant).First(&control).Error
+	return control
 }
 
 func loadRetentionPolicy(db *gorm.DB, tenant string) models.RetentionPolicy {
@@ -187,6 +232,51 @@ func retentionVerdict(policy models.RetentionPolicy, sample *models.RetentionDBS
 		return models.RetentionVerdictWarning
 	}
 	return models.RetentionVerdictHealthy
+}
+
+func retentionOperationalVerdict(policy models.RetentionPolicy, sample *models.RetentionDBSample, forecast retentionForecast, preview retentionPreview, recoveryInProgress bool) string {
+	if recoveryInProgress {
+		return models.RetentionVerdictRecoveryInProgress
+	}
+	base := retentionVerdict(policy, sample, forecast)
+	if sample == nil {
+		return models.RetentionVerdictInconclusive
+	}
+	if base == models.RetentionVerdictCritical || base == models.RetentionVerdictActionRequired {
+		if preview.CandidateRows > 0 {
+			return models.RetentionVerdictCompactionDue
+		}
+		return models.RetentionVerdictBlocked
+	}
+	if base == models.RetentionVerdictWarning && preview.CandidateRows > 0 {
+		return models.RetentionVerdictCompactionDue
+	}
+	return base
+}
+
+func retentionHistoricalSignal(db *gorm.DB, tenant, timezone string, policy models.RetentionPolicy) (string, map[string]interface{}) {
+	_, err := time.LoadLocation(timezone)
+	if err != nil {
+		return models.RetentionVerdictInconclusive, map[string]interface{}{"error": "invalid_news_timezone"}
+	}
+	monthStart := monthlyStart(time.Now(), timezone)
+	var oldRows int64
+	if err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND type=? AND published_at < ? AND status IN ?", tenant, models.ContentTypeNews, monthStart.UTC(), []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived, models.ContentStatusFailed}).Count(&oldRows).Error; err != nil {
+		return models.RetentionVerdictInconclusive, map[string]interface{}{"error": "historical_inventory_unavailable"}
+	}
+	var finalized int64
+	if err := db.Model(&models.NewsMonthArchive{}).Where("tenant_id=? AND month_start < ? AND finalized_at IS NOT NULL", tenant, monthStart.UTC()).Count(&finalized).Error; err != nil {
+		return models.RetentionVerdictInconclusive, map[string]interface{}{"error": "archive_inventory_unavailable"}
+	}
+	evidence := map[string]interface{}{"month_start": monthStart.Format("2006-01-02"), "old_news_rows": oldRows, "finalized_archives": finalized}
+	if oldRows == 0 {
+		return "", evidence
+	}
+	if finalized == 0 {
+		return models.RetentionVerdictArchiveBlocked, evidence
+	}
+	_ = policy // policy caps are applied by historical preparation, not status reads.
+	return models.RetentionVerdictCleanupDue, evidence
 }
 
 func runwayWithin(runway *float64, horizon float64) bool {
@@ -374,13 +464,48 @@ func retentionStatusFor(db *gorm.DB, tenant string) retentionStatus {
 	policy.NewsTimezone = retentionNewsTimezone(db, tenant)
 	sample, run := retentionLatestState(db, tenant)
 	forecast := calculateRetentionForecast(retentionSamples(db, tenant, 200), policy)
-	preview, _ := previewRetentionNews(db, tenant, policy.NewsTimezone)
+	preview, previewErr := previewRetentionNews(db, tenant, policy.NewsTimezone)
+	var activeRecovery int64
+	activeRecoveryErr := db.Table("feed_availability_states").Where("tenant_id = ? AND state <> 'normal'", tenant).Count(&activeRecovery).Error
 	now := time.Now().UTC()
 	promotion := retentionPromotionFor(db, tenant, policy)
 	satellite := retentionSatelliteEvaluation(db, tenant, policy, sample, forecast)
+	verdict := retentionOperationalVerdict(policy, sample, forecast, preview, activeRecovery > 0)
+	historicalVerdict, historicalEvidence := retentionHistoricalSignal(db, tenant, policy.NewsTimezone, policy)
+	statusReadErrors := []string{}
+	if previewErr != nil {
+		statusReadErrors = append(statusReadErrors, "news_preview_unavailable")
+	}
+	if activeRecoveryErr != nil {
+		statusReadErrors = append(statusReadErrors, "recovery_availability_unavailable")
+	}
+	if len(statusReadErrors) > 0 {
+		historicalEvidence["status_read_errors"] = statusReadErrors
+	}
+	var maintenance *models.RetentionMaintenanceReport
+	var latestMaintenance models.RetentionMaintenanceReport
+	if db.Where("tenant_id=?", tenant).Order("created_at DESC").First(&latestMaintenance).Error == nil {
+		maintenance = &latestMaintenance
+	}
+	if activeRecovery == 0 && verdict != models.RetentionVerdictCritical && verdict != models.RetentionVerdictActionRequired && verdict != models.RetentionVerdictCompactionDue {
+		if historicalVerdict != "" {
+			verdict = historicalVerdict
+		}
+	}
+	if activeRecovery == 0 && maintenance != nil && maintenance.PostgresReady && !maintenance.ProviderReady && verdict == models.RetentionVerdictHealthy {
+		verdict = models.RetentionVerdictMaintenanceRequired
+	}
+	if len(statusReadErrors) > 0 {
+		verdict = models.RetentionVerdictInconclusive
+	}
+	var latestIntegrity models.FeedIntegrityRun
+	if activeRecovery == 0 && db.Where("tenant_id=? AND started_at >= ?", tenant, time.Now().UTC().Add(-24*time.Hour)).Order("started_at DESC").First(&latestIntegrity).Error == nil && (latestIntegrity.Status != models.FeedIntegrityRunCompleted || latestIntegrity.Headline != "all_clear") {
+		verdict = models.RetentionVerdictRecoveryRequired
+	}
 	return retentionStatus{
 		Policy: policy, LatestSample: sample, LatestRun: run, Forecast: forecast,
-		Verdict: retentionVerdict(policy, sample, forecast), Preview: preview,
+		Verdict: verdict, Preview: preview, Historical: historicalEvidence, Maintenance: maintenance,
+		Execution:   retentionExecutionControlFor(db, tenant),
 		Paused:      policy.PausedUntil != nil && policy.PausedUntil.After(now),
 		ObserveOnly: policy.Mode == models.RetentionModeObserve,
 		Promotion:   promotion,
@@ -426,6 +551,83 @@ func GetRetentionPolicy(c *gin.Context) {
 	policy := loadRetentionPolicy(db, principal.TenantID)
 	policy.NewsTimezone = retentionNewsTimezone(db, principal.TenantID)
 	c.JSON(http.StatusOK, gin.H{"data": policy})
+}
+
+func GetRetentionExecutionControl(c *gin.Context) {
+	principal, ok := requireRetentionTenant(c)
+	if !ok {
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	c.JSON(http.StatusOK, gin.H{"data": retentionExecutionControlFor(db, principal.TenantID)})
+}
+
+func UpdateRetentionExecutionControl(c *gin.Context) {
+	principal, ok := requireRetentionTenant(c)
+	if !ok {
+		return
+	}
+	if !principal.HasRole("admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "administrator role required to change execution controls"})
+		return
+	}
+	var patch struct {
+		CanonicalCompactionEnabled *bool  `json:"canonical_compaction_enabled"`
+		HistoricalEnabled          *bool  `json:"historical_enabled"`
+		OwnerRunsEnabled           *bool  `json:"owner_runs_enabled"`
+		FeedRecoveryRotateEnabled  *bool  `json:"feed_recovery_rotate_enabled"`
+		FeedRecoveryPurgeEnabled   *bool  `json:"feed_recovery_purge_enabled"`
+		Reason                     string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&patch); err != nil || len(strings.TrimSpace(patch.Reason)) < 10 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "a reason of at least 10 characters is required"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var control models.RetentionExecutionControl
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=?", principal.TenantID).First(&control).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			control = models.RetentionExecutionControl{TenantID: principal.TenantID}
+			if err := tx.Create(&control).Error; err != nil {
+				return err
+			}
+		}
+		if patch.CanonicalCompactionEnabled != nil {
+			control.CanonicalCompactionEnabled = *patch.CanonicalCompactionEnabled
+		}
+		if patch.HistoricalEnabled != nil {
+			control.HistoricalEnabled = *patch.HistoricalEnabled
+		}
+		if patch.OwnerRunsEnabled != nil {
+			control.OwnerRunsEnabled = *patch.OwnerRunsEnabled
+		}
+		if patch.FeedRecoveryRotateEnabled != nil {
+			control.FeedRecoveryRotateEnabled = *patch.FeedRecoveryRotateEnabled
+		}
+		if patch.FeedRecoveryPurgeEnabled != nil {
+			control.FeedRecoveryPurgeEnabled = *patch.FeedRecoveryPurgeEnabled
+		}
+		control.UpdatedBy = principal.Email
+		control.UpdatedAt = time.Now().UTC()
+		return tx.Model(&control).Updates(map[string]interface{}{
+			"canonical_compaction_enabled": control.CanonicalCompactionEnabled,
+			"historical_enabled":           control.HistoricalEnabled,
+			"owner_runs_enabled":           control.OwnerRunsEnabled,
+			"feed_recovery_rotate_enabled": control.FeedRecoveryRotateEnabled,
+			"feed_recovery_purge_enabled":  control.FeedRecoveryPurgeEnabled,
+			"updated_by":                   control.UpdatedBy,
+			"updated_at":                   control.UpdatedAt,
+		}).Error
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not persist execution control"})
+		return
+	}
+	retentionAudit(db, principal, "retention.execution_control.update", principal.TenantID, "success", map[string]interface{}{"reason": patch.Reason, "control": control})
+	c.JSON(http.StatusOK, gin.H{"data": control})
 }
 
 func UpdateRetentionPolicy(c *gin.Context) {
@@ -836,17 +1038,56 @@ func ApproveRetentionAction(c *gin.Context) {
 		return
 	}
 	now := time.Now().UTC()
-	if err := db.Model(&action).Where("outcome = ?", models.RetentionActionApprovalRequired).
-		Updates(map[string]interface{}{"outcome": models.RetentionActionApproved, "decision": "approved", "approved_at": now, "approved_by": principal.Email}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not approve action"})
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var locked models.RetentionAction
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&locked).Error; err != nil {
+			return err
+		}
+		if locked.Outcome != models.RetentionActionApprovalRequired {
+			return fmt.Errorf("action is no longer awaiting approval")
+		}
+		result := tx.Model(&locked).Where("id = ? AND tenant_id = ? AND outcome = ?", locked.ID, principal.TenantID, models.RetentionActionApprovalRequired).
+			Updates(map[string]interface{}{"outcome": models.RetentionActionApproved, "decision": "approved", "approved_at": now, "approved_by": principal.Email})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("action approval compare-and-set lost a race")
+		}
+		manifestHash := locked.ManifestHash
+		decision := models.RetentionActionDecision{
+			ActionID: locked.ID, TenantID: locked.TenantID, ActionClass: locked.ActionClass,
+			Mode: locked.Mode, Decision: "approved", Actor: principal.Email,
+			ManifestHash: manifestHash, EvidenceFingerprint: locked.EvidenceFingerprint,
+			DecidedAt: now, Evidence: locked.Evidence,
+		}
+		if err := tx.Create(&decision).Error; err != nil {
+			return err
+		}
+		if result := tx.Model(&models.RetentionCompactionManifest{}).Where("action_id = ? AND state = 'prepared'", locked.ID).
+			Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}); result.Error != nil {
+			return result.Error
+		}
+		if result := tx.Model(&models.RetentionHistoricalManifest{}).Where("action_id = ? AND state = 'prepared'", locked.ID).
+			Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}); result.Error != nil {
+			return result.Error
+		}
+		if result := tx.Model(&models.RetentionOwnerRequest{}).Where("action_id = ? AND status = ?", locked.ID, "approval_required").
+			Update("status", "approved"); result.Error != nil {
+			return result.Error
+		}
+		action = locked
+		action.Outcome = models.RetentionActionApproved
+		action.Decision = "approved"
+		action.ApprovedAt = &now
+		action.ApprovedBy = principal.Email
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	_ = db.Model(&models.RetentionCompactionManifest{}).Where("action_id = ?", action.ID).
-		Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}).Error
-	_ = db.Model(&models.RetentionHistoricalManifest{}).Where("action_id = ?", action.ID).
-		Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}).Error
-	_ = db.Model(&models.RetentionOwnerRequest{}).Where("action_id = ? AND status = ?", action.ID, "approval_required").
-		Update("status", "approved").Error
 	retentionAudit(db, principal, "retention.action.approve", action.PublicID.String(), "success", nil)
 	c.JSON(http.StatusOK, gin.H{"data": action})
 }
@@ -870,17 +1111,35 @@ func RejectRetentionAction(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	now := time.Now().UTC()
-	result := db.Model(&models.RetentionAction{}).
-		Where("tenant_id = ? AND public_id = ? AND outcome IN ?", principal.TenantID, id,
-			[]string{models.RetentionActionApprovalRequired, models.RetentionActionApproved}).
-		Updates(map[string]interface{}{"outcome": models.RetentionActionRejected, "decision": "rejected",
-			"rejected_at": now, "rejected_by": principal.Email, "rejection_reason": request.Reason})
-	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not reject action"})
-		return
-	}
-	if result.RowsAffected == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "action is not rejectable"})
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var action models.RetentionAction
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&action).Error; err != nil {
+			return err
+		}
+		if action.Outcome != models.RetentionActionApprovalRequired {
+			return fmt.Errorf("action is not rejectable")
+		}
+		result := tx.Model(&action).Where("id = ? AND tenant_id = ? AND outcome = ?", action.ID, principal.TenantID, models.RetentionActionApprovalRequired).
+			Updates(map[string]interface{}{"outcome": models.RetentionActionRejected, "decision": "rejected",
+				"rejected_at": now, "rejected_by": principal.Email, "rejection_reason": request.Reason})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("action rejection compare-and-set lost a race")
+		}
+		manifestHash := action.ManifestHash
+		return tx.Create(&models.RetentionActionDecision{
+			ActionID: action.ID, TenantID: action.TenantID, ActionClass: action.ActionClass,
+			Mode: action.Mode, Decision: "rejected", Actor: principal.Email,
+			Reason: request.Reason, ManifestHash: manifestHash,
+			EvidenceFingerprint: action.EvidenceFingerprint, DecidedAt: now,
+			Evidence: action.Evidence,
+		}).Error
+	})
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"rejected_at": now}})

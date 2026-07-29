@@ -20,6 +20,10 @@ type FeedRecoveryPlan struct {
 	PlanHash         string         `gorm:"type:char(64);not null" json:"plan_hash"`
 	ManifestHash     string         `gorm:"type:char(64);not null" json:"manifest_hash"`
 	TargetCount      int            `json:"target_count"`
+	TargetRootHash   string         `gorm:"type:char(64)" json:"target_root_hash,omitempty"`
+	TargetScope      string         `gorm:"type:varchar(48)" json:"target_scope,omitempty"`
+	TargetSegments   int            `json:"target_segments,omitempty"`
+	TargetByteSize   int64          `json:"target_byte_size,omitempty"`
 	SourceChecksum   string         `gorm:"type:char(64);not null" json:"source_checksum"`
 	SourceCount      int            `json:"source_count"`
 	Evidence         datatypes.JSON `gorm:"type:jsonb" json:"evidence"`
@@ -34,6 +38,25 @@ type FeedRecoveryPlan struct {
 }
 
 func (FeedRecoveryPlan) TableName() string { return "feed_recovery_plans" }
+
+// FeedRecoveryPlanTarget is the normalized, immutable destructive scope. The
+// JSON purge manifest remains a readable compatibility/proof envelope, while
+// these rows are the authoritative target set for execution and retry.
+type FeedRecoveryPlanTarget struct {
+	ID               uint      `gorm:"primaryKey" json:"-"`
+	PlanID           uint      `gorm:"not null;index;uniqueIndex:idx_feed_recovery_plan_target,priority:1" json:"-"`
+	TenantID         string    `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	Lane             string    `gorm:"type:varchar(16);not null" json:"lane"`
+	TargetType       string    `gorm:"type:varchar(32);not null;uniqueIndex:idx_feed_recovery_plan_target,priority:2" json:"target_type"`
+	TargetID         uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:idx_feed_recovery_plan_target,priority:3" json:"target_id"`
+	Ordinal          int64     `gorm:"not null" json:"ordinal"`
+	Protected        bool      `gorm:"not null;default:false" json:"protected"`
+	ProtectionReason string    `gorm:"type:text" json:"protection_reason,omitempty"`
+	EvidenceHash     string    `gorm:"type:char(64);not null" json:"evidence_hash"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+func (FeedRecoveryPlanTarget) TableName() string { return "feed_recovery_plan_targets" }
 
 type FeedRecoveryRun struct {
 	ID                    uint           `gorm:"primaryKey" json:"-"`
@@ -64,6 +87,18 @@ type FeedRecoveryRun struct {
 }
 
 func (FeedRecoveryRun) TableName() string { return "feed_recovery_runs" }
+
+type FeedRecoveryLaneLease struct {
+	TenantID     string    `gorm:"primaryKey;type:varchar(64)" json:"tenant_id"`
+	Lane         string    `gorm:"primaryKey;type:varchar(16)" json:"lane"`
+	RunID        uint      `gorm:"not null;index" json:"-"`
+	FencingToken uuid.UUID `gorm:"type:uuid;not null;uniqueIndex" json:"fencing_token"`
+	AcquiredAt   time.Time `gorm:"not null" json:"acquired_at"`
+	HeartbeatAt  time.Time `gorm:"not null" json:"heartbeat_at"`
+	ExpiresAt    time.Time `gorm:"not null;index" json:"expires_at"`
+}
+
+func (FeedRecoveryLaneLease) TableName() string { return "feed_recovery_lane_leases" }
 
 type FeedRecoveryApproval struct {
 	ID              uint       `gorm:"primaryKey" json:"-"`
@@ -98,6 +133,33 @@ type FeedRecoveryAction struct {
 
 func (FeedRecoveryAction) TableName() string { return "feed_recovery_actions" }
 
+type FeedRecoveryMediaPurgeItem struct {
+	ID                     uint           `gorm:"primaryKey" json:"-"`
+	PublicID               uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	RunID                  uint           `gorm:"not null;index;uniqueIndex:idx_feed_recovery_media_saga,priority:1" json:"-"`
+	PlanID                 uint           `gorm:"not null;index" json:"-"`
+	TenantID               string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ContentItemID          uuid.UUID      `gorm:"type:uuid;not null;uniqueIndex:idx_feed_recovery_media_saga,priority:2" json:"content_item_id"`
+	ManifestHash           string         `gorm:"type:char(64);not null" json:"manifest_hash"`
+	ItemHash               string         `gorm:"type:char(64);not null" json:"item_hash"`
+	ProviderObjects        datatypes.JSON `gorm:"type:jsonb;not null" json:"provider_objects"`
+	RecoveryMapPresent     bool           `gorm:"not null;default:false" json:"recovery_map_present"`
+	NoFullRollback         bool           `gorm:"not null;default:false" json:"no_full_rollback"`
+	State                  string         `gorm:"type:varchar(32);not null;index" json:"state"`
+	ProviderRequestID      string         `gorm:"type:text" json:"provider_request_id,omitempty"`
+	ProviderResultHash     string         `gorm:"type:char(64)" json:"provider_result_hash,omitempty"`
+	ProviderIdempotencyKey string         `gorm:"type:text" json:"provider_idempotency_key,omitempty"`
+	AttemptCount           int            `gorm:"not null;default:0" json:"attempt_count"`
+	LastError              string         `gorm:"type:text" json:"last_error,omitempty"`
+	ObjectDeletedAt        *time.Time     `json:"object_deleted_at,omitempty"`
+	CMSDeletedAt           *time.Time     `json:"cms_deleted_at,omitempty"`
+	VerifiedAt             *time.Time     `json:"verified_at,omitempty"`
+	CreatedAt              time.Time      `json:"created_at"`
+	UpdatedAt              time.Time      `json:"updated_at"`
+}
+
+func (FeedRecoveryMediaPurgeItem) TableName() string { return "feed_recovery_media_purge_items" }
+
 type FeedRecoveryArtifact struct {
 	ID           uint      `gorm:"primaryKey" json:"-"`
 	PublicID     uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
@@ -115,13 +177,14 @@ type FeedRecoveryArtifact struct {
 func (FeedRecoveryArtifact) TableName() string { return "feed_recovery_artifacts" }
 
 type FeedAvailabilityState struct {
-	TenantID          string    `gorm:"primaryKey" json:"tenant_id"`
-	Lane              string    `gorm:"primaryKey" json:"lane"`
-	State             string    `json:"state"`
-	RecoveryRunID     *uint     `json:"recovery_run_id,omitempty"`
-	MessageKey        string    `json:"message_key,omitempty"`
-	RetryAfterSeconds *int      `json:"retry_after_seconds,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	TenantID          string     `gorm:"primaryKey" json:"tenant_id"`
+	Lane              string     `gorm:"primaryKey" json:"lane"`
+	State             string     `json:"state"`
+	RecoveryRunID     *uint      `json:"recovery_run_id,omitempty"`
+	FencingToken      *uuid.UUID `gorm:"type:uuid" json:"-"`
+	MessageKey        string     `json:"message_key,omitempty"`
+	RetryAfterSeconds *int       `json:"retry_after_seconds,omitempty"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 func (FeedAvailabilityState) TableName() string { return "feed_availability_states" }

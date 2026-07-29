@@ -2,10 +2,19 @@ package controllers
 
 import (
 	"testing"
+	"time"
 
 	"content-management-system/src/models"
 	"github.com/google/uuid"
 )
+
+func TestMonthlyStartUsesTenantTimezoneBoundary(t *testing.T) {
+	got := monthlyStart(time.Date(2026, 7, 1, 0, 30, 0, 0, time.UTC), "Asia/Riyadh")
+	want := time.Date(2026, 7, 1, 0, 0, 0, 0, time.FixedZone("Asia/Riyadh", 3*60*60)).UTC()
+	if !got.Equal(want) {
+		t.Fatalf("monthly start = %s, want Riyadh midnight %s", got, want)
+	}
+}
 
 // Golden fixture for the locked V1 selector: identical evidence must produce
 // the same ordered, diversity-bounded archive on every regeneration.

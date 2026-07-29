@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,6 +55,7 @@ func main() {
 		check            = flag.Bool("check", false, "validate every pending migration without applying it")
 		baseline         = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
 		allowDestructive = flag.Bool("allow-destructive", false, "allow migrations containing destructive SQL such as DROP TABLE, DROP COLUMN, TRUNCATE, or DELETE FROM")
+		bootstrapEmpty   = flag.Bool("bootstrap-empty", false, "allow reviewed historical large-table migrations only on an explicitly acknowledged empty local disposable database")
 		dir              = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
@@ -69,6 +71,9 @@ func main() {
 	}
 	if !*status && !*check && !*applyAll && *baseline == "" && flag.NArg() == 0 {
 		log.Fatal("no migrations selected. Use --status, --check, --all, --baseline-through, or pass explicit migration filenames")
+	}
+	if *bootstrapEmpty && (!*applyAll || *status || *check || *baseline != "") {
+		log.Fatal("--bootstrap-empty is only valid with --all and an apply operation")
 	}
 
 	db, err := utils.ConnectDB()
@@ -140,7 +145,12 @@ func main() {
 		log.Println("No migrations to apply.")
 		return
 	}
-	if err := requireLargeTableMigrationSafety(selected); err != nil {
+	if *bootstrapEmpty {
+		if err := requireEmptyDisposableBootstrap(db); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := requireLargeTableMigrationSafety(selected); err != nil && !*bootstrapEmpty {
 		log.Fatalf("migration safety check failed: %v", err)
 	}
 	if err := requireDestructiveApproval(selected, *allowDestructive); err != nil {
@@ -159,6 +169,55 @@ func main() {
 	if blockedAt != "" {
 		log.Printf("Stopped before destructive migration %s; safe preceding migrations were applied. Re-run with --allow-destructive only after reviewing that migration and satisfying its readiness guards.", blockedAt)
 	}
+}
+
+const disposableBootstrapMarker = "I_UNDERSTAND_THIS_DATABASE_IS_DISPOSABLE"
+
+// requireEmptyDisposableBootstrap is deliberately stricter than the normal
+// migration guard. It exists only to replay historical migrations into a new
+// local fixture whose old files predate the large-table safety marker. It must
+// never be usable against a managed provider or a non-test database.
+func requireEmptyDisposableBootstrap(db *gorm.DB) error {
+	if os.Getenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") != disposableBootstrapMarker {
+		return fmt.Errorf("--bootstrap-empty requires CMS_MIGRATION_BOOTSTRAP_DISPOSABLE=%s", disposableBootstrapMarker)
+	}
+	raw := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		return fmt.Errorf("--bootstrap-empty requires a PostgreSQL DATABASE_URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		return fmt.Errorf("--bootstrap-empty is restricted to localhost PostgreSQL targets")
+	}
+	database := strings.TrimPrefix(u.Path, "/")
+	if !strings.HasPrefix(database, "wahb_cms_test_") {
+		return fmt.Errorf("--bootstrap-empty requires a database named wahb_cms_test_<suffix>")
+	}
+	var tables []string
+	if err := db.Raw("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'cms_schema_migrations' ORDER BY tablename").Scan(&tables).Error; err != nil {
+		return fmt.Errorf("inspect bootstrap schema: %w", err)
+	}
+	if len(tables) > 0 {
+		return fmt.Errorf("--bootstrap-empty refused: database already contains public tables (%s)", strings.Join(tables, ", "))
+	}
+	for _, table := range []string{"content_items", "stories"} {
+		var exists bool
+		if err := db.Raw("SELECT to_regclass(?) IS NOT NULL", "public."+table).Scan(&exists).Error; err != nil {
+			return fmt.Errorf("inspect bootstrap table %s: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		var count int64
+		if err := db.Table(table).Count(&count).Error; err != nil {
+			return fmt.Errorf("count bootstrap table %s: %w", table, err)
+		}
+		if count != 0 {
+			return fmt.Errorf("--bootstrap-empty refused: %s contains %d rows", table, count)
+		}
+	}
+	return nil
 }
 
 var destructiveSQL = regexp.MustCompile(`(?im)^\s*(DROP\s+TABLE|ALTER\s+TABLE\b.*\bDROP\s+COLUMN|TRUNCATE\b|DELETE\s+FROM\b)`)

@@ -161,3 +161,19 @@ func TestMigrationExecutionErrorExplainsStatementTimeout(t *testing.T) {
 		t.Fatalf("timeout error is not actionable: %v", err)
 	}
 }
+
+func TestEmptyBootstrapRequiresExplicitDisposableAcknowledgement(t *testing.T) {
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE", "")
+	t.Setenv("DATABASE_URL", "postgresql://postgres:test@127.0.0.1:5432/wahb_cms_test_local123")
+	if err := requireEmptyDisposableBootstrap(nil); err == nil || !strings.Contains(err.Error(), "CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") {
+		t.Fatalf("missing bootstrap acknowledgement was accepted: %v", err)
+	}
+}
+
+func TestEmptyBootstrapRejectsManagedDatabaseBeforeOpeningIt(t *testing.T) {
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE", disposableBootstrapMarker)
+	t.Setenv("DATABASE_URL", "postgresql://postgres:test@db.supabase.co:5432/wahb_cms_test_local123")
+	if err := requireEmptyDisposableBootstrap(nil); err == nil || !strings.Contains(err.Error(), "localhost") {
+		t.Fatalf("managed bootstrap target was accepted: %v", err)
+	}
+}

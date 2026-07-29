@@ -15,6 +15,11 @@ const (
 	RetentionVerdictHealthy             = "healthy"
 	RetentionVerdictWarning             = "warning"
 	RetentionVerdictActionRequired      = "action_required"
+	RetentionVerdictCompactionDue       = "compaction_due"
+	RetentionVerdictArchiveBlocked      = "archive_blocked"
+	RetentionVerdictCleanupDue          = "cleanup_due"
+	RetentionVerdictRecoveryRequired    = "recovery_required"
+	RetentionVerdictBlocked             = "blocked"
 	RetentionVerdictCritical            = "critical"
 	RetentionVerdictMaintenanceRequired = "maintenance_required"
 	RetentionVerdictRecoveryInProgress  = "recovery_in_progress"
@@ -85,6 +90,23 @@ type RetentionPolicy struct {
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 }
+
+// RetentionExecutionControl is the persisted rollout gate for high-risk
+// operations. Missing/disabled controls are fail-closed; observation and
+// manifest preparation remain available while an operator completes rollout.
+type RetentionExecutionControl struct {
+	ID                         uint      `gorm:"primaryKey" json:"-"`
+	TenantID                   string    `gorm:"type:varchar(64);not null;uniqueIndex" json:"tenant_id"`
+	CanonicalCompactionEnabled bool      `gorm:"not null;default:false" json:"canonical_compaction_enabled"`
+	HistoricalEnabled          bool      `gorm:"not null;default:false" json:"historical_enabled"`
+	OwnerRunsEnabled           bool      `gorm:"not null;default:false" json:"owner_runs_enabled"`
+	FeedRecoveryRotateEnabled  bool      `gorm:"not null;default:false" json:"feed_recovery_rotate_enabled"`
+	FeedRecoveryPurgeEnabled   bool      `gorm:"not null;default:false" json:"feed_recovery_purge_enabled"`
+	UpdatedBy                  string    `gorm:"type:varchar(255)" json:"updated_by,omitempty"`
+	UpdatedAt                  time.Time `json:"updated_at"`
+}
+
+func (RetentionExecutionControl) TableName() string { return "retention_execution_controls" }
 
 func (RetentionPolicy) TableName() string { return "retention_policies" }
 
@@ -206,24 +228,53 @@ type RetentionAction struct {
 
 func (RetentionAction) TableName() string { return "retention_actions" }
 
+// RetentionActionDecision is immutable human decision evidence. RetentionAction
+// is an execution state machine and may later move from approved to running or
+// verification_passed; trust mileage must continue to see the original human
+// decision after that transition.
+type RetentionActionDecision struct {
+	ID                  uint           `gorm:"primaryKey" json:"-"`
+	PublicID            uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID            uint           `gorm:"not null;uniqueIndex" json:"-"`
+	TenantID            string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ActionClass         string         `gorm:"type:varchar(80);not null" json:"action_class"`
+	Mode                string         `gorm:"type:varchar(24);not null" json:"mode"`
+	Decision            string         `gorm:"type:varchar(16);not null" json:"decision"`
+	Actor               string         `gorm:"type:varchar(255);not null" json:"actor"`
+	Reason              string         `gorm:"type:text" json:"reason,omitempty"`
+	ManifestHash        *string        `gorm:"type:char(64)" json:"manifest_hash,omitempty"`
+	EvidenceFingerprint string         `gorm:"type:char(64);not null" json:"evidence_fingerprint"`
+	DecidedAt           time.Time      `gorm:"not null;index" json:"decided_at"`
+	Evidence            datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence,omitempty"`
+	CreatedAt           time.Time      `json:"created_at"`
+}
+
+func (RetentionActionDecision) TableName() string { return "retention_action_decisions" }
+
 // RetentionOwnerRequest is an orchestration-only bridge to a registered
 // owner. It never duplicates an owner's candidate or action ledger.
 type RetentionOwnerRequest struct {
-	ID             uint           `gorm:"primaryKey" json:"-"`
-	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	ActionID       uint           `gorm:"not null;index" json:"-"`
-	ActionPublicID *uuid.UUID     `gorm:"-" json:"action_id,omitempty"`
-	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	OwnerSystem    string         `gorm:"type:varchar(64);not null;index" json:"owner_system"`
-	IdempotencyKey string         `gorm:"type:varchar(255);not null" json:"idempotency_key"`
-	RequestHash    string         `gorm:"type:char(64);not null" json:"request_hash"`
-	OwnerRunID     *uuid.UUID     `gorm:"type:uuid" json:"owner_run_id,omitempty"`
-	OwnerActionID  *uuid.UUID     `gorm:"type:uuid" json:"owner_action_id,omitempty"`
-	Status         string         `gorm:"type:varchar(32);not null" json:"status"`
-	ResultHash     *string        `gorm:"type:char(64)" json:"result_hash,omitempty"`
-	Result         datatypes.JSON `gorm:"type:jsonb;not null" json:"result"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	ID                   uint           `gorm:"primaryKey" json:"-"`
+	PublicID             uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID             uint           `gorm:"not null;index" json:"-"`
+	ActionPublicID       *uuid.UUID     `gorm:"-" json:"action_id,omitempty"`
+	TenantID             string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	OwnerSystem          string         `gorm:"type:varchar(64);not null;index" json:"owner_system"`
+	IdempotencyKey       string         `gorm:"type:varchar(255);not null" json:"idempotency_key"`
+	RequestHash          string         `gorm:"type:char(64);not null" json:"request_hash"`
+	AllowedActionClasses datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'" json:"allowed_action_classes"`
+	MaxBytes             int64          `gorm:"not null;default:0" json:"max_bytes"`
+	MaxItems             int            `gorm:"not null;default:0" json:"max_items"`
+	MaxActions           int            `gorm:"not null;default:0" json:"max_actions"`
+	CorrelationID        *uuid.UUID     `gorm:"type:uuid" json:"correlation_id,omitempty"`
+	ExpiresAt            time.Time      `gorm:"not null;index" json:"expires_at"`
+	OwnerRunID           *uuid.UUID     `gorm:"type:uuid" json:"owner_run_id,omitempty"`
+	OwnerActionID        *uuid.UUID     `gorm:"type:uuid" json:"owner_action_id,omitempty"`
+	Status               string         `gorm:"type:varchar(32);not null" json:"status"`
+	ResultHash           *string        `gorm:"type:char(64)" json:"result_hash,omitempty"`
+	Result               datatypes.JSON `gorm:"type:jsonb;not null" json:"result"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
 }
 
 func (RetentionOwnerRequest) TableName() string { return "retention_owner_requests" }
@@ -398,6 +449,23 @@ type NewsMonthArchiveStory struct {
 
 func (NewsMonthArchiveStory) TableName() string { return "news_month_archive_stories" }
 
+type NewsMonthArchiveStorySource struct {
+	ID                uint           `gorm:"primaryKey" json:"-"`
+	PublicID          uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ArchiveStoryID    uint           `gorm:"not null;index;uniqueIndex:idx_news_month_archive_story_source,priority:1" json:"-"`
+	Ordinal           int            `gorm:"not null;uniqueIndex:idx_news_month_archive_story_source,priority:2" json:"ordinal"`
+	OriginalContentID uuid.UUID      `gorm:"type:uuid;not null;uniqueIndex:idx_news_month_archive_story_source_content" json:"original_content_id"`
+	SourceID          *uuid.UUID     `gorm:"type:uuid" json:"source_id,omitempty"`
+	SourceName        string         `gorm:"type:text;not null" json:"source_name"`
+	Headline          string         `gorm:"type:text;not null" json:"headline"`
+	OriginalURL       string         `gorm:"type:text" json:"original_url,omitempty"`
+	PublishedAt       *time.Time     `json:"published_at,omitempty"`
+	Evidence          datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+func (NewsMonthArchiveStorySource) TableName() string { return "news_month_archive_story_sources" }
+
 // NewsEngagementMonthlyRollup is immutable selection evidence before a later
 // lifecycle may expire raw high-volume telemetry.
 type NewsEngagementMonthlyRollup struct {
@@ -485,15 +553,22 @@ func (RetentionHistoricalRecoveryArtifact) TableName() string {
 }
 
 type RetentionMaintenanceReport struct {
-	ID             uint           `gorm:"primaryKey" json:"-"`
-	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	DatabaseBytes  int64          `gorm:"not null" json:"database_bytes"`
-	TargetBytes    int64          `gorm:"not null" json:"target_bytes"`
-	SparseUseCount int64          `gorm:"not null" json:"sparse_use_count"`
-	State          string         `gorm:"type:varchar(24);not null" json:"state"`
-	Evidence       datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
-	CreatedAt      time.Time      `json:"created_at"`
+	ID                 uint           `gorm:"primaryKey" json:"-"`
+	PublicID           uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID           string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	DatabaseBytes      int64          `gorm:"not null" json:"database_bytes"`
+	TargetBytes        int64          `gorm:"not null" json:"target_bytes"`
+	SparseUseCount     int64          `gorm:"not null" json:"sparse_use_count"`
+	ProviderBytes      *int64         `json:"provider_bytes,omitempty"`
+	ProviderSource     string         `gorm:"type:varchar(32);not null;default:'unavailable'" json:"provider_source"`
+	ProviderMeasuredAt *time.Time     `json:"provider_measured_at,omitempty"`
+	ProviderFresh      bool           `gorm:"not null;default:false" json:"provider_fresh"`
+	PostgresReady      bool           `gorm:"not null;default:false" json:"postgres_ready"`
+	ProviderReady      bool           `gorm:"not null;default:false" json:"provider_ready"`
+	BlockingReasons    datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'" json:"blocking_reasons"`
+	State              string         `gorm:"type:varchar(24);not null" json:"state"`
+	Evidence           datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	CreatedAt          time.Time      `json:"created_at"`
 }
 
 func (RetentionMaintenanceReport) TableName() string { return "retention_maintenance_reports" }

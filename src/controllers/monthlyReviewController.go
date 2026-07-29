@@ -44,6 +44,39 @@ func monthlyReviewJSON(v interface{}) datatypes.JSON {
 	return datatypes.JSON(raw)
 }
 
+func archiveStoryIDs(rows []models.NewsMonthArchiveStory) []uint {
+	ids := make([]uint, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	return ids
+}
+
+type monthlyReviewStoryView struct {
+	models.NewsMonthArchiveStory
+	RepresentativeSources []models.NewsMonthArchiveStorySource `json:"representative_sources"`
+}
+
+func monthlyReviewStoryViews(db *gorm.DB, rows []models.NewsMonthArchiveStory) ([]monthlyReviewStoryView, error) {
+	views := make([]monthlyReviewStoryView, len(rows))
+	if len(rows) == 0 {
+		return views, nil
+	}
+	ids := archiveStoryIDs(rows)
+	var sources []models.NewsMonthArchiveStorySource
+	if err := db.Where("archive_story_id IN ?", ids).Order("archive_story_id ASC, ordinal ASC").Find(&sources).Error; err != nil {
+		return nil, err
+	}
+	byStory := make(map[uint][]models.NewsMonthArchiveStorySource, len(ids))
+	for _, source := range sources {
+		byStory[source.ArchiveStoryID] = append(byStory[source.ArchiveStoryID], source)
+	}
+	for i, row := range rows {
+		views[i] = monthlyReviewStoryView{NewsMonthArchiveStory: row, RepresentativeSources: byStory[row.ID]}
+	}
+	return views, nil
+}
+
 func monthlyReviewLocation(timezone string) *time.Location {
 	l, err := time.LoadLocation(timezone)
 	if err != nil {
@@ -52,8 +85,9 @@ func monthlyReviewLocation(timezone string) *time.Location {
 	return l
 }
 func monthlyStart(value time.Time, timezone string) time.Time {
-	local := value.In(monthlyReviewLocation(timezone))
-	return time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, time.UTC)
+	location := monthlyReviewLocation(timezone)
+	local := value.In(location)
+	return time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, location).UTC()
 }
 
 func loadMonthlyReviewPolicy(db *gorm.DB, tenant string) (models.MonthlyReviewPolicyVersion, error) {
@@ -101,6 +135,7 @@ type monthlyCandidate struct {
 	ExcludedEvents, DeduplicatedEvents                    int
 	Importance, Engagement, Score                         float64
 	Category, LeadSource                                  string
+	Representatives                                       []models.ContentItem
 }
 
 func monthlyCountNorm(x, p95 float64) float64 {
@@ -148,7 +183,7 @@ func monthlySource(item models.ContentItem) string {
 	return strings.ToLower(string(item.Source))
 }
 
-func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([]monthlyCandidate, error) {
+func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time, timezone string) ([]monthlyCandidate, error) {
 	var stories []models.Story
 	if err := db.Where("tenant_id = ? AND last_member_at >= ? AND last_member_at < ?", tenant, start, end).Order("public_id ASC").Find(&stories).Error; err != nil {
 		return nil, err
@@ -188,7 +223,12 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 	excludedByStory, deduplicatedByStory := map[uuid.UUID]int{}, map[uuid.UUID]int{}
 	actorWindows := map[string][]time.Time{}
 	actorStoryDay := map[string]int{}
+	abusiveActors := map[string]bool{}
+	location := monthlyReviewLocation(timezone)
 	sort.SliceStable(interactions, func(i, j int) bool { return interactions[i].CreatedAt.Before(interactions[j].CreatedAt) })
+	// First pass identifies actors that crossed either abuse threshold anywhere
+	// in the month. The second pass excludes their entire month's quality
+	// engagement, matching the locked anti-abuse policy.
 	for _, event := range interactions {
 		storyID, exists := itemStories[event.ContentItemID]
 		if !exists {
@@ -196,9 +236,9 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 		}
 		actor := ""
 		if event.UserID != nil {
-			actor = event.UserID.String()
+			actor = "user:" + event.UserID.String()
 		} else if event.SessionID != nil {
-			actor = strings.TrimSpace(*event.SessionID)
+			actor = "session:" + strings.TrimSpace(*event.SessionID)
 		}
 		if actor == "" {
 			continue
@@ -210,13 +250,33 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 		}
 		window = append(window, event.CreatedAt)
 		actorWindows[actor] = window
-		day := event.CreatedAt.UTC().Format("2006-01-02")
+		day := event.CreatedAt.In(location).Format("2006-01-02")
 		actorStoryKey := actor + ":" + storyID.String() + ":" + day
 		actorStoryDay[actorStoryKey]++
 		if len(window) > 100 || actorStoryDay[actorStoryKey] > 20 {
+			abusiveActors[actor] = true
+		}
+	}
+	seenEngagement = map[string]bool{}
+	for _, event := range interactions {
+		storyID, exists := itemStories[event.ContentItemID]
+		if !exists {
+			continue
+		}
+		actor := ""
+		if event.UserID != nil {
+			actor = "user:" + event.UserID.String()
+		} else if event.SessionID != nil {
+			actor = "session:" + strings.TrimSpace(*event.SessionID)
+		}
+		if actor == "" {
+			continue
+		}
+		if abusiveActors[actor] {
 			excludedByStory[storyID]++
 			continue
 		}
+		day := event.CreatedAt.In(location).Format("2006-01-02")
 		key := storyID.String() + ":" + string(event.Type) + ":" + actor + ":" + day
 		if seenEngagement[key] {
 			deduplicatedByStory[storyID]++
@@ -257,7 +317,7 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 			if latest.IsZero() || t.After(latest) {
 				latest = t
 			}
-			days[t.UTC().Format("2006-01-02")] = true
+			days[t.In(location).Format("2006-01-02")] = true
 			candidate.Views += m.ViewCount
 			candidate.Likes += m.LikeCount
 			candidate.Shares += m.ShareCount
@@ -265,6 +325,7 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 			candidate.Impressions += m.ImpressionCount
 		}
 		candidate.Sources = len(sources)
+		candidate.Representatives = monthlyRepresentativeMembers(members, lead)
 		candidate.CoverageDays = len(days)
 		candidate.CoverageHours = latest.Sub(earliest).Hours()
 		counts := engagement[story.PublicID]
@@ -278,6 +339,32 @@ func buildMonthlyCandidates(db *gorm.DB, tenant string, start, end time.Time) ([
 		result = append(result, candidate)
 	}
 	return result, nil
+}
+
+func monthlyRepresentativeMembers(members []models.ContentItem, lead models.ContentItem) []models.ContentItem {
+	ordered := append([]models.ContentItem(nil), members...)
+	sort.SliceStable(ordered, func(i, j int) bool { return newestMemberLess(ordered[i], ordered[j]) })
+	seenSources := map[string]bool{monthlySource(lead): true}
+	seenIDs := map[uuid.UUID]bool{lead.PublicID: true}
+	result := make([]models.ContentItem, 0, 3)
+	for pass := 0; pass < 2 && len(result) < 3; pass++ {
+		for _, item := range ordered {
+			if seenIDs[item.PublicID] {
+				continue
+			}
+			source := monthlySource(item)
+			if pass == 0 && seenSources[source] {
+				continue
+			}
+			seenIDs[item.PublicID] = true
+			seenSources[source] = true
+			result = append(result, item)
+			if len(result) == 3 {
+				break
+			}
+		}
+	}
+	return result
 }
 
 func scoreMonthlyCandidates(c []monthlyCandidate) []monthlyCandidate {
@@ -468,7 +555,7 @@ func BuildMonthlyReview(c *gin.Context) {
 		return
 	}
 	end := start.AddDate(0, 1, 0)
-	candidates, err := buildMonthlyCandidates(db, principal.TenantID, start, end)
+	candidates, err := buildMonthlyCandidates(db, principal.TenantID, start, end, timezone)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -495,9 +582,14 @@ func BuildMonthlyReview(c *gin.Context) {
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		manifest := map[string]interface{}{"formula_version": monthlyReviewFormulaVersion, "policy_version": policy.Version, "month_start": start.Format("2006-01-02"), "qualified_count": qualified, "selected_ids": []string{}}
+		manifest := map[string]interface{}{"formula_version": monthlyReviewFormulaVersion, "policy_version": policy.Version, "month_start": start.Format("2006-01-02"), "qualified_count": qualified, "selected_ids": []string{}, "representative_ids": map[string][]string{}}
 		for _, x := range selected {
 			manifest["selected_ids"] = append(manifest["selected_ids"].([]string), x.Story.PublicID.String())
+			representatives := make([]string, 0, len(x.Representatives))
+			for _, representative := range x.Representatives {
+				representatives = append(representatives, representative.PublicID.String())
+			}
+			manifest["representative_ids"].(map[string][]string)[x.Story.PublicID.String()] = representatives
 		}
 		raw, _ := json.Marshal(manifest)
 		sum := sha256.Sum256(raw)
@@ -509,11 +601,42 @@ func BuildMonthlyReview(c *gin.Context) {
 		}
 		rows := make([]models.NewsMonthArchiveStory, 0, len(selected))
 		for i, x := range selected {
-			snapshot := monthlyReviewJSON(map[string]interface{}{"title": x.Lead.Title, "excerpt": x.Lead.Excerpt, "body_text": x.Lead.BodyText, "original_url": x.Lead.OriginalURL, "source_name": x.Lead.SourceName, "published_at": x.Lead.PublishedAt, "category": x.Story.Category, "summary": x.Story.Summary, "bullets": x.Story.Bullets, "member_count": x.Story.OriginalMemberCount, "source_count": x.Sources})
+			representativeIDs := make([]string, 0, len(x.Representatives))
+			for _, representative := range x.Representatives {
+				representativeIDs = append(representativeIDs, representative.PublicID.String())
+			}
+			snapshot := monthlyReviewJSON(map[string]interface{}{"title": x.Lead.Title, "excerpt": x.Lead.Excerpt, "body_text": x.Lead.BodyText, "original_url": x.Lead.OriginalURL, "source_name": x.Lead.SourceName, "published_at": x.Lead.PublishedAt, "category": x.Story.Category, "summary": x.Story.Summary, "bullets": x.Story.Bullets, "member_count": x.Story.OriginalMemberCount, "source_count": x.Sources, "representative_content_ids": representativeIDs})
 			rows = append(rows, models.NewsMonthArchiveStory{ArchiveID: archive.ID, Position: i + 1, Section: "The month in review", OriginalStoryID: x.Story.PublicID, LeadContentID: x.Lead.PublicID, Label: x.Story.Label, Snapshot: snapshot, ImportanceScore: x.Importance, EngagementScore: x.Engagement, FinalScore: x.Score, SelectionEvidence: monthlyReviewJSON(map[string]interface{}{"sources": x.Sources, "coverage_hours": x.CoverageHours, "coverage_days": x.CoverageDays, "bookmarks": x.Bookmarks, "likes": x.Likes, "shares": x.Shares, "comments": x.Comments, "meaningful_opens": x.Meaningful})})
 		}
 		if err := tx.Create(&rows).Error; err != nil {
 			return err
+		}
+		sourceRows := make([]models.NewsMonthArchiveStorySource, 0)
+		for i, x := range selected {
+			for ordinal, representative := range x.Representatives {
+				sourceName := strings.TrimSpace(derefStr(representative.SourceName))
+				if sourceName == "" {
+					sourceName = monthlySource(representative)
+				}
+				if sourceName == "" {
+					sourceName = "unknown"
+				}
+				headline := strings.TrimSpace(derefStr(representative.Title))
+				if headline == "" {
+					headline = "untitled source item"
+				}
+				sourceRows = append(sourceRows, models.NewsMonthArchiveStorySource{
+					ArchiveStoryID: rows[i].ID, Ordinal: ordinal + 1, OriginalContentID: representative.PublicID,
+					SourceName: sourceName, Headline: headline,
+					OriginalURL: derefStr(representative.OriginalURL), PublishedAt: representative.PublishedAt,
+					Evidence: monthlyReviewJSON(map[string]interface{}{"source_key": monthlySource(representative), "original_content_id": representative.PublicID.String()}),
+				})
+			}
+		}
+		if len(sourceRows) > 0 {
+			if err := tx.Create(&sourceRows).Error; err != nil {
+				return err
+			}
 		}
 		var persisted int64
 		if err := tx.Model(&models.NewsMonthArchiveStory{}).Where("archive_id = ?", archive.ID).Count(&persisted).Error; err != nil {
@@ -521,6 +644,13 @@ func BuildMonthlyReview(c *gin.Context) {
 		}
 		if persisted != int64(len(rows)) {
 			return errors.New("archive story readback is incomplete")
+		}
+		var persistedSources int64
+		if err := tx.Model(&models.NewsMonthArchiveStorySource{}).Where("archive_story_id IN ?", archiveStoryIDs(rows)).Count(&persistedSources).Error; err != nil {
+			return err
+		}
+		if persistedSources != int64(len(sourceRows)) {
+			return errors.New("archive representative source readback is incomplete")
 		}
 		rollups := make([]models.NewsEngagementMonthlyRollup, 0, len(candidates)*5)
 		for _, candidate := range candidates {
@@ -776,7 +906,12 @@ func GetMonthlyReviewArchiveAdmin(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"data": gin.H{"archive": archive, "stories": stories}})
+	views, err := monthlyReviewStoryViews(db, stories)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"data": gin.H{"archive": archive, "stories": views}})
 }
 func GetPublicMonthlyReview(c *gin.Context) {
 	month, err := time.Parse("2006-01", c.Param("month"))
@@ -785,7 +920,7 @@ func GetPublicMonthlyReview(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	start := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC)
+	start := monthlyStart(month, retentionNewsTimezone(db, "default"))
 	var head models.NewsMonthArchiveHead
 	if err := db.Where("tenant_id=? AND month_start=?", "default", start).First(&head).Error; err != nil {
 		c.JSON(404, gin.H{"error": "month in review not found"})
@@ -797,6 +932,14 @@ func GetPublicMonthlyReview(c *gin.Context) {
 		return
 	}
 	var stories []models.NewsMonthArchiveStory
-	db.Where("archive_id=?", archive.ID).Order("position ASC").Find(&stories)
-	c.JSON(200, gin.H{"data": gin.H{"archive": archive, "stories": stories}})
+	if err := db.Where("archive_id=?", archive.ID).Order("position ASC").Find(&stories).Error; err != nil {
+		c.JSON(500, gin.H{"error": "month in review stories unavailable"})
+		return
+	}
+	views, err := monthlyReviewStoryViews(db, stories)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "month in review representatives unavailable"})
+		return
+	}
+	c.JSON(200, gin.H{"data": gin.H{"archive": archive, "stories": views}})
 }

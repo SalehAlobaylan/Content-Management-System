@@ -560,6 +560,12 @@ func (r *mediaAutopilotRunner) countApply(executes bool) {
 type mediaAutopilotRunOptions struct {
 	Trigger   string
 	CreatedBy string
+	// MaxBytes is an optional external owner bound. It can only shrink the
+	// tenant policy cap; it can never expand it.
+	MaxBytes    int64
+	MaxItems    int
+	MaxActions  int
+	RequestHash string
 }
 
 var errMediaAutopilotDisabled = errors.New("media circulation autopilot is not enabled for this tenant")
@@ -607,6 +613,15 @@ func runMediaCirculationAutopilot(db *gorm.DB, tenantID string, opts mediaAutopi
 	observe := policy.AutopilotMode != models.MediaAutopilotModeSafeAuto
 	var intakePaused bool
 	policy, intakePaused = mediaAutopilotElevatedCaps(policy)
+	if opts.MaxBytes > 0 && opts.MaxBytes < policy.AutopilotMaxBytesPerRun {
+		policy.AutopilotMaxBytesPerRun = opts.MaxBytes
+	}
+	if opts.MaxActions > 0 && opts.MaxActions < policy.AutopilotMaxActionsPerRun {
+		policy.AutopilotMaxActionsPerRun = opts.MaxActions
+	}
+	if opts.MaxItems > 0 && opts.MaxItems < policy.AutopilotMaxActionsPerRun {
+		policy.AutopilotMaxActionsPerRun = opts.MaxItems
+	}
 
 	// Scheduled automation is a named machine caller, never a CMS-minted human
 	// admin JWT. Aggregation accepts this credential only on its explicitly

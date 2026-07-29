@@ -262,13 +262,15 @@ func deleteRecoveryArtifact(key string) error {
 	return nil
 }
 
-func markRetentionCompactionBlocked(db *gorm.DB, action models.RetentionAction, manifest models.RetentionCompactionManifest, cause error) {
+func markRetentionCompactionBlocked(db *gorm.DB, action models.RetentionAction, manifest models.RetentionCompactionManifest, cause error) error {
 	now := time.Now().UTC()
 	evidence := retentionActionEvidence(map[string]interface{}{"phase": "preflight", "error": cause.Error(), "manifest_hash": manifest.ManifestHash})
-	_ = db.Transaction(func(tx *gorm.DB) error {
-		_ = tx.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{
 			"outcome": models.RetentionActionToolFailed, "finished_at": now, "guardrail": "execution_preflight_blocked", "verification": evidence,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
 		return tx.Model(&models.RetentionCompactionManifest{}).Where("id = ?", manifest.ID).Updates(map[string]interface{}{"state": "blocked", "updated_at": now}).Error
 	})
 }
@@ -324,7 +326,10 @@ func revalidateCompactionPlan(tx *gorm.DB, tenant string, payload retentionManif
 			return nil, nil, errors.New("live retirement bytes exceed the configured byte cap")
 		}
 	}
-	protected := retentionProtectedContentIDs(tx, tenant, actual)
+	protected, err := retentionProtectedContentIDs(tx, tenant, actual)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, id := range retireIDs {
 		if protected[id] {
 			return nil, nil, errors.New("a retirement candidate gained a protected reference")
@@ -645,8 +650,8 @@ func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.Retent
 		return nil, fmt.Errorf("feed integrity verification finished %s", feedRun.Status)
 	}
 	health, anomalies := collectSystemHealthSnapshot(db)
-	if health.Overall == "unhealthy" {
-		return nil, errors.New("system health verification is unhealthy")
+	if health.Overall != "healthy" {
+		return nil, fmt.Errorf("system health verification is %s", health.Overall)
 	}
 	result["feed_integrity"] = map[string]interface{}{
 		"run_id": feedRun.PublicID.String(), "status": feedRun.Status, "headline": feedRun.Headline,
@@ -654,30 +659,49 @@ func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.Retent
 	result["system_health"] = map[string]interface{}{
 		"overall": health.Overall, "anomaly_count": len(anomalies), "observed_at": health.Timestamp,
 	}
+	if feedRun.Headline != "all_clear" {
+		return nil, fmt.Errorf("feed integrity verification finished with headline %s", feedRun.Headline)
+	}
 	return retentionActionEvidence(result), nil
 }
 
 func finalizeCompactionVerification(db *gorm.DB, tenant string, action models.RetentionAction, manifest models.RetentionCompactionManifest, payload retentionManifestPayload) (models.RetentionAction, error) {
 	now := time.Now().UTC()
-	_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifying, "started_at": now}).Error
-	_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Update("state", "verifying").Error
+	if err := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifying, "started_at": now}).Error; err != nil {
+		return action, fmt.Errorf("record compaction verification start: %w", err)
+	}
+	if err := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Update("state", "verifying").Error; err != nil {
+		return action, fmt.Errorf("record compaction batch verification start: %w", err)
+	}
 	verification, err := verifyCompactionReadback(db, tenant, manifest, payload)
 	if err != nil {
-		_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "readback", "error": err.Error()})}).Error
-		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": err.Error(), "finished_at": time.Now().UTC()}).Error
+		if persistErr := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "readback", "error": err.Error()})}).Error; persistErr != nil {
+			return action, errors.Join(err, fmt.Errorf("record readback failure: %w", persistErr))
+		}
+		if persistErr := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": err.Error(), "finished_at": time.Now().UTC()}).Error; persistErr != nil {
+			return action, errors.Join(err, fmt.Errorf("record batch readback failure: %w", persistErr))
+		}
 		return action, err
 	}
 	if err := db.Exec("VACUUM (ANALYZE) content_items").Error; err != nil {
 		maintenanceErr := fmt.Errorf("post-compaction vacuum/analyze: %w", err)
-		_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "maintenance", "error": maintenanceErr.Error()})}).Error
-		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": maintenanceErr.Error(), "finished_at": time.Now().UTC()}).Error
+		if persistErr := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "maintenance", "error": maintenanceErr.Error()})}).Error; persistErr != nil {
+			return action, errors.Join(maintenanceErr, fmt.Errorf("record maintenance failure: %w", persistErr))
+		}
+		if persistErr := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": maintenanceErr.Error(), "finished_at": time.Now().UTC()}).Error; persistErr != nil {
+			return action, errors.Join(maintenanceErr, fmt.Errorf("record batch maintenance failure: %w", persistErr))
+		}
 		return action, maintenanceErr
 	}
 	afterSample, err := collectRetentionDBSample(db, tenant)
 	if err != nil {
 		measurementErr := fmt.Errorf("post-compaction database measurement: %w", err)
-		_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "measurement", "error": measurementErr.Error()})}).Error
-		_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": measurementErr.Error(), "finished_at": time.Now().UTC()}).Error
+		if persistErr := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "measurement", "error": measurementErr.Error()})}).Error; persistErr != nil {
+			return action, errors.Join(measurementErr, fmt.Errorf("record measurement failure: %w", persistErr))
+		}
+		if persistErr := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_failed", "error": measurementErr.Error(), "finished_at": time.Now().UTC()}).Error; persistErr != nil {
+			return action, errors.Join(measurementErr, fmt.Errorf("record batch measurement failure: %w", persistErr))
+		}
 		return action, measurementErr
 	}
 	var verificationMap map[string]interface{}
@@ -688,7 +712,9 @@ func finalizeCompactionVerification(db *gorm.DB, tenant string, action models.Re
 	if err := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerified, "finished_at": time.Now().UTC(), "verification": verification, "after_bytes": afterSample.DatabaseBytes}).Error; err != nil {
 		return action, err
 	}
-	_ = db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_passed", "finished_at": time.Now().UTC(), "after_evidence": verification}).Error
+	if err := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Updates(map[string]interface{}{"state": "verification_passed", "finished_at": time.Now().UTC(), "after_evidence": verification}).Error; err != nil {
+		return action, fmt.Errorf("record compaction batch verification: %w", err)
+	}
 	if err := db.Where("id = ?", action.ID).First(&action).Error; err != nil {
 		return action, err
 	}
@@ -731,6 +757,10 @@ func ExecuteRetentionCompaction(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"data": result})
 		return
 	}
+	if err := requireRetentionCapability(db, principal.TenantID, retentionCapabilityCanonicalCompaction); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 	var manifest models.RetentionCompactionManifest
 	if err := db.Where("tenant_id = ? AND action_id = ?", principal.TenantID, existing.ID).First(&manifest).Error; err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "action has no compaction manifest"})
@@ -770,10 +800,16 @@ func ExecuteRetentionCompaction(c *gin.Context) {
 	if execErr != nil {
 		if action.ID != 0 && executedManifest.ID != 0 {
 			if errors.Is(execErr, errRetentionManifestExpired) {
-				_ = db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Update("outcome", models.RetentionActionExpired).Error
-				_ = db.Model(&models.RetentionCompactionManifest{}).Where("id = ?", executedManifest.ID).Update("state", "expired").Error
+				if persistErr := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Update("outcome", models.RetentionActionExpired).Error; persistErr != nil {
+					execErr = errors.Join(execErr, fmt.Errorf("record expired action: %w", persistErr))
+				}
+				if persistErr := db.Model(&models.RetentionCompactionManifest{}).Where("id = ?", executedManifest.ID).Update("state", "expired").Error; persistErr != nil {
+					execErr = errors.Join(execErr, fmt.Errorf("record expired manifest: %w", persistErr))
+				}
 			} else {
-				markRetentionCompactionBlocked(db, action, executedManifest, execErr)
+				if persistErr := markRetentionCompactionBlocked(db, action, executedManifest, execErr); persistErr != nil {
+					execErr = errors.Join(execErr, fmt.Errorf("record blocked compaction: %w", persistErr))
+				}
 			}
 		}
 		c.JSON(http.StatusConflict, gin.H{"error": execErr.Error()})

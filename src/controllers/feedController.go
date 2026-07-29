@@ -578,6 +578,12 @@ func supportsAtomizedPodsSchema(db *gorm.DB) bool {
 }
 
 func supportsStorageStateSchema(db *gorm.DB) bool {
+	// Query-shape tests use a DryRun sqlmock without a real information_schema.
+	// Keep the compatibility predicate disabled for that compile-only path; the
+	// live request path still checks the column before adding the filter.
+	if db != nil && db.Statement != nil && db.Statement.DryRun {
+		return false
+	}
 	return db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
 }
 

@@ -514,6 +514,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		if policy.PodsLatencyBudgetMS > 0 && elapsed > time.Duration(policy.PodsLatencyBudgetMS)*time.Millisecond {
 			add("edge_pods_latency", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, 1, map[string]interface{}{"latency_ms": elapsed.Milliseconds(), "budget_ms": policy.PodsLatencyBudgetMS})
 		}
+		add("edge_pods_page_success", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "info", "ok", "page", variant, len(payload.Items), map[string]interface{}{"page": 1, "full_page_target": 20})
 		if len(payload.Items) == 0 {
 			var count int64
 			podsEligibleMediaQuery(db, policy.TenantID, supportsAtomizedPodsSchema(db)).Count(&count)
@@ -584,6 +585,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 				add("edge_pods_http", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
 				break
 			}
+			add("edge_pods_page_success", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "info", "ok", "page", variant, len(next.Items), map[string]interface{}{"page": page + 1, "full_page_target": 20})
 			for _, item := range next.Items {
 				if seen[item.ID] {
 					add("edge_pods_dup", "edge", "pods", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "content_item", item.ID, 1, map[string]interface{}{"page": page + 1})
@@ -649,6 +651,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 		if policy.NewsLatencyBudgetMS > 0 && elapsed > time.Duration(policy.NewsLatencyBudgetMS)*time.Millisecond {
 			add("edge_news_latency", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, 1, map[string]interface{}{"latency_ms": elapsed.Milliseconds(), "budget_ms": policy.NewsLatencyBudgetMS})
 		}
+		add("edge_news_page_success", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "info", "ok", "page", variant, len(payload.Slides), map[string]interface{}{"page": 1, "full_page_target": 10})
 		// Consumer-facing News staleness. The serving path only returns
 		// Source="cache" when age <= newsSnapshotMaxStale (past that it
 		// assembles live), so a pure `age > maxStale` test on a cache response
@@ -709,6 +712,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 				add("edge_news_http", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "critical", "check_error", "page", variant, 1, map[string]interface{}{"page": page + 1, "error": safeIntegrityError(nextErr)})
 				break
 			}
+			add("edge_news_page_success", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "info", "ok", "page", variant, len(next.Slides), map[string]interface{}{"page": page + 1, "full_page_target": 10})
 			for _, slide := range next.Slides {
 				if seen[slide.Featured.StoryID] {
 					add("edge_news_dup", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, map[string]interface{}{"page": page + 1})
@@ -767,13 +771,18 @@ func runFeedIntegrityProbes(ctx context.Context, policy models.FeedIntegrityPoli
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			if err := probeIntegrityURL(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond); err != nil {
-				add("probe_url_dead", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
+			probeErr := probeIntegrityURL(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond)
+			if probeErr != nil {
+				add("probe_url_dead", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(probeErr)})
 			}
 			if strings.Contains(strings.ToLower(strings.Split(raw, "?")[0]), ".m3u8") {
-				if err := probeIntegrityHLS(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond); err != nil {
-					add("probe_hls_manifest", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(err)})
+				if hlsErr := probeIntegrityHLS(ctx, raw, time.Duration(policy.ProbeTimeoutMS)*time.Millisecond); hlsErr != nil {
+					probeErr = hlsErr
+					add("probe_hls_manifest", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "major", "violation", "url", redactIntegrityURL(raw), 1, map[string]interface{}{"reason": safeIntegrityError(hlsErr)})
 				}
+			}
+			if probeErr == nil {
+				add("probe_url_success", "probe", "pods", "default", models.FeedIntegrityAxisConsumer, "info", "ok", "url", redactIntegrityURL(raw), 1, nil)
 			}
 		}()
 	}

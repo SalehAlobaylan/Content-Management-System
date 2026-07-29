@@ -120,7 +120,14 @@ func validateConsumptionEvidence(interactionType models.InteractionType, metadat
 		return errors.New("consumption evidence is out of range")
 	}
 	expected := consumptionClassForEvidence(*evidence.ActualPlayedSeconds, *evidence.FurthestPositionSecs, durationSeconds)
-	if *evidence.Classification != string(expected) || interactionType != expected {
+	classification := strings.TrimSpace(*evidence.Classification)
+	// Older clients emitted the human-facing "completed" label while the
+	// canonical interaction enum is "complete". Keep that payload compatible
+	// without weakening the evidence-derived classification check.
+	if classification == "completed" {
+		classification = string(models.InteractionTypeComplete)
+	}
+	if classification != string(expected) || interactionType != expected {
 		return errors.New("consumption classification does not match playback evidence")
 	}
 	return nil

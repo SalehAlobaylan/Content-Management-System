@@ -6,12 +6,15 @@ package controllers
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"content-management-system/src/models"
@@ -44,6 +47,35 @@ func historicalManifestHash(tenant, timezone string, content, stories []uuid.UUI
 	raw, _ := json.Marshal(map[string]interface{}{"v": 1, "tenant": tenant, "timezone": timezone, "content": content, "stories": stories})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+type historicalCursor struct {
+	OrderedAt time.Time `json:"ordered_at"`
+	ContentID uuid.UUID `json:"content_id"`
+}
+
+func encodeHistoricalCursor(item models.ContentItem) string {
+	orderedAt := item.CreatedAt
+	if item.PublishedAt != nil {
+		orderedAt = *item.PublishedAt
+	}
+	raw, _ := json.Marshal(historicalCursor{OrderedAt: orderedAt.UTC(), ContentID: item.PublicID})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func decodeHistoricalCursor(raw string) (historicalCursor, error) {
+	if strings.TrimSpace(raw) == "" {
+		return historicalCursor{}, nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return historicalCursor{}, fmt.Errorf("invalid historical cursor: %w", err)
+	}
+	var cursor historicalCursor
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.ContentID == uuid.Nil || cursor.OrderedAt.IsZero() {
+		return historicalCursor{}, errors.New("invalid historical cursor")
+	}
+	return cursor, nil
 }
 
 func finalizedArchiveMonths(db *gorm.DB, tenant string) (map[string]bool, error) {
@@ -123,66 +155,134 @@ func historicalDependencyPreflight(db *gorm.DB, tenant string, ids []uuid.UUID) 
 	return issues, nil
 }
 
-func historicalCandidates(db *gorm.DB, tenant, timezone string) ([]models.ContentItem, []uuid.UUID, int64, error) {
+func historicalCandidates(db *gorm.DB, tenant, timezone, cursor string, maxRows int, maxBytes int64) ([]models.ContentItem, []uuid.UUID, int64, string, bool, error) {
 	months, err := finalizedArchiveMonths(db, tenant)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, "", false, err
 	}
 	if len(months) == 0 {
-		return nil, nil, 0, nil
-	}
-	var archiveLeads []uuid.UUID
-	if err := db.Model(&models.NewsMonthArchiveStory{}).Joins("JOIN news_month_archives a ON a.id = news_month_archive_stories.archive_id").Where("a.tenant_id=? AND a.state=?", tenant, "finalized").Pluck("lead_content_id", &archiveLeads).Error; err != nil {
-		return nil, nil, 0, err
-	}
-	var items []models.ContentItem
-	if err := db.Where("tenant_id=? AND type=? AND status IN ?", tenant, models.ContentTypeNews, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusFailed, models.ContentStatusArchived}).Find(&items).Error; err != nil {
-		return nil, nil, 0, err
-	}
-	leadSet := map[uuid.UUID]bool{}
-	for _, id := range archiveLeads {
-		leadSet[id] = true
+		return nil, nil, 0, "", false, nil
 	}
 	location := monthlyReviewLocation(timezone)
-	candidates := []models.ContentItem{}
-	var estimated int64
-	for _, item := range items {
-		month := itemTime(item).In(location)
-		key := time.Date(month.Year(), month.Month(), 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
-		if !months[key] || leadSet[item.PublicID] {
-			continue
+	monthPredicates := make([]string, 0, len(months))
+	monthArgs := make([]interface{}, 0, len(months)*2)
+	for monthKey := range months {
+		monthStart, parseErr := time.Parse("2006-01-02", monthKey)
+		if parseErr != nil {
+			return nil, nil, 0, "", false, fmt.Errorf("invalid finalized archive month %q: %w", monthKey, parseErr)
 		}
-		candidates = append(candidates, item)
+		start := time.Date(monthStart.Year(), monthStart.Month(), 1, 0, 0, 0, 0, location).UTC()
+		end := start.In(location).AddDate(0, 1, 0).UTC()
+		monthPredicates = append(monthPredicates, "COALESCE(published_at, created_at) >= ? AND COALESCE(published_at, created_at) < ?")
+		monthArgs = append(monthArgs, start, end)
 	}
-	ids := extractPublicIDs(candidates)
+	parsedCursor, err := decodeHistoricalCursor(cursor)
+	if err != nil {
+		return nil, nil, 0, "", false, err
+	}
+	probeLimit := 1000
+	if maxRows > 0 && maxRows < probeLimit {
+		probeLimit = maxRows * 2
+		if probeLimit < 100 {
+			probeLimit = 100
+		}
+	}
+	query := db.Select("id, public_id, tenant_id, type, status, story_id, published_at, created_at").
+		Where("tenant_id=? AND type=? AND status IN ?", tenant, models.ContentTypeNews, []models.ContentStatus{models.ContentStatusReady, models.ContentStatusFailed, models.ContentStatusArchived}).
+		Where("("+strings.Join(monthPredicates, " OR ")+")", monthArgs...).
+		Where("NOT EXISTS (SELECT 1 FROM news_month_archive_stories nas JOIN news_month_archives na ON na.id = nas.archive_id WHERE na.tenant_id = ? AND na.state = 'finalized' AND nas.lead_content_id = content_items.public_id)", tenant).
+		Order("COALESCE(published_at, created_at) ASC, public_id ASC").
+		Limit(probeLimit + 1)
+	if !parsedCursor.OrderedAt.IsZero() {
+		query = query.Where("(COALESCE(published_at, created_at) > ? OR (COALESCE(published_at, created_at) = ? AND public_id > ?))", parsedCursor.OrderedAt, parsedCursor.OrderedAt, parsedCursor.ContentID)
+	}
+	var items []models.ContentItem
+	if err := query.Find(&items).Error; err != nil {
+		return nil, nil, 0, "", false, err
+	}
+	fetchedHasMore := len(items) > probeLimit
+	if fetchedHasMore {
+		items = items[:probeLimit]
+	}
+	ids := extractPublicIDs(items)
 	protected, err := historicalProtectedContentIDs(db, tenant, ids, time.Now().UTC())
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, "", fetchedHasMore, err
 	}
-	filtered := candidates[:0]
-	for _, item := range candidates {
-		if !protected[item.PublicID] {
-			filtered = append(filtered, item)
-		}
-	}
-	candidates = filtered
-	ids = extractPublicIDs(candidates)
-	storySet := map[uuid.UUID]bool{}
-	for _, item := range candidates {
-		if item.StoryID != nil {
-			storySet[*item.StoryID] = true
-		}
-	}
+	// Estimate only the bounded metadata page. We walk the original ordered
+	// page below so protected/oversized rows advance the cursor, while the first
+	// row that would exceed this batch remains at the continuation boundary.
 	if len(ids) > 0 {
-		if err := db.Raw("SELECT COALESCE(SUM(pg_column_size(content_items)),0)::bigint FROM content_items WHERE tenant_id=? AND public_id IN ?", tenant, ids).Scan(&estimated).Error; err != nil {
-			return nil, nil, 0, err
+		var bytes []struct {
+			ID    uuid.UUID `gorm:"column:public_id"`
+			Bytes int64     `gorm:"column:bytes"`
 		}
+		if err := db.Model(&models.ContentItem{}).Select("public_id, pg_column_size(content_items)::bigint AS bytes").Where("tenant_id=? AND public_id IN ?", tenant, ids).Find(&bytes).Error; err != nil {
+			return nil, nil, 0, "", fetchedHasMore, err
+		}
+		byID := make(map[uuid.UUID]int64, len(bytes))
+		for _, row := range bytes {
+			byID[row.ID] = row.Bytes
+		}
+		bounded := make([]models.ContentItem, 0, maxRows)
+		var running int64
+		pageCursor := ""
+		stoppedForCap := false
+		for _, item := range items {
+			if protected[item.PublicID] {
+				pageCursor = encodeHistoricalCursor(item)
+				continue
+			}
+			itemBytes := byID[item.PublicID]
+			if itemBytes > maxBytes {
+				// A single oversized row cannot be allowed to block every later
+				// candidate. It is excluded with an auditable bounded scan and the
+				// continuation advances beyond it.
+				pageCursor = encodeHistoricalCursor(item)
+				continue
+			}
+			if len(bounded) >= maxRows || (len(bounded) > 0 && running+itemBytes > maxBytes) {
+				stoppedForCap = true
+				break
+			}
+			bounded = append(bounded, item)
+			running += itemBytes
+			pageCursor = encodeHistoricalCursor(item)
+		}
+		items = bounded
+		hasMore := fetchedHasMore || stoppedForCap
+		ids = extractPublicIDs(items)
+		storySet := map[uuid.UUID]bool{}
+		for _, item := range items {
+			if item.StoryID != nil {
+				storySet[*item.StoryID] = true
+			}
+		}
+		var estimated int64
+		if len(ids) > 0 {
+			if err := db.Raw("SELECT COALESCE(SUM(pg_column_size(content_items)),0)::bigint FROM content_items WHERE tenant_id=? AND public_id IN ?", tenant, ids).Scan(&estimated).Error; err != nil {
+				return nil, nil, 0, pageCursor, hasMore, err
+			}
+		}
+		stories := make([]uuid.UUID, 0, len(storySet))
+		for id := range storySet {
+			stories = append(stories, id)
+		}
+		return items, stories, estimated, pageCursor, hasMore, nil
 	}
-	stories := make([]uuid.UUID, 0, len(storySet))
-	for id := range storySet {
-		stories = append(stories, id)
+	return nil, nil, 0, "", fetchedHasMore, nil
+}
+
+func historicalCandidateCursor(items []models.ContentItem) map[string]string {
+	if len(items) == 0 {
+		return map[string]string{}
 	}
-	return candidates, stories, estimated, nil
+	last := items[len(items)-1]
+	stamp := last.CreatedAt
+	if last.PublishedAt != nil {
+		stamp = *last.PublishedAt
+	}
+	return map[string]string{"ordered_at": stamp.UTC().Format(time.RFC3339Nano), "public_id": last.PublicID.String()}
 }
 
 func PrepareHistoricalRetention(c *gin.Context) {
@@ -191,6 +291,15 @@ func PrepareHistoricalRetention(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
+	var request struct {
+		Cursor string `json:"cursor"`
+	}
+	if c.Request != nil && c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid historical cursor request"})
+			return
+		}
+	}
 	policy := loadRetentionPolicy(db, principal.TenantID)
 	timezone := retentionNewsTimezone(db, principal.TenantID)
 	run, err := runRetention(db, principal.TenantID, "manual", principal.Email)
@@ -198,18 +307,24 @@ func PrepareHistoricalRetention(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	items, stories, estimated, err := historicalCandidates(db, principal.TenantID, timezone)
+	items, stories, estimated, nextCursor, hasMore, err := historicalCandidates(db, principal.TenantID, timezone, request.Cursor, policy.MaxRowsPerRun, policy.MaxBytesPerRun)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	ids := extractPublicIDs(items)
 	if len(ids) == 0 {
-		c.JSON(409, gin.H{"error": "no archive-gated, unprotected historical News is eligible"})
+		response := gin.H{"error": "no archive-gated, unprotected historical News is eligible"}
+		if hasMore && nextCursor != "" {
+			response["next_cursor"] = nextCursor
+		}
+		c.JSON(409, response)
 		return
 	}
+	// historicalCandidates already returns a deterministic bounded prefix. A
+	// second assertion protects against future callers widening that helper.
 	if len(ids) > policy.MaxRowsPerRun || estimated > policy.MaxBytesPerRun {
-		c.JSON(409, gin.H{"error": "historical scope exceeds policy cap"})
+		c.JSON(409, gin.H{"error": "historical batch exceeds policy cap"})
 		return
 	}
 	issues, err := historicalDependencyPreflight(db, principal.TenantID, ids)
@@ -223,7 +338,7 @@ func PrepareHistoricalRetention(c *gin.Context) {
 	}
 	hash := historicalManifestHash(principal.TenantID, timezone, ids, stories)
 	now := time.Now().UTC()
-	manifest := models.RetentionHistoricalManifest{RunID: run.ID, TenantID: principal.TenantID, PolicyVersion: policy.PolicyVersion, Timezone: timezone, ManifestHash: hash, State: "prepared", ContentIDs: idsJSON(ids), StoryIDs: idsJSON(stories), ContentCount: len(ids), StoryCount: len(stories), EstimatedBytes: estimated, ExpiresAt: now.Add(24 * time.Hour), Evidence: retentionActionEvidence(map[string]interface{}{"archive_gate": "finalized", "source_targets": 0, "dependency_issues": issues, "protected_rows_excluded": len(items) - len(ids)})}
+	manifest := models.RetentionHistoricalManifest{RunID: run.ID, TenantID: principal.TenantID, PolicyVersion: policy.PolicyVersion, Timezone: timezone, ManifestHash: hash, State: "prepared", ContentIDs: idsJSON(ids), StoryIDs: idsJSON(stories), ContentCount: len(ids), StoryCount: len(stories), EstimatedBytes: estimated, ExpiresAt: now.Add(24 * time.Hour), Evidence: retentionActionEvidence(map[string]interface{}{"archive_gate": "finalized", "source_targets": 0, "dependency_issues": issues, "protected_rows_excluded": len(items) - len(ids), "next_cursor": nextCursor, "has_more": hasMore, "cursor_order": "coalesce(published_at,created_at),public_id"})}
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&manifest).Error; err != nil {
 			return err
@@ -410,6 +525,10 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		c.JSON(409, gin.H{"error": "historical purge requires enabled Assist mode"})
 		return
 	}
+	if err := requireRetentionCapability(db, principal.TenantID, retentionCapabilityHistorical); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 	now := time.Now().UTC()
 	var action models.RetentionAction
 	var manifest models.RetentionHistoricalManifest
@@ -547,7 +666,7 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 	} else {
 		verification["after_database_bytes"] = sample.DatabaseBytes
 	}
-	if integrityErr != nil || integrity.Status != models.FeedIntegrityRunCompleted || health.Overall == "unhealthy" || sampleErr != nil {
+	if integrityErr != nil || integrity.Status != models.FeedIntegrityRunCompleted || integrity.Headline != "all_clear" || health.Overall != "healthy" || sampleErr != nil {
 		_ = db.Model(&models.RetentionAction{}).Where("id=?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "verification": retentionActionEvidence(verification), "finished_at": time.Now().UTC()}).Error
 		c.JSON(http.StatusConflict, gin.H{"error": "historical purge completed but post-deploy safety verification failed"})
 		return
@@ -578,6 +697,42 @@ func CreateRetentionMaintenanceReport(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	var request struct {
+		ProviderBytes            *int64     `json:"provider_bytes"`
+		ProviderSource           string     `json:"provider_source"`
+		ProviderMeasuredAt       *time.Time `json:"provider_measured_at"`
+		PhysicalReclaimConfirmed bool       `json:"physical_reclaim_confirmed"`
+	}
+	if c.Request.Body != nil {
+		if err := c.ShouldBindJSON(&request); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid provider measurement payload"})
+			return
+		}
+	}
+	if request.ProviderBytes != nil && *request.ProviderBytes < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "provider_bytes must be non-negative"})
+		return
+	}
+	if request.ProviderBytes != nil {
+		if request.ProviderSource == "" {
+			request.ProviderSource = "operator_readback"
+		}
+		if request.ProviderSource != "operator_readback" && request.ProviderSource != "neon_api" && request.ProviderSource != "supabase_api" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "provider_source is not supported"})
+			return
+		}
+		if request.ProviderMeasuredAt == nil {
+			now := time.Now().UTC()
+			request.ProviderMeasuredAt = &now
+		}
+		sample.ProviderBytes = request.ProviderBytes
+		sample.ProviderSource = request.ProviderSource
+		sample.ProviderMeasuredAt = request.ProviderMeasuredAt
+		if err := db.Model(&models.RetentionDBSample{}).Where("id = ?", sample.ID).Updates(map[string]interface{}{"provider_bytes": request.ProviderBytes, "provider_source": request.ProviderSource, "provider_measured_at": request.ProviderMeasuredAt}).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not persist provider measurement"})
+			return
+		}
+	}
 	var sparseColumn bool
 	if err := db.Raw("SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='content_items' AND column_name='embedding_sparse')").Scan(&sparseColumn).Error; err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -590,11 +745,56 @@ func CreateRetentionMaintenanceReport(c *gin.Context) {
 			return
 		}
 	}
+	now := time.Now().UTC()
+	providerFresh := sample.ProviderBytes != nil && sample.ProviderMeasuredAt != nil &&
+		sample.ProviderSource != "unavailable" && !sample.ProviderMeasuredAt.UTC().After(now.Add(5*time.Minute)) && now.Sub(sample.ProviderMeasuredAt.UTC()) <= 24*time.Hour
+	postgresReady := sample.DatabaseBytes <= policy.DatabaseTargetBytes && sparse == 0
+	providerReady := providerFresh && *sample.ProviderBytes <= policy.DatabaseTargetBytes
+	var activeRetentionRuns, activeRecoveryLanes int64
+	if err := db.Model(&models.RetentionRun{}).Where("tenant_id=? AND status=?", principal.TenantID, models.RetentionRunRunning).Count(&activeRetentionRuns).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify active retention runs"})
+		return
+	}
+	if err := db.Table("feed_availability_states").Where("tenant_id=? AND state <> 'normal'", principal.TenantID).Count(&activeRecoveryLanes).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify active recovery lanes"})
+		return
+	}
 	state := "not_ready"
-	if sample.DatabaseBytes <= policy.DatabaseTargetBytes && sparse == 0 {
+	if postgresReady && providerReady && request.PhysicalReclaimConfirmed && activeRetentionRuns == 0 && activeRecoveryLanes == 0 {
 		state = "free_downgrade_ready"
 	}
-	report := models.RetentionMaintenanceReport{TenantID: principal.TenantID, DatabaseBytes: sample.DatabaseBytes, TargetBytes: policy.DatabaseTargetBytes, SparseUseCount: sparse, State: state, Evidence: retentionActionEvidence(map[string]interface{}{"vacuum": "operator_only", "hnsw_toast": "operator_maintenance_required", "physical_reclaim": "provider measurement required"})}
+	blocking := []string{}
+	if !postgresReady {
+		blocking = append(blocking, "postgres_or_sparse_not_ready")
+	}
+	if !providerFresh {
+		blocking = append(blocking, "provider_measurement_missing_or_stale")
+	}
+	if !providerReady {
+		blocking = append(blocking, "provider_bytes_above_target")
+	}
+	if !request.PhysicalReclaimConfirmed {
+		blocking = append(blocking, "physical_reclaim_readback_missing")
+	}
+	if activeRetentionRuns > 0 {
+		blocking = append(blocking, "active_retention_run")
+	}
+	if activeRecoveryLanes > 0 {
+		blocking = append(blocking, "active_recovery_lane")
+	}
+	report := models.RetentionMaintenanceReport{
+		TenantID: principal.TenantID, DatabaseBytes: sample.DatabaseBytes, TargetBytes: policy.DatabaseTargetBytes,
+		SparseUseCount: sparse, ProviderBytes: sample.ProviderBytes, ProviderSource: sample.ProviderSource,
+		ProviderMeasuredAt: sample.ProviderMeasuredAt, ProviderFresh: providerFresh,
+		PostgresReady: postgresReady, ProviderReady: providerReady, BlockingReasons: datatypes.JSON(rawJSON(blocking)), State: state,
+		Evidence: retentionActionEvidence(map[string]interface{}{
+			"vacuum": "operator_only", "hnsw_toast": "operator_maintenance_required",
+			"physical_reclaim_confirmed": request.PhysicalReclaimConfirmed,
+			"active_retention_runs":      activeRetentionRuns,
+			"active_recovery_lanes":      activeRecoveryLanes,
+			"blocking_reasons":           blocking, "provider_source": sample.ProviderSource,
+		}),
+	}
 	if err := db.Create(&report).Error; err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
