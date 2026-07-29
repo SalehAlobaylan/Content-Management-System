@@ -41,7 +41,7 @@ func serveWithDB(db *gorm.DB, handler gin.HandlerFunc, target string) *httptest.
 func TestGetMissingEnrichmentCountsReturnsCombinedCounts(t *testing.T) {
 	db, mock := newMockGorm(t)
 	countSQL := regexp.QuoteMeta(`SELECT count(*) FROM "content_items"`)
-	for _, n := range []int64{2, 3, 5, 7, 11, 13} {
+	for _, n := range []int64{2, 3, 7, 11} {
 		mock.ExpectQuery(countSQL).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
 	}
@@ -57,8 +57,8 @@ func TestGetMissingEnrichmentCountsReturnsCombinedCounts(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if body.Data.Transcript != 2 || body.Data.Embedding != 3 || body.Data.Sparse != 5 ||
-		body.Data.Image != 7 || body.Data.TranscriptImage != 11 || body.Data.EmbeddingSparse != 13 {
+	if body.Data.Transcript != 2 || body.Data.Embedding != 3 || body.Data.Sparse != 0 ||
+		body.Data.Image != 7 || body.Data.TranscriptImage != 11 || body.Data.EmbeddingSparse != 0 {
 		t.Fatalf("unexpected counts: %+v", body.Data)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

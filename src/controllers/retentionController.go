@@ -768,6 +768,8 @@ func ApproveRetentionAction(c *gin.Context) {
 	}
 	_ = db.Model(&models.RetentionCompactionManifest{}).Where("action_id = ?", action.ID).
 		Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}).Error
+	_ = db.Model(&models.RetentionHistoricalManifest{}).Where("action_id = ?", action.ID).
+		Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}).Error
 	retentionAudit(db, principal, "retention.action.approve", action.PublicID.String(), "success", nil)
 	c.JSON(http.StatusOK, gin.H{"data": action})
 }

@@ -38,8 +38,6 @@ type enrichmentStatsResponse struct {
 	MissingTranscriptActionable int64 `json:"missing_transcript_actionable"`
 	WithEmbedding               int64 `json:"with_embedding"`
 	MissingEmbedding            int64 `json:"missing_embedding"`
-	WithSparse                  int64 `json:"with_sparse"`
-	MissingSparse               int64 `json:"missing_sparse"`
 	WithImageEmbedding          int64 `json:"with_image_embedding"`
 	MissingImageEmbedding       int64 `json:"missing_image_embedding"`
 	TotalReady                  int64 `json:"total_ready"`
@@ -48,10 +46,10 @@ type enrichmentStatsResponse struct {
 type missingEnrichmentCountsResponse struct {
 	Transcript      int64 `json:"transcript"`
 	Embedding       int64 `json:"embedding"`
-	Sparse          int64 `json:"sparse"`
+	Sparse          int64 `json:"sparse"` // deprecated; always zero
 	Image           int64 `json:"image"`
 	TranscriptImage int64 `json:"transcript_image"`
-	EmbeddingSparse int64 `json:"embedding_sparse"`
+	EmbeddingSparse int64 `json:"embedding_sparse"` // deprecated; always zero
 }
 
 type missingEnrichmentItem struct {
@@ -62,7 +60,6 @@ type missingEnrichmentItem struct {
 	Status            string `json:"status"`
 	HasTranscript     bool   `json:"has_transcript"`
 	HasEmbedding      bool   `json:"has_embedding"`
-	HasSparse         bool   `json:"has_sparse"`
 	HasImageEmbedding bool   `json:"has_image_embedding"`
 	MediaURL          string `json:"media_url"`
 	ThumbnailURL      string `json:"thumbnail_url"`
@@ -123,8 +120,6 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 				COUNT(*) FILTER (WHERE type IN ('VIDEO','PODCAST') AND transcript_id IS NULL AND status = 'READY' AND (duration_sec IS NULL OR duration_sec <= 2400)) as missing_transcript_actionable,
 			COUNT(*) FILTER (WHERE embedding IS NOT NULL) as with_embedding,
 			COUNT(*) FILTER (WHERE embedding IS NULL AND status = 'READY') as missing_embedding,
-			COUNT(*) FILTER (WHERE embedding_sparse IS NOT NULL) as with_sparse,
-			COUNT(*) FILTER (WHERE embedding IS NOT NULL AND embedding_sparse IS NULL AND status = 'READY') as missing_sparse,
 			COUNT(*) FILTER (WHERE image_embedding IS NOT NULL) as with_image_embedding,
 			COUNT(*) FILTER (WHERE thumbnail_url IS NOT NULL AND image_embedding IS NULL AND status = 'READY') as missing_image_embedding,
 			COUNT(*) FILTER (WHERE status = 'READY') as total_ready
@@ -139,8 +134,6 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 		&stats.MissingTranscriptActionable,
 		&stats.WithEmbedding,
 		&stats.MissingEmbedding,
-		&stats.WithSparse,
-		&stats.MissingSparse,
 		&stats.WithImageEmbedding,
 		&stats.MissingImageEmbedding,
 		&stats.TotalReady,
@@ -173,20 +166,12 @@ func GetMissingEnrichmentCounts(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count embedding gaps: " + err.Error()})
 		return
 	}
-	if counts.Sparse, err = countFor("sparse"); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count sparse gaps: " + err.Error()})
-		return
-	}
 	if counts.Image, err = countFor("image"); err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count image gaps: " + err.Error()})
 		return
 	}
 	if counts.TranscriptImage, err = countFor("transcript,image"); err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count media enrichment gaps: " + err.Error()})
-		return
-	}
-	if counts.EmbeddingSparse, err = countFor("embedding,sparse"); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to count news enrichment gaps: " + err.Error()})
 		return
 	}
 
@@ -238,7 +223,6 @@ func GetMissingEnrichments(c *gin.Context) {
 			Status:            string(item.Status),
 			HasTranscript:     item.TranscriptID != nil,
 			HasEmbedding:      item.Embedding != nil,
-			HasSparse:         item.EmbeddingSparse != nil,
 			HasImageEmbedding: item.ImageEmbedding != nil,
 			CreatedAt:         item.CreatedAt.Format("2006-01-02T15:04:05Z"),
 		}
@@ -465,9 +449,6 @@ func missingEnrichmentClauses(missingParam string) []string {
 			conditions = append(conditions, "transcript_id IS NULL AND type IN ('VIDEO','PODCAST')")
 		case "embedding":
 			conditions = append(conditions, "embedding IS NULL")
-		case "sparse":
-			// Has a dense vector but no sparse lexical weights.
-			conditions = append(conditions, "embedding IS NOT NULL AND embedding_sparse IS NULL")
 		case "image":
 			// Has a thumbnail but no CLIP image embedding.
 			conditions = append(conditions, "image_embedding IS NULL AND thumbnail_url IS NOT NULL")
@@ -564,15 +545,6 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
 				o.Status = artifactOutcomeTriggered
-			}
-			out = append(out, o)
-
-		case "sparse":
-			o := artifactOutcome{Artifact: "sparse"}
-			if item.EmbeddingSparse != nil {
-				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
-			} else {
-				o.Status, o.Reason = artifactOutcomeSkipped, "legacy sparse embeddings are no longer generated"
 			}
 			out = append(out, o)
 

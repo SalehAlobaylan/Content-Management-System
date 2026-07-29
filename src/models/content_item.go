@@ -175,10 +175,6 @@ type ContentItem struct {
 	// populated by Enrichment-Service. Multilingual — strong on Arabic + English.
 	// (Replaced BGE-M3; semantic similarity is dense cosine only.)
 	Embedding *pgvector.Vector `gorm:"type:vector(1024)" json:"-"`
-	// EmbeddingSparse is a dead BGE-M3-era column (250002-dim sparsevec). It was
-	// for lexical retrieval but is unused post-Qwen — always NULL for new content.
-	// Retained only for migration compatibility with the legacy knn-sparse path.
-	EmbeddingSparse *pgvector.SparseVector `gorm:"type:sparsevec(250002)" json:"-"`
 	// EmbeddingModel records WHICH model produced the current Embedding
 	// (e.g. "Qwen/Qwen3-Embedding-0.6B"). Set by the write-back; NULL means the
 	// vector has no provenance (written by a pre-provenance service) and the

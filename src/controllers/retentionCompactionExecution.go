@@ -344,7 +344,7 @@ func compactAnchorUpdates(tx *gorm.DB, tenant, hash string, payload retentionMan
 		if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id = ?", tenant, story.LeadID).Updates(map[string]interface{}{
 			"news_retention_state": "compact", "news_feed_role": "lead", "news_representative_ordinal": nil,
 			"news_compacted_at": now, "news_compaction_hash": hash,
-			"embedding": nil, "embedding_sparse": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
+			"embedding": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
 			"image_embedding": nil, "image_embedding_model": nil, "image_embedding_space_id": nil, "image_embedding_producer_id": nil,
 		}).Error; err != nil {
 			return err
@@ -354,7 +354,7 @@ func compactAnchorUpdates(tx *gorm.DB, tenant, hash string, payload retentionMan
 			if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id = ?", tenant, id).Updates(map[string]interface{}{
 				"news_retention_state": "compact", "news_feed_role": "representative", "news_representative_ordinal": ordinal,
 				"news_compacted_at": now, "news_compaction_hash": hash,
-				"embedding": nil, "embedding_sparse": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
+				"embedding": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
 				"image_embedding": nil, "image_embedding_model": nil, "image_embedding_space_id": nil, "image_embedding_producer_id": nil,
 			}).Error; err != nil {
 				return err
@@ -364,7 +364,7 @@ func compactAnchorUpdates(tx *gorm.DB, tenant, hash string, payload retentionMan
 			if err := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id IN ?", tenant, story.ProtectedIDs).Updates(map[string]interface{}{
 				"news_retention_state": "compact", "news_feed_role": "protected_only", "news_representative_ordinal": nil,
 				"news_compacted_at": now, "news_compaction_hash": hash,
-				"embedding": nil, "embedding_sparse": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
+				"embedding": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
 				"image_embedding": nil, "image_embedding_model": nil, "image_embedding_space_id": nil, "image_embedding_producer_id": nil,
 			}).Error; err != nil {
 				return err

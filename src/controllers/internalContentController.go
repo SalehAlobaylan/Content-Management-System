@@ -174,12 +174,7 @@ type internalUpdateArtifactsRequest struct {
 
 type internalUpdateEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
-	// EmbeddingSparse is BGE-M3's learned sparse output: {token_id_string: weight}.
-	// Optional — Slice 0 only sets the dense vector; Slice A starts populating
-	// sparse once FlagEmbedding lands. JSON keys are stringified token IDs
-	// (BGE-M3 returns them that way); converted to pgvector.SparseVector below.
-	EmbeddingSparse map[string]float32 `json:"embedding_sparse"`
-	TopicTags       []string           `json:"topic_tags"`
+	TopicTags []string  `json:"topic_tags"`
 	// Model is the embedder that produced this vector (provenance). Optional
 	// for back-compat — when absent the row's embedding_model is cleared, which
 	// flags the vector for re-embedding by the reconcile sweep.
@@ -192,10 +187,6 @@ type internalUpdateEmbeddingRequest struct {
 	SpaceID    string `json:"space_id"`
 	ProducerID string `json:"producer_id"`
 }
-
-// bgeM3SparseDim is BGE-M3's vocabulary size — the dimension of its sparse
-// output. Must match the sparsevec(N) column type in the schema.
-const bgeM3SparseDim int32 = 250002
 
 // textEmbeddingDim is the dense embedding length Qwen3-Embedding-0.6B produces.
 // Mirrors the strict-dimension check on image embeddings (CLIP at 512).
@@ -671,24 +662,6 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	item.EmbeddingSpaceID = stampOrNil(req.SpaceID)
 	item.EmbeddingProducerID = stampOrNil(req.ProducerID)
 
-	// Sparse output is optional (Slice A populates it). Convert BGE-M3's
-	// {token_id_string: weight} map to pgvector.SparseVector if supplied.
-	if len(req.EmbeddingSparse) > 0 {
-		elements := make(map[int32]float32, len(req.EmbeddingSparse))
-		for k, v := range req.EmbeddingSparse {
-			idx, parseErr := strconv.ParseInt(k, 10, 32)
-			if parseErr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error": "embedding_sparse key '" + k + "' is not a valid token id",
-				})
-				return
-			}
-			elements[int32(idx)] = v
-		}
-		sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
-		item.EmbeddingSparse = &sparse
-	}
-
 	if len(req.TopicTags) > 0 {
 		item.TopicTags = req.TopicTags
 	}
@@ -781,13 +754,6 @@ type internalKNNDenseRequest struct {
 	ExcludeIDs []string  `json:"exclude_ids"` // optional public_ids to skip
 }
 
-type internalKNNSparseRequest struct {
-	EmbeddingSparse map[string]float32 `json:"embedding_sparse"` // {token_id_str: weight}
-	Types           []string           `json:"types"`
-	K               int                `json:"k"`
-	ExcludeIDs      []string           `json:"exclude_ids"`
-}
-
 type internalKNNHit struct {
 	ID     string  `json:"id"`   // public_id (UUID string)
 	Type   string  `json:"type"` // canonical ContentType (NEWS, VIDEO, PODCAST)
@@ -806,14 +772,13 @@ type internalKNNResponse struct {
 }
 
 type internalEmbeddingsResponse struct {
-	Embedding        []float32          `json:"embedding"` // 1024 dense, null if missing
-	EmbeddingSpaceID string             `json:"embedding_space_id,omitempty"`
-	EmbeddingSparse  map[string]float32 `json:"embedding_sparse"` // legacy BGE-M3 sparse, null for new content
+	Embedding        []float32 `json:"embedding"` // 1024 dense, null if missing
+	EmbeddingSpaceID string    `json:"embedding_space_id,omitempty"`
 }
 
 // InternalGetContentEmbeddings handles GET /internal/content-items/:id/embeddings.
-// Returns the dense vector (and legacy sparse field for compatibility) for one
-// content item so Enrichment /v1/related can skip re-embedding for an anchor.
+// Returns the dense vector for one content item so Enrichment /v1/related can
+// skip re-embedding for an anchor.
 func InternalGetContentEmbeddings(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	publicID := c.Param("id")
@@ -825,7 +790,7 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", id).
-		Select("embedding", "embedding_sparse", "embedding_space_id").
+		Select("embedding", "embedding_space_id").
 		First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
@@ -837,16 +802,6 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 		if item.EmbeddingSpaceID != nil {
 			resp.EmbeddingSpaceID = *item.EmbeddingSpaceID
 		}
-	}
-	if item.EmbeddingSparse != nil {
-		// Convert pgvector.SparseVector → BGE-M3 wire format {token_id_str: weight}.
-		indices := item.EmbeddingSparse.Indices()
-		values := item.EmbeddingSparse.Values()
-		sparse := make(map[string]float32, len(indices))
-		for i, idx := range indices {
-			sparse[strconv.FormatInt(int64(idx), 10)] = values[i]
-		}
-		resp.EmbeddingSparse = sparse
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -883,46 +838,10 @@ func InternalKNNDense(c *gin.Context) {
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
-// InternalKNNSparse handles POST /internal/content-items/knn-sparse.
-// Runs inner-product kNN against the `embedding_sparse` HNSW index. Sparse
-// inputs are sent in BGE-M3's wire format ({token_id_str: weight}) — same
-// shape InternalUpdateContentEmbedding accepts.
+// InternalKNNSparse is a compatibility response for clients that have not yet
+// moved to the Qwen dense-only retrieval endpoint.
 func InternalKNNSparse(c *gin.Context) {
-	db := c.MustGet("db").(*gorm.DB)
-
-	var req internalKNNSparseRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
-		return
-	}
-	if len(req.EmbeddingSparse) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "embedding_sparse is required"})
-		return
-	}
-	if req.K <= 0 || req.K > 200 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "k must be in [1, 200]"})
-		return
-	}
-
-	// Convert BGE-M3 sparse map → pgvector.SparseVector (same conversion as
-	// InternalUpdateContentEmbedding) then serialize to the literal form
-	// pgvector accepts in raw SQL: '{idx1:val1,idx2:val2,…}/N'.
-	elements := make(map[int32]float32, len(req.EmbeddingSparse))
-	for k, v := range req.EmbeddingSparse {
-		idx, parseErr := strconv.ParseInt(k, 10, 32)
-		if parseErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "embedding_sparse key '" + k + "' is not a valid token id",
-			})
-			return
-		}
-		elements[int32(idx)] = v
-	}
-	sparse := pgvector.NewSparseVectorFromMap(elements, bgeM3SparseDim)
-
-	hits := runKNNQuery(db, "embedding_sparse", sparse.String(), "",
-		req.Types, nil, req.K, req.ExcludeIDs)
-	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
+	c.JSON(http.StatusGone, gin.H{"error": "sparse retrieval was removed; use /content-items/knn"})
 }
 
 // ─── Slice B: batch text fetch for the reranker stage ────────────────
@@ -1088,14 +1007,8 @@ func InternalListMissingEmbedding(c *gin.Context) {
 	c.JSON(http.StatusOK, internalBatchTextResponse{Items: items})
 }
 
-// runKNNQuery is the shared GORM body for dense + sparse kNN.
-// column is "embedding" or "embedding_sparse" — both indexes already exist.
-// vecLiteral is the pgvector literal form (dense `[…]` or sparse `{…}/N`).
-//
-// Uses `<=>` (cosine distance) regardless of mode — pgvector's cosine
-// operator works on both vector and sparsevec when the matching ops class
-// is on the index. The RRF fusion in Enrichment only uses RANK, not raw
-// scores, so cross-mode score scales don't need to match.
+// runKNNQuery is the shared dense-vector kNN body. The RRF fusion in
+// Enrichment only uses rank, not the raw cosine score.
 func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string) []internalKNNHit {
 	q := db.Model(&models.ContentItem{}).
 		Where("status = ?", models.ContentStatusReady).

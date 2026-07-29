@@ -41,7 +41,9 @@ const (
 	RetentionActionSkipped          = "skipped"
 	RetentionActionExpired          = "expired"
 
-	RetentionActionPreviewNewsCompaction = "news_database.preview_compaction"
+	RetentionActionPreviewNewsCompaction  = "news_database.preview_compaction"
+	RetentionActionPrepareHistoricalPurge = "news_database.prepare_historical_purge"
+	RetentionActionExecuteHistoricalPurge = "news_database.execute_historical_purge"
 )
 
 const (
@@ -402,6 +404,74 @@ type MonthlyReviewStoryOverride struct {
 }
 
 func (MonthlyReviewStoryOverride) TableName() string { return "monthly_review_story_overrides" }
+
+// RetentionHistoricalManifest is the exact, approval-bound old-month deletion
+// scope. Sources are intentionally absent from its target types.
+type RetentionHistoricalManifest struct {
+	ID             uint           `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	RunID          uint           `gorm:"not null" json:"-"`
+	ActionID       *uint          `gorm:"uniqueIndex" json:"-"`
+	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	PolicyVersion  int            `gorm:"not null" json:"policy_version"`
+	Timezone       string         `gorm:"type:varchar(64);not null" json:"timezone"`
+	ManifestHash   string         `gorm:"type:char(64);not null;uniqueIndex" json:"manifest_hash"`
+	State          string         `gorm:"type:varchar(24);not null;index" json:"state"`
+	ContentIDs     datatypes.JSON `gorm:"type:jsonb;not null" json:"content_ids"`
+	StoryIDs       datatypes.JSON `gorm:"type:jsonb;not null" json:"story_ids"`
+	Evidence       datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	ContentCount   int            `gorm:"not null" json:"content_count"`
+	StoryCount     int            `gorm:"not null" json:"story_count"`
+	EstimatedBytes int64          `gorm:"not null" json:"estimated_bytes"`
+	ExpiresAt      time.Time      `gorm:"not null;index" json:"expires_at"`
+	ApprovedAt     *time.Time     `json:"approved_at,omitempty"`
+	ApprovedBy     string         `gorm:"type:varchar(255)" json:"approved_by,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+}
+
+func (RetentionHistoricalManifest) TableName() string { return "retention_historical_manifests" }
+
+// RetentionHistoricalRecoveryArtifact is a short-lived, verified logical
+// recovery object for an approved old-month retirement. It is deliberately a
+// separate ledger because the normal compaction artifact belongs to a
+// different immutable-manifest family.
+type RetentionHistoricalRecoveryArtifact struct {
+	ID                uint       `gorm:"primaryKey" json:"-"`
+	PublicID          uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID          uint       `gorm:"not null;uniqueIndex" json:"-"`
+	ManifestID        uint       `gorm:"not null;uniqueIndex" json:"-"`
+	TenantID          string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ArtifactKey       string     `gorm:"type:text;not null;uniqueIndex" json:"artifact_key"`
+	SHA256            string     `gorm:"type:char(64);not null" json:"sha256"`
+	CompressedBytes   int64      `gorm:"not null" json:"compressed_bytes"`
+	UncompressedBytes int64      `gorm:"not null" json:"uncompressed_bytes"`
+	State             string     `gorm:"type:varchar(24);not null;index" json:"state"`
+	ExpiresAt         time.Time  `gorm:"not null;index" json:"expires_at"`
+	VerifiedAt        *time.Time `json:"verified_at,omitempty"`
+	DeletedAt         *time.Time `json:"deleted_at,omitempty"`
+	LastError         string     `gorm:"type:text" json:"last_error,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+func (RetentionHistoricalRecoveryArtifact) TableName() string {
+	return "retention_historical_recovery_artifacts"
+}
+
+type RetentionMaintenanceReport struct {
+	ID             uint           `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	DatabaseBytes  int64          `gorm:"not null" json:"database_bytes"`
+	TargetBytes    int64          `gorm:"not null" json:"target_bytes"`
+	SparseUseCount int64          `gorm:"not null" json:"sparse_use_count"`
+	State          string         `gorm:"type:varchar(24);not null" json:"state"`
+	Evidence       datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	CreatedAt      time.Time      `json:"created_at"`
+}
+
+func (RetentionMaintenanceReport) TableName() string { return "retention_maintenance_reports" }
 
 // NewsIngestTombstone retains only irreversibly hashed identity evidence. It
 // never references sources, and its original content UUID is a value so the

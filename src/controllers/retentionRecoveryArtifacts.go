@@ -28,4 +28,19 @@ func sweepExpiredRetentionRecoveryArtifacts(db *gorm.DB) {
 		}
 		_ = db.Model(&models.RetentionRecoveryArtifact{}).Where("id = ?", artifact.ID).Updates(map[string]interface{}{"state": "deleted", "deleted_at": now, "last_error": ""}).Error
 	}
+	var historical []models.RetentionHistoricalRecoveryArtifact
+	if err := db.Where("state IN ? AND expires_at <= ?", []string{"verified", "expired", "delete_failed"}, now).
+		Order("expires_at ASC").Limit(20).Find(&historical).Error; err != nil {
+		return
+	}
+	for _, artifact := range historical {
+		if artifact.State == "verified" {
+			_ = db.Model(&models.RetentionHistoricalRecoveryArtifact{}).Where("id = ?", artifact.ID).Update("state", "expired").Error
+		}
+		if err := deleteRecoveryArtifact(artifact.ArtifactKey); err != nil {
+			_ = db.Model(&models.RetentionHistoricalRecoveryArtifact{}).Where("id = ?", artifact.ID).Updates(map[string]interface{}{"state": "delete_failed", "last_error": err.Error()}).Error
+			continue
+		}
+		_ = db.Model(&models.RetentionHistoricalRecoveryArtifact{}).Where("id = ?", artifact.ID).Updates(map[string]interface{}{"state": "deleted", "deleted_at": now, "last_error": ""}).Error
+	}
 }
