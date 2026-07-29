@@ -23,6 +23,48 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// FeedRecoveryReauthClaims accepts only IAM's dedicated, short-lived proof.
+// It intentionally cannot be satisfied by a normal refreshed access token.
+type FeedRecoveryReauthClaims struct {
+	UserID       string `json:"user_id"`
+	Email        string `json:"email"`
+	TenantID     string `json:"tenant_id"`
+	Purpose      string `json:"purpose"`
+	PlanID       string `json:"plan_id"`
+	ManifestHash string `json:"manifest_hash"`
+	AuthTime     int64  `json:"auth_time"`
+	jwt.RegisteredClaims
+}
+
+func ParseFeedRecoveryReauthProof(tokenString string, secret []byte) (*FeedRecoveryReauthClaims, error) {
+	claims := &FeedRecoveryReauthClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, ErrTokenInvalid
+		}
+		return secret, nil
+	})
+	if err != nil || !token.Valid || !isAllowedIssuer(claims.Issuer) || claims.Subject == "" || claims.ID == "" || claims.Purpose != "feed_recovery" || claims.AuthTime == 0 {
+		return nil, ErrTokenInvalid
+	}
+	if !hasAudience(claims.Audience, "wahb-feed-recovery-reauth") {
+		return nil, ErrTokenInvalid
+	}
+	if time.Since(time.Unix(claims.AuthTime, 0)) > 5*time.Minute {
+		return nil, ErrTokenExpired
+	}
+	return claims, nil
+}
+
+func hasAudience(values jwt.ClaimStrings, expected string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, expected) {
+			return true
+		}
+	}
+	return false
+}
+
 type AdminPrincipal struct {
 	UserID      string
 	Email       string

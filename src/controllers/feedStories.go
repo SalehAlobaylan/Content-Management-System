@@ -165,8 +165,9 @@ type StorySlide struct {
 
 // StoryNewsResponse is the Phase-13 News feed response (story-slides).
 type StoryNewsResponse struct {
-	Cursor *string      `json:"cursor"`
-	Slides []StorySlide `json:"slides"`
+	Cursor *string               `json:"cursor"`
+	Slides []StorySlide          `json:"slides"`
+	Meta   *feedAvailabilityMeta `json:"meta,omitempty"`
 }
 
 func derefStr(s *string) string {

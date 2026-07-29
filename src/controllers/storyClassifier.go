@@ -204,6 +204,10 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 	})
 
 	item.StoryID = &topicID
+	// A News item can become READY before its classification completes. Attach
+	// here as well as the generic READY transition so a candidate generation
+	// receives the item at the exact "classification ready" boundary.
+	attachReadyContentToFeedGenerations(db, *item)
 
 	if !alreadyMember {
 		// A story just gained a member — a news event the feed must reflect.

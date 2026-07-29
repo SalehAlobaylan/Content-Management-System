@@ -16,9 +16,10 @@ import (
 
 // PodsResponse is the API response for the Pods feed
 type PodsResponse struct {
-	Cursor   *string      `json:"cursor"`
-	Items    []PodsItem `json:"items"`
-	CaughtUp bool         `json:"caught_up"`
+	Cursor   *string               `json:"cursor"`
+	Items    []PodsItem            `json:"items"`
+	CaughtUp bool                  `json:"caught_up"`
+	Meta     *feedAvailabilityMeta `json:"meta,omitempty"`
 }
 
 // PodsItem represents a single item in the Pods feed
@@ -68,6 +69,10 @@ func hasCursor(pagination *utils.CursorPagination) bool {
 // GET /api/v1/feed/pods?cursor=xxx&limit=20
 func GetPodsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	availability := currentFeedAvailability(db, "default", "media")
+	if availability != nil && availability.RetryAfterSeconds != nil {
+		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
+	}
 	deliveryLanguage, ok := parseDeliveryLanguage(c.Query("content_language"))
 	if !ok {
 		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "content_language must be ar, en, or both"})
@@ -221,7 +226,7 @@ func GetPodsFeed(c *gin.Context) {
 			responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
 		}
 
-		c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination)})
+		c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination), Meta: availability})
 		if !isFeedIntegritySynthetic(c) {
 			recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
 		}
@@ -315,6 +320,7 @@ func GetPodsFeed(c *gin.Context) {
 		Cursor:   nextCursor,
 		Items:    responseItems,
 		CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
+		Meta:     availability,
 	})
 	if !isFeedIntegritySynthetic(c) {
 		recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
@@ -378,6 +384,10 @@ func recordPodsServe(db *gorm.DB, items []models.ContentItem, requestedLimit, du
 // GET /api/v1/feed/news?window=today|week|month&cursor=xxx&limit=10
 func GetNewsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	availability := currentFeedAvailability(db, "default", "news")
+	if availability != nil && availability.RetryAfterSeconds != nil {
+		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
+	}
 
 	// Parse cursor pagination
 	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
@@ -448,6 +458,7 @@ func GetNewsFeed(c *gin.Context) {
 	c.JSON(http.StatusOK, StoryNewsResponse{
 		Cursor: nextCursor,
 		Slides: slides,
+		Meta:   availability,
 	})
 }
 

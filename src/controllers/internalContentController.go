@@ -484,6 +484,7 @@ func InternalUpdateContentStatus(c *gin.Context) {
 			Where("tenant_id = ? AND child_content_item_id = ?", item.TenantID, item.PublicID).
 			Update("status", chapterStatusPublished).Error
 	}
+	attachReadyContentToFeedGenerations(db, item)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }

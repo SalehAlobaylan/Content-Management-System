@@ -412,6 +412,16 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/retention/holds", perm("feed", "manage"), controllers.CreateRetentionHold)
 	adminGroup.DELETE("/retention/holds/:id", perm("feed", "manage"), controllers.DeleteRetentionHold)
 
+	// Feed Recovery foundation: plans/approvals are durable and execution remains
+	// intentionally unavailable until the Repair and Rotate slice.
+	adminGroup.POST("/feed-recovery/plans", perm("feed", "manage"), controllers.CreateFeedRecoveryPlan)
+	adminGroup.GET("/feed-recovery/plans/:id", perm("feed", "read"), controllers.GetFeedRecoveryPlan)
+	adminGroup.POST("/feed-recovery/plans/:id/refresh-preflight", perm("feed", "manage"), controllers.RefreshFeedRecoveryPlan)
+	adminGroup.POST("/feed-recovery/plans/:id/approve", perm("feed", "manage"), controllers.ApproveFeedRecoveryPlan)
+	adminGroup.GET("/feed-recovery/runs", perm("feed", "read"), controllers.ListFeedRecoveryRuns)
+	adminGroup.GET("/feed-recovery/runs/:id", perm("feed", "read"), controllers.GetFeedRecoveryRun)
+	adminGroup.GET("/feed-recovery/runs/:id/actions", perm("feed", "read"), controllers.ListFeedRecoveryActions)
+
 	// Embedding & Model Lifecycle System (stage 10) — vector-space custodian.
 	// Reads under content:read, policy/manual-audit under content:write, privileged
 	// mutations (campaign start/abort, overrides — Slice 3) gated by admin role.

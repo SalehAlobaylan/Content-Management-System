@@ -22,11 +22,11 @@ const consumerFeedSessionLifetime = 6 * time.Hour
 const consumerFeedSnapshotLimit = 50
 
 type frozenPodsSessionResponse struct {
-	SessionID string       `json:"session_id"`
-	ExpiresAt time.Time    `json:"expires_at"`
-	Cursor    *string      `json:"cursor"`
+	SessionID string     `json:"session_id"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	Cursor    *string    `json:"cursor"`
 	Items     []PodsItem `json:"items"`
-	CaughtUp  bool         `json:"caught_up"`
+	CaughtUp  bool       `json:"caught_up"`
 }
 
 type frozenPodsSessionFreshnessResponse struct {
@@ -76,6 +76,14 @@ func frozenSessionLimit(c *gin.Context) int {
 		return 50
 	}
 	return limit
+}
+
+func activeFeedGeneration(db *gorm.DB, tenantID, lane string) int64 {
+	var head models.FeedGenerationHead
+	if err := db.Where("tenant_id=? AND lane=?", tenantID, lane).First(&head).Error; err != nil || head.Generation < 1 {
+		return 1
+	}
+	return head.Generation
 }
 
 // snapshotCurrentPodsFeed deliberately routes through the same controller
@@ -169,6 +177,7 @@ func CreatePodsFeedSession(c *gin.Context) {
 		IdentityScope: identityScope,
 		FeedType:      "pods",
 		Snapshot:      datatypes.JSON(snapshot),
+		Generation:    activeFeedGeneration(db, "default", "media"),
 		ExpiresAt:     now.Add(consumerFeedSessionLifetime),
 	}
 	if err := db.Create(&session).Error; err != nil {
@@ -200,6 +209,10 @@ func GetPodsFeedSessionPage(c *gin.Context) {
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
 		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
+		return
+	}
+	if session.Generation != activeFeedGeneration(db, "default", "media") {
+		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session was refreshed; create a new session"})
 		return
 	}
 	offset, err := parseFrozenSessionCursor(c.Query("cursor"))

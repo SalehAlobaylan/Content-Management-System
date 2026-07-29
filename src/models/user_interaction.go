@@ -82,6 +82,7 @@ type ConsumerFeedSession struct {
 	IdentityScope string         `gorm:"column:identity_scope;type:varchar(320);not null;index"`
 	FeedType      string         `gorm:"column:feed_type;type:varchar(24);not null"`
 	Snapshot      datatypes.JSON `gorm:"column:snapshot_json;type:jsonb;not null"`
+	Generation    int64          `gorm:"column:generation;not null;default:1" json:"generation"`
 	ExpiresAt     time.Time      `gorm:"column:expires_at;not null;index"`
 	CreatedAt     time.Time      `gorm:"column:created_at;autoCreateTime"`
 }
