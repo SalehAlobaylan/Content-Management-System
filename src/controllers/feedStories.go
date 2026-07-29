@@ -239,14 +239,15 @@ func assembleStoryNewsFeed(
 
 	windowStart := circ.Window.QueryStart
 	var members []models.ContentItem
-	db.Select(storyScoreColumns).
+	membersQuery := db.Select(storyScoreColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IS NOT NULL",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady).
 		Where(newsRetentionFeedPredicate).
 		Where("COALESCE(published_at, created_at) > ?", windowStart).
 		Order("COALESCE(published_at, created_at) DESC").
-		Limit(storyMemberPoolLimit).
-		Find(&members)
+		Limit(storyMemberPoolLimit)
+	membersQuery = applyActiveGenerationMembership(db, membersQuery, tenantID, "news", "story", "content_items.story_id")
+	membersQuery.Find(&members)
 
 	if len(members) == 0 {
 		return []StorySlide{}, nil

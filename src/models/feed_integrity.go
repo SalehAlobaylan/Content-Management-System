@@ -79,19 +79,19 @@ type FeedIntegrityPolicy struct {
 	// "pods_latency_budget_ms", and "expected_min_pods_units" from these
 	// field names, none of which match the migration's columns. Pin them
 	// explicitly so reads/writes round-trip instead of silently returning 0.
-	FlapCycles24h          int        `gorm:"column:flap_cycles_24h;not null;default:3" json:"flap_cycles_24h"`
-	EdgePagesPerFeed       int        `gorm:"not null;default:3" json:"edge_pages_per_feed"`
-	ProbeURLBudget         int        `gorm:"not null;default:40" json:"probe_url_budget"`
-	ProbeConcurrency       int        `gorm:"not null;default:2" json:"probe_concurrency"`
-	ProbeTimeoutMS         int        `gorm:"not null;default:5000" json:"probe_timeout_ms"`
-	PodsLatencyBudgetMS  int        `gorm:"column:pods_latency_budget_ms;not null;default:1500" json:"pods_latency_budget_ms"`
-	NewsLatencyBudgetMS    int        `gorm:"not null;default:2000" json:"news_latency_budget_ms"`
-	ThinSlideFloor         float64    `gorm:"not null;default:0.80" json:"thin_slide_floor"`
-	ExpectedMinPodsUnits int        `gorm:"column:expected_min_pods_units;not null;default:1" json:"expected_min_pods_units"`
-	ExpectedMinNewsSlides  int        `gorm:"not null;default:1" json:"expected_min_news_slides"`
-	PausedUntil            *time.Time `gorm:"type:timestamp" json:"paused_until,omitempty"`
-	LastLightRunAt         *time.Time `gorm:"type:timestamp" json:"last_light_run_at,omitempty"`
-	LastDeepRunAt          *time.Time `gorm:"type:timestamp" json:"last_deep_run_at,omitempty"`
+	FlapCycles24h         int        `gorm:"column:flap_cycles_24h;not null;default:3" json:"flap_cycles_24h"`
+	EdgePagesPerFeed      int        `gorm:"not null;default:3" json:"edge_pages_per_feed"`
+	ProbeURLBudget        int        `gorm:"not null;default:40" json:"probe_url_budget"`
+	ProbeConcurrency      int        `gorm:"not null;default:2" json:"probe_concurrency"`
+	ProbeTimeoutMS        int        `gorm:"not null;default:5000" json:"probe_timeout_ms"`
+	PodsLatencyBudgetMS   int        `gorm:"column:pods_latency_budget_ms;not null;default:1500" json:"pods_latency_budget_ms"`
+	NewsLatencyBudgetMS   int        `gorm:"not null;default:2000" json:"news_latency_budget_ms"`
+	ThinSlideFloor        float64    `gorm:"not null;default:0.80" json:"thin_slide_floor"`
+	ExpectedMinPodsUnits  int        `gorm:"column:expected_min_pods_units;not null;default:1" json:"expected_min_pods_units"`
+	ExpectedMinNewsSlides int        `gorm:"not null;default:1" json:"expected_min_news_slides"`
+	PausedUntil           *time.Time `gorm:"type:timestamp" json:"paused_until,omitempty"`
+	LastLightRunAt        *time.Time `gorm:"type:timestamp" json:"last_light_run_at,omitempty"`
+	LastDeepRunAt         *time.Time `gorm:"type:timestamp" json:"last_deep_run_at,omitempty"`
 
 	AutopilotEnabled               bool           `gorm:"column:autopilot_enabled;not null;default:false" json:"autopilot_enabled"`
 	AutopilotMode                  string         `gorm:"column:autopilot_mode;type:varchar(24);not null;default:'observe'" json:"autopilot_mode"`
@@ -120,6 +120,8 @@ type FeedIntegrityRun struct {
 	PublicID             uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_feed_integrity_runs_public_id" json:"id"`
 	TenantID             string         `gorm:"type:varchar(64);not null;index:idx_feed_integrity_runs_tenant" json:"tenant_id"`
 	Trigger              string         `gorm:"type:varchar(24);not null" json:"trigger"`
+	CorrelationID        *uuid.UUID     `gorm:"type:uuid" json:"correlation_id,omitempty"`
+	TriggerRef           string         `gorm:"type:varchar(128)" json:"trigger_ref,omitempty"`
 	Tier                 string         `gorm:"type:varchar(16);not null" json:"tier"`
 	Status               string         `gorm:"type:varchar(24);not null;index:idx_feed_integrity_runs_status" json:"status"`
 	Headline             string         `gorm:"type:varchar(32);not null" json:"headline"`

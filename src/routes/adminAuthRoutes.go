@@ -421,6 +421,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/feed-recovery/runs", perm("feed", "read"), controllers.ListFeedRecoveryRuns)
 	adminGroup.GET("/feed-recovery/runs/:id", perm("feed", "read"), controllers.GetFeedRecoveryRun)
 	adminGroup.GET("/feed-recovery/runs/:id/actions", perm("feed", "read"), controllers.ListFeedRecoveryActions)
+	adminGroup.POST("/feed-recovery/runs/:id/execute", perm("feed", "manage"), controllers.ExecuteFeedRecoveryRun)
+	adminGroup.POST("/feed-recovery/runs/:id/cancel", perm("feed", "manage"), controllers.CancelFeedRecoveryRun)
+	adminGroup.POST("/feed-recovery/runs/:id/rollback", utils.RequireAdminRole("admin"), controllers.RollbackFeedRecoveryRun)
 
 	// Embedding & Model Lifecycle System (stage 10) — vector-space custodian.
 	// Reads under content:read, policy/manual-audit under content:write, privileged

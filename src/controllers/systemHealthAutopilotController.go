@@ -40,8 +40,10 @@ var (
 )
 
 type systemAutopilotRunOptions struct {
-	Trigger   string
-	CreatedBy string
+	Trigger       string
+	CreatedBy     string
+	CorrelationID *uuid.UUID
+	TriggerRef    string
 }
 
 // systemAutopilotDeps keeps the runner deterministic in DB tests without
@@ -185,13 +187,15 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	now := deps.now()
 	policy := loadSystemAutopilotPolicy(db)
 	run := models.SystemAutopilotRun{
-		Trigger:    opts.Trigger,
-		Mode:       policy.Mode,
-		Status:     models.SystemAutopilotRunStatusRunning,
-		Headline:   models.SystemAutopilotHeadlineWatching,
-		StartedAt:  now,
-		CreatedBy:  opts.CreatedBy,
-		ErrorClass: models.SystemAutopilotErrorClassNone,
+		Trigger:       opts.Trigger,
+		Mode:          policy.Mode,
+		Status:        models.SystemAutopilotRunStatusRunning,
+		Headline:      models.SystemAutopilotHeadlineWatching,
+		StartedAt:     now,
+		CreatedBy:     opts.CreatedBy,
+		ErrorClass:    models.SystemAutopilotErrorClassNone,
+		CorrelationID: opts.CorrelationID,
+		TriggerRef:    opts.TriggerRef,
 	}
 	if err := db.Create(&run).Error; err != nil {
 		return run, nil, err

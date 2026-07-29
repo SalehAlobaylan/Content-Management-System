@@ -7,8 +7,8 @@ import (
 	"gorm.io/datatypes"
 )
 
-// FeedRecoveryPlan is immutable preflight evidence. Slice 7 creates and
-// approves plans only; execution is installed in the later Repair/Rotate slice.
+// FeedRecoveryPlan is immutable preflight evidence. Execution remains bound to
+// this identity so every repair/rotate action can be audited and resumed.
 type FeedRecoveryPlan struct {
 	ID             uint           `gorm:"primaryKey" json:"-"`
 	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
@@ -42,6 +42,11 @@ type FeedRecoveryRun struct {
 	CorrelationID         uuid.UUID  `json:"correlation_id"`
 	Phase                 string     `json:"phase"`
 	NotBefore             *time.Time `json:"not_before,omitempty"`
+	CancelDeadline        *time.Time `json:"cancel_deadline,omitempty"`
+	HeartbeatAt           *time.Time `json:"heartbeat_at,omitempty"`
+	ClaimToken            *uuid.UUID `json:"-"`
+	ClaimExpiresAt        *time.Time `json:"claim_expires_at,omitempty"`
+	LaneLease             string     `json:"lane_lease,omitempty"`
 	RollbackDeadline      *time.Time `json:"rollback_deadline,omitempty"`
 	VerificationDueAt     *time.Time `json:"verification_due_at,omitempty"`
 	ActiveGenerationID    *uuid.UUID `json:"active_generation_id,omitempty"`

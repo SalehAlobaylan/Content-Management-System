@@ -611,7 +611,7 @@ func podsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema boo
 	if supportsStorageStateSchema(db) {
 		q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
 	}
-	return q
+	return applyActiveGenerationMembership(db, q, tenantID, "media", "feed_unit", "content_items.public_id")
 }
 
 func chapterSiblingKey(item models.ContentItem) string {

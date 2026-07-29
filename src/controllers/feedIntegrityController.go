@@ -67,7 +67,11 @@ func isFeedIntegritySynthetic(c *gin.Context) bool {
 	return len(v) == len(feedIntegrityCapability) && subtle.ConstantTimeCompare([]byte(v), []byte(feedIntegrityCapability)) == 1
 }
 
-type feedIntegrityRunOptions struct{ Trigger, CreatedBy, Tier string }
+type feedIntegrityRunOptions struct {
+	Trigger, CreatedBy, Tier string
+	CorrelationID            *uuid.UUID
+	TriggerRef               string
+}
 
 type feedIntegrityCheck struct {
 	Key, Label, Lane, Feed, Axis, OwnerSurface string
@@ -215,7 +219,7 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 	if tier != models.FeedIntegrityTierDeep {
 		tier = models.FeedIntegrityTierLight
 	}
-	run := models.FeedIntegrityRun{TenantID: tenant, Trigger: feedIntegrityOr(opts.Trigger, "manual"), Tier: tier, Status: models.FeedIntegrityRunRunning, Headline: "running", StartedAt: now, CreatedBy: feedIntegrityOr(opts.CreatedBy, "automation"), ErrorClass: "none"}
+	run := models.FeedIntegrityRun{TenantID: tenant, Trigger: feedIntegrityOr(opts.Trigger, "manual"), Tier: tier, Status: models.FeedIntegrityRunRunning, Headline: "running", StartedAt: now, CreatedBy: feedIntegrityOr(opts.CreatedBy, "automation"), ErrorClass: "none", CorrelationID: opts.CorrelationID, TriggerRef: opts.TriggerRef}
 	if err := db.Create(&run).Error; err != nil {
 		return run, err
 	}
@@ -1159,9 +1163,9 @@ type feedIntegrityPolicyPatch struct {
 	ProbeURLBudget       *int  `json:"probe_url_budget"`
 	ProbeConcurrency     *int  `json:"probe_concurrency"`
 	ProbeTimeoutMS       *int  `json:"probe_timeout_ms"`
-	PodsLatencyMS      *int  `json:"pods_latency_budget_ms"`
+	PodsLatencyMS        *int  `json:"pods_latency_budget_ms"`
 	NewsLatencyMS        *int  `json:"news_latency_budget_ms"`
-	ExpectedPods       *int  `json:"expected_min_pods_units"`
+	ExpectedPods         *int  `json:"expected_min_pods_units"`
 	ExpectedNews         *int  `json:"expected_min_news_slides"`
 }
 

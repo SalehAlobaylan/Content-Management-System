@@ -134,10 +134,12 @@ type SystemAutopilotRun struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_system_autopilot_runs_public_id" json:"id"`
 
-	Trigger  string `gorm:"type:varchar(24);not null" json:"trigger"`
-	Mode     string `gorm:"type:varchar(24);not null" json:"mode"`
-	Status   string `gorm:"type:varchar(24);not null;index:idx_system_autopilot_runs_status" json:"status"`
-	Headline string `gorm:"type:varchar(32);not null" json:"headline"`
+	Trigger       string     `gorm:"type:varchar(24);not null" json:"trigger"`
+	CorrelationID *uuid.UUID `gorm:"type:uuid" json:"correlation_id,omitempty"`
+	TriggerRef    string     `gorm:"type:varchar(128)" json:"trigger_ref,omitempty"`
+	Mode          string     `gorm:"type:varchar(24);not null" json:"mode"`
+	Status        string     `gorm:"type:varchar(24);not null;index:idx_system_autopilot_runs_status" json:"status"`
+	Headline      string     `gorm:"type:varchar(32);not null" json:"headline"`
 
 	StartedAt    time.Time      `gorm:"type:timestamp;not null;index:idx_system_autopilot_runs_started_at" json:"started_at"`
 	FinishedAt   *time.Time     `gorm:"type:timestamp" json:"finished_at,omitempty"`
