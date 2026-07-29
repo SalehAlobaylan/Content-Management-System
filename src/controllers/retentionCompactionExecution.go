@@ -308,7 +308,7 @@ func revalidateCompactionPlan(tx *gorm.DB, tenant string, payload retentionManif
 		}
 	}
 	for _, item := range members {
-		if derefStr(item.NewsRetentionState) != "full" || derefStr(item.NewsFeedRole) != "full_member" {
+		if !retentionItemIsFull(item) {
 			return nil, nil, errRetentionManifestStale
 		}
 	}
@@ -509,7 +509,7 @@ func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUI
 			return err
 		}
 		if len(retireIDs) > 0 {
-			result := tx.Where("tenant_id = ? AND public_id IN ? AND type = ? AND news_retention_state = ?", tenant, retireIDs, models.ContentTypeNews, "full").Delete(&models.ContentItem{})
+			result := tx.Where("tenant_id = ? AND public_id IN ? AND type = ? AND COALESCE(news_retention_state, 'full') = ?", tenant, retireIDs, models.ContentTypeNews, "full").Delete(&models.ContentItem{})
 			if result.Error != nil {
 				return result.Error
 			}

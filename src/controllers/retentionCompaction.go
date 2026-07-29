@@ -41,6 +41,15 @@ type retentionManifestPayload struct {
 	Stories       []retentionManifestStory `json:"stories"`
 }
 
+// Legacy News rows predate the Retention columns. NULL/NULL is their
+// compatibility representation of full/full_member; all new News writes stamp
+// the explicit values at the CMS boundary.
+func retentionItemIsFull(item models.ContentItem) bool {
+	state := derefStr(item.NewsRetentionState)
+	role := derefStr(item.NewsFeedRole)
+	return (state == "" && role == "") || (state == "full" && role == "full_member")
+}
+
 // retentionDependencyPreflight classifies relationships whose deletion semantics
 // are not owned by the bounded News executor. Any result is a hard block: it is
 // safer to leave a row in full fidelity than to silently cascade a transcript,

@@ -51,20 +51,24 @@ func main() {
 	var (
 		applyAll         = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
 		status           = flag.Bool("status", false, "print migration ledger status without applying files")
+		check            = flag.Bool("check", false, "validate every pending migration without applying it")
 		baseline         = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
 		allowDestructive = flag.Bool("allow-destructive", false, "allow migrations containing destructive SQL such as DROP TABLE, DROP COLUMN, TRUNCATE, or DELETE FROM")
 		dir              = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
 
-	if *status && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
-		log.Fatal("--status cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
+	if *status && *check {
+		log.Fatal("--status cannot be combined with --check")
+	}
+	if (*status || *check) && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
+		log.Fatal("--status and --check cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
 	}
 	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
 		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
 	}
-	if !*status && !*applyAll && *baseline == "" && flag.NArg() == 0 {
-		log.Fatal("no migrations selected. Use --status, --all, --baseline-through, or pass explicit migration filenames")
+	if !*status && !*check && !*applyAll && *baseline == "" && flag.NArg() == 0 {
+		log.Fatal("no migrations selected. Use --status, --check, --all, --baseline-through, or pass explicit migration filenames")
 	}
 
 	db, err := utils.ConnectDB()
@@ -93,6 +97,24 @@ func main() {
 		printStatus(files, applied)
 		return
 	}
+	if *check {
+		pending, err := selectMigrations(files, applied, true, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := requireLargeTableMigrationSafety(pending); err != nil {
+			log.Fatalf("migration safety check failed: %v", err)
+		}
+		_, blockedAt, err := migrationsBeforeDestructiveBoundary(pending)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if blockedAt != "" {
+			log.Printf("Destructive boundary: %s (normal apply will stop before it)", blockedAt)
+		}
+		log.Printf("Migration safety check passed for %d pending migration(s).", len(pending))
+		return
+	}
 	if *baseline != "" {
 		if err := baselineThrough(db, files, applied, *baseline); err != nil {
 			log.Fatalf("baseline migrations: %v", err)
@@ -104,9 +126,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	blockedAt := ""
+	if *applyAll && !*allowDestructive {
+		selected, blockedAt, err = migrationsBeforeDestructiveBoundary(selected)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	if len(selected) == 0 {
+		if blockedAt != "" {
+			log.Fatalf("next pending migration %s is destructive; review it and re-run with --allow-destructive when its own readiness guards are satisfied", blockedAt)
+		}
 		log.Println("No migrations to apply.")
 		return
+	}
+	if err := requireLargeTableMigrationSafety(selected); err != nil {
+		log.Fatalf("migration safety check failed: %v", err)
 	}
 	if err := requireDestructiveApproval(selected, *allowDestructive); err != nil {
 		log.Fatal(err)
@@ -121,18 +156,73 @@ func main() {
 		}
 		log.Printf("Applied %s", file.Version)
 	}
+	if blockedAt != "" {
+		log.Printf("Stopped before destructive migration %s; safe preceding migrations were applied. Re-run with --allow-destructive only after reviewing that migration and satisfying its readiness guards.", blockedAt)
+	}
 }
 
 var destructiveSQL = regexp.MustCompile(`(?im)^\s*(DROP\s+TABLE|ALTER\s+TABLE\b.*\bDROP\s+COLUMN|TRUNCATE\b|DELETE\s+FROM\b)`)
+var largeTableUpdateSQL = regexp.MustCompile(`(?im)^\s*UPDATE\s+(?:ONLY\s+)?(?:(?:"?public"?)\.)?"?(content_items|stories)"?\b`)
+var largeTableSafetyMarker = regexp.MustCompile(`(?im)^\s*--\s*wahb:large-table-backfill:\s*(bounded|operator-maintenance)\s*$`)
 
-func requireDestructiveApproval(files []migrationFile, allowed bool) error {
-	destructive := make([]string, 0)
+// content_items and stories are live, high-volume tables. Rewriting every row
+// in either table can exceed hosted Postgres statement limits and amplify WAL
+// and storage. A pending migration that updates one of these tables must carry
+// an explicit safety classification after its predicate/batching strategy has
+// been reviewed. Applied historical files are checksum-verified but not
+// retroactively linted.
+func requireLargeTableMigrationSafety(files []migrationFile) error {
 	for _, file := range files {
 		sql, err := os.ReadFile(file.Path)
 		if err != nil {
 			return err
 		}
-		if destructiveSQL.Match(sql) {
+		matches := largeTableUpdateSQL.FindSubmatch(sql)
+		if len(matches) == 0 || largeTableSafetyMarker.Match(sql) {
+			continue
+		}
+		return fmt.Errorf(
+			"%s updates large live table %s without a reviewed safety classification; avoid whole-table rewrites, use compatibility semantics or bounded indexed batches, then add exactly one of \"-- wahb:large-table-backfill: bounded\" or \"-- wahb:large-table-backfill: operator-maintenance\"",
+			file.Version,
+			string(matches[1]),
+		)
+	}
+	return nil
+}
+
+func migrationIsDestructive(file migrationFile) (bool, error) {
+	sql, err := os.ReadFile(file.Path)
+	if err != nil {
+		return false, err
+	}
+	return destructiveSQL.Match(sql), nil
+}
+
+// Normal --all execution advances only through the safe ordered prefix. It
+// never skips over a destructive migration because later migrations may depend
+// on the destructive schema transition. This lets operators use the wrapper
+// script for ordinary progress without granting premature destructive approval.
+func migrationsBeforeDestructiveBoundary(files []migrationFile) ([]migrationFile, string, error) {
+	for i, file := range files {
+		destructive, err := migrationIsDestructive(file)
+		if err != nil {
+			return nil, "", err
+		}
+		if destructive {
+			return files[:i], file.Version, nil
+		}
+	}
+	return files, "", nil
+}
+
+func requireDestructiveApproval(files []migrationFile, allowed bool) error {
+	destructive := make([]string, 0)
+	for _, file := range files {
+		isDestructive, err := migrationIsDestructive(file)
+		if err != nil {
+			return err
+		}
+		if isDestructive {
 			destructive = append(destructive, file.Version)
 		}
 	}
@@ -328,18 +418,34 @@ func applyMigration(db *gorm.DB, file migrationFile) error {
 	}
 	if legacy {
 		if err := db.Exec(sql).Error; err != nil {
-			return err
+			return migrationExecutionError(err)
 		}
 		return db.Exec("INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'legacy')", file.Version, file.Checksum).Error
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Exec(sql).Error; err != nil {
+		// Fail fast on DDL lock contention instead of consuming the provider's
+		// full statement timeout while waiting for a busy live table.
+		if err := tx.Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
 			return err
+		}
+		if err := tx.Exec(sql).Error; err != nil {
+			return migrationExecutionError(err)
 		}
 		return tx.Exec(
 			"INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'runner')",
 			file.Version, file.Checksum,
 		).Error
 	})
+}
+
+func migrationExecutionError(err error) error {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "statement timeout") || strings.Contains(message, "sqlstate 57014") {
+		return fmt.Errorf("migration statement timed out; do not rewrite a large live table in one statement—use compatibility semantics or bounded indexed batches: %w", err)
+	}
+	if strings.Contains(message, "lock timeout") || strings.Contains(message, "sqlstate 55p03") {
+		return fmt.Errorf("migration could not acquire a database lock within 10 seconds; retry during lower traffic or use an online-safe schema transition: %w", err)
+	}
+	return err
 }

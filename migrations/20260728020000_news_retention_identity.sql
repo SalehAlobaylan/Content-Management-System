@@ -1,5 +1,8 @@
--- News compact-identity contract. Columns default existing/new NEWS rows to
--- full fidelity; no content is compacted by this migration.
+-- News compact-identity contract. Existing NULL retention fields are the
+-- compatibility representation of full/full_member; new NEWS writes stamp
+-- those values explicitly in CMS. Avoid a whole-table UPDATE here:
+-- content_items contains large vector/TOAST payloads and rewriting every NEWS
+-- row can exceed provider statement/storage limits. No content is compacted.
 
 ALTER TABLE content_items
     ADD COLUMN IF NOT EXISTS news_retention_state VARCHAR(24),
@@ -9,18 +12,21 @@ ALTER TABLE content_items
     ADD COLUMN IF NOT EXISTS news_retention_expires_at TIMESTAMPTZ,
     ADD COLUMN IF NOT EXISTS news_compaction_hash CHAR(64);
 
-UPDATE content_items
-SET news_retention_state = 'full',
-    news_feed_role = 'full_member'
-WHERE type = 'NEWS'
-  AND (news_retention_state IS NULL OR news_feed_role IS NULL);
-
 ALTER TABLE content_items
     DROP CONSTRAINT IF EXISTS chk_content_news_retention_state,
     ADD CONSTRAINT chk_content_news_retention_state CHECK (
         (type = 'NEWS'
-            AND news_retention_state IN ('full', 'compact', 'archive_anchor')
-            AND news_feed_role IN ('full_member', 'lead', 'representative', 'protected_only'))
+            AND (
+                (news_retention_state IS NULL
+                    AND news_feed_role IS NULL
+                    AND news_representative_ordinal IS NULL
+                    AND news_compacted_at IS NULL
+                    AND news_retention_expires_at IS NULL
+                    AND news_compaction_hash IS NULL)
+                OR
+                (news_retention_state IN ('full', 'compact', 'archive_anchor')
+                    AND news_feed_role IN ('full_member', 'lead', 'representative', 'protected_only'))
+            ))
         OR
         (type <> 'NEWS'
             AND news_retention_state IS NULL
@@ -29,18 +35,18 @@ ALTER TABLE content_items
             AND news_compacted_at IS NULL
             AND news_retention_expires_at IS NULL
             AND news_compaction_hash IS NULL)
-    ),
+    ) NOT VALID,
     DROP CONSTRAINT IF EXISTS chk_content_news_representative_ordinal,
     ADD CONSTRAINT chk_content_news_representative_ordinal CHECK (
         (news_feed_role = 'representative' AND news_representative_ordinal BETWEEN 1 AND 3)
         OR (news_feed_role <> 'representative' AND news_representative_ordinal IS NULL)
         OR news_feed_role IS NULL
-    ),
+    ) NOT VALID,
     DROP CONSTRAINT IF EXISTS chk_content_news_protected_state,
     ADD CONSTRAINT chk_content_news_protected_state CHECK (
         news_feed_role <> 'protected_only'
         OR news_retention_state IN ('compact', 'archive_anchor')
-    );
+    ) NOT VALID;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_content_items_one_retained_lead
     ON content_items(tenant_id, story_id)
@@ -50,7 +56,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_content_items_representative_order
     WHERE news_feed_role = 'representative';
 CREATE INDEX IF NOT EXISTS idx_content_items_news_retention_candidates
     ON content_items(tenant_id, story_id, published_at)
-    WHERE type = 'NEWS' AND news_retention_state = 'full';
+    WHERE type = 'NEWS'
+      AND (news_retention_state = 'full' OR news_retention_state IS NULL);
 
 ALTER TABLE stories
     ADD COLUMN IF NOT EXISTS news_retention_state VARCHAR(24) NOT NULL DEFAULT 'full',
@@ -60,22 +67,6 @@ ALTER TABLE stories
     ADD COLUMN IF NOT EXISTS retained_member_count INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS original_source_count INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS retained_source_count INTEGER NOT NULL DEFAULT 0;
-
-UPDATE stories story
-SET original_member_count = counts.member_count,
-    retained_member_count = counts.member_count,
-    original_source_count = counts.source_count,
-    retained_source_count = counts.source_count
-FROM (
-    SELECT story_id,
-           COUNT(*)::integer AS member_count,
-           COUNT(DISTINCT COALESCE(NULLIF(source_name, ''), source::text))::integer AS source_count
-    FROM content_items
-    WHERE type = 'NEWS' AND story_id IS NOT NULL
-    GROUP BY story_id
-) counts
-WHERE story.public_id = counts.story_id
-  AND story.news_retention_state = 'full';
 
 ALTER TABLE stories
     DROP CONSTRAINT IF EXISTS chk_stories_news_retention_state,

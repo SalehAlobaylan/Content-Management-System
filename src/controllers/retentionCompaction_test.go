@@ -40,6 +40,20 @@ func TestDecodeRetentionManifestRejectsTamperingAndKeepsExactScope(t *testing.T)
 	}
 }
 
+func TestRetentionItemIsFullTreatsLegacyNullAsFull(t *testing.T) {
+	if !retentionItemIsFull(models.ContentItem{}) {
+		t.Fatal("legacy NULL retention fields must preserve full/full_member semantics")
+	}
+	full := "full"
+	if retentionItemIsFull(models.ContentItem{NewsRetentionState: &full}) {
+		t.Fatal("partially stamped retention identity must fail closed")
+	}
+	state, role := "compact", "lead"
+	if retentionItemIsFull(models.ContentItem{NewsRetentionState: &state, NewsFeedRole: &role}) {
+		t.Fatal("compact lead must not be treated as a full legacy item")
+	}
+}
+
 func TestSnapshotContainsRetiredIDDetectsFeaturedAndRelatedMembers(t *testing.T) {
 	retired := uuid.MustParse("00000000-0000-0000-0000-000000000201")
 	member := uuid.MustParse("00000000-0000-0000-0000-000000000202")

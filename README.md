@@ -18,7 +18,7 @@ It does **not** scrape sources, run FFmpeg, run ML models, or orchestrate the in
 
 - **Language:** Go 1.24 (Gin HTTP, GORM ORM)
 - **Database:** PostgreSQL 15+ with the `pgvector` extension
-- **Vectors:** dense `vector(1024)` text embeddings (`Qwen/Qwen3-Embedding-0.6B`, set by Enrichment), `vector(512)` CLIP image embeddings (set by Media). A legacy `sparsevec(250002)` column from the BGE-M3 era still exists but is dead/unused — semantic similarity is dense cosine only.
+- **Vectors:** dense `vector(1024)` text embeddings (`Qwen/Qwen3-Embedding-0.6B`, set by Enrichment), `vector(512)` CLIP image embeddings (set by Media). The BGE-M3 sparse path is retired and canonical migration `20260729010000` removes its dead column under explicit destructive approval; semantic similarity is dense cosine only.
 - **Auth:** JWT HS256 — **issued by IAM, only validated here** (shared secret). Service-to-service `/internal` calls use a static bearer token.
 
 ## Quick Start
@@ -41,11 +41,12 @@ Inspect or apply canonical CMS SQL migrations explicitly:
 
 ```bash
 ./scripts/cms-migrate.sh status
+./scripts/cms-migrate.sh check
 ./scripts/cms-migrate.sh apply
 ./scripts/cms-migrate.sh apply --allow-destructive
 ```
 
-For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. The script refuses destructive migrations unless `--allow-destructive` is supplied explicitly.
+For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. Run `check` before a release to checksum the ledger and lint every pending migration. Normal `apply` advances the ordered safe prefix and stops before the first destructive migration; it never skips that boundary. Continue with `apply --allow-destructive` only after reviewing the blocked migration and satisfying its own readiness guards. Pending updates to the large live `content_items` or `stories` tables are rejected unless the migration declares a reviewed bounded-backfill or operator-maintenance strategy.
 
 ### Go API docs (terminal)
 

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -63,5 +65,99 @@ func TestRequireDestructiveApproval(t *testing.T) {
 	}
 	if err := requireDestructiveApproval(files, true); err != nil {
 		t.Fatalf("approved destructive migration was rejected: %v", err)
+	}
+}
+
+func TestMigrationsBeforeDestructiveBoundaryKeepsSafeOrderedPrefix(t *testing.T) {
+	dir := t.TempDir()
+	names := []string{
+		"20260728030000_safe.sql",
+		"20260729010000_destructive.sql",
+		"20260729020000_later_safe.sql",
+	}
+	sql := []string{"CREATE TABLE safe_one(id bigint);", "ALTER TABLE content_items DROP COLUMN embedding_sparse;", "CREATE TABLE safe_two(id bigint);"}
+	files := make([]migrationFile, 0, len(names))
+	for i, name := range names {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(sql[i]), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, migrationFile{Version: name, Path: path})
+	}
+	selected, blockedAt, err := migrationsBeforeDestructiveBoundary(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 1 || selected[0].Version != names[0] {
+		t.Fatalf("safe prefix = %#v, want only %s", selected, names[0])
+	}
+	if blockedAt != names[1] {
+		t.Fatalf("blocked at %q, want %q", blockedAt, names[1])
+	}
+}
+
+func TestMigrationsBeforeDestructiveBoundaryBlocksImmediately(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260729010000_destructive.sql")
+	if err := os.WriteFile(path, []byte("DELETE FROM legacy_rows;"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	selected, blockedAt, err := migrationsBeforeDestructiveBoundary([]migrationFile{{Version: filepath.Base(path), Path: path}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 0 || blockedAt != filepath.Base(path) {
+		t.Fatalf("selected=%#v blockedAt=%q", selected, blockedAt)
+	}
+}
+
+func TestRequireLargeTableMigrationSafetyRejectsUnclassifiedUpdate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260730000000_risky_backfill.sql")
+	if err := os.WriteFile(path, []byte("UPDATE public.content_items SET retention_state = 'full';"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := requireLargeTableMigrationSafety([]migrationFile{{Version: filepath.Base(path), Path: path}})
+	if err == nil {
+		t.Fatal("unclassified large-table update was accepted")
+	}
+	if !strings.Contains(err.Error(), "content_items") {
+		t.Fatalf("error does not identify the large table: %v", err)
+	}
+}
+
+func TestRequireLargeTableMigrationSafetyAcceptsReviewedBoundedUpdate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260730000000_bounded_backfill.sql")
+	sql := `-- wahb:large-table-backfill: bounded
+UPDATE stories
+SET retention_state = 'full'
+WHERE id IN (SELECT id FROM stories WHERE retention_state IS NULL ORDER BY id LIMIT 1000);`
+	if err := os.WriteFile(path, []byte(sql), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := requireLargeTableMigrationSafety([]migrationFile{{Version: filepath.Base(path), Path: path}}); err != nil {
+		t.Fatalf("reviewed bounded update was rejected: %v", err)
+	}
+}
+
+func TestRequireLargeTableMigrationSafetyAcceptsUnrelatedMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260730000000_safe.sql")
+	if err := os.WriteFile(path, []byte("CREATE TABLE safe_table (id bigint PRIMARY KEY);"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := requireLargeTableMigrationSafety([]migrationFile{{Version: filepath.Base(path), Path: path}}); err != nil {
+		t.Fatalf("unrelated migration was rejected: %v", err)
+	}
+}
+
+func TestMigrationExecutionErrorExplainsStatementTimeout(t *testing.T) {
+	err := migrationExecutionError(errors.New("ERROR: canceling statement due to statement timeout (SQLSTATE 57014)"))
+	if !strings.Contains(err.Error(), "bounded indexed batches") {
+		t.Fatalf("timeout error is not actionable: %v", err)
 	}
 }
