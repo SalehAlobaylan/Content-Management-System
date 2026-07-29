@@ -8,9 +8,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// StartRetentionHeartbeat polls persisted policy state. The runner is
-// intentionally observe-only in this slice; scheduled work can write samples
-// and ledgers but cannot mutate canonical content.
+// StartRetentionHeartbeat polls persisted policy state. Scheduled work may
+// execute only the Slice 10 trusted derived-state snapshot refresh; canonical
+// content, sources, objects, and physical storage remain human/operator-owned.
 func StartRetentionHeartbeat(db *gorm.DB) {
 	go func() {
 		ticker := time.NewTicker(time.Minute)

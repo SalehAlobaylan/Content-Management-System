@@ -397,6 +397,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/retention/actions/:id/approve", perm("feed", "manage"), controllers.ApproveRetentionAction)
 	adminGroup.POST("/retention/actions/:id/reject", perm("feed", "manage"), controllers.RejectRetentionAction)
 	adminGroup.POST("/retention/actions/:id/execute", perm("feed", "manage"), controllers.ExecuteRetentionCompaction)
+	adminGroup.POST("/retention/autopilot/breakers/:class/reset", perm("feed", "manage"), controllers.ResetRetentionAutopilotBreaker)
 	adminGroup.GET("/retention/months", perm("feed", "read"), controllers.ListRetentionMonths)
 	adminGroup.GET("/retention/monthly-review/policy", perm("feed", "read"), controllers.GetMonthlyReviewPolicy)
 	adminGroup.GET("/retention/monthly-review/policies", perm("feed", "read"), controllers.ListMonthlyReviewPolicies)

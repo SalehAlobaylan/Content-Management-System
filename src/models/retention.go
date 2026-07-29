@@ -46,6 +46,7 @@ const (
 	RetentionActionExecuteHistoricalPurge = "news_database.execute_historical_purge"
 	RetentionActionRequestStorageRun      = "storage.request_bounded_run"
 	RetentionActionRequestMediaRun        = "media_circulation.request_bounded_run"
+	RetentionActionRefreshNewsSnapshots   = "news_database.refresh_snapshots"
 )
 
 const (

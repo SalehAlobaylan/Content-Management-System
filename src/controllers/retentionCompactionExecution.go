@@ -715,6 +715,22 @@ func ExecuteRetentionCompaction(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "retention action not found"})
 		return
 	}
+	if existing.ActionClass == models.RetentionActionRefreshNewsSnapshots {
+		if existing.Outcome != models.RetentionActionApproved && existing.Outcome != models.RetentionActionReady {
+			c.JSON(http.StatusConflict, gin.H{"error": "snapshot refresh action is not approved or ready"})
+			return
+		}
+		updated, refreshErr := executeRetentionSnapshotRefresh(db, existing, principal.Email)
+		if refreshErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": refreshErr.Error(), "data": updated})
+			return
+		}
+		retentionAudit(db, principal, "retention.snapshot_refresh.execute", existing.PublicID.String(), "success", map[string]interface{}{"canonical_rows_deleted": false})
+		var result models.RetentionAction
+		_ = db.Where("id=?", existing.ID).First(&result).Error
+		c.JSON(http.StatusOK, gin.H{"data": result})
+		return
+	}
 	var manifest models.RetentionCompactionManifest
 	if err := db.Where("tenant_id = ? AND action_id = ?", principal.TenantID, existing.ID).First(&manifest).Error; err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "action has no compaction manifest"})
