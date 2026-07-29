@@ -284,6 +284,125 @@ type RetentionRecoveryArtifact struct {
 
 func (RetentionRecoveryArtifact) TableName() string { return "retention_recovery_artifacts" }
 
+// MonthlyReviewPolicyVersion is immutable selection policy evidence. The head
+// is the only mutable pointer; finalized archives retain this exact version.
+type MonthlyReviewPolicyVersion struct {
+	ID          uint           `gorm:"primaryKey" json:"-"`
+	PublicID    uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID    string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_monthly_review_policy_version,priority:1" json:"tenant_id"`
+	Version     int            `gorm:"not null;uniqueIndex:idx_monthly_review_policy_version,priority:2" json:"version"`
+	State       string         `gorm:"type:varchar(24);not null" json:"state"`
+	Config      datatypes.JSON `gorm:"type:jsonb;not null" json:"config"`
+	Reason      string         `gorm:"type:text" json:"reason,omitempty"`
+	CreatedBy   string         `gorm:"type:varchar(255)" json:"created_by,omitempty"`
+	PreviousID  *uint          `json:"-"`
+	EffectiveAt time.Time      `gorm:"not null" json:"effective_at"`
+	CreatedAt   time.Time      `json:"created_at"`
+}
+
+func (MonthlyReviewPolicyVersion) TableName() string { return "monthly_review_policy_versions" }
+
+type MonthlyReviewPolicyHead struct {
+	TenantID  string    `gorm:"primaryKey;type:varchar(64)" json:"tenant_id"`
+	PolicyID  uint      `gorm:"not null" json:"-"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (MonthlyReviewPolicyHead) TableName() string { return "monthly_review_policy_heads" }
+
+type NewsMonthArchive struct {
+	ID                uint           `gorm:"primaryKey" json:"-"`
+	PublicID          uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID          string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_news_month_archive_revision,priority:1" json:"tenant_id"`
+	MonthStart        time.Time      `gorm:"type:date;not null;uniqueIndex:idx_news_month_archive_revision,priority:2" json:"month_start"`
+	Timezone          string         `gorm:"type:varchar(64);not null" json:"timezone"`
+	Revision          int            `gorm:"not null;uniqueIndex:idx_news_month_archive_revision,priority:3" json:"revision"`
+	SupersedesID      *uint          `json:"-"`
+	PolicyVersionID   uint           `gorm:"not null" json:"-"`
+	State             string         `gorm:"type:varchar(24);not null;index" json:"state"`
+	LimitedCoverage   bool           `gorm:"not null;default:false" json:"limited_coverage"`
+	Headline          string         `gorm:"type:text;not null" json:"headline"`
+	Introduction      string         `gorm:"type:text;not null" json:"introduction"`
+	Sections          datatypes.JSON `gorm:"type:jsonb;not null" json:"sections"`
+	HeadlineAR        string         `gorm:"type:text;not null" json:"headline_ar"`
+	IntroductionAR    string         `gorm:"type:text;not null" json:"introduction_ar"`
+	SectionsAR        datatypes.JSON `gorm:"type:jsonb;not null" json:"sections_ar"`
+	SelectionManifest datatypes.JSON `gorm:"type:jsonb;not null" json:"selection_manifest"`
+	SelectionHash     string         `gorm:"type:char(64);not null" json:"selection_hash"`
+	CompositionHash   string         `gorm:"type:char(64);not null" json:"composition_hash"`
+	QualifiedCount    int            `gorm:"not null" json:"qualified_count"`
+	SelectedCount     int            `gorm:"not null" json:"selected_count"`
+	Verification      datatypes.JSON `gorm:"type:jsonb;not null" json:"verification"`
+	BuiltAt           time.Time      `gorm:"not null" json:"built_at"`
+	VerifiedAt        *time.Time     `json:"verified_at,omitempty"`
+	FinalizedAt       *time.Time     `json:"finalized_at,omitempty"`
+	FinalizedBy       string         `gorm:"type:varchar(255)" json:"finalized_by,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+func (NewsMonthArchive) TableName() string { return "news_month_archives" }
+
+type NewsMonthArchiveHead struct {
+	TenantID   string    `gorm:"primaryKey;type:varchar(64);uniqueIndex:idx_news_month_archive_head,priority:1" json:"tenant_id"`
+	MonthStart time.Time `gorm:"primaryKey;type:date;uniqueIndex:idx_news_month_archive_head,priority:2" json:"month_start"`
+	ArchiveID  uint      `gorm:"not null" json:"-"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func (NewsMonthArchiveHead) TableName() string { return "news_month_archive_heads" }
+
+type NewsMonthArchiveStory struct {
+	ID                uint           `gorm:"primaryKey" json:"-"`
+	PublicID          uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ArchiveID         uint           `gorm:"not null;uniqueIndex:idx_news_month_archive_story_position,priority:1" json:"-"`
+	Position          int            `gorm:"not null;uniqueIndex:idx_news_month_archive_story_position,priority:2" json:"position"`
+	Section           string         `gorm:"type:varchar(120);not null" json:"section"`
+	OriginalStoryID   uuid.UUID      `gorm:"type:uuid;not null" json:"original_story_id"`
+	LeadContentID     uuid.UUID      `gorm:"type:uuid;not null" json:"lead_content_id"`
+	Label             string         `gorm:"type:text;not null" json:"label"`
+	Snapshot          datatypes.JSON `gorm:"type:jsonb;not null" json:"snapshot"`
+	ImportanceScore   float64        `gorm:"not null" json:"importance_score"`
+	EngagementScore   float64        `gorm:"not null" json:"engagement_score"`
+	FinalScore        float64        `gorm:"not null" json:"final_score"`
+	SelectionEvidence datatypes.JSON `gorm:"type:jsonb;not null" json:"selection_evidence"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+func (NewsMonthArchiveStory) TableName() string { return "news_month_archive_stories" }
+
+// NewsEngagementMonthlyRollup is immutable selection evidence before a later
+// lifecycle may expire raw high-volume telemetry.
+type NewsEngagementMonthlyRollup struct {
+	ID                 uint           `gorm:"primaryKey" json:"-"`
+	TenantID           string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_news_engagement_monthly_rollup,priority:1" json:"tenant_id"`
+	MonthStart         time.Time      `gorm:"type:date;not null;uniqueIndex:idx_news_engagement_monthly_rollup,priority:2" json:"month_start"`
+	StoryID            uuid.UUID      `gorm:"type:uuid;not null;uniqueIndex:idx_news_engagement_monthly_rollup,priority:3" json:"story_id"`
+	InteractionType    string         `gorm:"type:varchar(32);not null;uniqueIndex:idx_news_engagement_monthly_rollup,priority:4" json:"interaction_type"`
+	TotalCount         int            `gorm:"not null" json:"total_count"`
+	UniqueActorCount   int            `gorm:"not null" json:"unique_actor_count"`
+	ImpressionCount    int64          `gorm:"not null" json:"impression_count"`
+	ExcludedEventCount int            `gorm:"not null" json:"excluded_event_count"`
+	Evidence           datatypes.JSON `gorm:"type:jsonb;not null" json:"evidence"`
+	CreatedAt          time.Time      `json:"created_at"`
+}
+
+func (NewsEngagementMonthlyRollup) TableName() string { return "news_engagement_monthly_rollups" }
+
+type MonthlyReviewStoryOverride struct {
+	ID         uint      `gorm:"primaryKey" json:"-"`
+	PublicID   uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID   string    `gorm:"type:varchar(64);not null;uniqueIndex:idx_monthly_review_override,priority:1" json:"tenant_id"`
+	MonthStart time.Time `gorm:"type:date;not null;uniqueIndex:idx_monthly_review_override,priority:2" json:"month_start"`
+	StoryID    uuid.UUID `gorm:"type:uuid;not null;uniqueIndex:idx_monthly_review_override,priority:3" json:"story_id"`
+	Decision   string    `gorm:"type:varchar(16);not null" json:"decision"`
+	Reason     string    `gorm:"type:text;not null" json:"reason"`
+	CreatedBy  string    `gorm:"type:varchar(255);not null" json:"created_by"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+func (MonthlyReviewStoryOverride) TableName() string { return "monthly_review_story_overrides" }
+
 // NewsIngestTombstone retains only irreversibly hashed identity evidence. It
 // never references sources, and its original content UUID is a value so the
 // retention deletion cannot erase the reason a later crawler was rejected.

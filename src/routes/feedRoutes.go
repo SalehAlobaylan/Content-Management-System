@@ -22,6 +22,7 @@ func SetupFeedRoutes(group *gin.RouterGroup, db *gorm.DB) {
 
 	// News feed - magazine-style slides
 	group.GET("/feed/news", auth, controllers.GetNewsFeed)
+	group.GET("/feed/news/months/:month/review", auth, controllers.GetPublicMonthlyReview)
 
 	// Syndication output — ad-hoc (per-topic) feeds in 3 formats…
 	group.GET("/feed/rss.xml", controllers.GetRSSFeed)
