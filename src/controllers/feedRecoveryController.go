@@ -1,14 +1,19 @@
 package controllers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +33,35 @@ type feedRecoveryPlanRequest struct {
 	NoFullRollback bool   `json:"no_full_rollback"`
 }
 
+type recoveryPurgeManifest struct {
+	Version         int         `json:"version"`
+	TenantID        string      `json:"tenant_id"`
+	Lane            string      `json:"lane"`
+	SourceIDs       []uuid.UUID `json:"source_ids"`
+	NewsContentIDs  []uuid.UUID `json:"news_content_ids"`
+	NewsStoryIDs    []uuid.UUID `json:"news_story_ids"`
+	MediaContentIDs []uuid.UUID `json:"media_content_ids"`
+	LookbackHours   int         `json:"lookback_hours"`
+	NewsMaxItems    int         `json:"news_max_items"`
+	MediaMaxItems   int         `json:"media_max_items"`
+	CreatedAt       time.Time   `json:"created_at"`
+}
+
+func recoveryApprovalPhrase(plan models.FeedRecoveryPlan) string {
+	manifestPrefix := plan.ManifestHash
+	if len(manifestPrefix) > 12 {
+		manifestPrefix = manifestPrefix[:12]
+	}
+	if plan.Level == "purge_reseed" {
+		phrase := "PURGE " + strings.ToUpper(plan.Lane) + " " + strconv.Itoa(plan.TargetCount) + " ITEMS " + strings.ToUpper(manifestPrefix)
+		if plan.NoFullRollback {
+			phrase += " NO FULL ROLLBACK"
+		}
+		return phrase
+	}
+	return "APPROVE FEED RECOVERY " + strings.ToUpper(manifestPrefix)
+}
+
 func normalizedRecoveryField(value string, allowed ...string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	for _, candidate := range allowed {
@@ -41,6 +75,60 @@ func recoveryHash(value interface{}) string {
 	raw, _ := json.Marshal(value)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+func buildRecoveryPurgeManifest(db *gorm.DB, tenant, lane, sourceChecksum string) (recoveryPurgeManifest, error) {
+	manifest := recoveryPurgeManifest{Version: 1, TenantID: tenant, Lane: lane, LookbackHours: 72, NewsMaxItems: 500, MediaMaxItems: 30, CreatedAt: time.Now().UTC()}
+	q := db.Model(&models.ContentSource{}).Where("tenant_id=? AND is_active=?", tenant, true)
+	if lane == "news" {
+		q = q.Where("category=?", "news")
+	} else if lane == "media" {
+		q = q.Where("category=?", "media")
+	}
+	var sources []models.ContentSource
+	if err := q.Order("public_id ASC").Find(&sources).Error; err != nil {
+		return manifest, err
+	}
+	for _, source := range sources {
+		manifest.SourceIDs = append(manifest.SourceIDs, source.PublicID)
+	}
+	if len(manifest.SourceIDs) > 200 {
+		return manifest, fmt.Errorf("purge manifest exceeds the 200-source recovery bound")
+	}
+	if lane == "news" || lane == "both" {
+		var ids []uuid.UUID
+		if err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND type=? AND status=?", tenant, models.ContentTypeNews, models.ContentStatusReady).Order("created_at ASC, public_id ASC").Limit(manifest.NewsMaxItems).Pluck("public_id", &ids).Error; err != nil {
+			return manifest, err
+		}
+		protected := retentionProtectedContentIDs(db, tenant, ids)
+		for _, id := range ids {
+			if !protected[id] {
+				manifest.NewsContentIDs = append(manifest.NewsContentIDs, id)
+			}
+		}
+		if len(manifest.NewsContentIDs) > 0 {
+			_ = db.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id IN ?", tenant, manifest.NewsContentIDs).Where("story_id IS NOT NULL").Distinct("story_id").Pluck("story_id", &manifest.NewsStoryIDs).Error
+		}
+	}
+	if lane == "media" || lane == "both" {
+		var ids []uuid.UUID
+		if err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND type IN ? AND status=? AND is_feed_unit=TRUE AND feed_visibility=?", tenant, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, models.ContentStatusReady, feedVisibilityVisible).Order("created_at ASC, public_id ASC").Limit(manifest.MediaMaxItems).Pluck("public_id", &ids).Error; err != nil {
+			return manifest, err
+		}
+		manifest.MediaContentIDs = ids
+	}
+	_ = sourceChecksum // kept in the surrounding plan hash/evidence contract.
+	return manifest, nil
+}
+
+func recoveryManifestIDs(manifest recoveryPurgeManifest, lane string) []uuid.UUID {
+	if lane == "news" {
+		return manifest.NewsContentIDs
+	}
+	if lane == "media" {
+		return manifest.MediaContentIDs
+	}
+	return append(append([]uuid.UUID{}, manifest.NewsContentIDs...), manifest.MediaContentIDs...)
 }
 
 func recoverySourceProof(db *gorm.DB, tenant, lane string) (string, int, error) {
@@ -76,13 +164,32 @@ func buildRecoveryPlan(db *gorm.DB, tenant string, req feedRecoveryPlanRequest, 
 	if err != nil {
 		return models.FeedRecoveryPlan{}, err
 	}
-	evidence := map[string]interface{}{"source_checksum": checksum, "source_count": count, "execution_installed": true, "enabled_levels": []string{"repair", "rotate"}, "disabled_levels": []string{"purge_reseed"}, "safe_note": "Repair and single-lane Safe Cutover change only derived feed state; sources and canonical content are never mutated."}
+	evidence := map[string]interface{}{"source_checksum": checksum, "source_count": count, "execution_installed": true, "enabled_levels": []string{"repair", "rotate", "purge_reseed"}, "safe_note": "Repair and Safe Cutover change derived feed state; Purge & Reseed only touches the frozen content manifest and never sources/checkpoints."}
 	manifest := map[string]interface{}{"tenant": tenant, "lane": lane, "level": level, "capacity_mode": mode, "source_checksum": checksum, "source_count": count}
+	var purgeManifest recoveryPurgeManifest
+	if level == "purge_reseed" {
+		purgeManifest, err = buildRecoveryPurgeManifest(db, tenant, lane, checksum)
+		if err != nil {
+			return models.FeedRecoveryPlan{}, err
+		}
+		manifest["purge_manifest"] = purgeManifest
+		evidence["purge_manifest"] = purgeManifest
+	}
 	manifestHash := recoveryHash(manifest)
 	planHash := recoveryHash(map[string]interface{}{"manifest": manifest, "no_full_rollback": req.NoFullRollback})
 	evidenceJSON, _ := json.Marshal(evidence)
-	policyJSON, _ := json.Marshal(map[string]interface{}{"execution": "repair_and_single_lane_rotate", "purge_reseed": "disabled_until_slice_9", "both_rotate": "disabled_until_slice_9"})
-	return models.FeedRecoveryPlan{TenantID: tenant, Lane: lane, Level: level, CapacityMode: mode, State: "awaiting_approval", PlanHash: planHash, ManifestHash: manifestHash, SourceChecksum: checksum, SourceCount: count, Evidence: datatypes.JSON(evidenceJSON), PolicySnapshot: datatypes.JSON(policyJSON), NoFullRollback: req.NoFullRollback, ExpiresAt: time.Now().UTC().Add(feedRecoveryPlanTTL), CreatedBy: actor}, nil
+	policyJSON, _ := json.Marshal(map[string]interface{}{"execution": "repair_rotate_and_bounded_purge_reseed", "purge_reseed_caps": map[string]int{"news_lookback_hours": 72, "news_max_items": 500, "media_max_items": 30}, "sources": "preserve_definitions_and_checkpoints"})
+	targetCount := 0
+	if level == "purge_reseed" {
+		targetCount = len(purgeManifest.NewsContentIDs) + len(purgeManifest.MediaContentIDs)
+	}
+	purgeJSON, _ := json.Marshal(purgeManifest)
+	var frozenAt *time.Time
+	if level == "purge_reseed" {
+		t := purgeManifest.CreatedAt
+		frozenAt = &t
+	}
+	return models.FeedRecoveryPlan{TenantID: tenant, Lane: lane, Level: level, CapacityMode: mode, State: "awaiting_approval", PlanHash: planHash, ManifestHash: manifestHash, TargetCount: targetCount, SourceChecksum: checksum, SourceCount: count, Evidence: datatypes.JSON(evidenceJSON), PolicySnapshot: datatypes.JSON(policyJSON), NoFullRollback: req.NoFullRollback, PurgeManifest: datatypes.JSON(purgeJSON), ManifestFrozenAt: frozenAt, ExpiresAt: time.Now().UTC().Add(feedRecoveryPlanTTL), CreatedBy: actor}, nil
 }
 
 func ensureFeedGenerationFoundation(db *gorm.DB, tenant, requestedLane string) error {
@@ -229,7 +336,7 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "fresh re-auth proof does not match this plan"})
 		return
 	}
-	expectedPhrase := "APPROVE FEED RECOVERY " + strings.ToUpper(plan.ManifestHash[:12])
+	expectedPhrase := recoveryApprovalPhrase(plan)
 	if strings.TrimSpace(req.Phrase) != expectedPhrase {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation phrase does not match plan"})
 		return
@@ -238,7 +345,7 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 	notBefore := now.Add(time.Minute)
 	phraseHash := recoveryHash(req.Phrase)
 	approval := models.FeedRecoveryApproval{PlanID: plan.ID, TenantID: plan.TenantID, Actor: principal.Email, PlanHash: plan.PlanHash, ManifestHash: plan.ManifestHash, TargetCount: plan.TargetCount, PhraseProofHash: phraseHash, ReauthJTI: proof.ID, NoFullRollback: plan.NoFullRollback, ApprovedAt: now, ConsumedAt: &now}
-	run := models.FeedRecoveryRun{PlanID: plan.ID, TenantID: plan.TenantID, Lane: plan.Lane, CorrelationID: uuid.New(), Phase: "cancel_window", NotBefore: &notBefore, CancelDeadline: &notBefore}
+	run := models.FeedRecoveryRun{PlanID: plan.ID, TenantID: plan.TenantID, Lane: plan.Lane, CorrelationID: uuid.New(), Phase: "cancel_window", NotBefore: &notBefore, CancelDeadline: &notBefore, DestructiveManifest: plan.PurgeManifest, ExpectedEmpty: plan.TargetCount == 0}
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&approval).Error; err != nil {
 			return err
@@ -246,7 +353,13 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		if err := tx.Create(&run).Error; err != nil {
 			return err
 		}
-		if err := tx.Create(&models.FeedRecoveryAction{RunID: run.ID, ActionType: "approval", State: "succeeded", IdempotencyKey: "approval:" + plan.PlanHash, Evidence: datatypes.JSON([]byte(`{"fresh_reauth":true,"cancel_window_seconds":60}`))}).Error; err != nil {
+		approvalEvidence := map[string]interface{}{"fresh_reauth": true, "cancel_window_seconds": 60, "manifest_hash": plan.ManifestHash, "target_count": plan.TargetCount}
+		if plan.Level == "purge_reseed" {
+			approvalEvidence["destructive"] = true
+			approvalEvidence["no_full_rollback"] = plan.NoFullRollback
+		}
+		approvalRaw, _ := json.Marshal(approvalEvidence)
+		if err := tx.Create(&models.FeedRecoveryAction{RunID: run.ID, ActionType: "approval", State: "succeeded", IdempotencyKey: "approval:" + plan.PlanHash, Evidence: datatypes.JSON(approvalRaw)}).Error; err != nil {
 			return err
 		}
 		return tx.Model(&plan).Update("state", "approved").Error
@@ -398,6 +511,11 @@ func setRecoveryAvailability(db *gorm.DB, tenant, lane, state string, runID *uin
 		value := 60
 		retry = &value
 	}
+	if state == "expected_empty" {
+		message = "feed_recovery_empty"
+		value := 60
+		retry = &value
+	}
 	_ = db.Where("tenant_id=? AND lane=?", tenant, lane).Assign(models.FeedAvailabilityState{State: state, RecoveryRunID: runID, MessageKey: message, RetryAfterSeconds: retry, UpdatedAt: time.Now().UTC()}).FirstOrCreate(&models.FeedAvailabilityState{TenantID: tenant, Lane: lane})
 	_ = db.Model(&models.FeedAvailabilityState{}).Where("tenant_id=? AND lane=?", tenant, lane).Updates(map[string]interface{}{"state": state, "recovery_run_id": runID, "message_key": message, "retry_after_seconds": retry, "updated_at": time.Now().UTC()}).Error
 }
@@ -421,7 +539,7 @@ func claimRecoveryRun(db *gorm.DB, tenant string, publicID uuid.UUID) (models.Fe
 			// A failed/partial run is resumable only through the same persisted
 			// phase machine; it never reopens approval or widens its plan.
 			run.Phase = "executing"
-		} else if run.Phase != "executing" && run.Phase != "reseeding" {
+		} else if run.Phase != "executing" && run.Phase != "reseeding" && run.Phase != "purging_news" && run.Phase != "reseeding_news" && run.Phase != "purging_media" && run.Phase != "reseeding_media" {
 			return fmt.Errorf("run is not resumable from phase %s", run.Phase)
 		}
 		if run.ClaimExpiresAt != nil && run.ClaimExpiresAt.After(now) {
@@ -510,6 +628,246 @@ func runRecoveryVerification(db *gorm.DB, run models.FeedRecoveryRun, pass int) 
 	return clean
 }
 
+func decodeRecoveryPurgeManifest(plan models.FeedRecoveryPlan) (recoveryPurgeManifest, error) {
+	var manifest recoveryPurgeManifest
+	if len(plan.PurgeManifest) == 0 || json.Unmarshal(plan.PurgeManifest, &manifest) != nil {
+		return manifest, fmt.Errorf("purge manifest is unreadable")
+	}
+	if manifest.TenantID != plan.TenantID || manifest.Lane != plan.Lane || manifest.Version != 1 {
+		return manifest, fmt.Errorf("purge manifest scope is invalid")
+	}
+	outer := map[string]interface{}{"tenant": plan.TenantID, "lane": plan.Lane, "level": plan.Level, "capacity_mode": plan.CapacityMode, "source_checksum": plan.SourceChecksum, "source_count": plan.SourceCount, "purge_manifest": manifest}
+	if recoveryHash(outer) != plan.ManifestHash {
+		return manifest, fmt.Errorf("purge manifest hash does not match approval")
+	}
+	return manifest, nil
+}
+
+func createRecoveryProofArtifact(db *gorm.DB, plan models.FeedRecoveryPlan, run models.FeedRecoveryRun, manifest recoveryPurgeManifest) (string, error) {
+	payload := map[string]interface{}{"version": 1, "run_id": run.PublicID, "plan_id": plan.PublicID, "manifest_hash": plan.ManifestHash, "tenant_id": plan.TenantID, "source_ids": manifest.SourceIDs, "news_content_ids": manifest.NewsContentIDs, "media_content_ids": manifest.MediaContentIDs, "no_full_rollback": plan.NoFullRollback, "created_at": time.Now().UTC()}
+	raw, _ := json.Marshal(payload)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(raw); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	body := compressed.Bytes()
+	sum := sha256.Sum256(body)
+	checksum := hex.EncodeToString(sum[:])
+	key := fmt.Sprintf("system/recovery/%s/%s/%s.json.gz", plan.TenantID, plan.PublicID.String(), checksum)
+	request := map[string]string{"key": key, "sha256": checksum, "payload_base64": base64.StdEncoding.EncodeToString(body)}
+	_, status, err := callAggregationInternal(http.MethodPost, "/internal/recovery-artifacts", request)
+	if err != nil || status < 200 || status >= 300 {
+		return "", fmt.Errorf("recovery proof artifact upload failed (%d): %v", status, err)
+	}
+	_, verifyStatus, verifyErr := callAggregationInternal(http.MethodPost, "/internal/recovery-artifacts/verify", map[string]string{"key": key, "sha256": checksum})
+	if verifyErr != nil || verifyStatus < 200 || verifyStatus >= 300 {
+		return "", fmt.Errorf("recovery proof artifact readback failed (%d): %v", verifyStatus, verifyErr)
+	}
+	artifact := models.FeedRecoveryArtifact{PlanID: plan.ID, TenantID: plan.TenantID, ArtifactType: "purge_manifest", ArtifactKey: key, SHA256: checksum, ByteSize: int64(len(body)), State: "verified", ExpiresAt: time.Now().UTC().Add(24 * time.Hour)}
+	if err := db.Create(&artifact).Error; err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// ensureRecoveryProofArtifact makes the immutable manifest proof durable before
+// the first destructive phase. A retry reuses the verified artifact recorded
+// for the plan instead of uploading a second proof or changing its checksum.
+func ensureRecoveryProofArtifact(db *gorm.DB, plan models.FeedRecoveryPlan, run models.FeedRecoveryRun, manifest recoveryPurgeManifest) (string, error) {
+	if strings.TrimSpace(run.RecoveryArtifactRef) != "" {
+		return run.RecoveryArtifactRef, nil
+	}
+	var artifact models.FeedRecoveryArtifact
+	err := db.Where("plan_id=? AND artifact_type=?", plan.ID, "purge_manifest").First(&artifact).Error
+	if err == nil {
+		if artifact.State != "verified" || strings.TrimSpace(artifact.ArtifactKey) == "" {
+			return "", fmt.Errorf("recovery proof artifact is not verified")
+		}
+		return artifact.ArtifactKey, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", err
+	}
+	return createRecoveryProofArtifact(db, plan, run, manifest)
+}
+
+func createFeedRecoveryTombstones(tx *gorm.DB, run models.FeedRecoveryRun, manifestHash string, items []models.ContentItem) error {
+	rows := make([]models.NewsIngestTombstone, 0, len(items))
+	for _, item := range items {
+		identity, source, originalURL, err := retentionTombstoneIdentity(run.TenantID, item)
+		if err != nil {
+			return fmt.Errorf("recovery tombstone identity: %w", err)
+		}
+		runPublicID := run.PublicID
+		rows = append(rows, models.NewsIngestTombstone{TenantID: run.TenantID, IdentityHash: identity, SourceIdentityHash: source, OriginalURLHash: originalURL, OriginalContentID: item.PublicID, ManifestHash: manifestHash, RecoveryRunID: &run.ID, RecoveryRunPublicID: &runPublicID, Reason: "feed_recovery_purge"})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return tx.Create(&rows).Error
+}
+
+func purgeRecoveryNews(db *gorm.DB, run models.FeedRecoveryRun, plan models.FeedRecoveryPlan, manifest recoveryPurgeManifest) error {
+	ids := uniqueUUIDs(manifest.NewsContentIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	var existing int64
+	_ = db.Model(&models.FeedRecoveryAction{}).Where("run_id=? AND idempotency_key=?", run.ID, "purge-news:"+plan.ManifestHash).Count(&existing)
+	if existing > 0 {
+		return nil
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		var items []models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id IN ? AND type=? AND status=?", run.TenantID, ids, models.ContentTypeNews, models.ContentStatusReady).Find(&items).Error; err != nil || len(items) != len(ids) {
+			return fmt.Errorf("News purge manifest is stale")
+		}
+		if protected := retentionProtectedContentIDs(tx, run.TenantID, ids); len(protected) > 0 {
+			return fmt.Errorf("News purge manifest contains protected content")
+		}
+		if issues, err := retentionDependencyPreflight(tx, run.TenantID, ids); err != nil {
+			return err
+		} else if err := retentionDependencyError(issues); err != nil {
+			return err
+		}
+		if err := createFeedRecoveryTombstones(tx, run, plan.ManifestHash, items); err != nil {
+			return err
+		}
+		if err := reconcileHistoricalTelemetry(tx, ids, time.Now().UTC()); err != nil {
+			return err
+		}
+		if err := reconcileHistoricalRedundancy(tx, run.TenantID, ids, "feed-recovery", time.Now().UTC()); err != nil {
+			return err
+		}
+		if result := tx.Where("tenant_id=? AND public_id IN ?", run.TenantID, ids).Delete(&models.ContentItem{}); result.Error != nil || result.RowsAffected != int64(len(ids)) {
+			return fmt.Errorf("News purge did not match frozen manifest")
+		}
+		for _, storyID := range manifest.NewsStoryIDs {
+			var remaining int64
+			if err := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND story_id=?", run.TenantID, storyID).Count(&remaining).Error; err != nil {
+				return err
+			}
+			if remaining == 0 {
+				if err := reconcileHistoricalStories(tx, run.TenantID, []uuid.UUID{storyID}, time.Now().UTC()); err != nil {
+					return err
+				}
+				if err := tx.Where("tenant_id=? AND public_id=?", run.TenantID, storyID).Delete(&models.Story{}).Error; err != nil {
+					return err
+				}
+			}
+		}
+		if err := advanceNewsSnapshotGenerations(tx, run.TenantID); err != nil {
+			return err
+		}
+		return tx.Create(&models.FeedRecoveryAction{RunID: run.ID, ActionType: "purge_news", State: "succeeded", IdempotencyKey: "purge-news:" + plan.ManifestHash, Evidence: datatypes.JSON([]byte(fmt.Sprintf(`{"count":%d,"sources_preserved":true}`, len(ids))))}).Error
+	})
+}
+
+func requestRecoveryReseed(run models.FeedRecoveryRun, plan models.FeedRecoveryPlan, manifest recoveryPurgeManifest, lane string) error {
+	sourceIDs := manifest.SourceIDs
+	// A tenant may intentionally have no active sources during an expected-empty
+	// reset. Treat that lane as a durable no-op; availability and verification
+	// still expose the empty/partial result to operators.
+	if len(sourceIDs) == 0 {
+		return nil
+	}
+	if lane == "news" || lane == "media" {
+		payload := map[string]interface{}{"run_id": run.PublicID.String(), "tenant_id": run.TenantID, "lane": lane, "source_ids": sourceIDs, "lookback_hours": manifest.LookbackHours, "max_items": map[string]int{"news": manifest.NewsMaxItems, "media": manifest.MediaMaxItems}[lane], "manifest_hash": plan.ManifestHash, "idempotency_key": "reseed:" + plan.ManifestHash + ":" + lane, "preserve_checkpoints": true}
+		_, status, err := callAggregationInternal(http.MethodPost, "/internal/recovery/reseed", payload)
+		if err != nil || status < 200 || status >= 300 {
+			return fmt.Errorf("%s reseed request failed (%d): %v", lane, status, err)
+		}
+	}
+	return nil
+}
+
+func purgeRecoveryMedia(db *gorm.DB, run models.FeedRecoveryRun, plan models.FeedRecoveryPlan, manifest recoveryPurgeManifest) error {
+	ids := uniqueUUIDs(manifest.MediaContentIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	var existing int64
+	_ = db.Model(&models.FeedRecoveryAction{}).Where("run_id=? AND idempotency_key=?", run.ID, "purge-media:"+plan.ManifestHash).Count(&existing)
+	if existing > 0 {
+		return nil
+	}
+	payload := map[string]interface{}{"run_id": run.PublicID.String(), "tenant_id": run.TenantID, "content_ids": ids, "manifest_hash": plan.ManifestHash, "idempotency_key": "purge-media:" + plan.ManifestHash}
+	_, status, err := callAggregationInternal(http.MethodPost, "/internal/recovery/purge-media", payload)
+	if err != nil || status < 200 || status >= 300 {
+		return fmt.Errorf("media artifact purge failed (%d): %v", status, err)
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if result := tx.Where("tenant_id=? AND public_id IN ?", run.TenantID, ids).Delete(&models.ContentItem{}); result.Error != nil || result.RowsAffected != int64(len(ids)) {
+			return fmt.Errorf("media purge did not match frozen manifest")
+		}
+		return tx.Create(&models.FeedRecoveryAction{RunID: run.ID, ActionType: "purge_media", State: "succeeded", IdempotencyKey: "purge-media:" + plan.ManifestHash, Evidence: datatypes.JSON([]byte(fmt.Sprintf(`{"count":%d,"source_checkpoints_preserved":true}`, len(ids))))}).Error
+	})
+}
+
+func executePurgeReseedRun(db *gorm.DB, run models.FeedRecoveryRun, plan models.FeedRecoveryPlan) (string, error) {
+	if run.Phase == "verification_wait" || run.Phase == "verifying_probe_2" {
+		return "verifying_probe_2", nil
+	}
+	manifest, err := decodeRecoveryPurgeManifest(plan)
+	if err != nil {
+		return "", err
+	}
+	artifactRef, err := ensureRecoveryProofArtifact(db, plan, run, manifest)
+	if err != nil {
+		return "partial", err
+	}
+	if strings.TrimSpace(run.RecoveryArtifactRef) == "" {
+		if err := db.Model(&run).Updates(map[string]interface{}{"recovery_artifact_ref": artifactRef, "destructive_manifest": plan.PurgeManifest, "updated_at": time.Now().UTC()}).Error; err != nil {
+			return "partial", err
+		}
+		run.RecoveryArtifactRef = artifactRef
+	}
+	if run.ExpectedEmpty {
+		setRecoveryAvailabilityForRun(db, run, "expected_empty")
+	} else {
+		setRecoveryAvailabilityForRun(db, run, "refreshing")
+	}
+	lanes := recoveryLanes(run.Lane)
+	current := run.DestructiveLane
+	if current == "" {
+		current = lanes[0]
+	}
+	start := 0
+	for i, lane := range lanes {
+		if lane == current {
+			start = i
+			break
+		}
+	}
+	for _, lane := range lanes[start:] {
+		if lane == "news" {
+			if err := purgeRecoveryNews(db, run, plan, manifest); err != nil {
+				return "partial", err
+			}
+		} else {
+			if err := purgeRecoveryMedia(db, run, plan, manifest); err != nil {
+				return "partial", err
+			}
+		}
+		reseedKey := "reseed:" + plan.ManifestHash + ":" + lane
+		var reseedExists int64
+		_ = db.Model(&models.FeedRecoveryAction{}).Where("run_id=? AND idempotency_key=?", run.ID, reseedKey).Count(&reseedExists)
+		if reseedExists == 0 {
+			if err := requestRecoveryReseed(run, plan, manifest, lane); err != nil {
+				return "partial", err
+			}
+			_ = db.Create(&models.FeedRecoveryAction{RunID: run.ID, ActionType: "reseed_" + lane, State: "succeeded", IdempotencyKey: reseedKey, Evidence: datatypes.JSON([]byte(fmt.Sprintf(`{"checkpoint_mode":"preserve","lookback_hours":%d}`, manifest.LookbackHours)))})
+		}
+		_ = db.Model(&run).Updates(map[string]interface{}{"destructive_lane": lane, "phase": "reseeding_" + lane, "heartbeat_at": time.Now().UTC(), "updated_at": time.Now().UTC()})
+	}
+	_ = db.Model(&run).Updates(map[string]interface{}{"phase": "verifying_probe_1", "destructive_lane": "", "heartbeat_at": time.Now().UTC(), "updated_at": time.Now().UTC()})
+	return "verifying_probe_1", nil
+}
+
 func ExecuteFeedRecoveryRun(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -531,20 +889,28 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "recovery plan not found"})
 		return
 	}
-	if plan.Level == "purge_reseed" {
-		_ = db.Model(&run).Updates(map[string]interface{}{"phase": "blocked", "outcome": "purge_reseed_not_installed", "claim_token": nil, "claim_expires_at": nil, "updated_at": time.Now().UTC()})
-		c.JSON(http.StatusConflict, gin.H{"error": "Purge & Reseed is not installed in Slice 8"})
+	if plan.Level == "purge_reseed" && !principal.HasRole("admin") {
+		_ = db.Model(&run).Updates(map[string]interface{}{"phase": "blocked", "outcome": "admin_role_required", "claim_token": nil, "claim_expires_at": nil, "lane_lease": ""})
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin role required for Purge & Reseed"})
 		return
 	}
-	// Slice 8 owns single-lane Safe Cutover. Low-Space/typed Both sequencing
-	// is deliberately reserved for Slice 9; reject it explicitly instead of
-	// ever writing an invalid `both` availability or generation head.
 	if plan.Level == "rotate" && run.Lane == "both" {
 		_ = db.Model(&run).Updates(map[string]interface{}{"phase": "blocked", "outcome": "both_requires_sequential_lane_execution", "claim_token": nil, "claim_expires_at": nil, "updated_at": time.Now().UTC()})
 		c.JSON(http.StatusConflict, gin.H{"error": "Both-lane rotate is blocked until sequential lane execution is enabled"})
 		return
 	}
-	setRecoveryAvailabilityForRun(db, run, "refreshing")
+	if plan.Level == "purge_reseed" {
+		phase, purgeErr := executePurgeReseedRun(db, run, plan)
+		if purgeErr != nil {
+			_ = db.Model(&run).Updates(map[string]interface{}{"phase": "partial", "outcome": "purge_reseed_failed", "error": purgeErr.Error(), "claim_token": nil, "claim_expires_at": nil, "lane_lease": ""})
+			setRecoveryAvailabilityForRun(db, run, "partial")
+			c.JSON(http.StatusConflict, gin.H{"error": purgeErr.Error()})
+			return
+		}
+		run.Phase = phase
+	} else {
+		setRecoveryAvailabilityForRun(db, run, "refreshing")
+	}
 	if plan.Level == "repair" {
 		if repairErr := runRegisteredRecoveryRepairTools(db, run); repairErr != nil {
 			_ = db.Model(&run).Updates(map[string]interface{}{"phase": "partial", "outcome": "repair_failed", "error": repairErr.Error(), "claim_token": nil, "claim_expires_at": nil, "lane_lease": ""})

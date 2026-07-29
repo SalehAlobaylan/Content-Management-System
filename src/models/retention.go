@@ -501,18 +501,20 @@ func (RetentionMaintenanceReport) TableName() string { return "retention_mainten
 // never references sources, and its original content UUID is a value so the
 // retention deletion cannot erase the reason a later crawler was rejected.
 type NewsIngestTombstone struct {
-	ID                 uint       `gorm:"primaryKey" json:"-"`
-	PublicID           uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID           string     `gorm:"type:varchar(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:1" json:"tenant_id"`
-	IdentityHash       string     `gorm:"type:char(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:2" json:"identity_hash"`
-	SourceIdentityHash string     `gorm:"type:char(64);not null" json:"source_identity_hash"`
-	OriginalURLHash    string     `gorm:"type:char(64);not null;index" json:"original_url_hash"`
-	OriginalContentID  uuid.UUID  `gorm:"type:uuid;not null" json:"original_content_id"`
-	ManifestHash       string     `gorm:"type:char(64);not null" json:"manifest_hash"`
-	RetirementActionID uint       `gorm:"not null" json:"-"`
-	Reason             string     `gorm:"type:varchar(64);not null" json:"reason"`
-	ReplayConsumedAt   *time.Time `json:"replay_consumed_at,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                  uint       `gorm:"primaryKey" json:"-"`
+	PublicID            uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID            string     `gorm:"type:varchar(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:1" json:"tenant_id"`
+	IdentityHash        string     `gorm:"type:char(64);not null;uniqueIndex:idx_news_tombstone_identity,priority:2" json:"identity_hash"`
+	SourceIdentityHash  string     `gorm:"type:char(64);not null" json:"source_identity_hash"`
+	OriginalURLHash     string     `gorm:"type:char(64);not null;index" json:"original_url_hash"`
+	OriginalContentID   uuid.UUID  `gorm:"type:uuid;not null" json:"original_content_id"`
+	ManifestHash        string     `gorm:"type:char(64);not null" json:"manifest_hash"`
+	RetirementActionID  *uint      `json:"-"`
+	RecoveryRunID       *uint      `json:"-"`
+	RecoveryRunPublicID *uuid.UUID `json:"-"`
+	Reason              string     `gorm:"type:varchar(64);not null" json:"reason"`
+	ReplayConsumedAt    *time.Time `json:"replay_consumed_at,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 func (NewsIngestTombstone) TableName() string { return "news_ingest_tombstones" }

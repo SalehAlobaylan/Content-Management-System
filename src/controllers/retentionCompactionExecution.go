@@ -137,6 +137,7 @@ func createRetentionTombstones(tx *gorm.DB, tenant string, action models.Retenti
 		retireSet[id] = true
 	}
 	rows := make([]models.NewsIngestTombstone, 0, len(retireIDs))
+	actionID := action.ID
 	for _, item := range members {
 		if !retireSet[item.PublicID] {
 			continue
@@ -147,7 +148,7 @@ func createRetentionTombstones(tx *gorm.DB, tenant string, action models.Retenti
 		}
 		rows = append(rows, models.NewsIngestTombstone{
 			TenantID: tenant, IdentityHash: identity, SourceIdentityHash: source, OriginalURLHash: originalURL,
-			OriginalContentID: item.PublicID, ManifestHash: manifest.ManifestHash, RetirementActionID: action.ID, Reason: "retention_compaction",
+			OriginalContentID: item.PublicID, ManifestHash: manifest.ManifestHash, RetirementActionID: &actionID, Reason: "retention_compaction",
 		})
 	}
 	if len(rows) != len(retireIDs) {

@@ -10,51 +10,57 @@ import (
 // FeedRecoveryPlan is immutable preflight evidence. Execution remains bound to
 // this identity so every repair/rotate action can be audited and resumed.
 type FeedRecoveryPlan struct {
-	ID             uint           `gorm:"primaryKey" json:"-"`
-	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	Lane           string         `gorm:"type:varchar(16);not null" json:"lane"`
-	Level          string         `gorm:"type:varchar(24);not null" json:"level"`
-	CapacityMode   string         `gorm:"type:varchar(24);not null" json:"capacity_mode"`
-	State          string         `gorm:"type:varchar(32);not null" json:"state"`
-	PlanHash       string         `gorm:"type:char(64);not null" json:"plan_hash"`
-	ManifestHash   string         `gorm:"type:char(64);not null" json:"manifest_hash"`
-	TargetCount    int            `json:"target_count"`
-	SourceChecksum string         `gorm:"type:char(64);not null" json:"source_checksum"`
-	SourceCount    int            `json:"source_count"`
-	Evidence       datatypes.JSON `gorm:"type:jsonb" json:"evidence"`
-	PolicySnapshot datatypes.JSON `gorm:"type:jsonb" json:"policy_snapshot"`
-	NoFullRollback bool           `json:"no_full_rollback"`
-	ExpiresAt      time.Time      `json:"expires_at"`
-	CreatedBy      string         `json:"created_by"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	ID               uint           `gorm:"primaryKey" json:"-"`
+	PublicID         uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID         string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	Lane             string         `gorm:"type:varchar(16);not null" json:"lane"`
+	Level            string         `gorm:"type:varchar(24);not null" json:"level"`
+	CapacityMode     string         `gorm:"type:varchar(24);not null" json:"capacity_mode"`
+	State            string         `gorm:"type:varchar(32);not null" json:"state"`
+	PlanHash         string         `gorm:"type:char(64);not null" json:"plan_hash"`
+	ManifestHash     string         `gorm:"type:char(64);not null" json:"manifest_hash"`
+	TargetCount      int            `json:"target_count"`
+	SourceChecksum   string         `gorm:"type:char(64);not null" json:"source_checksum"`
+	SourceCount      int            `json:"source_count"`
+	Evidence         datatypes.JSON `gorm:"type:jsonb" json:"evidence"`
+	PolicySnapshot   datatypes.JSON `gorm:"type:jsonb" json:"policy_snapshot"`
+	NoFullRollback   bool           `json:"no_full_rollback"`
+	PurgeManifest    datatypes.JSON `gorm:"type:jsonb" json:"purge_manifest,omitempty"`
+	ManifestFrozenAt *time.Time     `json:"manifest_frozen_at,omitempty"`
+	ExpiresAt        time.Time      `json:"expires_at"`
+	CreatedBy        string         `json:"created_by"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
 }
 
 func (FeedRecoveryPlan) TableName() string { return "feed_recovery_plans" }
 
 type FeedRecoveryRun struct {
-	ID                    uint       `gorm:"primaryKey" json:"-"`
-	PublicID              uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	PlanID                uint       `json:"-"`
-	TenantID              string     `json:"tenant_id"`
-	Lane                  string     `json:"lane"`
-	CorrelationID         uuid.UUID  `json:"correlation_id"`
-	Phase                 string     `json:"phase"`
-	NotBefore             *time.Time `json:"not_before,omitempty"`
-	CancelDeadline        *time.Time `json:"cancel_deadline,omitempty"`
-	HeartbeatAt           *time.Time `json:"heartbeat_at,omitempty"`
-	ClaimToken            *uuid.UUID `json:"-"`
-	ClaimExpiresAt        *time.Time `json:"claim_expires_at,omitempty"`
-	LaneLease             string     `json:"lane_lease,omitempty"`
-	RollbackDeadline      *time.Time `json:"rollback_deadline,omitempty"`
-	VerificationDueAt     *time.Time `json:"verification_due_at,omitempty"`
-	ActiveGenerationID    *uuid.UUID `json:"active_generation_id,omitempty"`
-	CandidateGenerationID *uuid.UUID `json:"candidate_generation_id,omitempty"`
-	Outcome               string     `json:"outcome,omitempty"`
-	Error                 string     `json:"error,omitempty"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	ID                    uint           `gorm:"primaryKey" json:"-"`
+	PublicID              uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	PlanID                uint           `json:"-"`
+	TenantID              string         `json:"tenant_id"`
+	Lane                  string         `json:"lane"`
+	CorrelationID         uuid.UUID      `json:"correlation_id"`
+	Phase                 string         `json:"phase"`
+	NotBefore             *time.Time     `json:"not_before,omitempty"`
+	CancelDeadline        *time.Time     `json:"cancel_deadline,omitempty"`
+	HeartbeatAt           *time.Time     `json:"heartbeat_at,omitempty"`
+	ClaimToken            *uuid.UUID     `json:"-"`
+	ClaimExpiresAt        *time.Time     `json:"claim_expires_at,omitempty"`
+	LaneLease             string         `json:"lane_lease,omitempty"`
+	RollbackDeadline      *time.Time     `json:"rollback_deadline,omitempty"`
+	VerificationDueAt     *time.Time     `json:"verification_due_at,omitempty"`
+	ActiveGenerationID    *uuid.UUID     `json:"active_generation_id,omitempty"`
+	CandidateGenerationID *uuid.UUID     `json:"candidate_generation_id,omitempty"`
+	Outcome               string         `json:"outcome,omitempty"`
+	Error                 string         `json:"error,omitempty"`
+	DestructiveManifest   datatypes.JSON `gorm:"type:jsonb" json:"destructive_manifest,omitempty"`
+	DestructiveLane       string         `json:"destructive_lane,omitempty"`
+	ExpectedEmpty         bool           `json:"expected_empty"`
+	RecoveryArtifactRef   string         `json:"recovery_artifact_ref,omitempty"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 
 func (FeedRecoveryRun) TableName() string { return "feed_recovery_runs" }

@@ -717,6 +717,26 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		limit = 20
 	}
 	force := strings.EqualFold(c.Query("force"), "true")
+	preserveCheckpoints := strings.EqualFold(c.Query("preserve_checkpoints"), "true")
+	recoveryLane := strings.ToLower(strings.TrimSpace(c.Query("recovery_lane")))
+	category := models.SourceCategoryNews
+	if recoveryLane == "media" {
+		category = models.SourceCategoryMedia
+	}
+	recoveryRunID := strings.TrimSpace(c.Query("recovery_run_id"))
+	recoveryManifestHash := strings.TrimSpace(c.Query("recovery_manifest_hash"))
+	recoverySourceIDs := make([]uuid.UUID, 0)
+	for _, raw := range strings.Split(c.Query("recovery_source_ids"), ",") {
+		if id, err := uuid.Parse(strings.TrimSpace(raw)); err == nil {
+			recoverySourceIDs = append(recoverySourceIDs, id)
+		}
+	}
+	recoveryLookbackHours, _ := strconv.Atoi(c.DefaultQuery("recovery_lookback_hours", "72"))
+	recoveryMaxItems, _ := strconv.Atoi(c.DefaultQuery("recovery_max_items", "500"))
+	if preserveCheckpoints && (recoveryLane != "news" && recoveryLane != "media" || recoveryRunID == "" || recoveryManifestHash == "" || len(recoverySourceIDs) == 0 || recoveryLookbackHours < 1 || recoveryLookbackHours > 72 || recoveryMaxItems < 1 || recoveryMaxItems > 500) {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "bounded recovery source claim is invalid"})
+		return
+	}
 	now := time.Now().UTC()
 
 	type sourceClaim struct {
@@ -738,14 +758,19 @@ func InternalClaimCirculationSources(c *gin.Context) {
 	// fetch bills.
 	err := db.Transaction(func(tx *gorm.DB) error {
 		q := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, models.SourceCategoryNews, true).
+			Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, category, true).
 			Where("feed_url IS NOT NULL AND feed_url <> ''")
-		if force {
-			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ?",
-				now.Add(-time.Duration(policy.SourceMinIntervalMinutes)*time.Minute))
-		} else {
-			q = q.Where("last_fetched_at IS NULL OR last_fetched_at < (?::timestamp - (GREATEST(fetch_interval_minutes, ?)::integer * interval '1 minute'))",
-				now, policy.SourceMinIntervalMinutes)
+		if preserveCheckpoints {
+			q = q.Where("public_id IN ?", recoverySourceIDs)
+		}
+		if !preserveCheckpoints {
+			if force {
+				q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ?",
+					now.Add(-time.Duration(policy.SourceMinIntervalMinutes)*time.Minute))
+			} else {
+				q = q.Where("last_fetched_at IS NULL OR last_fetched_at < (?::timestamp - (GREATEST(fetch_interval_minutes, ?)::integer * interval '1 minute'))",
+					now, policy.SourceMinIntervalMinutes)
+			}
 		}
 
 		var sources []models.ContentSource
@@ -771,11 +796,35 @@ func InternalClaimCirculationSources(c *gin.Context) {
 			})
 			ids = append(ids, source.PublicID)
 		}
-		if len(ids) > 0 {
+		if len(ids) > 0 && !preserveCheckpoints {
 			if err := tx.Model(&models.ContentSource{}).
 				Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
 				UpdateColumn("last_fetched_at", now).Error; err != nil {
 				return err
+			}
+		}
+		if preserveCheckpoints {
+			if len(claims) > recoveryMaxItems {
+				claims = claims[:recoveryMaxItems]
+			}
+			remaining := recoveryMaxItems
+			for index := range claims {
+				settings := claims[index].Settings
+				remainingSources := len(claims) - index
+				perSource := remaining / remainingSources
+				if remaining%remainingSources != 0 {
+					perSource++
+				}
+				if perSource < 1 {
+					perSource = 1
+				}
+				if perSource > remaining {
+					perSource = remaining
+				}
+				settings["recovery"] = map[string]interface{}{"run_id": recoveryRunID, "manifest_hash": recoveryManifestHash, "lookback_hours": recoveryLookbackHours, "preserve_checkpoints": true}
+				settings["max_results"] = perSource
+				claims[index].Settings = settings
+				remaining -= perSource
 			}
 		}
 		return nil
@@ -801,6 +850,15 @@ type sourceRunReportRequest struct {
 	FinishedAt  *string                `json:"finished_at"`
 	DurationMs  int                    `json:"duration_ms"`
 	Metadata    map[string]interface{} `json:"metadata"`
+}
+
+func sourceRunPreservesCheckpoint(metadata map[string]interface{}) bool {
+	recovery, ok := metadata["recovery"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	preserve, ok := recovery["preserve_checkpoints"].(bool)
+	return ok && preserve
 }
 
 func InternalReportSourceRun(c *gin.Context) {
@@ -875,7 +933,7 @@ func InternalReportSourceRun(c *gin.Context) {
 	// a whole cycle — but never below the floor, so a persistently broken source
 	// still can't be hammered. The `last_fetched_at > retryDue` guard only ever
 	// moves the source earlier, so repeated reports are idempotent.
-	if req.Fetched == 0 && req.Accepted == 0 && req.Failed > 0 {
+	if !sourceRunPreservesCheckpoint(req.Metadata) && req.Fetched == 0 && req.Accepted == 0 && req.Failed > 0 {
 		policy := loadCirculationPolicy(db, tenantID)
 		var source models.ContentSource
 		if err := db.Where("tenant_id = ? AND public_id = ?", tenantID, sourceID).First(&source).Error; err == nil {

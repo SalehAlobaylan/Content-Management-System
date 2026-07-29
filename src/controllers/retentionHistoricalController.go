@@ -245,12 +245,13 @@ func PrepareHistoricalRetention(c *gin.Context) {
 
 func createHistoricalTombstones(tx *gorm.DB, tenant string, action models.RetentionAction, manifest models.RetentionHistoricalManifest, items []models.ContentItem) error {
 	rows := make([]models.NewsIngestTombstone, 0, len(items))
+	actionID := action.ID
 	for _, item := range items {
-		identity, source, originalURL, err := retentionTombstoneIdentity(tenant, item)
+		identity, source, _, err := retentionTombstoneIdentity(tenant, item)
 		if err != nil {
 			return fmt.Errorf("historical tombstone preflight: %w", err)
 		}
-		rows = append(rows, models.NewsIngestTombstone{TenantID: tenant, IdentityHash: identity, SourceIdentityHash: source, OriginalURLHash: originalURL, OriginalContentID: item.PublicID, ManifestHash: manifest.ManifestHash, RetirementActionID: action.ID, Reason: "historical_retention"})
+		rows = append(rows, models.NewsIngestTombstone{TenantID: tenant, IdentityHash: identity, SourceIdentityHash: source, OriginalContentID: item.PublicID, ManifestHash: manifest.ManifestHash, RetirementActionID: &actionID, Reason: "historical_retention"})
 	}
 	return tx.Create(&rows).Error
 }

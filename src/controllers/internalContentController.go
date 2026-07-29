@@ -22,25 +22,27 @@ import (
 )
 
 type internalCreateContentItemRequest struct {
-	IdempotencyKey  string                 `json:"idempotency_key"`
-	Type            string                 `json:"type"`
-	Format          *string                `json:"format"`
-	Source          string                 `json:"source"`
-	Status          string                 `json:"status"`
-	Title           string                 `json:"title"`
-	BodyText        *string                `json:"body_text"`
-	Excerpt         *string                `json:"excerpt"`
-	ContentLanguage *string                `json:"content_language"`
-	Author          *string                `json:"author"`
-	SourceName      string                 `json:"source_name"`
-	SourceFeedURL   *string                `json:"source_feed_url"`
-	OriginalURL     string                 `json:"original_url"`
-	MediaURL        *string                `json:"media_url"`
-	ThumbnailURL    *string                `json:"thumbnail_url"`
-	DurationSec     *int                   `json:"duration_sec"`
-	TopicTags       []string               `json:"topic_tags"`
-	Metadata        map[string]interface{} `json:"metadata"`
-	PublishedAt     *string                `json:"published_at"`
+	IdempotencyKey       string                 `json:"idempotency_key"`
+	Type                 string                 `json:"type"`
+	Format               *string                `json:"format"`
+	Source               string                 `json:"source"`
+	Status               string                 `json:"status"`
+	Title                string                 `json:"title"`
+	BodyText             *string                `json:"body_text"`
+	Excerpt              *string                `json:"excerpt"`
+	ContentLanguage      *string                `json:"content_language"`
+	Author               *string                `json:"author"`
+	SourceName           string                 `json:"source_name"`
+	SourceFeedURL        *string                `json:"source_feed_url"`
+	OriginalURL          string                 `json:"original_url"`
+	MediaURL             *string                `json:"media_url"`
+	ThumbnailURL         *string                `json:"thumbnail_url"`
+	DurationSec          *int                   `json:"duration_sec"`
+	TopicTags            []string               `json:"topic_tags"`
+	Metadata             map[string]interface{} `json:"metadata"`
+	PublishedAt          *string                `json:"published_at"`
+	RecoveryRunID        *string                `json:"recovery_run_id"`
+	RecoveryManifestHash string                 `json:"recovery_manifest_hash"`
 }
 
 type internalCreateContentItemResponse struct {
@@ -310,11 +312,19 @@ func InternalCreateContentItem(c *gin.Context) {
 		}
 		var tombstone models.NewsIngestTombstone
 		if err := db.Where("tenant_id = ? AND identity_hash = ?", retentionV1Tenant, identity).First(&tombstone).Error; err == nil {
-			c.JSON(http.StatusOK, internalCreateContentItemResponse{
-				ID: tombstone.OriginalContentID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true,
-				CreatedAt: tombstone.CreatedAt.UTC().Format(time.RFC3339),
-			})
-			return
+			if req.RecoveryRunID != nil && strings.TrimSpace(req.RecoveryManifestHash) != "" && tombstone.RecoveryRunPublicID != nil && tombstone.RecoveryRunPublicID.String() == strings.TrimSpace(*req.RecoveryRunID) && tombstone.ManifestHash == strings.TrimSpace(req.RecoveryManifestHash) && tombstone.ReplayConsumedAt == nil {
+				consumed := time.Now().UTC()
+				if err := db.Model(&tombstone).Where("replay_consumed_at IS NULL").Update("replay_consumed_at", consumed).Error; err != nil {
+					c.JSON(http.StatusConflict, gin.H{"error": "Recovery tombstone replay could not be consumed"})
+					return
+				}
+			} else {
+				c.JSON(http.StatusOK, internalCreateContentItemResponse{
+					ID: tombstone.OriginalContentID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true,
+					CreatedAt: tombstone.CreatedAt.UTC().Format(time.RFC3339),
+				})
+				return
+			}
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check retired News identity"})
 			return
@@ -1234,6 +1244,7 @@ func InternalGetContentItem(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"id":        item.PublicID.String(),
 		"tenant_id": item.TenantID,
+		"status":    string(item.Status),
 		// Content type (TWEET/ARTICLE/…) — distinct from source_type below.
 		// FeedNewsService anchors read this; without it the slide anchor's
 		// type field is the empty string.
