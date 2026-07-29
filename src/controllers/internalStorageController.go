@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // -----------------------------------------------------------------------------
@@ -220,9 +223,177 @@ func parseStorageCandidateIDs(raw string) []uuid.UUID {
 	return out
 }
 
+// storageOwnedItems is the canonical direct-ID guard. Callers may narrow a
+// Storage run, but they can never turn an arbitrary UUID into a storage target
+// or cross a tenant boundary.
+func storageOwnedItems(db *gorm.DB, tenant string, ids []uuid.UUID, action string) ([]models.ContentItem, error) {
+	if len(ids) == 0 || strings.TrimSpace(tenant) == "" {
+		return nil, fmt.Errorf("storage tenant and ids are required")
+	}
+	policy := loadEffectiveStoragePolicy(db, tenant)
+	if !policy.Enabled {
+		return nil, fmt.Errorf("storage policy is disabled")
+	}
+	archiveAction := action
+	if archiveAction != "delete" && archiveAction != "move_to_cold" && archiveAction != "re_encode" {
+		return nil, fmt.Errorf("unsupported storage operation")
+	}
+	var items []models.ContentItem
+	query := buildCandidateQuery(db, candidateFilter{tenantID: tenant, minAgeDays: policy.MinAgeDays, maxViewCount: policy.MinViewCountForKeep, deleteFailedImmediately: policy.DeleteFailedImmediately, protectTopNByViews: policy.ProtectTopNByViews, protectTopNWindowDays: policy.ProtectTopNWindowDays, excludeColdTier: true, includeAtomizedParents: true, archiveAction: archiveAction}).Where("public_id IN ?", ids)
+	if err := query.Find(&items).Error; err != nil {
+		return nil, err
+	}
+	if len(items) != len(ids) {
+		return nil, fmt.Errorf("one or more direct storage ids are not canonical owner candidates")
+	}
+	return items, nil
+}
+
+func storageSagaKey(idempotencyKey, operation string, itemID uuid.UUID) string {
+	key := strings.TrimSpace(idempotencyKey)
+	if key == "" {
+		key = fmt.Sprintf("legacy-%s", operation)
+	}
+	return key + ":" + itemID.String()
+}
+
+func createPreparedStorageSaga(db *gorm.DB, tenant string, item models.ContentItem, operation, idempotencyKey, manifestHash, correlationID, ownerRequestID string, evidence map[string]interface{}) (*models.StorageOperationSaga, error) {
+	key := storageSagaKey(idempotencyKey, operation, item.PublicID)
+	var ownerID *uint
+	if parsed, err := uuid.Parse(strings.TrimSpace(ownerRequestID)); err == nil {
+		var owner models.RetentionOwnerRequest
+		if err := db.Where("tenant_id=? AND public_id=?", tenant, parsed).First(&owner).Error; err == nil {
+			ownerID = &owner.ID
+		}
+	}
+	var correlation *uuid.UUID
+	if parsed, err := uuid.Parse(strings.TrimSpace(correlationID)); err == nil {
+		correlation = &parsed
+	}
+	var manifest *string
+	if trimmed := strings.TrimSpace(manifestHash); trimmed != "" {
+		manifest = &trimmed
+	}
+	saga := models.StorageOperationSaga{TenantID: tenant, ContentItemID: item.PublicID, OwnerRequestID: ownerID, Operation: operation, IdempotencyKey: key, ManifestHash: manifest, CorrelationID: correlation, State: "prepared", ObjectEvidence: storageJSON(evidence), CMSEvidence: datatypes.JSON([]byte(`{}`)), StartedAt: time.Now().UTC()}
+	create := db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "content_item_id"}, {Name: "operation"}, {Name: "idempotency_key"}}, DoNothing: true}).Create(&saga)
+	if create.Error != nil {
+		return nil, create.Error
+	}
+	saga.Created = create.RowsAffected == 1
+	if !saga.Created {
+		if err := db.Where("tenant_id=? AND content_item_id=? AND operation=? AND idempotency_key=?", tenant, item.PublicID, operation, key).First(&saga).Error; err != nil {
+			return nil, err
+		}
+	}
+	return &saga, nil
+}
+
+func requireObjectAppliedSaga(db *gorm.DB, tenant string, item models.ContentItem, operation, idempotencyKey string) (*models.StorageOperationSaga, error) {
+	var saga models.StorageOperationSaga
+	key := storageSagaKey(idempotencyKey, operation, item.PublicID)
+	if err := db.Where("tenant_id=? AND content_item_id=? AND operation=? AND idempotency_key=?", tenant, item.PublicID, operation, key).First(&saga).Error; err != nil {
+		return nil, fmt.Errorf("storage operation saga is missing")
+	}
+	if saga.State != "object_applied" {
+		return nil, fmt.Errorf("storage operation saga has not confirmed object mutation")
+	}
+	return &saga, nil
+}
+
+func completeStorageSaga(db *gorm.DB, saga *models.StorageOperationSaga, evidence map[string]interface{}) {
+	now := time.Now().UTC()
+	_ = db.Model(&models.StorageOperationSaga{}).Where("id=?", saga.ID).Updates(map[string]interface{}{"state": "cms_committed", "cms_evidence": storageJSON(evidence), "completed_at": now, "error": ""}).Error
+}
+
+type internalStartStorageSagaRequest struct {
+	TenantID       string                 `json:"tenant_id"`
+	ContentItemID  string                 `json:"content_item_id"`
+	Operation      string                 `json:"operation"`
+	IdempotencyKey string                 `json:"idempotency_key"`
+	ManifestHash   string                 `json:"manifest_hash"`
+	CorrelationID  string                 `json:"correlation_id"`
+	OwnerRequestID string                 `json:"owner_request_id"`
+	Evidence       map[string]interface{} `json:"evidence"`
+}
+
+// InternalStartStorageOperationSaga writes the durable intent before
+// Aggregation mutates any object. A failed intent write must prevent mutation.
+func InternalStartStorageOperationSaga(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	var req internalStartStorageSagaRequest
+	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.TenantID) == "" || strings.TrimSpace(req.IdempotencyKey) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_id and idempotency_key required"})
+		return
+	}
+	id, err := uuid.Parse(strings.TrimSpace(req.ContentItemID))
+	if err != nil || (req.Operation != "recoverable_delete" && req.Operation != "move_to_cold") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid content_item_id and operation required"})
+		return
+	}
+	action := "delete"
+	if req.Operation == "move_to_cold" {
+		action = "move_to_cold"
+	}
+	items, err := storageOwnedItems(db, req.TenantID, []uuid.UUID{id}, action)
+	if err != nil || len(items) != 1 {
+		c.JSON(http.StatusConflict, gin.H{"error": "content item is not a canonical storage candidate"})
+		return
+	}
+	saga, err := createPreparedStorageSaga(db, req.TenantID, items[0], req.Operation, req.IdempotencyKey, req.ManifestHash, req.CorrelationID, req.OwnerRequestID, req.Evidence)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start storage operation saga"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": saga})
+}
+
+type internalMarkStorageSagaObjectAppliedRequest struct {
+	Evidence map[string]interface{} `json:"evidence"`
+}
+
+// InternalMarkStorageSagaObjectApplied records the provider-side success before
+// CMS references are changed. Prepared rows without this marker are explicit
+// reconciliation work, never silently treated as committed.
+func InternalMarkStorageSagaObjectApplied(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saga id"})
+		return
+	}
+	var req internalMarkStorageSagaObjectAppliedRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	var saga models.StorageOperationSaga
+	if err := db.Where("public_id=?", id).First(&saga).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "storage operation saga not found"})
+		return
+	}
+	if saga.State == "cms_committed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "storage operation already committed"})
+		return
+	}
+	if saga.State != "prepared" && saga.State != "object_applied" {
+		c.JSON(http.StatusConflict, gin.H{"error": "storage operation cannot be marked"})
+		return
+	}
+	if err := db.Model(&saga).Updates(map[string]interface{}{"state": "object_applied", "object_evidence": storageJSON(req.Evidence)}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark object mutation"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"id": saga.PublicID, "state": "object_applied"}})
+}
+
 type internalArchiveItemsRequest struct {
 	IDs                []string `json:"ids"`
 	PreserveThumbnails bool     `json:"preserve_thumbnails"`
+	TenantID           string   `json:"tenant_id"`
+	IdempotencyKey     string   `json:"idempotency_key"`
+	ManifestHash       string   `json:"manifest_hash"`
+	CorrelationID      string   `json:"correlation_id"`
+	OwnerRequestID     string   `json:"owner_request_id"`
 }
 
 type internalArchiveItemsResponse struct {
@@ -236,7 +407,7 @@ type internalArchiveItemsResponse struct {
 func InternalArchiveItems(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var req internalArchiveItemsRequest
-	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 || strings.TrimSpace(req.TenantID) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ids required"})
 		return
 	}
@@ -252,8 +423,11 @@ func InternalArchiveItems(c *gin.Context) {
 		return
 	}
 
-	var items []models.ContentItem
-	db.Where("public_id IN ?", ids).Find(&items)
+	items, err := storageOwnedItems(db, req.TenantID, ids, "delete")
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 	var freed int64
 	for _, item := range items {
 		freed += item.FileSizeBytes
@@ -271,7 +445,16 @@ func InternalArchiveItems(c *gin.Context) {
 	if !req.PreserveThumbnails {
 		updates["thumbnail_url"] = nil
 	}
-	res := db.Model(&models.ContentItem{}).Where("public_id IN ?", ids).Updates(updates)
+	sagas := make(map[uuid.UUID]*models.StorageOperationSaga, len(items))
+	for _, item := range items {
+		saga, err := requireObjectAppliedSaga(db, req.TenantID, item, "recoverable_delete", req.IdempotencyKey)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record storage saga"})
+			return
+		}
+		sagas[item.PublicID] = saga
+	}
+	res := db.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id IN ?", req.TenantID, ids).Updates(updates)
 	if res.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to archive"})
 		return
@@ -295,6 +478,7 @@ func InternalArchiveItems(c *gin.Context) {
 			StorageStateReason:    "storage_archive",
 			StorageRecoveryStatus: models.StorageRecoveryRecoverable,
 		})
+		completeStorageSaga(db, sagas[item.PublicID], map[string]interface{}{"storage_state": models.StorageStateRecoverableDeleted, "freed_bytes": item.FileSizeBytes})
 	}
 
 	c.JSON(http.StatusOK, internalArchiveItemsResponse{
@@ -311,7 +495,12 @@ type internalMoveToColdItem struct {
 }
 
 type internalMoveToColdRequest struct {
-	Items []internalMoveToColdItem `json:"items"`
+	Items          []internalMoveToColdItem `json:"items"`
+	TenantID       string                   `json:"tenant_id"`
+	IdempotencyKey string                   `json:"idempotency_key"`
+	ManifestHash   string                   `json:"manifest_hash"`
+	CorrelationID  string                   `json:"correlation_id"`
+	OwnerRequestID string                   `json:"owner_request_id"`
 }
 
 type internalMoveToColdResponse struct {
@@ -325,7 +514,7 @@ type internalMoveToColdResponse struct {
 func InternalMoveItemsToCold(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var req internalMoveToColdRequest
-	if err := c.ShouldBindJSON(&req); err != nil || len(req.Items) == 0 {
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Items) == 0 || strings.TrimSpace(req.TenantID) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "items required"})
 		return
 	}
@@ -342,11 +531,17 @@ func InternalMoveItemsToCold(c *gin.Context) {
 		}
 
 		var item models.ContentItem
-		if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		owned, ownerErr := storageOwnedItems(db, req.TenantID, []uuid.UUID{id}, "move_to_cold")
+		if ownerErr != nil || len(owned) != 1 {
 			continue
 		}
+		item = owned[0]
 
 		oldSize := item.FileSizeBytes
+		saga, sagaErr := requireObjectAppliedSaga(db, req.TenantID, item, "move_to_cold", req.IdempotencyKey)
+		if sagaErr != nil {
+			continue
+		}
 		updates := map[string]interface{}{
 			"storage_tier":             &cold,
 			"last_storage_check":       &now,
@@ -371,7 +566,7 @@ func InternalMoveItemsToCold(c *gin.Context) {
 			freed += oldSize
 		}
 
-		if err := db.Model(&models.ContentItem{}).Where("id = ?", item.ID).Updates(updates).Error; err == nil {
+		if err := db.Model(&models.ContentItem{}).Where("id = ? AND tenant_id=?", item.ID, req.TenantID).Updates(updates).Error; err == nil {
 			updated++
 			newSize := int64Value(it.NewSizeBytes, oldSize)
 			eventFreed := oldSize - newSize
@@ -402,6 +597,7 @@ func InternalMoveItemsToCold(c *gin.Context) {
 				StorageStateReason:    "moved_to_cold",
 				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
 			})
+			completeStorageSaga(db, saga, map[string]interface{}{"storage_state": models.StorageStateCold, "new_size_bytes": newSize})
 		}
 	}
 
@@ -421,6 +617,10 @@ type internalSweepRunRequest struct {
 	FreedBytes       int64   `json:"freed_bytes"`
 	Trigger          string  `json:"trigger"`
 	Error            string  `json:"error,omitempty"`
+	CorrelationID    string  `json:"correlation_id"`
+	OwnerRequestID   string  `json:"owner_request_id"`
+	IdempotencyKey   string  `json:"idempotency_key"`
+	ManifestHash     string  `json:"manifest_hash"`
 }
 
 // InternalCreateSweepRun handles POST /internal/storage/sweep-runs
@@ -448,6 +648,25 @@ func InternalCreateSweepRun(c *gin.Context) {
 		trigger = "auto"
 	}
 
+	var correlationID *uuid.UUID
+	if parsed, parseErr := uuid.Parse(strings.TrimSpace(req.CorrelationID)); parseErr == nil {
+		correlationID = &parsed
+	}
+	var ownerRequestID *uint
+	if parsed, parseErr := uuid.Parse(strings.TrimSpace(req.OwnerRequestID)); parseErr == nil {
+		var owner models.RetentionOwnerRequest
+		if err := db.Where("tenant_id=? AND public_id=?", req.TenantID, parsed).First(&owner).Error; err == nil {
+			ownerRequestID = &owner.ID
+		}
+	}
+	var manifestHash *string
+	if value := strings.TrimSpace(req.ManifestHash); value != "" {
+		manifestHash = &value
+	}
+	var idempotencyKey *string
+	if value := strings.TrimSpace(req.IdempotencyKey); value != "" {
+		idempotencyKey = &value
+	}
 	run := models.StorageSweepRun{
 		TenantID:         req.TenantID,
 		StartedAt:        started,
@@ -458,6 +677,10 @@ func InternalCreateSweepRun(c *gin.Context) {
 		FreedBytes:       req.FreedBytes,
 		Trigger:          trigger,
 		Error:            req.Error,
+		CorrelationID:    correlationID,
+		OwnerRequestID:   ownerRequestID,
+		IdempotencyKey:   idempotencyKey,
+		ManifestHash:     manifestHash,
 	}
 	if err := db.Create(&run).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record sweep run"})

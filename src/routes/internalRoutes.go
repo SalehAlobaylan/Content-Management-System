@@ -70,6 +70,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 
 	route(http.MethodGet, "/storage/policies", controllers.InternalListStoragePolicies)
 	route(http.MethodGet, "/storage/candidates", controllers.InternalListStorageCandidates)
+	route(http.MethodPost, "/storage/operation-sagas", controllers.InternalStartStorageOperationSaga)
+	route(http.MethodPost, "/storage/operation-sagas/:id/object-applied", controllers.InternalMarkStorageSagaObjectApplied)
 	route(http.MethodPost, "/storage/archive", controllers.InternalArchiveItems)
 	route(http.MethodPost, "/storage/move-to-cold", controllers.InternalMoveItemsToCold)
 	route(http.MethodPost, "/storage/sweep-runs", controllers.InternalCreateSweepRun)

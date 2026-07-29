@@ -80,3 +80,29 @@ type MediaStorageArtifactEvent struct {
 func (MediaStorageArtifactEvent) TableName() string {
 	return "media_storage_artifact_events"
 }
+
+// StorageOperationSaga makes the object-store then CMS-state transition
+// durable. Aggregation owns object movement; CMS owns the canonical artifact
+// state and records the phase so a reconciler can safely finish or flag it.
+type StorageOperationSaga struct {
+	ID             uint           `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ContentItemID  uuid.UUID      `gorm:"type:uuid;not null;index" json:"content_item_id"`
+	OwnerRequestID *uint          `gorm:"index" json:"-"`
+	Operation      string         `gorm:"type:varchar(32);not null" json:"operation"`
+	IdempotencyKey string         `gorm:"type:varchar(255);not null" json:"idempotency_key"`
+	ManifestHash   *string        `gorm:"type:char(64)" json:"manifest_hash,omitempty"`
+	CorrelationID  *uuid.UUID     `gorm:"type:uuid" json:"correlation_id,omitempty"`
+	State          string         `gorm:"type:varchar(32);not null;index" json:"state"`
+	ObjectEvidence datatypes.JSON `gorm:"type:jsonb;not null" json:"object_evidence"`
+	CMSEvidence    datatypes.JSON `gorm:"type:jsonb;not null" json:"cms_evidence"`
+	Error          string         `gorm:"type:text" json:"error,omitempty"`
+	StartedAt      time.Time      `json:"started_at"`
+	CompletedAt    *time.Time     `json:"completed_at,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	Created        bool           `gorm:"-" json:"created"`
+}
+
+func (StorageOperationSaga) TableName() string { return "storage_operation_sagas" }

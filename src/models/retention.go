@@ -44,6 +44,8 @@ const (
 	RetentionActionPreviewNewsCompaction  = "news_database.preview_compaction"
 	RetentionActionPrepareHistoricalPurge = "news_database.prepare_historical_purge"
 	RetentionActionExecuteHistoricalPurge = "news_database.execute_historical_purge"
+	RetentionActionRequestStorageRun      = "storage.request_bounded_run"
+	RetentionActionRequestMediaRun        = "media_circulation.request_bounded_run"
 )
 
 const (
@@ -202,6 +204,28 @@ type RetentionAction struct {
 }
 
 func (RetentionAction) TableName() string { return "retention_actions" }
+
+// RetentionOwnerRequest is an orchestration-only bridge to a registered
+// owner. It never duplicates an owner's candidate or action ledger.
+type RetentionOwnerRequest struct {
+	ID             uint           `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ActionID       uint           `gorm:"not null;index" json:"-"`
+	ActionPublicID *uuid.UUID     `gorm:"-" json:"action_id,omitempty"`
+	TenantID       string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	OwnerSystem    string         `gorm:"type:varchar(64);not null;index" json:"owner_system"`
+	IdempotencyKey string         `gorm:"type:varchar(255);not null" json:"idempotency_key"`
+	RequestHash    string         `gorm:"type:char(64);not null" json:"request_hash"`
+	OwnerRunID     *uuid.UUID     `gorm:"type:uuid" json:"owner_run_id,omitempty"`
+	OwnerActionID  *uuid.UUID     `gorm:"type:uuid" json:"owner_action_id,omitempty"`
+	Status         string         `gorm:"type:varchar(32);not null" json:"status"`
+	ResultHash     *string        `gorm:"type:char(64)" json:"result_hash,omitempty"`
+	Result         datatypes.JSON `gorm:"type:jsonb;not null" json:"result"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+}
+
+func (RetentionOwnerRequest) TableName() string { return "retention_owner_requests" }
 
 // RetentionCompactionManifest freezes a small, tenant-scoped set of News
 // identities before a human can approve a future compaction executor. It has

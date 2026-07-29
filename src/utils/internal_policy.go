@@ -75,6 +75,8 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodGet, "/content-items/missing-embedding", "content.read", agg, true},
 		{http.MethodGet, "/storage/policies", "storage.read", agg, true},
 		{http.MethodGet, "/storage/candidates", "storage.read", agg, true},
+		{http.MethodPost, "/storage/operation-sagas", "storage.write", agg, true},
+		{http.MethodPost, "/storage/operation-sagas/:id/object-applied", "storage.write", agg, true},
 		{http.MethodPost, "/storage/archive", "storage.write", agg, true},
 		{http.MethodPost, "/storage/move-to-cold", "storage.write", agg, true},
 		{http.MethodPost, "/storage/sweep-runs", "storage.write", agg, true},

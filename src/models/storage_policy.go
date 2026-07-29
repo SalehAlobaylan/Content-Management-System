@@ -2,6 +2,8 @@ package models
 
 import "time"
 
+import "github.com/google/uuid"
+
 // StoragePolicy controls auto-circulation behavior for a tenant.
 // A row with TenantID == nil is the global default. A row with a non-nil
 // TenantID is a per-tenant override that fully replaces the global one
@@ -76,6 +78,7 @@ func (StoragePolicy) TableName() string {
 // populated for any given row.
 type StorageSweepRun struct {
 	ID               uint       `gorm:"primaryKey" json:"id"`
+	PublicID         uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"public_id"`
 	TenantID         string     `gorm:"type:varchar(64);not null;index:idx_storage_sweep_runs_tenant" json:"tenant_id"`
 	StartedAt        time.Time  `gorm:"type:timestamp;not null" json:"started_at"`
 	FinishedAt       *time.Time `gorm:"type:timestamp" json:"finished_at,omitempty"`
@@ -85,6 +88,10 @@ type StorageSweepRun struct {
 	FreedBytes       int64      `gorm:"type:bigint;default:0" json:"freed_bytes"`
 	Trigger          string     `gorm:"type:varchar(20);default:'auto'" json:"trigger"` // auto | manual
 	Error            string     `gorm:"type:text" json:"error,omitempty"`
+	CorrelationID    *uuid.UUID `gorm:"type:uuid" json:"correlation_id,omitempty"`
+	OwnerRequestID   *uint      `json:"-"`
+	IdempotencyKey   *string    `gorm:"type:varchar(255)" json:"idempotency_key,omitempty"`
+	ManifestHash     *string    `gorm:"type:char(64)" json:"manifest_hash,omitempty"`
 }
 
 func (StorageSweepRun) TableName() string {
