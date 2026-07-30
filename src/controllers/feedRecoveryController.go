@@ -437,8 +437,7 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Phrase      string `json:"phrase"`
-		ReauthProof string `json:"reauth_proof"`
+		Phrase string `json:"phrase"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "approval details required"})
@@ -454,16 +453,6 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "plan is no longer approvable"})
 		return
 	}
-	secret, err := utils.GetJWTSecret()
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "re-auth unavailable"})
-		return
-	}
-	proof, err := utils.ParseFeedRecoveryReauthProof(strings.TrimSpace(req.ReauthProof), secret)
-	if err != nil || proof.UserID != principal.UserID || proof.TenantID != principal.TenantID || proof.PlanID != plan.PublicID.String() || proof.ManifestHash != plan.ManifestHash {
-		c.JSON(http.StatusForbidden, gin.H{"error": "fresh re-auth proof does not match this plan"})
-		return
-	}
 	expectedPhrase := recoveryApprovalPhrase(plan)
 	if strings.TrimSpace(req.Phrase) != expectedPhrase {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "confirmation phrase does not match plan"})
@@ -472,7 +461,10 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 	now := time.Now().UTC()
 	notBefore := now.Add(time.Minute)
 	phraseHash := recoveryHash(req.Phrase)
-	approval := models.FeedRecoveryApproval{PlanID: plan.ID, TenantID: plan.TenantID, Actor: principal.Email, PlanHash: plan.PlanHash, ManifestHash: plan.ManifestHash, TargetCount: plan.TargetCount, PhraseProofHash: phraseHash, ReauthJTI: proof.ID, NoFullRollback: plan.NoFullRollback, ApprovedAt: now, ConsumedAt: &now}
+	// Admin JWT + feed:manage authorization and the manifest-bound phrase are
+	// sufficient approval proof. Keep the existing unique audit column populated
+	// with a server-generated identifier; it is not a password credential.
+	approval := models.FeedRecoveryApproval{PlanID: plan.ID, TenantID: plan.TenantID, Actor: principal.Email, PlanHash: plan.PlanHash, ManifestHash: plan.ManifestHash, TargetCount: plan.TargetCount, PhraseProofHash: phraseHash, ReauthJTI: uuid.New().String(), NoFullRollback: plan.NoFullRollback, ApprovedAt: now, ConsumedAt: &now}
 	// Low-Space Purge & Reseed intentionally exposes an expected-empty state
 	// while the approved targets are being removed and reseeded. A zero-target
 	// plan is not evidence of an empty production feed.
@@ -485,7 +477,7 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		if err := tx.Create(&run).Error; err != nil {
 			return err
 		}
-		approvalEvidence := map[string]interface{}{"fresh_reauth": true, "cancel_window_seconds": 60, "manifest_hash": plan.ManifestHash, "target_count": plan.TargetCount}
+		approvalEvidence := map[string]interface{}{"authorization": "admin_jwt_feed_manage", "fresh_reauth": false, "cancel_window_seconds": 60, "manifest_hash": plan.ManifestHash, "target_count": plan.TargetCount}
 		if plan.Level == "purge_reseed" {
 			approvalEvidence["destructive"] = true
 			approvalEvidence["no_full_rollback"] = plan.NoFullRollback
@@ -500,6 +492,7 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "approval proof was already consumed or approval could not be saved"})
 		return
 	}
+	run.PlanPublicID = plan.PublicID
 	c.JSON(http.StatusOK, gin.H{"plan": plan.PublicID, "run": run, "cancel_deadline": notBefore})
 }
 
@@ -508,12 +501,37 @@ func ListFeedRecoveryRuns(c *gin.Context) {
 	if !ok {
 		return
 	}
+	db := c.MustGet("db").(*gorm.DB)
 	var runs []models.FeedRecoveryRun
-	if err := c.MustGet("db").(*gorm.DB).Where("tenant_id=?", principal.TenantID).Order("created_at DESC").Limit(100).Find(&runs).Error; err != nil {
+	if err := db.Where("tenant_id=?", principal.TenantID).Order("created_at DESC").Limit(100).Find(&runs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list runs"})
 		return
 	}
+	attachRecoveryPlanPublicIDs(db, principal.TenantID, runs)
 	c.JSON(http.StatusOK, gin.H{"data": runs})
+}
+
+func attachRecoveryPlanPublicIDs(db *gorm.DB, tenant string, runs []models.FeedRecoveryRun) {
+	if len(runs) == 0 {
+		return
+	}
+	ids := make([]uint, 0, len(runs))
+	for _, run := range runs {
+		ids = append(ids, run.PlanID)
+	}
+	var plans []models.FeedRecoveryPlan
+	if db.Select("id", "public_id").Where("tenant_id=? AND id IN ?", tenant, ids).Find(&plans).Error != nil {
+		return
+	}
+	byID := make(map[uint]uuid.UUID, len(plans))
+	for _, plan := range plans {
+		byID[plan.ID] = plan.PublicID
+	}
+	for i := range runs {
+		if publicID, ok := byID[runs[i].PlanID]; ok {
+			runs[i].PlanPublicID = publicID
+		}
+	}
 }
 
 func GetFeedRecoveryRun(c *gin.Context) {
@@ -526,11 +544,13 @@ func GetFeedRecoveryRun(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
 		return
 	}
+	db := c.MustGet("db").(*gorm.DB)
 	var run models.FeedRecoveryRun
-	if err := c.MustGet("db").(*gorm.DB).Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&run).Error; err != nil {
+	if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&run).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
 		return
 	}
+	attachRecoveryPlanPublicIDs(db, principal.TenantID, []models.FeedRecoveryRun{run})
 	c.JSON(http.StatusOK, run)
 }
 
@@ -1725,14 +1745,39 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	run, err := claimRecoveryRun(db, principal.TenantID, id)
-	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+	var req struct {
+		ReauthProof string `json:"reauth_proof"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "execution confirmation required"})
+		return
+	}
+	// Validate the fresh password proof before claiming a run or acquiring any
+	// recovery lease. Plan approval is phrase/JWT-only; this proof is required
+	// only at the final Execute action.
+	var pendingRun models.FeedRecoveryRun
+	if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&pendingRun).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
 		return
 	}
 	var plan models.FeedRecoveryPlan
-	if err := db.First(&plan, run.PlanID).Error; err != nil {
+	if err := db.Where("tenant_id=? AND id=?", principal.TenantID, pendingRun.PlanID).First(&plan).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "recovery plan not found"})
+		return
+	}
+	secret, err := utils.GetJWTSecret()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "execution re-auth unavailable"})
+		return
+	}
+	proof, err := utils.ParseFeedRecoveryReauthProof(strings.TrimSpace(req.ReauthProof), secret)
+	if err != nil || proof.UserID != principal.UserID || proof.TenantID != principal.TenantID || proof.PlanID != plan.PublicID.String() || proof.ManifestHash != plan.ManifestHash {
+		c.JSON(http.StatusForbidden, gin.H{"error": "fresh execution confirmation does not match this plan"})
+		return
+	}
+	run, err := claimRecoveryRun(db, principal.TenantID, id)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 	if plan.Level == "purge_reseed" && !principal.HasRole("admin") {

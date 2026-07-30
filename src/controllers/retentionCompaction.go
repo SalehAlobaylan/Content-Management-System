@@ -167,7 +167,7 @@ func retentionEligibleStoryPage(db *gorm.DB, tenant, timezone, cursor string, li
 		SELECT s.public_id AS story_id, s.last_member_at
 		FROM stories s
 		WHERE s.tenant_id = ?
-		  AND COALESCE(s.news_retention_state, 'full') = 'full'
+		  AND (s.news_retention_state = 'full' OR s.news_retention_state IS NULL)
 		  AND s.last_member_at >= ?
 		  AND s.last_member_at <= ?
 		  AND s.last_member_at < ?

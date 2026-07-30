@@ -62,6 +62,7 @@ type FeedRecoveryRun struct {
 	ID                    uint           `gorm:"primaryKey" json:"-"`
 	PublicID              uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
 	PlanID                uint           `json:"-"`
+	PlanPublicID          uuid.UUID      `gorm:"-" json:"plan_id,omitempty"`
 	TenantID              string         `json:"tenant_id"`
 	Lane                  string         `json:"lane"`
 	CorrelationID         uuid.UUID      `json:"correlation_id"`

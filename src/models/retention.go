@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 const (
@@ -227,6 +228,20 @@ type RetentionAction struct {
 }
 
 func (RetentionAction) TableName() string { return "retention_actions" }
+
+// BeforeCreate makes the action-ledger JSON envelopes explicit at the model
+// boundary. PostgreSQL has defaults for these columns, but a nil
+// datatypes.JSON value can otherwise be serialized by GORM as SQL NULL rather
+// than omitted, violating the ledger's NOT NULL contract.
+func (action *RetentionAction) BeforeCreate(_ *gorm.DB) error {
+	if len(action.Evidence) == 0 {
+		action.Evidence = datatypes.JSON([]byte(`{}`))
+	}
+	if len(action.Verification) == 0 {
+		action.Verification = datatypes.JSON([]byte(`{}`))
+	}
+	return nil
+}
 
 // RetentionActionDecision is immutable human decision evidence. RetentionAction
 // is an execution state machine and may later move from approved to running or

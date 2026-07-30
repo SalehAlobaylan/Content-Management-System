@@ -5,6 +5,7 @@ package controllers
 // can promote only the verified derived-state snapshot refresh action.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -29,10 +30,26 @@ import (
 const retentionV1Tenant = "default"
 
 var (
-	retentionRunMu      sync.Mutex
-	retentionRunTenants = map[string]bool{}
-	errRetentionBusy    = errors.New("a retention run is already active for this tenant")
+	retentionRunMu        sync.Mutex
+	retentionRunTenants   = map[string]bool{}
+	errRetentionBusy      = errors.New("a retention run is already active for this tenant")
+	retentionPreviewMu    sync.Mutex
+	retentionPreviewCache = map[string]retentionPreviewCacheEntry{}
 )
+
+const (
+	// The preview is advisory evidence used by the cockpit. It must never be
+	// allowed to hold the status endpoint open while a busy provider is
+	// scanning content_items. Preparation/run paths still execute a fresh
+	// preview and therefore retain their fail-closed behavior.
+	retentionPreviewReadTimeout = 5 * time.Second
+	retentionPreviewCacheTTL    = 15 * time.Second
+)
+
+type retentionPreviewCacheEntry struct {
+	preview   retentionPreview
+	expiresAt time.Time
+}
 
 type retentionForecast struct {
 	GrowthBytesPerDay    int64    `json:"growth_bytes_per_day"`
@@ -339,16 +356,16 @@ func collectRetentionDBSample(db *gorm.DB, tenant string) (models.RetentionDBSam
 
 	var relations []retentionRelationSample
 	err := db.Raw(`
-		SELECT schemaname AS schema_name,
-		       relname AS table_name,
-		       pg_total_relation_size(relid) AS total_bytes,
-		       pg_indexes_size(relid) AS index_bytes,
-		       CASE WHEN reltoastrelid = 0 THEN 0 ELSE pg_total_relation_size(reltoastrelid) END AS toast_bytes,
-		       n_live_tup::bigint AS live_tuples,
-		       n_dead_tup::bigint AS dead_tuples
-		FROM pg_stat_user_tables
-		JOIN pg_class ON pg_class.oid = relid
-		ORDER BY pg_total_relation_size(relid) DESC
+		SELECT stat.schemaname AS schema_name,
+		       stat.relname AS table_name,
+		       pg_total_relation_size(stat.relid) AS total_bytes,
+		       pg_indexes_size(stat.relid) AS index_bytes,
+		       CASE WHEN class.reltoastrelid = 0 THEN 0 ELSE pg_total_relation_size(class.reltoastrelid) END AS toast_bytes,
+		       stat.n_live_tup::bigint AS live_tuples,
+		       stat.n_dead_tup::bigint AS dead_tuples
+		FROM pg_stat_user_tables AS stat
+		JOIN pg_class AS class ON class.oid = stat.relid
+		ORDER BY pg_total_relation_size(stat.relid) DESC
 		LIMIT 50`).Scan(&relations).Error
 	if err != nil {
 		return sample, fmt.Errorf("relation attribution: %w", err)
@@ -407,7 +424,7 @@ func previewRetentionNews(db *gorm.DB, tenant, timezone string) (retentionPrevie
 			SELECT s.id, s.public_id
 			FROM stories s
 			WHERE s.tenant_id = ?
-			  AND COALESCE(s.news_retention_state, 'full') = 'full'
+			  AND (s.news_retention_state = 'full' OR s.news_retention_state IS NULL)
 			  AND s.last_member_at >= ?
 			  AND s.last_member_at <= ?
 			  AND s.last_member_at < ?
@@ -433,7 +450,8 @@ func previewRetentionNews(db *gorm.DB, tenant, timezone string) (retentionPrevie
 		JOIN content_items items
 		  ON items.tenant_id = ? AND items.story_id = eligible.public_id
 		WHERE items.type = 'NEWS'
-		  AND COALESCE(items.news_retention_state, 'full') = 'full'`,
+		  AND items.status = 'READY'
+		  AND (items.news_retention_state = 'full' OR items.news_retention_state IS NULL)`,
 		tenant, monthStart, dormantCutoff, weekStart, tenant).Scan(&result).Error
 	if err != nil {
 		return retentionPreview{}, err
@@ -443,6 +461,34 @@ func previewRetentionNews(db *gorm.DB, tenant, timezone string) (retentionPrevie
 		CandidateRows:   result.CandidateRows,
 		EstimatedBytes:  result.EstimatedBytes,
 	}, nil
+}
+
+// previewRetentionNewsForStatus keeps the cockpit responsive under provider
+// contention. A preview is observation evidence, not an authorization to
+// mutate content, so a short-lived successful cache is safe. A timeout turns a
+// slow provider into an explicit inconclusive status instead of making the
+// entire Retention page hang; run/preparation paths still call the uncached
+// preview above and fail closed on errors.
+func previewRetentionNewsForStatus(db *gorm.DB, tenant, timezone string) (retentionPreview, error) {
+	key := tenant + "\x00" + timezone
+	now := time.Now()
+	retentionPreviewMu.Lock()
+	if cached, ok := retentionPreviewCache[key]; ok && cached.expiresAt.After(now) {
+		retentionPreviewMu.Unlock()
+		return cached.preview, nil
+	}
+	retentionPreviewMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), retentionPreviewReadTimeout)
+	defer cancel()
+	preview, err := previewRetentionNews(db.WithContext(ctx), tenant, timezone)
+	if err != nil {
+		return retentionPreview{}, err
+	}
+	retentionPreviewMu.Lock()
+	retentionPreviewCache[key] = retentionPreviewCacheEntry{preview: preview, expiresAt: time.Now().Add(retentionPreviewCacheTTL)}
+	retentionPreviewMu.Unlock()
+	return preview, nil
 }
 
 func retentionLatestState(db *gorm.DB, tenant string) (*models.RetentionDBSample, *models.RetentionRun) {
@@ -464,7 +510,7 @@ func retentionStatusFor(db *gorm.DB, tenant string) retentionStatus {
 	policy.NewsTimezone = retentionNewsTimezone(db, tenant)
 	sample, run := retentionLatestState(db, tenant)
 	forecast := calculateRetentionForecast(retentionSamples(db, tenant, 200), policy)
-	preview, previewErr := previewRetentionNews(db, tenant, policy.NewsTimezone)
+	preview, previewErr := previewRetentionNewsForStatus(db, tenant, policy.NewsTimezone)
 	var activeRecovery int64
 	activeRecoveryErr := db.Table("feed_availability_states").Where("tenant_id = ? AND state <> 'normal'", tenant).Count(&activeRecovery).Error
 	now := time.Now().UTC()

@@ -22,3 +22,16 @@ func TestContentItemBeforeCreateInitializesNewsRetentionOnly(t *testing.T) {
 		t.Fatal("Pods media must not receive News retention state")
 	}
 }
+
+func TestRetentionActionBeforeCreateInitializesJSONEnvelopes(t *testing.T) {
+	action := RetentionAction{}
+	if err := action.BeforeCreate(nil); err != nil {
+		t.Fatalf("BeforeCreate action: %v", err)
+	}
+	if string(action.Evidence) != `{}` {
+		t.Fatalf("Evidence = %s, want {}", action.Evidence)
+	}
+	if string(action.Verification) != `{}` {
+		t.Fatalf("Verification = %s, want {}", action.Verification)
+	}
+}
