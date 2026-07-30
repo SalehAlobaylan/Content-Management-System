@@ -187,10 +187,14 @@ func withFeedIntegrityLock(ctx context.Context, db *gorm.DB, tenant string) (fun
 }
 
 type integrityResult struct {
-	Feed, Variant, ConsumerVerdict, ReadinessVerdict string
-	ConsumerScore, ReadinessScore                    float64
-	Violations                                       int
-	Checked                                          int
+	Feed             string  `json:"feed"`
+	Variant          string  `json:"variant"`
+	ConsumerVerdict  string  `json:"consumer_verdict"`
+	ReadinessVerdict string  `json:"readiness_verdict"`
+	ConsumerScore    float64 `json:"consumer_score"`
+	ReadinessScore   float64 `json:"readiness_score"`
+	Violations       int     `json:"violations"`
+	Checked          int     `json:"checked"`
 }
 
 func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) (models.FeedIntegrityRun, error) {

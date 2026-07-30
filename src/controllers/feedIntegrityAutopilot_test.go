@@ -1,11 +1,37 @@
 package controllers
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"content-management-system/src/models"
 )
+
+func TestIntegrityResultJSONContract(t *testing.T) {
+	raw, err := json.Marshal(integrityResult{
+		Feed:             "pods",
+		Variant:          "default",
+		ConsumerVerdict:  "healthy",
+		ReadinessVerdict: "healthy",
+		ConsumerScore:    98,
+		ReadinessScore:   97,
+		Violations:       1,
+		Checked:          10,
+	})
+	if err != nil {
+		t.Fatalf("marshal integrity result: %v", err)
+	}
+	encoded := string(raw)
+	for _, key := range []string{`"feed"`, `"variant"`, `"consumer_verdict"`, `"readiness_verdict"`, `"consumer_score"`, `"readiness_score"`, `"violations"`, `"checked"`} {
+		if !strings.Contains(encoded, key) {
+			t.Fatalf("feed integrity JSON is missing %s: %s", key, encoded)
+		}
+	}
+	if strings.Contains(encoded, `"Feed"`) || strings.Contains(encoded, `"ConsumerScore"`) {
+		t.Fatalf("feed integrity JSON leaked Go field names: %s", encoded)
+	}
+}
 
 func TestSanitizeFeedIntegrityAutopilotPolicy(t *testing.T) {
 	p := models.FeedIntegrityPolicy{
