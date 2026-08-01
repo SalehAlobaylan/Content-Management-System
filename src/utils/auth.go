@@ -66,14 +66,15 @@ func hasAudience(values jwt.ClaimStrings, expected string) bool {
 }
 
 type AdminPrincipal struct {
-	UserID      string
-	Email       string
-	TenantID    string
-	Role        string
-	Roles       []string
-	Permissions []string
-	Issuer      string
-	ExpiresAt   time.Time
+	UserID        string
+	Email         string
+	TenantID      string
+	TenantClaimed bool
+	Role          string
+	Roles         []string
+	Permissions   []string
+	Issuer        string
+	ExpiresAt     time.Time
 }
 
 const AdminPrincipalContextKey = "admin_principal"
@@ -181,14 +182,15 @@ func BuildAdminPrincipal(claims *JWTClaims) AdminPrincipal {
 	}
 
 	return AdminPrincipal{
-		UserID:      claims.UserID,
-		Email:       claims.Email,
-		TenantID:    tenantID,
-		Role:        claims.Role,
-		Roles:       claims.Roles,
-		Permissions: claims.Permissions,
-		Issuer:      claims.Issuer,
-		ExpiresAt:   expiry,
+		UserID:        claims.UserID,
+		Email:         claims.Email,
+		TenantID:      tenantID,
+		TenantClaimed: strings.TrimSpace(claims.TenantID) != "",
+		Role:          claims.Role,
+		Roles:         claims.Roles,
+		Permissions:   claims.Permissions,
+		Issuer:        claims.Issuer,
+		ExpiresAt:     expiry,
 	}
 }
 

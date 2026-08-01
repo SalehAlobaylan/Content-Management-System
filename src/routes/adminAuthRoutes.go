@@ -19,6 +19,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 
 	adminGroup := router.Group("/admin")
 	adminGroup.Use(utils.AdminAuthMiddleware(db))
+	SetupOperatorRoutes(adminGroup, db)
 	// /me only needs a valid principal (any authenticated user may read their own access).
 	adminGroup.GET("/me", controllers.AdminMe)
 

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -98,5 +99,24 @@ func TestDefaultMediaCirculationPolicyDisabled(t *testing.T) {
 	}
 	if p.Preset != models.MediaCirculationPresetBalanced {
 		t.Errorf("default preset = %q, want balanced", p.Preset)
+	}
+}
+
+func TestBoundedIntakeAllocation(t *testing.T) {
+	tests := []struct {
+		name                       string
+		total, maxPerSource, count int
+		want                       []int
+	}{
+		{name: "splits a full cycle evenly", total: 25, maxPerSource: 5, count: 11, want: []int{3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2}},
+		{name: "respects per-source cap", total: 20, maxPerSource: 3, count: 7, want: []int{3, 3, 3, 3, 3, 3, 2}},
+		{name: "rejects an empty budget", total: 0, maxPerSource: 5, count: 1, want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := boundedIntakeAllocation(tt.total, tt.maxPerSource, tt.count); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("boundedIntakeAllocation(%d, %d, %d) = %v, want %v", tt.total, tt.maxPerSource, tt.count, got, tt.want)
+			}
+		})
 	}
 }

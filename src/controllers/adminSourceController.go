@@ -183,6 +183,13 @@ type aggregationTriggerRequest struct {
 	// sourceId so fetch/normalize telemetry reports back to source_run_telemetry
 	// (the workers skip reporting for non-UUID synthetic ids).
 	SourceID string `json:"sourceId,omitempty"`
+	// SourceRunRequestID is the CMS-owned handoff UUID. Aggregation propagates
+	// it through fetch/normalize and returns it in authoritative telemetry.
+	SourceRunRequestID string `json:"sourceRunRequestId,omitempty"`
+	TenantID           string `json:"tenantId,omitempty"`
+	OperatorPlanID     string `json:"operatorPlanId,omitempty"`
+	OperatorStepID     string `json:"operatorStepId,omitempty"`
+	IdempotencyKey     string `json:"idempotencyKey,omitempty"`
 }
 
 type aggregationTriggerResponse struct {
@@ -1027,12 +1034,19 @@ func RunContentSource(c *gin.Context) {
 	}
 
 	settings, _ := parseSourceAPIConfig(source.APIConfig)
+	lineageRequest, err := createSourceRunRequest(db, source, "manual", principal.UserID, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create source-run request", Code: "SOURCE_RUN_REQUEST_FAILED"})
+		return
+	}
 	triggerReq := aggregationTriggerRequest{
-		SourceType: string(source.Type),
-		URL:        sourceURL,
-		Name:       source.Name,
-		Settings:   settings,
-		SourceID:   source.PublicID.String(),
+		SourceType:         string(source.Type),
+		URL:                sourceURL,
+		Name:               source.Name,
+		Settings:           settings,
+		SourceID:           source.PublicID.String(),
+		SourceRunRequestID: lineageRequest.PublicID.String(),
+		TenantID:           source.TenantID,
 	}
 
 	triggerRes, err := triggerAggregationSourceRun(
@@ -1041,10 +1055,15 @@ func RunContentSource(c *gin.Context) {
 		triggerReq,
 	)
 	if err != nil {
+		markSourceRunDispatchFailed(db, lineageRequest.PublicID, err)
 		c.JSON(http.StatusBadGateway, authErrorResponse{
 			Message: "Failed to trigger aggregation run: " + err.Error(),
 			Code:    "AGGREGATION_TRIGGER_FAILED",
 		})
+		return
+	}
+	if err := markSourceRunAccepted(db, lineageRequest.PublicID, triggerRes.JobID); err != nil {
+		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation accepted the run but CMS could not record it", Code: "SOURCE_RUN_ACCEPTANCE_FAILED"})
 		return
 	}
 

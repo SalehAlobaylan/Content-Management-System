@@ -53,6 +53,7 @@ func main() {
 		applyAll         = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
 		status           = flag.Bool("status", false, "print migration ledger status without applying files")
 		check            = flag.Bool("check", false, "validate every pending migration without applying it")
+		verify           = flag.Bool("verify", false, "verify checksums and require no pending migration")
 		baseline         = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
 		allowDestructive = flag.Bool("allow-destructive", false, "allow migrations containing destructive SQL such as DROP TABLE, DROP COLUMN, TRUNCATE, or DELETE FROM")
 		bootstrapEmpty   = flag.Bool("bootstrap-empty", false, "allow reviewed historical large-table migrations only on an explicitly acknowledged empty local disposable database")
@@ -60,17 +61,17 @@ func main() {
 	)
 	flag.Parse()
 
-	if *status && *check {
-		log.Fatal("--status cannot be combined with --check")
+	if (*status && *check) || (*status && *verify) || (*check && *verify) {
+		log.Fatal("--status, --check, and --verify cannot be combined")
 	}
-	if (*status || *check) && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
-		log.Fatal("--status and --check cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
+	if (*status || *check || *verify) && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
+		log.Fatal("--status, --check, and --verify cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
 	}
 	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
 		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
 	}
-	if !*status && !*check && !*applyAll && *baseline == "" && flag.NArg() == 0 {
-		log.Fatal("no migrations selected. Use --status, --check, --all, --baseline-through, or pass explicit migration filenames")
+	if !*status && !*check && !*verify && !*applyAll && *baseline == "" && flag.NArg() == 0 {
+		log.Fatal("no migrations selected. Use --status, --check, --verify, --all, --baseline-through, or pass explicit migration filenames")
 	}
 	if *bootstrapEmpty && (!*applyAll || *status || *check || *baseline != "") {
 		log.Fatal("--bootstrap-empty is only valid with --all and an apply operation")
@@ -100,6 +101,17 @@ func main() {
 
 	if *status {
 		printStatus(files, applied)
+		return
+	}
+	if *verify {
+		pending, err := selectMigrations(files, applied, true, nil)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(pending) != 0 {
+			log.Fatalf("migration ledger is incomplete: %d pending migration(s)", len(pending))
+		}
+		log.Printf("Migration ledger verification passed for %d canonical migration(s).", len(files))
 		return
 	}
 	if *check {

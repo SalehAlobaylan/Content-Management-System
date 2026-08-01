@@ -49,6 +49,7 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodGet, "/circulation/policy", "circulation.read", agg, true},
 		{http.MethodPost, "/circulation/claim-sources", "circulation.write", agg, true},
 		{http.MethodPost, "/circulation/source-runs", "circulation.write", agg, true},
+		{http.MethodPost, "/source-run-requests/:id/accepted", "circulation.write", agg, true},
 		{http.MethodGet, "/intel/corpus-citations", "intel.read", agg, true},
 		{http.MethodGet, "/intel/approved-source-pages", "intel.read", agg, true},
 		{http.MethodGet, "/intel/approved-telegram-channels", "intel.read", agg, true},

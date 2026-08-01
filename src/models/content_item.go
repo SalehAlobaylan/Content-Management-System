@@ -152,6 +152,11 @@ type ContentItem struct {
 	Author        *string `gorm:"type:varchar(255)" json:"author,omitempty"`
 	SourceName    *string `gorm:"type:varchar(255)" json:"source_name,omitempty"`
 	SourceFeedURL *string `gorm:"type:text" json:"-"`
+	// ContentSourceID is the canonical source configuration identity for new
+	// Aggregation ingest. Existing name/feed-url attribution is intentionally
+	// not backfilled because it may be ambiguous.
+	ContentSourceID    *uuid.UUID `gorm:"type:uuid;index:idx_content_items_content_source" json:"content_source_id,omitempty"`
+	SourceRunRequestID *uint      `gorm:"index:idx_content_items_source_run_request" json:"-"`
 	// AuthorID points at the IAM user who submitted user-generated content.
 	// NULL for ingested content (RSS, scrapes, etc.) — keeps backwards-compat.
 	AuthorID *uuid.UUID `gorm:"type:uuid;index:idx_content_items_author_id" json:"author_id,omitempty"`

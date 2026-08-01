@@ -329,6 +329,18 @@ func main() {
 	// Observation only; disabled by default until an admin enables it.
 	controllers.StartEmbeddingLifecycleHeartbeat(db)
 	controllers.StartAISpendGovernorHeartbeat(db)
+	// Wahb Operator — resumes only expired, persisted read investigations after
+	// a fresh IAM access snapshot; no browser session or user bearer is replayed.
+	controllers.StartOperatorInvestigationHeartbeat(db)
+	// Read-only Operator schedules are separately leased and re-authorized on
+	// every tick. They never carry an approved action or browser credential.
+	controllers.StartOperatorScheduleHeartbeat(db)
+	// Approved Operator plans enter the CMS-owned durable work ledger. The
+	// worker rechecks IAM and tenant policy before it claims an immutable plan.
+	controllers.StartOperatorPlanWorker(db)
+	// Shadow qualification is a CMS-only read loop. It cannot render a Console
+	// surface, call a model, build a plan, or promote the launch state.
+	controllers.StartOperatorShadowHeartbeat(db)
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

@@ -702,26 +702,100 @@ func InternalGetCirculationPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, loadCirculationPolicy(db, tenantID))
 }
 
+// boundedIntakeAllocation divides a cycle budget fairly and deterministically.
+// Callers constrain sourceCount to total before using it, so every selected
+// source receives a positive, policy-capped provider limit.
+func boundedIntakeAllocation(total, maxPerSource, sourceCount int) []int {
+	if total < 1 || maxPerSource < 1 || sourceCount < 1 {
+		return nil
+	}
+	allocations := make([]int, sourceCount)
+	remaining := total
+	for index := range allocations {
+		remainingSources := sourceCount - index
+		allocation := remaining / remainingSources
+		if remaining%remainingSources != 0 {
+			allocation++
+		}
+		if allocation > maxPerSource {
+			allocation = maxPerSource
+		}
+		if allocation < 1 {
+			return nil
+		}
+		allocations[index] = allocation
+		remaining -= allocation
+	}
+	return allocations
+}
+
 func InternalClaimCirculationSources(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID := strings.TrimSpace(c.Query("tenant_id"))
 	if tenantID == "" {
 		tenantID = defaultCirculationTenant
 	}
-	policy := loadCirculationPolicy(db, tenantID)
+	// News and Pods share the durable source-run contract, but CMS keeps their
+	// cadence and intake limits separate. Aggregation may only select a lane;
+	// it never supplies a category, source ID list, or provider arguments.
+	requestedLane := strings.ToLower(strings.TrimSpace(c.Query("lane")))
+	lane := requestedLane
+	recoveryLane := strings.ToLower(strings.TrimSpace(c.Query("recovery_lane")))
+	if lane == "" {
+		lane = recoveryLane
+	}
+	if lane == "" {
+		lane = "news"
+	}
+	if lane != "news" && lane != "media" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "circulation lane is invalid"})
+		return
+	}
+
+	force := strings.EqualFold(c.Query("force"), "true")
+	preserveCheckpoints := strings.EqualFold(c.Query("preserve_checkpoints"), "true")
+
+	newsPolicy := loadCirculationPolicy(db, tenantID)
+	category := models.SourceCategoryNews
+	minIntervalMinutes := newsPolicy.SourceMinIntervalMinutes
+	defaultLimit := newsPolicy.SourceClaimBatchSize
+	policyResponse := interface{}(newsPolicy)
+	mediaMaxPerSource := 0
+	mediaMaxPerCycle := 0
+	// Recovery retains its established, checkpoint-preserving contract. Only
+	// the explicit, normal media lane uses media intake policy for automatic
+	// source polling.
+	isMediaCirculation := requestedLane == "media" && !preserveCheckpoints
+	if lane == "media" {
+		category = models.SourceCategoryMedia
+	}
+	if isMediaCirculation {
+		mediaPolicy := loadEffectiveMediaCirculationPolicy(db, tenantID)
+		if !mediaPolicy.Enabled {
+			c.JSON(http.StatusOK, gin.H{"data": []interface{}{}, "policy": mediaPolicy})
+			return
+		}
+		if mediaPolicy.MaxIntakePerCycle < 1 || mediaPolicy.MaxIntakePerSourcePerCycle < 1 {
+			c.JSON(http.StatusOK, gin.H{"data": []interface{}{}, "policy": mediaPolicy})
+			return
+		}
+		minIntervalMinutes = mediaPolicy.SourceMinIntervalMinutes
+		defaultLimit = mediaPolicy.MaxIntakePerCycle
+		mediaMaxPerSource = mediaPolicy.MaxIntakePerSourcePerCycle
+		mediaMaxPerCycle = mediaPolicy.MaxIntakePerCycle
+		policyResponse = mediaPolicy
+	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "0"))
 	if limit < 1 {
-		limit = policy.SourceClaimBatchSize
+		limit = defaultLimit
 	}
 	if limit < 1 || limit > 200 {
 		limit = 20
 	}
-	force := strings.EqualFold(c.Query("force"), "true")
-	preserveCheckpoints := strings.EqualFold(c.Query("preserve_checkpoints"), "true")
-	recoveryLane := strings.ToLower(strings.TrimSpace(c.Query("recovery_lane")))
-	category := models.SourceCategoryNews
-	if recoveryLane == "media" {
-		category = models.SourceCategoryMedia
+	if isMediaCirculation && limit > mediaMaxPerCycle {
+		// The automatic media lane may not expand its bounded per-cycle intake
+		// by passing a wider claim limit to this internal endpoint.
+		limit = mediaMaxPerCycle
 	}
 	recoveryRunID := strings.TrimSpace(c.Query("recovery_run_id"))
 	recoveryManifestHash := strings.TrimSpace(c.Query("recovery_manifest_hash"))
@@ -746,6 +820,7 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		URL                  string                 `json:"url"`
 		FetchIntervalMinutes int                    `json:"fetch_interval_minutes"`
 		Settings             map[string]interface{} `json:"settings"`
+		SourceRunRequestID   string                 `json:"source_run_request_id"`
 	}
 	claims := make([]sourceClaim, 0, limit)
 
@@ -766,10 +841,10 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		if !preserveCheckpoints {
 			if force {
 				q = q.Where("last_fetched_at IS NULL OR last_fetched_at < ?",
-					now.Add(-time.Duration(policy.SourceMinIntervalMinutes)*time.Minute))
+					now.Add(-time.Duration(minIntervalMinutes)*time.Minute))
 			} else {
 				q = q.Where("last_fetched_at IS NULL OR last_fetched_at < (?::timestamp - (GREATEST(fetch_interval_minutes, ?)::integer * interval '1 minute'))",
-					now, policy.SourceMinIntervalMinutes)
+					now, minIntervalMinutes)
 			}
 		}
 
@@ -779,13 +854,31 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		}
 
 		ids := make([]uuid.UUID, 0, len(sources))
-		for _, source := range sources {
+		mediaAllocations := boundedIntakeAllocation(mediaMaxPerCycle, mediaMaxPerSource, len(sources))
+		for sourceIndex, source := range sources {
 			interval := source.FetchIntervalMinutes
-			if interval < policy.SourceMinIntervalMinutes {
-				interval = policy.SourceMinIntervalMinutes
+			if interval < minIntervalMinutes {
+				interval = minIntervalMinutes
 			}
 			settings := map[string]interface{}{}
 			_ = json.Unmarshal(source.APIConfig, &settings)
+			if isMediaCirculation && mediaMaxPerSource > 0 {
+				// The policy owns the bounded media intake. A source configuration
+				// cannot widen it through its provider settings, and the cycle
+				// total is divided deterministically among all claimed sources.
+				settings["max_results"] = mediaAllocations[sourceIndex]
+			}
+			requestedBy := "schedule"
+			if force {
+				requestedBy = "manual"
+			}
+			if preserveCheckpoints {
+				requestedBy = "system"
+			}
+			request, err := createSourceRunRequest(tx, source, requestedBy, "", nil)
+			if err != nil {
+				return err
+			}
 			claims = append(claims, sourceClaim{
 				ID:                   source.PublicID.String(),
 				Name:                 source.Name,
@@ -793,6 +886,7 @@ func InternalClaimCirculationSources(c *gin.Context) {
 				URL:                  *source.FeedURL,
 				FetchIntervalMinutes: interval,
 				Settings:             settings,
+				SourceRunRequestID:   request.PublicID.String(),
 			})
 			ids = append(ids, source.PublicID)
 		}
@@ -833,23 +927,24 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to claim sources"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": claims, "policy": policy})
+	c.JSON(http.StatusOK, gin.H{"data": claims, "policy": policyResponse})
 }
 
 type sourceRunReportRequest struct {
-	TenantID    string                 `json:"tenant_id"`
-	SourceID    string                 `json:"source_id"`
-	JobID       string                 `json:"job_id"`
-	TriggeredBy string                 `json:"triggered_by"`
-	Fetched     int                    `json:"fetched"`
-	Accepted    int                    `json:"accepted"`
-	Duplicates  int                    `json:"duplicates"`
-	Filtered    int                    `json:"filtered"`
-	Failed      int                    `json:"failed"`
-	StartedAt   *string                `json:"started_at"`
-	FinishedAt  *string                `json:"finished_at"`
-	DurationMs  int                    `json:"duration_ms"`
-	Metadata    map[string]interface{} `json:"metadata"`
+	TenantID           string                 `json:"tenant_id"`
+	SourceID           string                 `json:"source_id"`
+	SourceRunRequestID string                 `json:"source_run_request_id"`
+	JobID              string                 `json:"job_id"`
+	TriggeredBy        string                 `json:"triggered_by"`
+	Fetched            int                    `json:"fetched"`
+	Accepted           int                    `json:"accepted"`
+	Duplicates         int                    `json:"duplicates"`
+	Filtered           int                    `json:"filtered"`
+	Failed             int                    `json:"failed"`
+	StartedAt          *string                `json:"started_at"`
+	FinishedAt         *string                `json:"finished_at"`
+	DurationMs         int                    `json:"duration_ms"`
+	Metadata           map[string]interface{} `json:"metadata"`
 }
 
 func sourceRunPreservesCheckpoint(metadata map[string]interface{}) bool {
@@ -923,6 +1018,48 @@ func InternalReportSourceRun(c *gin.Context) {
 	}).Create(&run).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to record run"})
 		return
+	}
+	if requestID := strings.TrimSpace(req.SourceRunRequestID); requestID != "" {
+		request, err := sourceRunRequestByPublicID(db, tenantID, requestID)
+		if err != nil || request.ContentSourceID != sourceID {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "source_run_request_id does not match source"})
+			return
+		}
+		stage, _ := req.Metadata["stage"].(string)
+		stage = strings.TrimSpace(stage)
+		state := models.SourceRunRunning
+		if stage == "normalize" {
+			if req.Accepted == 0 && req.Failed > 0 {
+				state = models.SourceRunFailed
+			} else {
+				state = models.SourceRunCompleted
+			}
+		}
+		now := time.Now().UTC()
+		updates := map[string]interface{}{"state": state}
+		if request.StartedAt == nil {
+			updates["started_at"] = now
+		}
+		if state == models.SourceRunCompleted || state == models.SourceRunFailed {
+			updates["finished_at"] = now
+		}
+		if state == models.SourceRunFailed {
+			updates["failure_class"] = "source_run_failed"
+			updates["failure_summary"] = "No accepted items were produced by the normalized run"
+		}
+		if err := db.Model(request).Updates(updates).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to update source-run request"})
+			return
+		}
+		if err := appendContentProcessingEvent(db, models.ContentProcessingEvent{
+			TenantID: tenantID, ContentSourceID: &sourceID, SourceRunRequestID: &request.ID,
+			Stage: lineageStageSourceRun + "." + stage, State: state, Producer: "aggregation", JobID: req.JobID,
+			CorrelationID: request.CorrelationID, IdempotencyKey: request.IdempotencyKey, EventClass: "source_run_" + state,
+			Payload: lineagePayload(map[string]interface{}{"fetched": req.Fetched, "accepted": req.Accepted, "duplicates": req.Duplicates, "filtered": req.Filtered, "failed": req.Failed}), OccurredAt: now,
+		}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to append source-run event"})
+			return
+		}
 	}
 
 	// Failure backoff. The claim optimistically stamped last_fetched_at=now, which

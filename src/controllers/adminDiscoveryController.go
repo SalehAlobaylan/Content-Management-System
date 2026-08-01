@@ -469,7 +469,7 @@ func ApproveSuggestion(c *gin.Context) {
 	writeDiscoveryAudit(db, principal, "discovery.approve", suggestion.PublicID.String(), "success", "")
 	// Kick off the first ingestion so the new source starts producing items
 	// immediately (best-effort — approval already succeeded regardless).
-	triggerSourceFirstFetch(c.GetHeader("Authorization"), source)
+	triggerSourceFirstFetch(db, c.GetHeader("Authorization"), source, "approval_handoff", principal.UserID, &suggestion.PublicID)
 	c.JSON(http.StatusOK, mapContentSourceResponse(*source))
 }
 
@@ -1819,7 +1819,7 @@ func defaultMediaAtomizationPolicy() map[string]interface{} {
 
 // triggerSourceFirstFetch best-effort kicks off the first ingestion for a
 // newly-approved source so it starts producing items without a manual run.
-func triggerSourceFirstFetch(authHeader string, source *models.ContentSource) {
+func triggerSourceFirstFetch(db *gorm.DB, authHeader string, source *models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID) {
 	if source == nil {
 		return
 	}
@@ -1832,13 +1832,24 @@ func triggerSourceFirstFetch(authHeader string, source *models.ContentSource) {
 		return
 	}
 	settings, _ := parseSourceAPIConfig(source.APIConfig)
-	_, _ = triggerAggregationSourceRun(aggregationBaseURL, authHeader, aggregationTriggerRequest{
-		SourceType: string(source.Type),
-		URL:        sourceURL,
-		Name:       source.Name,
-		Settings:   settings,
-		SourceID:   source.PublicID.String(),
+	lineageRequest, err := createSourceRunRequest(db, *source, requestedBy, actorID, suggestionID)
+	if err != nil {
+		return
+	}
+	response, err := triggerAggregationSourceRun(aggregationBaseURL, authHeader, aggregationTriggerRequest{
+		SourceType:         string(source.Type),
+		URL:                sourceURL,
+		Name:               source.Name,
+		Settings:           settings,
+		SourceID:           source.PublicID.String(),
+		SourceRunRequestID: lineageRequest.PublicID.String(),
+		TenantID:           source.TenantID,
 	})
+	if err != nil {
+		markSourceRunDispatchFailed(db, lineageRequest.PublicID, err)
+		return
+	}
+	_ = markSourceRunAccepted(db, lineageRequest.PublicID, response.JobID)
 }
 
 func triggerAggregationDiscoveryRun(aggregationBaseURL, authorizationHeader string, payload aggregationDiscoveryRequest) (aggregationTriggerResponse, error) {

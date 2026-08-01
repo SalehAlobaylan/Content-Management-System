@@ -77,6 +77,10 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `DEFAULT_TENANT_ID` | no | default | Fallback tenant |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_ROLE` | no | — | Seed a dev admin user |
 | `CMS_SERVICE_TOKEN` | **yes** | — | Bearer token Aggregation/Media/Enrichment use for `/internal/*` |
+| `IAM_BASE_URL` | no | http://localhost:4003 | IAM base URL for live Operator access snapshots |
+| `OPERATOR_IAM_ACCESS_SNAPSHOT_TOKEN` | Operator-enabled environments | — | Dedicated IAM read-only credential for fresh Operator authorization checks |
+| `OPERATOR_PLAN_SIGNING_KEY` | execution-enabled environments | — | 32+ byte server-only HMAC key for canonical Operator plans |
+| `OPERATOR_LAUNCH_MODE` | no | ignored | Deprecated compatibility setting; durable CMS capability controls determine Operator availability |
 | `ENRICHMENT_BASE_URL` | no | http://localhost:5050 | On-demand embed/translate/rerank/news-slide |
 | `ENRICHMENT_SERVICE_TOKEN` | no | falls back to `CMS_SERVICE_TOKEN` | Auth for Enrichment calls |
 | `REDIS_URL` | no | redis://localhost:6379 | Declared; caching is future-use |

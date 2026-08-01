@@ -34,6 +34,9 @@ type internalCreateContentItemRequest struct {
 	Author               *string                `json:"author"`
 	SourceName           string                 `json:"source_name"`
 	SourceFeedURL        *string                `json:"source_feed_url"`
+	TenantID             string                 `json:"tenant_id"`
+	ContentSourceID      string                 `json:"content_source_id"`
+	SourceRunRequestID   string                 `json:"source_run_request_id"`
 	OriginalURL          string                 `json:"original_url"`
 	MediaURL             *string                `json:"media_url"`
 	ThumbnailURL         *string                `json:"thumbnail_url"`
@@ -286,6 +289,33 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	metadataJSON, _ := json.Marshal(req.Metadata)
+	lineageTenantID := strings.TrimSpace(req.TenantID)
+	if lineageTenantID == "" {
+		lineageTenantID = defaultCirculationTenant
+	}
+	var contentSourceID *uuid.UUID
+	var sourceRunRequestID *uint
+	if strings.TrimSpace(req.ContentSourceID) != "" || strings.TrimSpace(req.SourceRunRequestID) != "" {
+		sourcePublicID, err := uuid.Parse(strings.TrimSpace(req.ContentSourceID))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content_source_id"})
+			return
+		}
+		var source models.ContentSource
+		if err := db.Where("public_id=? AND tenant_id=?", sourcePublicID, lineageTenantID).First(&source).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Unknown content source lineage"})
+			return
+		}
+		contentSourceID = &sourcePublicID
+		if strings.TrimSpace(req.SourceRunRequestID) != "" {
+			runRequest, err := sourceRunRequestByPublicID(db, lineageTenantID, req.SourceRunRequestID)
+			if err != nil || runRequest.ContentSourceID != sourcePublicID {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid source-run lineage"})
+				return
+			}
+			sourceRunRequestID = &runRequest.ID
+		}
+	}
 
 	// Normalize kind + format. New callers send type='NEWS' with an explicit
 	// format. Back-compat: legacy callers may still send type=ARTICLE/TWEET/
@@ -332,25 +362,28 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	item := models.ContentItem{
-		Type:            kind,
-		Format:          format,
-		Source:          models.SourceType(strings.ToUpper(req.Source)),
-		Status:          models.ContentStatus(strings.ToUpper(req.Status)),
-		IdempotencyKey:  &idempotencyKey,
-		Title:           &req.Title,
-		BodyText:        req.BodyText,
-		Excerpt:         req.Excerpt,
-		ContentLanguage: normalizeContentLanguage(req.ContentLanguage),
-		Author:          req.Author,
-		SourceName:      &req.SourceName,
-		SourceFeedURL:   req.SourceFeedURL,
-		MediaURL:        req.MediaURL,
-		ThumbnailURL:    req.ThumbnailURL,
-		OriginalURL:     &req.OriginalURL,
-		DurationSec:     req.DurationSec,
-		TopicTags:       req.TopicTags,
-		Metadata:        datatypes.JSON(metadataJSON),
-		PublishedAt:     publishedAt,
+		TenantID:           lineageTenantID,
+		Type:               kind,
+		Format:             format,
+		Source:             models.SourceType(strings.ToUpper(req.Source)),
+		Status:             models.ContentStatus(strings.ToUpper(req.Status)),
+		IdempotencyKey:     &idempotencyKey,
+		Title:              &req.Title,
+		BodyText:           req.BodyText,
+		Excerpt:            req.Excerpt,
+		ContentLanguage:    normalizeContentLanguage(req.ContentLanguage),
+		Author:             req.Author,
+		SourceName:         &req.SourceName,
+		SourceFeedURL:      req.SourceFeedURL,
+		ContentSourceID:    contentSourceID,
+		SourceRunRequestID: sourceRunRequestID,
+		MediaURL:           req.MediaURL,
+		ThumbnailURL:       req.ThumbnailURL,
+		OriginalURL:        &req.OriginalURL,
+		DurationSec:        req.DurationSec,
+		TopicTags:          req.TopicTags,
+		Metadata:           datatypes.JSON(metadataJSON),
+		PublishedAt:        publishedAt,
 	}
 	if kind == models.ContentTypeVideo || kind == models.ContentTypePodcast {
 		waiting := "waiting_media"
@@ -359,7 +392,19 @@ func InternalCreateContentItem(c *gin.Context) {
 		item.ChapteringStatus = &waiting
 	}
 
-	if err := db.Create(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&item).Error; err != nil {
+			return err
+		}
+		if contentSourceID == nil {
+			return nil
+		}
+		return appendContentProcessingEvent(tx, models.ContentProcessingEvent{
+			TenantID: lineageTenantID, ContentSourceID: contentSourceID, SourceRunRequestID: sourceRunRequestID, ContentItemID: &item.PublicID,
+			Stage: lineageStageIngest, State: "completed", Producer: "cms", IdempotencyKey: idempotencyKey, EventClass: "content_item_created",
+			Payload: lineagePayload(map[string]interface{}{"content_type": string(item.Type), "status": string(item.Status)}), OccurredAt: time.Now().UTC(),
+		})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create content item"})
 		return
 	}
@@ -485,7 +530,12 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		}
 	}
 
-	if err := db.Save(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "content_status", "completed", "aggregation", "content_status_updated", map[string]interface{}{"status": string(item.Status)})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update status"})
 		return
 	}
@@ -614,7 +664,12 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 		}
 	}
 
-	if err := db.Save(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update artifacts"})
 		return
 	}
@@ -677,7 +732,12 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		item.TopicTags = req.TopicTags
 	}
 
-	if err := db.Save(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "text_embedding", "completed", "enrichment", "text_embedding_persisted", map[string]interface{}{"model": req.Model})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update embedding"})
 		return
 	}
@@ -734,7 +794,12 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	item.ImageEmbeddingSpaceID = stampOrNil(req.SpaceID)
 	item.ImageEmbeddingProducerID = stampOrNil(req.ProducerID)
 
-	if err := db.Save(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "image_embedding", "completed", "media", "image_embedding_persisted", map[string]interface{}{"model": req.Model})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update image embedding"})
 		return
 	}
@@ -1120,7 +1185,12 @@ func InternalLinkTranscript(c *gin.Context) {
 
 	item.TranscriptID = &transcriptUUID
 
-	if err := db.Save(&item).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "transcript", "completed", "media", "transcript_linked", map[string]interface{}{"transcript_id": transcriptUUID.String()})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link transcript"})
 		return
 	}

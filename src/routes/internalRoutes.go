@@ -26,6 +26,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodGet, "/circulation/policy", controllers.InternalGetCirculationPolicy)
 	route(http.MethodPost, "/circulation/claim-sources", controllers.InternalClaimCirculationSources)
 	route(http.MethodPost, "/circulation/source-runs", controllers.InternalReportSourceRun)
+	route(http.MethodPost, "/source-run-requests/:id/accepted", controllers.InternalAcceptSourceRunRequest)
 
 	route(http.MethodGet, "/intel/corpus-citations", controllers.InternalGetCorpusCitations)
 	route(http.MethodGet, "/intel/approved-source-pages", controllers.InternalGetApprovedSourcePages)
