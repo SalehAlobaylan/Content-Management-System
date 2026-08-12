@@ -11,18 +11,21 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
 const (
-	approvalHandoffAdapterKey  = "media_sources.approval_handoff"
-	mediaCirculationAdapterKey = "media_circulation.state"
-	feedIntegrityAdapterKey    = "feed_integrity.snapshot_state"
-	feedRecoveryAdapterKey     = "feed_recovery.state"
-	retentionAdapterKey        = "retention.state"
-	operationalEvidenceMaxAge  = 60 * time.Second
+	approvalHandoffAdapterKey   = "media_sources.approval_handoff"
+	mediaCirculationAdapterKey  = "media_circulation.state"
+	feedIntegrityAdapterKey     = "feed_integrity.snapshot_state"
+	feedRecoveryAdapterKey      = "feed_recovery.state"
+	retentionAdapterKey         = "retention.state"
+	operationalEvidenceMaxAge   = 60 * time.Second
+	mediaContinuitySourceLimit  = 20
+	mediaSupplyEpisodeReadLimit = 12
 )
 
 // ReadBudget is a hard code-owned bound; adapters cannot silently expand their
@@ -206,8 +209,321 @@ func (fabric *ContextFabric) BuildMediaCirculationStatePacket(ctx context.Contex
 	if len(recommendations) == descriptor.MaxRows {
 		unknowns = append(unknowns, "Recommendation results reached the registered read limit; totals beyond this bounded sample are unknown.")
 	}
+	continuityFacts, continuityEvidence, continuityUnknowns, err := fabric.mediaCirculationContinuityFacts(ctx, descriptor, access, now)
+	if err != nil {
+		return DecisionPacket{}, err
+	}
+	facts = append(facts, continuityFacts...)
+	evidence = append(evidence, continuityEvidence...)
+	unknowns = append(unknowns, continuityUnknowns...)
 
 	return fabric.packet(visible, access, startedAt, facts, evidence, unknowns)
+}
+
+// mediaCirculationContinuityFacts brings the durable source-run evidence used
+// by the Media Circulation cockpit into the registered Operator adapter. It is
+// intentionally read-only and bounded; it never reads BullMQ, a provider, or a
+// receipt payload, and does not turn a due checkpoint into a retry authority.
+func (fabric *ContextFabric) mediaCirculationContinuityFacts(ctx context.Context, descriptor AdapterDescriptor, access AccessSnapshot, now time.Time) ([]Fact, []EvidenceRef, []string, error) {
+	var sources []models.ContentSource
+	if err := fabric.db.WithContext(ctx).Where("tenant_id = ? AND category = ?", access.TenantID, models.SourceCategoryMedia).
+		Order("CASE WHEN next_due_at IS NULL THEN 1 ELSE 0 END, next_due_at ASC, public_id ASC").Limit(mediaContinuitySourceLimit).Find(&sources).Error; err != nil {
+		return nil, nil, nil, err
+	}
+	rows := make([]map[string]any, 0, len(sources))
+	refs := make([]SubjectRef, 0, len(sources)*2)
+	observedAt := time.Time{}
+	unknowns := []string{}
+	for _, source := range sources {
+		var latest models.SourceRunRequest
+		err := fabric.db.WithContext(ctx).Where("tenant_id = ? AND content_source_id = ? AND lane = ?", access.TenantID, source.PublicID, models.SourceCategoryMedia).
+			Order("requested_at DESC, public_id DESC").First(&latest).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return nil, nil, nil, err
+		}
+		hasLatest := err == nil
+		state, reason := operatorMediaSourceScheduleState(source, hasLatest, latest, now)
+		row := map[string]any{
+			"source_id": source.PublicID.String(), "source_name": source.Name, "schedule_state": state, "reason": reason,
+			"next_due_at": source.NextDueAt, "last_claimed_at": source.LastClaimedAt, "last_attempted_at": source.LastAttemptedAt,
+			"last_provider_success_at": source.LastProviderSuccessAt, "last_new_item_at": source.LastNewItemAt,
+			"last_delivery_verified_at": source.LastDeliveryVerifiedAt, "intake_circuit_until": source.IntakeCircuitUntil,
+		}
+		refs = append(refs, SubjectRef{Type: "content_source", ID: source.PublicID.String(), Label: source.Name})
+		if source.UpdatedAt.After(observedAt) {
+			observedAt = source.UpdatedAt
+		}
+		if !hasLatest {
+			row["delivery_state"] = "unknown"
+			row["delivery_reason"] = "No CMS source-run request exists for this source."
+			unknowns = append(unknowns, "No CMS source-run request exists for media source "+source.Name+"; Aggregation acceptance and Pods delivery cannot be proven.")
+			rows = append(rows, row)
+			continue
+		}
+		refs = append(refs, SubjectRef{Type: "source_run_request", ID: latest.PublicID.String()})
+		row["latest_request_id"] = latest.PublicID.String()
+		row["latest_request_state"] = latest.State
+		row["latest_request_evidence_state"] = latest.EvidenceState
+		var terminalUnit models.SourceRunExecutionUnit
+		if err := fabric.db.WithContext(ctx).Where("tenant_id=? AND source_run_request_id=? AND terminal_outcome<>''", access.TenantID, latest.PublicID).Order("finished_at DESC NULLS LAST, created_at DESC").First(&terminalUnit).Error; err == nil {
+			row["terminal_outcome"] = terminalUnit.TerminalOutcome
+		} else if err != gorm.ErrRecordNotFound {
+			return nil, nil, nil, err
+		}
+		if latest.UpdatedAt.After(observedAt) {
+			observedAt = latest.UpdatedAt
+		}
+
+		var task models.SourceRunVerificationTask
+		taskErr := fabric.db.WithContext(ctx).Where("tenant_id = ? AND source_run_request_id = ? AND causation_id LIKE ?", access.TenantID, latest.PublicID, "consumer_pods_delivery:%").Order("created_at DESC, public_id DESC").First(&task).Error
+		if taskErr != nil && taskErr != gorm.ErrRecordNotFound {
+			return nil, nil, nil, taskErr
+		}
+		var events []models.SourceRunReconciliationEvent
+		if err := fabric.db.WithContext(ctx).Where("tenant_id = ? AND source_run_request_id = ? AND (causation_id = ? OR causation_id LIKE ?)", access.TenantID, latest.PublicID, "consumer_delivery", "consumer_pods_delivery:%").Order("observed_at DESC, public_id DESC").Limit(26).Find(&events).Error; err != nil {
+			return nil, nil, nil, err
+		}
+		var ingest, pods models.SourceRunReconciliationEvent
+		hasIngest, hasPods := false, false
+		for _, event := range events {
+			if event.CausationID == "consumer_delivery" && !hasIngest {
+				ingest, hasIngest = event, true
+			}
+			if strings.HasPrefix(event.CausationID, "consumer_pods_delivery:") && !hasPods {
+				pods, hasPods = event, true
+			}
+		}
+		deliveryState, deliveryReason := operatorMediaDeliveryState(latest, hasIngest, ingest, taskErr == nil, task, hasPods, pods)
+		row["delivery_state"] = deliveryState
+		row["delivery_reason"] = deliveryReason
+		if hasIngest {
+			row["cms_ingest_verdict"] = ingest.Verdict
+			row["cms_ingest_observed_at"] = ingest.ObservedAt
+		}
+		if hasPods {
+			row["pods_verdict"] = pods.Verdict
+			row["pods_observed_at"] = pods.ObservedAt
+		}
+		if taskErr == nil {
+			row["pods_observation_state"] = task.State
+			row["pods_observation_attempts"] = task.AttemptCount
+			row["pods_observation_next_at"] = task.NotBeforeAt
+		}
+		rows = append(rows, row)
+	}
+	if len(sources) == mediaContinuitySourceLimit {
+		unknowns = append(unknowns, "Media source continuity results reached the registered read limit; additional source schedules are unknown.")
+	}
+	if observedAt.IsZero() {
+		// An empty tenant-scoped collection is an observed CMS fact, not a stale
+		// fabricated source timestamp. The collection query itself occurred now.
+		observedAt = now
+	}
+	evidence := fabric.evidence(descriptor, access.TenantID, "media_circulation_source_continuity:"+access.TenantID, refs, observedAt, observedAt, evidenceAvailabilityForUpdatedAt(observedAt, now), map[string]any{"sampled_count": len(rows), "max_rows": mediaContinuitySourceLimit})
+	fact := Fact{Key: "media_circulation.source_continuity", Value: map[string]any{"sampled_count": len(rows), "max_rows": mediaContinuitySourceLimit, "truncated": len(sources) == mediaContinuitySourceLimit, "sources": rows, "legacy_last_fetched_is_not_provider_success": true}, EvidenceIDs: []string{evidence.EvidenceID}}
+
+	supplyFacts, supplyEvidence, supplyUnknowns := fabric.mediaSupplyContinuityFacts(ctx, descriptor, access, now, observedAt, rows, len(sources) == mediaContinuitySourceLimit)
+	return append([]Fact{fact}, supplyFacts...), append([]EvidenceRef{evidence}, supplyEvidence...), append(unknowns, supplyUnknowns...), nil
+}
+
+// mediaSupplyContinuityFacts projects the same bounded, CMS-owned source and
+// delivery observations into the Operator packet. It is deliberately a read
+// projection: no source run is created, replayed, or repaired while an admin
+// investigates an observed supply break.
+func (fabric *ContextFabric) mediaSupplyContinuityFacts(ctx context.Context, descriptor AdapterDescriptor, access AccessSnapshot, now, sourceObservedAt time.Time, sourceRows []map[string]any, truncated bool) ([]Fact, []EvidenceRef, []string) {
+	input := supply.SupplyEvaluationInput{
+		TenantID: access.TenantID, EvaluatedAt: now, ScheduleAvailable: true, ScheduleTruncated: truncated,
+		Schedule: make([]supply.SupplyScheduleObservation, 0, len(sourceRows)),
+		Delivery: make([]supply.SupplyDeliveryObservation, 0, len(sourceRows)),
+	}
+	for _, row := range sourceRows {
+		sourceID, _ := row["source_id"].(string)
+		state, _ := row["schedule_state"].(string)
+		input.Schedule = append(input.Schedule, supply.SupplyScheduleObservation{SourceID: sourceID, State: state})
+
+		// A delivery observation is meaningful only for a concrete durable
+		// source-run request. A source that has not been admitted must not be
+		// recast as a Pods-delivery failure.
+		requestID, hasRequest := row["latest_request_id"].(string)
+		if !hasRequest || strings.TrimSpace(requestID) == "" {
+			continue
+		}
+		requestState, _ := row["latest_request_state"].(string)
+		deliveryState, _ := row["delivery_state"].(string)
+		terminalOutcome, _ := row["terminal_outcome"].(string)
+		input.Delivery = append(input.Delivery, supply.SupplyDeliveryObservation{RequestID: requestID, SourceID: sourceID, RequestState: requestState, State: deliveryState, TerminalOutcome: terminalOutcome})
+	}
+	exposure := supply.BuildPodsExposureProof(fabric.db.WithContext(ctx), access.TenantID, now)
+	input.Exposure = &exposure
+	evaluation := supply.EvaluateMediaSupply(input)
+	digest, err := supply.EvaluationEvidenceDigest(evaluation)
+	unknowns := []string{}
+	if err != nil {
+		// The digest is an evidence fingerprint, not authority. Retain the
+		// current evaluator result as partial evidence if serialization ever
+		// fails instead of hiding the underlying source continuity facts.
+		digest = "unavailable"
+		unknowns = append(unknowns, "CMS could not fingerprint the current Supply Continuity evaluation.")
+	}
+	if sourceObservedAt.IsZero() {
+		sourceObservedAt = now
+	}
+	headlineEvidence := fabric.evidence(descriptor, access.TenantID, "media_supply_headline:"+access.TenantID,
+		[]SubjectRef{{Type: "media_supply_evaluation", ID: access.TenantID}}, sourceObservedAt, sourceObservedAt,
+		evidenceAvailabilityForUpdatedAt(sourceObservedAt, now), map[string]any{"evaluation": evaluation, "evaluation_digest": digest})
+	headlineFact := Fact{Key: "media_circulation.supply_continuity", Value: map[string]any{
+		"schema_version": evaluation.SchemaVersion, "verdict": string(evaluation.Verdict), "headline_boundary": evaluation.HeadlineBoundary,
+		"owner": evaluation.Owner, "evidence_completeness": evaluation.EvidenceCompleteness, "read_only": evaluation.ReadOnly,
+		"summary": evaluation.Summary, "counts": evaluation.Counts, "affected_source_ids": evaluation.AffectedSourceIDs,
+		"affected_request_ids": evaluation.AffectedRequestIDs, "unknowns": evaluation.Unknowns, "evaluation_digest": digest,
+	}, EvidenceIDs: []string{headlineEvidence.EvidenceID}}
+
+	facts := []Fact{headlineFact}
+	evidence := []EvidenceRef{headlineEvidence}
+	exposureEvidence := fabric.evidence(descriptor, access.TenantID, "media_supply_exposure:"+access.TenantID,
+		[]SubjectRef{{Type: "pods_exposure", ID: access.TenantID}}, exposure.GeneratedAt, exposure.GeneratedAt,
+		evidenceAvailabilityForUpdatedAt(exposure.GeneratedAt, now), map[string]any{"exposure": exposure})
+	facts = append(facts, Fact{Key: "media_circulation.pods_exposure", Value: map[string]any{
+		"schema_version": exposure.SchemaVersion, "verdict": exposure.Verdict, "evidence_completeness": exposure.EvidenceCompleteness,
+		"base_eligible_count": exposure.BaseEligibleCount, "reachable_count": exposure.ReachableCount, "returned_count": exposure.ReturnedCount,
+		"eligible_returned_gap": exposure.EligibleReturnedGap, "repeat_pressure": exposure.RepeatPressure,
+		"active_generation_id": exposure.ActiveGenerationID, "probe_id": exposure.ProbeID,
+		"newest_eligible_at": exposure.NewestEligibleAt, "newest_reachable_at": exposure.NewestReachableAt, "newest_returned_at": exposure.NewestReturnedAt,
+		"last_feed_rendered_at": exposure.LastFeedRenderedAt, "last_exact_view_at": exposure.LastExactViewAt,
+		"returned_ids": exposure.ReturnedIDs, "rendered_ids": exposure.RenderedIDs, "viewed_ids": exposure.ViewedIDs, "unknowns": exposure.Unknowns,
+	}, EvidenceIDs: []string{exposureEvidence.EvidenceID}})
+	evidence = append(evidence, exposureEvidence)
+
+	worker := supply.MediaSupplyEvaluatorWorkerStatusAt(now)
+	evaluatorObservedAt := now
+	if worker.LastHeartbeat != nil {
+		evaluatorObservedAt = *worker.LastHeartbeat
+	}
+	evaluator := map[string]any{
+		"worker_state": worker.State, "worker_last_heartbeat_at": worker.LastHeartbeat,
+		"worker_stale_after_at": worker.StaleAfterAt, "recording_enabled": nil,
+		"checkpoint_present": false, "checkpoint_last_trigger": "", "checkpoint_last_outcome": "",
+		"checkpoint_last_observed_at": nil, "checkpoint_last_evaluated_at": nil, "checkpoint_evaluation_digest": nil,
+	}
+	evaluatorRefs := []SubjectRef{{Type: "media_supply_evaluator", ID: access.TenantID}}
+	var control models.MediaSupplyControl
+	controlErr := fabric.db.WithContext(ctx).Where("tenant_id = ? AND control_key = ? AND scope_type = ? AND scope_id = ?", access.TenantID,
+		models.MediaSupplyControlReadEvaluation, models.MediaSupplyControlScopeTenant, models.MediaSupplyControlScopeAll).First(&control).Error
+	switch controlErr {
+	case nil:
+		value := false
+		evaluator["recording_enabled"] = value
+		evaluatorRefs = append(evaluatorRefs, SubjectRef{Type: "media_supply_control", ID: access.TenantID})
+		if control.UpdatedAt.After(evaluatorObservedAt) {
+			evaluatorObservedAt = control.UpdatedAt
+		}
+	case gorm.ErrRecordNotFound:
+		value := true
+		evaluator["recording_enabled"] = value
+	default:
+		unknowns = append(unknowns, "CMS could not read the Supply evaluator control state.")
+	}
+	var checkpoint models.MediaSupplyEvaluationCheckpoint
+	checkpointErr := fabric.db.WithContext(ctx).Where("tenant_id = ?", access.TenantID).First(&checkpoint).Error
+	switch checkpointErr {
+	case nil:
+		evaluator["checkpoint_present"] = true
+		evaluator["checkpoint_last_trigger"] = checkpoint.LastTrigger
+		evaluator["checkpoint_last_outcome"] = checkpoint.LastOutcome
+		evaluator["checkpoint_last_observed_at"] = checkpoint.LastObservedAt
+		evaluator["checkpoint_last_evaluated_at"] = checkpoint.LastEvaluatedAt
+		evaluator["checkpoint_evaluation_digest"] = checkpoint.EvaluationDigest
+		evaluatorRefs = append(evaluatorRefs, SubjectRef{Type: "media_supply_evaluation_checkpoint", ID: access.TenantID})
+		if checkpoint.LastObservedAt.After(evaluatorObservedAt) {
+			evaluatorObservedAt = checkpoint.LastObservedAt
+		}
+	case gorm.ErrRecordNotFound:
+		// No persisted checkpoint is a factual startup state. The current direct
+		// packet remains useful and should not be presented as an outage.
+	default:
+		unknowns = append(unknowns, "CMS could not read the Supply evaluator checkpoint.")
+	}
+	evaluatorEvidence := fabric.evidence(descriptor, access.TenantID, "media_supply_evaluator:"+access.TenantID, evaluatorRefs,
+		evaluatorObservedAt, evaluatorObservedAt, evidenceAvailabilityForUpdatedAt(evaluatorObservedAt, now), evaluator)
+	facts = append(facts, Fact{Key: "media_circulation.supply_evaluator", Value: evaluator, EvidenceIDs: []string{evaluatorEvidence.EvidenceID}})
+	evidence = append(evidence, evaluatorEvidence)
+
+	var episodes []models.MediaSupplyEpisode
+	episodeErr := fabric.db.WithContext(ctx).Where("tenant_id = ?", access.TenantID).
+		Order("state ASC, last_seen_at DESC, public_id ASC").
+		Limit(mediaSupplyEpisodeReadLimit).Find(&episodes).Error
+	if episodeErr != nil {
+		unknowns = append(unknowns, "CMS could not read the current Supply Continuity attention episodes.")
+		return facts, evidence, unknowns
+	}
+	episodeRows := make([]map[string]any, 0, len(episodes))
+	episodeRefs := make([]SubjectRef, 0, len(episodes))
+	episodeObservedAt := now
+	for _, episode := range episodes {
+		episodeRows = append(episodeRows, map[string]any{
+			"episode_id": episode.PublicID.String(), "verdict": episode.Verdict, "severity": episode.Severity,
+			"owner": episode.Owner, "state": episode.State, "summary": episode.Summary,
+			"first_failed_boundary": episode.FirstFailedBoundary, "evidence_completeness": episode.EvidenceCompleteness,
+			"first_seen_at": episode.FirstSeenAt, "last_seen_at": episode.LastSeenAt, "resolved_at": episode.ResolvedAt,
+			"has_resolution_proof": len(episode.ResolutionProof) > 0,
+		})
+		episodeRefs = append(episodeRefs, SubjectRef{Type: "media_supply_episode", ID: episode.PublicID.String()})
+		if episode.LastSeenAt.After(episodeObservedAt) {
+			episodeObservedAt = episode.LastSeenAt
+		}
+	}
+	if len(episodes) == mediaSupplyEpisodeReadLimit {
+		unknowns = append(unknowns, "Supply Continuity episode results reached the registered read limit; additional attention records are unknown.")
+	}
+	episodeEvidence := fabric.evidence(descriptor, access.TenantID, "media_supply_episodes:"+access.TenantID, episodeRefs,
+		episodeObservedAt, episodeObservedAt, evidenceAvailabilityForUpdatedAt(episodeObservedAt, now), map[string]any{"sampled_count": len(episodeRows), "max_rows": mediaSupplyEpisodeReadLimit, "episodes": episodeRows})
+	facts = append(facts, Fact{Key: "media_circulation.supply_attention", Value: map[string]any{
+		"sampled_count": len(episodeRows), "max_rows": mediaSupplyEpisodeReadLimit, "truncated": len(episodes) == mediaSupplyEpisodeReadLimit,
+		"episodes": episodeRows,
+	}, EvidenceIDs: []string{episodeEvidence.EvidenceID}})
+	evidence = append(evidence, episodeEvidence)
+	return facts, evidence, unknowns
+}
+
+func operatorMediaSourceScheduleState(source models.ContentSource, hasLatest bool, latest models.SourceRunRequest, now time.Time) (string, string) {
+	if !source.IsActive {
+		return "paused", "This source is inactive; no scheduling admission is expected."
+	}
+	if source.NextDueAt == nil {
+		return "unknown", "CMS has no explicit next-due checkpoint for this active source."
+	}
+	if hasLatest && operatorSourceRunRequestActive(latest.State) {
+		return "in_flight", "A durable source run is active; CMS will verify it before treating delivery as complete."
+	}
+	if now.Before(*source.NextDueAt) {
+		return "scheduled", "The source is not due yet under its current CMS schedule."
+	}
+	return "due_unadmitted", "The source is due and has no active CMS source run; this is an admission fact, not a provider failure."
+}
+
+func operatorSourceRunRequestActive(state string) bool {
+	switch state {
+	case models.SourceRunRequested, models.SourceRunAccepted, models.SourceRunRunning, models.SourceRunVerificationRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+func operatorMediaDeliveryState(request models.SourceRunRequest, hasIngest bool, ingest models.SourceRunReconciliationEvent, hasTask bool, task models.SourceRunVerificationTask, hasPods bool, pods models.SourceRunReconciliationEvent) (string, string) {
+	if hasPods && pods.Verdict == string(supply.VerdictPresent) {
+		return "verified", "CMS confirmed that source-run media remains eligible for Pods, directly or through an atomized child."
+	}
+	if hasPods && pods.Verdict == string(supply.VerdictUnknown) && hasTask && task.State == models.SourceRunVerificationTaskTerminal {
+		return "degraded", "Pods delivery evidence remained unknown after the bounded observation budget."
+	}
+	if hasTask && task.State != models.SourceRunVerificationTaskTerminal {
+		return "pending", "CMS is waiting for its next bounded Pods delivery observation."
+	}
+	if request.State == models.SourceRunVerificationRequired || (hasIngest && ingest.Verdict == string(supply.VerdictUnknown)) {
+		return "pending", "CMS ingest proof is still verification-required."
+	}
+	return "unknown", "No authoritative Pods delivery observation exists for this source run."
 }
 
 // BuildFeedRecoveryStatePacket is deliberately observational. It reads only

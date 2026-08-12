@@ -727,13 +727,9 @@ func resolvePurgeTargets(db *gorm.DB, tenantID string, req storagePurgeRequest, 
 }
 
 // -----------------------------------------------------------------------------
-// Restore — flips a purged item back to PENDING and asks Aggregation to re-fetch
+// Restore — legacy aggregate re-ingestion is permanently disabled. An exact,
+// approved owner recovery must be selected from current CMS evidence instead.
 // -----------------------------------------------------------------------------
-
-type restoreResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-}
 
 // RestoreStorageItem handles POST /admin/storage/restore/:id
 func RestoreStorageItem(c *gin.Context) {
@@ -755,73 +751,21 @@ func RestoreStorageItem(c *gin.Context) {
 		return
 	}
 
-	now := time.Now().UTC()
-	item.Status = models.ContentStatusPending
-	item.ArchivedAt = nil
-	item.LastRestoredAt = &now
-	item.StorageState = models.StorageStateRecoveryPending
-	reason := "restore_requested"
-	item.StorageStateReason = &reason
-	item.StorageRecoveryStatus = models.StorageRecoveryPending
-	if err := db.Save(&item).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to flip status", Code: "UPDATE_FAILED"})
-		return
-	}
 	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
 		TenantID:              item.TenantID,
 		ContentItemID:         item.PublicID,
 		ParentContentItemID:   item.ParentContentItemID,
 		EventType:             models.StorageArtifactEventRestoreRequested,
 		Status:                models.StorageArtifactEventStatusSuccess,
-		Reason:                "Restore requested from storage cockpit",
+		Reason:                "Legacy aggregate restore rejected; use an approved exact recovery",
 		Trigger:               "manual",
 		Source:                "cms_admin",
 		RecoveryPayload:       storageRecoveryPayloadForItem(item),
-		StorageState:          models.StorageStateRecoveryPending,
-		StorageStateReason:    "restore_requested",
-		StorageRecoveryStatus: models.StorageRecoveryPending,
+		StorageState:          item.StorageState,
+		StorageStateReason:    derefStr(item.StorageStateReason),
+		StorageRecoveryStatus: item.StorageRecoveryStatus,
 	})
-
-	// Ask Aggregation to enqueue a media job for this exact id.
-	if _, err := callAggregationRetryPending(c.GetHeader("Authorization"), 1, item.PublicID.String()); err != nil {
-		item.StorageRecoveryStatus = models.StorageRecoveryFailed
-		failReason := "reingest_queue_failed"
-		item.StorageStateReason = &failReason
-		_ = db.Save(&item).Error
-		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-			TenantID:              item.TenantID,
-			ContentItemID:         item.PublicID,
-			ParentContentItemID:   item.ParentContentItemID,
-			EventType:             models.StorageArtifactEventRecoveryFailed,
-			Status:                models.StorageArtifactEventStatusError,
-			Reason:                "Failed to queue best-effort re-ingestion",
-			Trigger:               "manual",
-			Source:                "cms_admin",
-			Error:                 err.Error(),
-			RecoveryPayload:       storageRecoveryPayloadForItem(item),
-			StorageState:          models.StorageStateRecoveryPending,
-			StorageStateReason:    "reingest_queue_failed",
-			StorageRecoveryStatus: models.StorageRecoveryFailed,
-		})
-		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation retry failed: " + err.Error(), Code: "RETRY_FAILED"})
-		return
-	}
-	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-		TenantID:              item.TenantID,
-		ContentItemID:         item.PublicID,
-		ParentContentItemID:   item.ParentContentItemID,
-		EventType:             models.StorageArtifactEventReingestQueued,
-		Status:                models.StorageArtifactEventStatusSuccess,
-		Reason:                "Best-effort re-ingestion queued",
-		Trigger:               "manual",
-		Source:                "cms_admin",
-		RecoveryPayload:       storageRecoveryPayloadForItem(item),
-		StorageState:          models.StorageStateRecoveryPending,
-		StorageStateReason:    "reingest_queued",
-		StorageRecoveryStatus: models.StorageRecoveryPending,
-	})
-
-	c.JSON(http.StatusOK, restoreResponse{Success: true, Message: "Restore enqueued"})
+	c.JSON(http.StatusGone, authErrorResponse{Message: "Legacy aggregate restore is disabled; use a CMS-approved exact recovery action.", Code: "EXACT_RECOVERY_REQUIRED"})
 }
 
 // -----------------------------------------------------------------------------
@@ -1448,21 +1392,6 @@ func callAggregationPolicyChanged(authHeader string) error {
 		return fmt.Errorf("aggregation policy-changed responded with %d", status)
 	}
 	return nil
-}
-
-func callAggregationRetryPending(authHeader string, limit int, ids ...string) ([]byte, error) {
-	payload := map[string]any{"limit": limit}
-	if len(ids) > 0 {
-		payload["ids"] = ids
-	}
-	body, status, err := proxyAggregationPost(authHeader, "/admin/retry-pending", payload)
-	if err != nil {
-		return nil, err
-	}
-	if status >= 300 {
-		return nil, fmt.Errorf("aggregation retry-pending responded with %d: %s", status, string(body))
-	}
-	return body, nil
 }
 
 func proxyAggregationPost(authHeader, path string, payload any) ([]byte, int, error) {

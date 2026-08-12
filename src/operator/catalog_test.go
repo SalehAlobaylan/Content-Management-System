@@ -142,6 +142,55 @@ func TestCatalogAdmitsOnlyFixedCurrentDomainPauseArguments(t *testing.T) {
 	}
 }
 
+func TestCatalogAdmitsOnlyFixedSupplyEvaluatorDisableArguments(t *testing.T) {
+	arguments, err := DefaultToolCatalog().DeriveArguments("media_circulation.supply.disable_evaluator", []string{"current"})
+	if err != nil || arguments["control_key"] != "supply_read_evaluation" || arguments["scope_type"] != "tenant" || arguments["scope_id"] != "all" {
+		t.Fatalf("Supply evaluator disable must derive only its fixed durable control: arguments=%#v err=%v", arguments, err)
+	}
+	if _, err := DefaultToolCatalog().DeriveArguments("media_circulation.supply.disable_evaluator", []string{uuid.NewString()}); err == nil {
+		t.Fatal("Supply evaluator disable must reject browser-selected control targets")
+	}
+	now := time.Now().UTC()
+	packet := DecisionPacket{
+		SchemaVersion: ContractVersion, PacketID: "media-supply-packet", Fingerprint: "media-supply-hash", TenantID: "tenant-a", ActorID: "admin-a",
+		VisibleContext:      VisibleContext{SchemaVersion: ContractVersion, Domain: "media_circulation", View: "supply", Filters: map[string]any{}, Subjects: []SubjectRef{{Type: "tenant", ID: "current"}}, Selection: &ExplicitSelection{Mode: "explicit", IDs: []string{"current"}, Count: 1}, AvailableIntents: []Intent{IntentResolve}},
+		CollectionStartedAt: now, CollectionEndedAt: now, Completeness: "complete",
+		Evidence: []EvidenceRef{{EvidenceID: "supply-evidence", Authority: EvidenceLive, Domain: "media_circulation", AdapterKey: "media_circulation.state", AdapterVersion: "v1", TenantID: "tenant-a", RequiredPermission: "aggregation:read", DeepLink: "/platform/media/circulation", ObservedAt: now, FetchedAt: now, MaxAgeSeconds: 60, ExpiresAt: now.Add(time.Minute), ContentHash: "hash", SourceVersion: "1", Availability: EvidenceAvailable}},
+		Facts:    []Fact{{Key: "media_circulation.supply_continuity", Value: map[string]any{"read_only": true}, EvidenceIDs: []string{"supply-evidence"}}},
+	}
+	access := AccessSnapshot{UserID: "admin-a", TenantID: "tenant-a", Active: true, Permissions: []string{"aggregation:manage"}, AccessVersion: "v1"}
+	if _, err := DefaultToolCatalog().BuildCanonicalPlan(packet, access, "media_circulation.supply.disable_evaluator", []string{"current"}, arguments); err != nil {
+		t.Fatalf("the admitted Supply evaluator disable action must create a signed plan: %v", err)
+	}
+}
+
+func TestCatalogRejectsRegisteredToolOutsideContextDomain(t *testing.T) {
+	packet := catalogPacket()
+	arguments, err := DefaultToolCatalog().DeriveArguments("pipeline.pause.24h", []string{"current"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DefaultToolCatalog().BuildCanonicalPlan(packet, catalogAccess(), "pipeline.pause.24h", []string{"current"}, arguments); err == nil {
+		t.Fatal("a registered tool must still be rejected outside its CMS-admitted context domain")
+	}
+}
+
+func TestDomainToolKeysAreTheSharedAdmissionSource(t *testing.T) {
+	keys := ToolKeysForDomain("media_circulation")
+	foundSupplyDisable := false
+	for _, key := range keys {
+		if key == "media_circulation.supply.disable_evaluator" {
+			foundSupplyDisable = true
+		}
+	}
+	if !foundSupplyDisable || !ToolAdmittedForDomain("media_circulation", "media_circulation.supply.disable_evaluator") {
+		t.Fatalf("media-circulation action must be exposed by the same static admission list: %#v", keys)
+	}
+	if ToolAdmittedForDomain("pipeline", "media_circulation.supply.disable_evaluator") || len(ToolKeysForDomain("unknown")) != 0 {
+		t.Fatal("a tool cannot escape its explicitly admitted domain")
+	}
+}
+
 func TestCatalogAllowsStaleEvidenceOnlyForContainmentPause(t *testing.T) {
 	now := time.Now().UTC()
 	packet := DecisionPacket{

@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"content-management-system/src/models"
 )
 
 type ReasonRequest struct {
@@ -216,6 +218,8 @@ func DeterministicDegradedBlocksForLocale(packet DecisionPacket, locale, reason 
 	if len(packet.Evidence) > 0 {
 		blocks = append(blocks, ResponseBlock{Kind: "fact", Text: factText, EvidenceIDs: []string{packet.Evidence[0].EvidenceID}})
 	}
+	blocks = append(blocks, mediaSupplyContinuityDegradedBlocks(packet, locale)...)
+	blocks = append(blocks, mediaContinuityDegradedBlocks(packet, locale)...)
 	for _, unknown := range packet.Unknowns {
 		if locale == "ar" {
 			blocks = append(blocks, ResponseBlock{Kind: "unknown", Text: "توجد حالة تشغيلية مطلوبة لا تثبتها سجلات CMS الحالية."})
@@ -234,6 +238,198 @@ func DeterministicDegradedBlocksForLocale(packet DecisionPacket, locale, reason 
 	return blocks
 }
 
+// mediaSupplyContinuityDegradedBlocks presents the deterministic Supply
+// Continuity headline before the lower-level source sample. It only names
+// fields carried in CMS facts and does not imply that a retry, repair, or any
+// external worker action has occurred.
+func mediaSupplyContinuityDegradedBlocks(packet DecisionPacket, locale string) []ResponseBlock {
+	var headline, evaluator, exposure, attention *Fact
+	for index := range packet.Facts {
+		switch packet.Facts[index].Key {
+		case "media_circulation.supply_continuity":
+			headline = &packet.Facts[index]
+		case "media_circulation.supply_evaluator":
+			evaluator = &packet.Facts[index]
+		case "media_circulation.pods_exposure":
+			exposure = &packet.Facts[index]
+		case "media_circulation.supply_attention":
+			attention = &packet.Facts[index]
+		}
+	}
+	if headline == nil || len(headline.EvidenceIDs) == 0 {
+		return nil
+	}
+	value, ok := headline.Value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	verdict, _ := value["verdict"].(string)
+	boundary, _ := value["headline_boundary"].(string)
+	owner, _ := value["owner"].(string)
+	completeness, _ := value["evidence_completeness"].(string)
+	evidenceIDs := append([]string{}, headline.EvidenceIDs...)
+	workerState := "unknown"
+	if evaluator != nil {
+		if evaluatorValue, ok := evaluator.Value.(map[string]any); ok {
+			if state, ok := evaluatorValue["worker_state"].(string); ok && strings.TrimSpace(state) != "" {
+				workerState = state
+			}
+		}
+		evidenceIDs = append(evidenceIDs, evaluator.EvidenceIDs...)
+	}
+	blocks := []ResponseBlock{{Kind: "fact", Text: localizedSupplyHeadline(locale, verdict, boundary, owner, completeness, workerState), EvidenceIDs: evidenceIDs}}
+	if exposure != nil && len(exposure.EvidenceIDs) > 0 {
+		if exposureValue, ok := exposure.Value.(map[string]any); ok {
+			verdict, _ := exposureValue["verdict"].(string)
+			eligible, _ := numericCount(exposureValue["base_eligible_count"])
+			reachable, _ := numericCount(exposureValue["reachable_count"])
+			returned, _ := numericCount(exposureValue["returned_count"])
+			text := fmt.Sprintf("Pods exposure proof is %s: %d base-eligible, %d generation-reachable, and %d returned by the isolated non-perturbing probe.", verdict, eligible, reachable, returned)
+			if locale == "ar" {
+				text = fmt.Sprintf("دليل وصول Pods هو %s: عدد المؤهلة أساسياً %d، والقابلة للوصول في الجيل %d، والمعادة في الفحص المعزول غير المؤثر %d.", verdict, eligible, reachable, returned)
+			}
+			blocks = append(blocks, ResponseBlock{Kind: "fact", Text: text, EvidenceIDs: exposure.EvidenceIDs})
+		}
+	}
+	if attention == nil || len(attention.EvidenceIDs) == 0 {
+		return blocks
+	}
+	attentionValue, ok := attention.Value.(map[string]any)
+	if !ok {
+		return blocks
+	}
+	count, _ := attentionValue["sampled_count"].(int)
+	if count <= 0 {
+		return blocks
+	}
+	open, recovering, resolved := supplyEpisodeStateCounts(attentionValue["episodes"])
+	blocks = append(blocks, ResponseBlock{Kind: "fact", Text: localizedSupplyAttention(locale, count, open, recovering, resolved), EvidenceIDs: attention.EvidenceIDs})
+	return blocks
+}
+
+func supplyEpisodeStateCounts(value any) (open, recovering, resolved int) {
+	for _, episode := range continuityRows(value) {
+		state, _ := episode["state"].(string)
+		switch state {
+		case models.MediaSupplyEpisodeOpen:
+			open++
+		case models.MediaSupplyEpisodeRecovering:
+			recovering++
+		case models.MediaSupplyEpisodeResolved:
+			resolved++
+		}
+	}
+	return open, recovering, resolved
+}
+
+func numericCount(value any) (int, bool) {
+	switch current := value.(type) {
+	case int:
+		return current, true
+	case int64:
+		return int(current), true
+	case float64:
+		return int(current), true
+	default:
+		return 0, false
+	}
+}
+
+func localizedSupplyHeadline(locale, verdict, boundary, owner, completeness, workerState string) string {
+	if locale == "ar" {
+		return fmt.Sprintf("تقييم استمرارية الإمداد من CMS: النتيجة %s عند حد %s، والمالك %s. اكتمال الدليل %s؛ حالة عامل التقييم %s. هذه لقطة قراءة فقط ولا تثبت إعادة محاولة أو إصلاحاً.", verdict, boundary, owner, completeness, workerState)
+	}
+	return fmt.Sprintf("CMS Supply Continuity reports %s at the %s boundary (owner: %s). Evidence is %s; evaluator worker state is %s. This is read-only evidence and does not prove a retry or repair.", verdict, boundary, owner, completeness, workerState)
+}
+
+func localizedSupplyAttention(locale string, total, open, recovering, resolved int) string {
+	if locale == "ar" {
+		return fmt.Sprintf("سجّل CMS %d من سجلات تنبيه استمرارية الإمداد: %d مفتوحة، %d قيد التحقق من الحل، و%d محلولة في العينة.", total, open, recovering, resolved)
+	}
+	return fmt.Sprintf("CMS sampled %d Supply Continuity attention records: %d open, %d verifying resolution, and %d resolved.", total, open, recovering, resolved)
+}
+
+// mediaContinuityDegradedBlocks turns the registered Media Circulation source
+// continuity fact into an evidence-cited diagnosis when the optional LLM is
+// unavailable. It only summarizes CMS states already in the packet; it never
+// asserts a provider failure, queue acceptance, or a recovery action.
+func mediaContinuityDegradedBlocks(packet DecisionPacket, locale string) []ResponseBlock {
+	for _, fact := range packet.Facts {
+		if fact.Key != "media_circulation.source_continuity" || len(fact.EvidenceIDs) == 0 {
+			continue
+		}
+		value, ok := fact.Value.(map[string]any)
+		if !ok {
+			return nil
+		}
+		rows := continuityRows(value["sources"])
+		if rows == nil {
+			return nil
+		}
+		schedule := map[string]int{}
+		delivery := map[string]int{}
+		dueNames := make([]string, 0, 3)
+		for _, row := range rows {
+			state, _ := row["schedule_state"].(string)
+			schedule[state]++
+			if state == "due_unadmitted" {
+				if name, ok := row["source_name"].(string); ok && strings.TrimSpace(name) != "" && len(dueNames) < 3 {
+					dueNames = append(dueNames, name)
+				}
+			}
+			if state, ok := row["delivery_state"].(string); ok {
+				delivery[state]++
+			}
+		}
+		evidenceIDs := fact.EvidenceIDs
+		blocks := []ResponseBlock{{Kind: "fact", Text: localizedContinuitySnapshot(locale, len(rows), schedule, delivery), EvidenceIDs: evidenceIDs}}
+		if schedule["due_unadmitted"] > 0 {
+			blocks = append(blocks, ResponseBlock{Kind: "interpretation", Text: localizedDueUnadmittedDiagnosis(locale, dueNames), EvidenceIDs: evidenceIDs})
+		}
+		return blocks
+	}
+	return nil
+}
+
+func continuityRows(value any) []map[string]any {
+	switch rows := value.(type) {
+	case []map[string]any:
+		return rows
+	case []any:
+		out := make([]map[string]any, 0, len(rows))
+		for _, row := range rows {
+			mapped, ok := row.(map[string]any)
+			if !ok {
+				return nil
+			}
+			out = append(out, mapped)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func localizedContinuitySnapshot(locale string, total int, schedule, delivery map[string]int) string {
+	if locale == "ar" {
+		return fmt.Sprintf("لقطة CMS شملت %d من مصادر الوسائط: %d مستحقّة بلا طلب تشغيل نشط، %d قيد التنفيذ، %d مجدولة، و%d بحالة جدول غير معروفة. تحقق وصول Pods: %d مثبت، %d قيد المراقبة، و%d غير معروف.", total, schedule["due_unadmitted"], schedule["in_flight"], schedule["scheduled"], schedule["unknown"], delivery["verified"], delivery["pending"], delivery["unknown"]+delivery["degraded"])
+	}
+	return fmt.Sprintf("CMS sampled %d Media sources: %d due with no active source run, %d in flight, %d scheduled, and %d with an unknown schedule. Pods delivery: %d verified, %d still observing, and %d unknown or degraded.", total, schedule["due_unadmitted"], schedule["in_flight"], schedule["scheduled"], schedule["unknown"], delivery["verified"], delivery["pending"], delivery["unknown"]+delivery["degraded"])
+}
+
+func localizedDueUnadmittedDiagnosis(locale string, names []string) string {
+	if locale == "ar" {
+		if len(names) > 0 {
+			return "أول انقطاع مرصود هو قبول CMS للتشغيل: هذه المصادر مستحقّة بلا طلب تشغيل نشط (" + strings.Join(names, "، ") + "). لا يثبت هذا فشل المزود أو حالة الطابور."
+		}
+		return "أول انقطاع مرصود هو قبول CMS للتشغيل: توجد مصادر مستحقّة بلا طلب تشغيل نشط. لا يثبت هذا فشل المزود أو حالة الطابور."
+	}
+	if len(names) > 0 {
+		return "The first observed break is CMS admission: these sources are due without an active source run (" + strings.Join(names, ", ") + "). This does not prove a provider failure or queue state."
+	}
+	return "The first observed break is CMS admission: one or more sources are due without an active source run. This does not prove a provider failure or queue state."
+}
+
 func localizedRecommendationSummary(recommendation Recommendation) string {
 	if recommendation.Kind != "inspect" {
 		return "راجع الدليل التشغيلي الحالي في CMS قبل اتخاذ أي تغيير."
@@ -242,7 +438,7 @@ func localizedRecommendationSummary(recommendation Recommendation) string {
 	case "media_sources":
 		return "راجع المصدر وطلب التشغيل الدائم ومسار المعالجة في مصادر الوسائط."
 	case "media_circulation":
-		return "راجع السياسة الحالية وآخر تشغيل مسجل وقائمة توصيات التوزيع المحدودة."
+		return "راجع حالة جدولة المصادر وأدلة وصول Pods والسياسة الحالية قبل اتخاذ أي تغيير."
 	case "feed_integrity":
 		return "راجع حالة لقطة الأخبار المباشرة، وجهّز إجراء التحديث المسجل عند ملاءمته."
 	case "feed_recovery":

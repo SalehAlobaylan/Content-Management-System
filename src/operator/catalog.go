@@ -5,6 +5,9 @@ import (
 	"sort"
 	"strings"
 
+	"content-management-system/src/models"
+	"content-management-system/src/supply"
+
 	"github.com/google/uuid"
 )
 
@@ -42,6 +45,37 @@ func DefaultToolCatalog() ToolCatalog {
 		refreshSnapshot.Key: refreshSnapshot,
 		sourceRun.Key:       sourceRun,
 		mediaSourceRun.Key:  mediaSourceRun,
+	}
+	// This is the Supply evaluator's only Operator-admitted mutation. It is a
+	// durable, tenant-scoped emergency brake for new evidence recording;
+	// observations, verification, cancellation, and safe episode resolution
+	// remain available. It can never resume or otherwise widen authority.
+	tools["media_circulation.supply.disable_evaluator"] = ToolDescriptor{
+		Key: "media_circulation.supply.disable_evaluator", Version: "v1", OwnerDomain: "media_circulation",
+		TargetType: "media_supply_evaluator", ArgumentSchema: "fixed-current-media-supply-evaluator-v1", RequiredPermission: "aggregation:manage",
+		RiskTier: RiskHigh, Batchable: false, TargetCap: 1, Executor: "media_circulation.supply.disable_evaluator",
+		Monitor: "media_supply.evaluator_monitor", Verifier: "media_supply.evaluator_control_verify", Idempotency: "operator_plan_step",
+		Cancellation: "before_start_only", Rollback: "disable_only",
+		Contingencies:   []string{"control_already_disabled:verify_current_state", "control_write_failed:stop_and_record_failure", "verification_failed:stop_and_record_failure"},
+		AffectedDomains: []string{"media_circulation"}, LocalizedActionKey: "operator.action.media_circulation_supply_disable_evaluator",
+	}
+	for _, key := range OperatorSupplyRecoveryToolKeys() {
+		native, ok := supply.SupplyAction(key)
+		if !ok {
+			continue
+		}
+		risk := RiskRoutine
+		if native.Risk == "high" {
+			risk = RiskHigh
+		}
+		tools[key] = ToolDescriptor{
+			Key: key, Version: "v1", OwnerDomain: "media_circulation", TargetType: "media_supply_episode",
+			ArgumentSchema: "media-supply-episode-uuid-v1", RequiredPermission: "aggregation:manage", RiskTier: risk,
+			Batchable: false, TargetCap: 1, Executor: key, Monitor: "media_supply.action_monitor", Verifier: "media_supply.signed_handoff_verify",
+			Idempotency: "operator_plan_step", Cancellation: "before_start_only", Rollback: native.Rollback,
+			Contingencies:   []string{"episode_or_target_changed:stop_and_record_failure", "native_action_disabled:stop_and_record_failure", "durable_handoff_failed:stop_and_record_failure"},
+			AffectedDomains: append([]string(nil), native.AffectedDomains...), LocalizedActionKey: "operator.action." + strings.ReplaceAll(key, ".", "_"),
+		}
 	}
 	for _, spec := range []struct{ key, domain, category, rollback string }{
 		{"sources.pause", "sources", "news", "sources.resume"},
@@ -168,6 +202,26 @@ func (catalog ToolCatalog) DeriveArguments(toolKey string, targetIDs []string) (
 			return nil, fmt.Errorf("%w: unsupported registered snapshot window", ErrInvalidContract)
 		}
 		return map[string]any{"window": window}, nil
+	case "media_circulation.supply.disable_evaluator":
+		if targetIDs[0] != "current" {
+			return nil, fmt.Errorf("%w: Supply evaluator target must be current", ErrInvalidContract)
+		}
+		return map[string]any{
+			"control_key": models.MediaSupplyControlReadEvaluation,
+			"scope_type":  models.MediaSupplyControlScopeTenant,
+			"scope_id":    models.MediaSupplyControlScopeAll,
+		}, nil
+	case supply.SupplyActionRepairMissedAdmission, supply.SupplyActionReclaimDispatchClaim, supply.SupplyActionTransferUnitLease,
+		supply.SupplyActionAdoptUnitJob, supply.SupplyActionRedeliverReceipt, supply.SupplyActionVerifyEffect,
+		supply.SupplyActionFinalizeVerifiedNoChange, supply.SupplyActionCancelUnstarted, supply.SupplyActionPipelineResumeExactStage,
+		supply.SupplyActionArtifactRequestTranscript, supply.SupplyActionArtifactRequestImageEmbedding,
+		supply.SupplyActionArtifactRequestTextEmbedding, supply.SupplyActionArtifactRequestLLMMetadata,
+		supply.SupplyActionAtomizationExecuteExactParent, supply.SupplyActionFeedGenerationAttachVerifiedMember:
+		id, err := registeredUUIDTarget(targetIDs[0])
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"episode_id": id}, nil
 	case "sources.run_once", "media_sources.run_once", "sources.pause", "sources.resume", "media_sources.pause", "media_sources.resume":
 		id, err := uuid.Parse(strings.TrimSpace(targetIDs[0]))
 		if err != nil || id == uuid.Nil {
@@ -289,6 +343,9 @@ func (catalog ToolCatalog) BuildCanonicalPlan(packet DecisionPacket, access Acce
 	}
 	if err := descriptor.Validate(); err != nil || !access.HasPermission(descriptor.RequiredPermission) {
 		return CanonicalPlan{}, fmt.Errorf("%w: tool is not currently permitted", ErrForbiddenTool)
+	}
+	if !ToolAdmittedForDomain(packet.VisibleContext.Domain, descriptor.Key) {
+		return CanonicalPlan{}, fmt.Errorf("%w: tool is not admitted for this context domain", ErrForbiddenTool)
 	}
 	if packet.Conflicts != nil && len(packet.Conflicts) > 0 {
 		return CanonicalPlan{}, fmt.Errorf("%w: conflicting evidence blocks action planning", ErrInvalidContract)

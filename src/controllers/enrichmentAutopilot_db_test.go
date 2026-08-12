@@ -73,7 +73,7 @@ func TestEnrichmentAutopilotDB_TranscriptScopeAndTrustReset(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int64
-	if err := buildMissingQuery(db, models.EnrichmentArtifactTranscript, "VIDEO,PODCAST", "READY").Where("(duration_sec IS NULL OR duration_sec <= 2400)").Count(&count).Error; err != nil {
+	if err := buildMissingQuery(db, "default", models.EnrichmentArtifactTranscript, "VIDEO,PODCAST", "READY").Where("(duration_sec IS NULL OR duration_sec <= 2400)").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {

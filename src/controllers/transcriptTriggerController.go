@@ -275,6 +275,7 @@ func UserAuthMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set("user_id", claims.UserID)
+		c.Set("tenant_id", strings.TrimSpace(claims.TenantID))
 		c.Next()
 	}
 }
@@ -322,6 +323,7 @@ func OptionalUserAuthMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set("user_id", claims.UserID)
+		c.Set("tenant_id", strings.TrimSpace(claims.TenantID))
 		c.Next()
 	}
 }

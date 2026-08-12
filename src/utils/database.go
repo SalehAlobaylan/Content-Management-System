@@ -2,13 +2,25 @@ package utils
 
 import (
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 )
+
+func cmsDatabaseLogger() gormlogger.Interface {
+	return gormlogger.New(log.New(os.Stdout, "", log.LstdFlags), gormlogger.Config{
+		SlowThreshold:             200 * time.Millisecond,
+		LogLevel:                  gormlogger.Warn,
+		IgnoreRecordNotFoundError: true,
+		Colorful:                  false,
+	})
+}
 
 // ConnectDB connects to PostgreSQL using DATABASE_URL environment variable
 func ConnectDB() (*gorm.DB, error) {
@@ -18,7 +30,7 @@ func ConnectDB() (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  dsn,
 		PreferSimpleProtocol: true,
-	}), &gorm.Config{})
+	}), &gorm.Config{Logger: cmsDatabaseLogger()})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -318,7 +330,7 @@ func ensureDatabaseExistsFromURL(dsn string) error {
 	adminDB, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  adminDSN,
 		PreferSimpleProtocol: true,
-	}), &gorm.Config{})
+	}), &gorm.Config{Logger: cmsDatabaseLogger()})
 	if err != nil {
 		return err
 	}

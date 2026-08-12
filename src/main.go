@@ -4,7 +4,9 @@ import (
 	"content-management-system/src/controllers"
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models" // needs it for automigrate
+	"content-management-system/src/pipeline"
 	"content-management-system/src/routes"
+	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 
 	"log"
@@ -28,6 +30,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 			"message": "Welcome to Content Management System API",
 			"version": "1.1.0",
 			"endpoints": gin.H{
+				"live":          "/live",
 				"health":        "/health",
 				"api":           "/api/v1",
 				"posts":         "/api/v1/posts",
@@ -42,10 +45,53 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		})
 	})
 
+	// Liveness is deliberately independent of dependency and worker readiness.
+	// Dependencies use it to detect that CMS can accept HTTP requests without
+	// creating a circular /health -> owner /ready -> CMS /health failure.
+	router.GET("/live", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
 	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "ok",
+		now := time.Now().UTC()
+		projectionHealthy := supply.ProjectionWorkerHealthy(now)
+		recoveryHealthy := supply.RecoveryWorkerHealthy(now)
+		reconcilerHealthy := supply.ReconcilerWorkerHealthy(now)
+		supplyActionHealthy := supply.SupplyActionWorkerHealthy(now)
+		supplyEvaluationHealthy := supply.MediaSupplyEvaluatorWorkerHealthy(now)
+		sourceRunSchedulerHealthy := supply.SourceRunSchedulerHealthy(now)
+		pipelineRepairHealthy := pipeline.WorkerHealthy(now)
+		artifactCoverageHealthy := controllers.ArtifactCoverageWorkerHealthy(now)
+		atomizationWorkHealthy := controllers.AtomizationWorkVerifierHealthy(now)
+		studioClearanceHealthy := controllers.StudioClearanceWorkerHealthy(now)
+		upstreamObservationHealthy := supply.UpstreamObservationWorkerHealthy(now)
+		supplyOwners := supply.SupplyOwnerReadinessAt(now)
+		externalSupplyOwnersHealthy := true
+		for _, owner := range []string{"aggregation", "media", "enrichment"} {
+			if supplyOwners[owner].State != "ready" {
+				externalSupplyOwnersHealthy = false
+				break
+			}
+		}
+		status := 200
+		if !projectionHealthy || !recoveryHealthy || !reconcilerHealthy || !supplyActionHealthy || !supplyEvaluationHealthy || !sourceRunSchedulerHealthy || !pipelineRepairHealthy || !artifactCoverageHealthy || !atomizationWorkHealthy || !studioClearanceHealthy || !upstreamObservationHealthy || !externalSupplyOwnersHealthy {
+			status = 503
+		}
+		c.JSON(status, gin.H{
+			"status":                       map[bool]string{true: "ok", false: "degraded"}[projectionHealthy && recoveryHealthy && reconcilerHealthy && supplyActionHealthy && supplyEvaluationHealthy && sourceRunSchedulerHealthy && pipelineRepairHealthy && artifactCoverageHealthy && atomizationWorkHealthy && studioClearanceHealthy && upstreamObservationHealthy && externalSupplyOwnersHealthy],
+			"source_run_projection_ready":  projectionHealthy,
+			"source_run_recovery_ready":    recoveryHealthy,
+			"source_run_reconciler_ready":  reconcilerHealthy,
+			"media_supply_action_ready":    supplyActionHealthy,
+			"media_supply_evaluator_ready": supplyEvaluationHealthy,
+			"source_run_scheduler_ready":   sourceRunSchedulerHealthy,
+			"pipeline_repair_ready":        pipelineRepairHealthy,
+			"artifact_coverage_ready":      artifactCoverageHealthy,
+			"atomization_work_ready":       atomizationWorkHealthy,
+			"studio_clearance_ready":       studioClearanceHealthy,
+			"upstream_observation_ready":   upstreamObservationHealthy,
+			"supply_owner_readiness":       supplyOwners,
 		})
 	})
 
@@ -338,6 +384,40 @@ func main() {
 	// Approved Operator plans enter the CMS-owned durable work ledger. The
 	// worker rechecks IAM and tenant policy before it claims an immutable plan.
 	controllers.StartOperatorPlanWorker(db)
+	// Source-run evidence reduction is CMS-owned and read-only with respect to
+	// providers and queues. It replays immutable receipts after commit; it does
+	// not enable source dispatch or any new provider effect.
+	supply.StartProjectionWorker(db)
+	// Deferred upstream identities have their own immutable disposition and
+	// expiry projection. This worker never materializes provider content.
+	supply.StartUpstreamObservationWorker(db)
+	// Expired claims converge without provider I/O: pre-effect dispatch can be
+	// redelivered while started units enter verification, never blind retry.
+	supply.StartRecoveryWorker(db)
+	// Reconciliation independently repairs interrupted verification-task
+	// creation. It cannot dispatch or repeat a source/provider effect.
+	supply.StartReconcilerWorker(db)
+	// Only CMS-owned, static Supply actions are claimable here. Owner-service
+	// handoffs remain unavailable until their typed capability protocols exist.
+	supply.StartSupplyActionWorker(db)
+	// Static owner readiness is cached outside request paths. It can deny only
+	// new external handoffs; recovery evidence, cancellation, and verification
+	// retain authority when an owner is unavailable.
+	supply.StartSupplyOwnerReadinessObserver()
+	// Pipeline repair is verification/recovery only; Aggregation remains the
+	// sole owner of its declared stage effect.
+	pipeline.StartWorker(db)
+	controllers.StartArtifactCoverageWorker(db)
+	controllers.StartAtomizationWorkVerifier(db)
+	controllers.StartStudioClearanceWorker(db)
+	// Admission records due work in CMS only. Aggregation later claims the
+	// CMS-issued unit; this scheduler never selects a queue or provider itself.
+	supply.StartSourceRunScheduler(db)
+	// Supply Continuity records CMS-derived attention episodes for explicitly
+	// owned Media-source tenants. It has no source admission, dispatch, queue,
+	// provider, retry, or Operator-plan authority; its only possible effect is
+	// one separately promotion-gated native Supply action.
+	controllers.StartMediaSupplyEvaluationHeartbeat(db)
 	// Shadow qualification is a CMS-only read loop. It cannot render a Console
 	// surface, call a model, build a plan, or promote the launch state.
 	controllers.StartOperatorShadowHeartbeat(db)

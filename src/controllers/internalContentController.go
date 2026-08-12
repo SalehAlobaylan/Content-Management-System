@@ -1,13 +1,17 @@
 package controllers
 
 import (
+	"content-management-system/src/artifacts"
+	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
+	"content-management-system/src/pipeline"
 	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,6 +23,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type internalCreateContentItemRequest struct {
@@ -73,7 +78,24 @@ type internalUpdateContentItemRequest struct {
 // only generated summaries, key points, and language-specific translations.
 // It must not receive a general metadata replacement capability.
 type internalEnrichmentMetadataRequest struct {
-	Fields map[string]interface{} `json:"fields"`
+	Fields           map[string]interface{}              `json:"fields"`
+	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+}
+
+type artifactRecoveryCorrelationRequest struct {
+	RequestID       string `json:"request_id"`
+	AttemptID       string `json:"attempt_id"`
+	ClaimToken      string `json:"claim_token"`
+	FenceToken      string `json:"fence_token"`
+	InputDigest     string `json:"input_digest"`
+	ProducerEventID string `json:"producer_event_id"`
+}
+
+func (value *artifactRecoveryCorrelationRequest) correlation() artifacts.Correlation {
+	if value == nil {
+		return artifacts.Correlation{}
+	}
+	return artifacts.Correlation{RequestID: value.RequestID, AttemptID: value.AttemptID, ClaimToken: value.ClaimToken, FenceToken: value.FenceToken, InputDigest: value.InputDigest, ProducerEventID: value.ProducerEventID}
 }
 
 func normalizeContentLanguage(raw *string) *string {
@@ -124,18 +146,37 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 			return
 		}
 	}
+	var recoveryRequest models.ArtifactCoverageRequest
+	var recoveryAttempt models.ArtifactCoverageAttempt
+	if req.ArtifactRecovery != nil {
+		recoveryRequest, recoveryAttempt, err = artifacts.AuthorizeWriteback(db, id, artifacts.EnrichmentOwner, artifacts.ArtifactLLMMetadata, req.ArtifactRecovery.correlation())
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
+			return
+		}
+	}
 	raw, err := json.Marshal(req.Fields)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid enrichment metadata"})
 		return
 	}
-	result := db.Model(&models.ContentItem{}).Where("public_id = ?", id).
-		UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
-	if result.Error != nil {
+	var rows int64
+	err = db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.ContentItem{}).Where("public_id = ?", id).UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
+		rows = result.RowsAffected
+		if result.Error != nil {
+			return result.Error
+		}
+		if req.ArtifactRecovery != nil {
+			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"fields": len(req.Fields)})
+		}
+		return nil
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to merge enrichment metadata"})
 		return
 	}
-	if result.RowsAffected == 0 {
+	if rows == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
@@ -175,6 +216,10 @@ type internalUpdateArtifactsRequest struct {
 	// sponsor_segments, categories). MERGED into the existing metadata jsonb so
 	// fetcher-set keys (videoId, tags, categoryId, …) are preserved.
 	Metadata map[string]interface{} `json:"metadata"`
+	// ExpectedItemUpdatedAt is an optional owner-issued fence. Normal ingest
+	// leaves it empty; exact Pipeline repair writes must use it so a stale
+	// worker cannot attach an artifact to a newer item version.
+	ExpectedItemUpdatedAt *string `json:"expected_item_updated_at"`
 }
 
 type internalUpdateEmbeddingRequest struct {
@@ -189,8 +234,26 @@ type internalUpdateEmbeddingRequest struct {
 	// recomputed?". When absent both are cleared so the row is visibly unstamped
 	// debt rather than silently inheriting a stale identity. The comparability
 	// guards exclude NULL-space rows from similarity.
-	SpaceID    string `json:"space_id"`
-	ProducerID string `json:"producer_id"`
+	SpaceID          string                              `json:"space_id"`
+	ProducerID       string                              `json:"producer_id"`
+	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	PipelineRepair   *pipelineRepairCorrelationRequest   `json:"pipeline_repair,omitempty"`
+}
+
+type pipelineRepairCorrelationRequest struct {
+	RepairID            string `json:"repair_id"`
+	AttemptID           string `json:"attempt_id"`
+	ClaimToken          string `json:"claim_token"`
+	FenceToken          string `json:"fence_token"`
+	ExpectedItemVersion string `json:"expected_item_version"`
+	InputDigest         string `json:"input_digest"`
+}
+
+func (value *pipelineRepairCorrelationRequest) correlation() pipeline.TextEmbeddingWriteback {
+	if value == nil {
+		return pipeline.TextEmbeddingWriteback{}
+	}
+	return pipeline.TextEmbeddingWriteback{RepairID: value.RepairID, AttemptID: value.AttemptID, ClaimToken: value.ClaimToken, FenceToken: value.FenceToken, ExpectedItemVersion: value.ExpectedItemVersion, InputDigest: value.InputDigest}
 }
 
 // textEmbeddingDim is the dense embedding length Qwen3-Embedding-0.6B produces.
@@ -201,13 +264,15 @@ type internalUpdateImageEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
 	// Vector-space provenance for the CLIP space (stage 10), mirroring the text
 	// write-back. Media supplies these on write-back; absent ⇒ cleared.
-	Model      string `json:"model"`
-	SpaceID    string `json:"space_id"`
-	ProducerID string `json:"producer_id"`
+	Model            string                              `json:"model"`
+	SpaceID          string                              `json:"space_id"`
+	ProducerID       string                              `json:"producer_id"`
+	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
 }
 
 type internalLinkTranscriptRequest struct {
-	TranscriptID string `json:"transcript_id"`
+	TranscriptID     string                              `json:"transcript_id"`
+	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
 }
 
 const maxIdempotencyKeyLength = 512
@@ -396,6 +461,9 @@ func InternalCreateContentItem(c *gin.Context) {
 		if err := tx.Create(&item).Error; err != nil {
 			return err
 		}
+		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+			return err
+		}
 		if contentSourceID == nil {
 			return nil
 		}
@@ -438,7 +506,6 @@ func InternalUpdateContentItem(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
-
 	if req.Title != nil {
 		item.Title = req.Title
 	}
@@ -508,7 +575,6 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
-
 	item.Status = models.ContentStatus(strings.ToUpper(req.Status))
 	if req.FeedVisibility != nil && strings.TrimSpace(*req.FeedVisibility) != "" {
 		item.FeedVisibility = strings.TrimSpace(*req.FeedVisibility)
@@ -534,6 +600,9 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
+		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+			return err
+		}
 		return appendItemProcessingEvent(tx, item, "content_status", "completed", "aggregation", "content_status_updated", map[string]interface{}{"status": string(item.Status)})
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update status"})
@@ -544,7 +613,6 @@ func InternalUpdateContentStatus(c *gin.Context) {
 			Where("tenant_id = ? AND child_content_item_id = ?", item.TenantID, item.PublicID).
 			Update("status", chapterStatusPublished).Error
 	}
-	attachReadyContentToFeedGenerations(db, item)
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -569,6 +637,15 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
+	}
+	var expectedItemUpdatedAt *time.Time
+	if req.ExpectedItemUpdatedAt != nil {
+		parsed, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(*req.ExpectedItemUpdatedAt))
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid expected item version"})
+			return
+		}
+		expectedItemUpdatedAt = &parsed
 	}
 
 	if req.MediaURL != nil {
@@ -665,12 +742,25 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if expectedItemUpdatedAt != nil {
+			var current models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=? AND updated_at=?", item.PublicID, item.TenantID, *expectedItemUpdatedAt).First(&current).Error; err != nil {
+				return fmt.Errorf("artifact target version is stale: %w", err)
+			}
+		}
 		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
 			return err
 		}
 		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update artifacts"})
+		if strings.Contains(err.Error(), "artifact target version is stale") {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact target version is stale"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update artifacts"})
+		}
 		return
 	}
 
@@ -715,6 +805,15 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
+	var recoveryRequest models.ArtifactCoverageRequest
+	var recoveryAttempt models.ArtifactCoverageAttempt
+	if req.ArtifactRecovery != nil {
+		recoveryRequest, recoveryAttempt, err = artifacts.AuthorizeWriteback(db, id, artifacts.EnrichmentOwner, artifacts.ArtifactTextEmbedding, req.ArtifactRecovery.correlation())
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
+			return
+		}
+	}
 
 	vec := pgvector.NewVector(req.Embedding)
 	item.Embedding = &vec
@@ -733,12 +832,27 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if req.PipelineRepair != nil {
+			if err := pipeline.AuthorizeTextEmbeddingWriteback(tx, id, req.PipelineRepair.correlation()); err != nil {
+				return err
+			}
+		}
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
-		return appendItemProcessingEvent(tx, item, "text_embedding", "completed", "enrichment", "text_embedding_persisted", map[string]interface{}{"model": req.Model})
+		if err := appendItemProcessingEvent(tx, item, "text_embedding", "completed", "enrichment", "text_embedding_persisted", map[string]interface{}{"model": req.Model}); err != nil {
+			return err
+		}
+		if req.ArtifactRecovery != nil {
+			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"model": req.Model, "space_id": req.SpaceID})
+		}
+		return nil
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update embedding"})
+		if req.PipelineRepair != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Pipeline repair embedding writeback is stale"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update embedding"})
+		}
 		return
 	}
 
@@ -787,6 +901,15 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
+	var recoveryRequest models.ArtifactCoverageRequest
+	var recoveryAttempt models.ArtifactCoverageAttempt
+	if req.ArtifactRecovery != nil {
+		recoveryRequest, recoveryAttempt, err = artifacts.AuthorizeWriteback(db, id, artifacts.MediaOwner, artifacts.ArtifactImageEmbedding, req.ArtifactRecovery.correlation())
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
+			return
+		}
+	}
 
 	vec := pgvector.NewVector(req.Embedding)
 	item.ImageEmbedding = &vec
@@ -798,7 +921,13 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
-		return appendItemProcessingEvent(tx, item, "image_embedding", "completed", "media", "image_embedding_persisted", map[string]interface{}{"model": req.Model})
+		if err := appendItemProcessingEvent(tx, item, "image_embedding", "completed", "media", "image_embedding_persisted", map[string]interface{}{"model": req.Model}); err != nil {
+			return err
+		}
+		if req.ArtifactRecovery != nil {
+			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"model": req.Model, "space_id": req.SpaceID})
+		}
+		return nil
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update image embedding"})
 		return
@@ -871,7 +1000,6 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
-
 	resp := internalEmbeddingsResponse{}
 	if item.Embedding != nil {
 		resp.Embedding = item.Embedding.Slice()
@@ -1182,6 +1310,15 @@ func InternalLinkTranscript(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
+	var recoveryRequest models.ArtifactCoverageRequest
+	var recoveryAttempt models.ArtifactCoverageAttempt
+	if req.ArtifactRecovery != nil {
+		recoveryRequest, recoveryAttempt, err = artifacts.AuthorizeWriteback(db, id, artifacts.MediaOwner, artifacts.ArtifactTranscript, req.ArtifactRecovery.correlation())
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
+			return
+		}
+	}
 
 	item.TranscriptID = &transcriptUUID
 
@@ -1189,7 +1326,13 @@ func InternalLinkTranscript(c *gin.Context) {
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
-		return appendItemProcessingEvent(tx, item, "transcript", "completed", "media", "transcript_linked", map[string]interface{}{"transcript_id": transcriptUUID.String()})
+		if err := appendItemProcessingEvent(tx, item, "transcript", "completed", "media", "transcript_linked", map[string]interface{}{"transcript_id": transcriptUUID.String()}); err != nil {
+			return err
+		}
+		if req.ArtifactRecovery != nil {
+			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"transcript_id": transcriptUUID.String()})
+		}
+		return nil
 	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link transcript"})
 		return

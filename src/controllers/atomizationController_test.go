@@ -241,6 +241,9 @@ func TestPodsEligibleMediaQueryAppliesFeedDurationFloorAndCeiling(t *testing.T) 
 	if !foundMin || !foundMax {
 		t.Fatalf("query vars %v do not include min %d and hard max %d", query.Statement.Vars, podsMinDurationSec, podsHardMaxDurationSec)
 	}
+	if strings.Contains(sql, "LOWER(media_url)") || strings.Contains(sql, "thumbnail_url") {
+		t.Fatalf("compatibility Pods predicate must not require MP4 format or artwork: %s", sql)
+	}
 }
 
 func TestPodsEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testing.T) {
@@ -274,6 +277,12 @@ func TestPodsEligibleMediaQueryRequiresFeedUnitsWithinDurationBounds(t *testing.
 	}
 	if !foundMin || !foundHard {
 		t.Fatalf("atomized query vars %v do not include min %d and hard max %d", query.Statement.Vars, podsMinDurationSec, podsHardMaxDurationSec)
+	}
+	if strings.Contains(sql, "thumbnail_url") {
+		t.Fatalf("atomized Pods predicate must not require artwork: %s", sql)
+	}
+	if !strings.Contains(sql, "COALESCE(playback_url, media_url) IS NOT NULL") {
+		t.Fatalf("atomized Pods predicate must require playback presence: %s", sql)
 	}
 }
 

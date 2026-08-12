@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/models"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -36,7 +37,7 @@ const (
 var (
 	systemAutopilotMu      sync.Mutex
 	systemAutopilotRunning bool
-	errSystemAutopilotBusy = fmt.Errorf("system health autopilot already running")
+	errSystemAutopilotBusy = errors.New("system health autopilot already running")
 )
 
 type systemAutopilotRunOptions struct {
@@ -2144,6 +2145,13 @@ func runSystemHealthAutopilotDue(db *gorm.DB) {
 		return
 	}
 	if _, _, err := runSystemHealthAutopilot(db, systemAutopilotRunOptions{Trigger: "scheduled"}); err != nil {
+		// A heartbeat can overlap a long-running manual or prior scheduled run.
+		// This is an expected coalescing outcome, not a failed health run. Keep
+		// real probe/persistence errors visible at error level.
+		if errors.Is(err, errSystemAutopilotBusy) {
+			log.Printf("system health autopilot scheduled run deferred: already running")
+			return
+		}
 		log.Printf("system health autopilot scheduled run failed: %v", err)
 	}
 }

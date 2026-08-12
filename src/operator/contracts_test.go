@@ -47,7 +47,7 @@ func TestDecisionPacketRequiresTenantScopedEvidenceAndFactProof(t *testing.T) {
 }
 
 func TestInternalDeepLinkRejectsProtocolRelativeAndMalformedValues(t *testing.T) {
-	for _, value := range []string{"https://unsafe.example", "//unsafe.example", "/\\unsafe", "/platform/ok\nnext"} {
+	for _, value := range []string{"https://unsafe.example", "//unsafe.example", "/\\unsafe", "/platform/ok\nnext", "/platform/../operator", "/platform/%2e%2e/operator", "/platform/%2f%2funsafe"} {
 		if IsInternalDeepLink(value) {
 			t.Fatalf("%q must not be accepted as an internal link", value)
 		}

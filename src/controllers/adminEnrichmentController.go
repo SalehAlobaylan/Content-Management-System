@@ -3,6 +3,7 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -87,9 +88,13 @@ type triggerResultItem struct {
 // ── GET /admin/enrichment/stats ─────────────────────────────
 
 func GetEnrichmentStats(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 
-	stats, err := computeEnrichmentStats(db)
+	stats, err := computeEnrichmentStats(db, principal.TenantID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{
 			Code:    http.StatusInternalServerError,
@@ -108,8 +113,11 @@ func GetEnrichmentStats(c *gin.Context) {
 // computeEnrichmentStats runs the coverage FILTER query and returns the struct.
 // Extracted so the Enrichment Autopilot can capture before/after snapshots from
 // the exact same read-model the admin sees on the page.
-func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
+func computeEnrichmentStats(db *gorm.DB, tenantID string) (enrichmentStatsResponse, error) {
 	var stats enrichmentStatsResponse
+	if strings.TrimSpace(tenantID) == "" {
+		return stats, fmt.Errorf("tenant scope is required")
+	}
 
 	// Single efficient query using PostgreSQL FILTER
 	row := db.Raw(`
@@ -124,8 +132,8 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 			COUNT(*) FILTER (WHERE thumbnail_url IS NOT NULL AND image_embedding IS NULL AND status = 'READY') as missing_image_embedding,
 			COUNT(*) FILTER (WHERE status = 'READY') as total_ready
 		FROM content_items
-		WHERE status != 'ARCHIVED'
-	`).Row()
+		WHERE tenant_id = ? AND status != 'ARCHIVED'
+	`, tenantID).Row()
 
 	if err := row.Scan(
 		&stats.TotalMedia,
@@ -146,13 +154,17 @@ func computeEnrichmentStats(db *gorm.DB) (enrichmentStatsResponse, error) {
 // ── GET /admin/enrichment/missing-counts ───────────────────
 
 func GetMissingEnrichmentCounts(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 	contentType := c.Query("type")
 	status := c.DefaultQuery("status", "READY")
 
 	countFor := func(missingParam string) (int64, error) {
 		var total int64
-		err := buildMissingQuery(db, missingParam, contentType, status).Count(&total).Error
+		err := buildMissingQuery(db, principal.TenantID, missingParam, contentType, status).Count(&total).Error
 		return total, err
 	}
 
@@ -185,6 +197,10 @@ func GetMissingEnrichmentCounts(c *gin.Context) {
 // ── GET /admin/enrichment/missing ───────────────────────────
 
 func GetMissingEnrichments(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 
 	// Parse query params
@@ -204,7 +220,7 @@ func GetMissingEnrichments(c *gin.Context) {
 	}
 
 	// Build the filtered query (shared with the bulk trigger endpoint).
-	query := buildMissingQuery(db, missingParam, contentType, status)
+	query := buildMissingQuery(db, principal.TenantID, missingParam, contentType, status)
 
 	// Count total
 	var total int64
@@ -256,6 +272,10 @@ func GetMissingEnrichments(c *gin.Context) {
 // ── POST /admin/enrichment/trigger/:id ──────────────────────
 
 func TriggerEnrichment(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 
 	contentIDStr := c.Param("id")
@@ -279,7 +299,7 @@ func TriggerEnrichment(c *gin.Context) {
 
 	// Look up content item
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", contentID).First(&item).Error; err != nil {
+	if err := db.Where("public_id = ? AND tenant_id = ?", contentID, principal.TenantID).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Content item not found",
@@ -303,6 +323,10 @@ func TriggerEnrichment(c *gin.Context) {
 // ── POST /admin/enrichment/trigger-batch ────────────────────
 
 func TriggerBatchEnrichment(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 
 	var req triggerBatchRequest
@@ -333,7 +357,7 @@ func TriggerBatchEnrichment(c *gin.Context) {
 		}
 
 		var item models.ContentItem
-		if err := db.Where("public_id = ?", contentID).First(&item).Error; err != nil {
+		if err := db.Where("public_id = ? AND tenant_id = ?", contentID, principal.TenantID).First(&item).Error; err != nil {
 			results = append(results, triggerResultItem{ContentID: idStr, Status: "error", Error: "not found"})
 			continue
 		}
@@ -459,8 +483,12 @@ func missingEnrichmentClauses(missingParam string) []string {
 
 // buildMissingQuery applies the shared status + type + missing-artifact filters.
 // `contentType` accepts a comma-separated list (e.g. "VIDEO,PODCAST").
-func buildMissingQuery(db *gorm.DB, missingParam, contentType, status string) *gorm.DB {
-	query := db.Model(&models.ContentItem{}).Where("status != ?", "ARCHIVED")
+func buildMissingQuery(db *gorm.DB, tenantID, missingParam, contentType, status string) *gorm.DB {
+	query := db.Model(&models.ContentItem{}).Where("1 = 0")
+	if strings.TrimSpace(tenantID) == "" {
+		return query
+	}
+	query = db.Model(&models.ContentItem{}).Where("tenant_id = ? AND status != ?", tenantID, "ARCHIVED")
 
 	if status != "" {
 		query = query.Where("status = ?", status)
@@ -593,6 +621,7 @@ func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string,
 // just resets it — the reconcile sweep + re-trigger remain the backstop.
 
 type bulkEnrichStatus struct {
+	TenantID    string     `json:"-"`
 	Running     bool       `json:"running"`
 	Total       int        `json:"total"`
 	Done        int        `json:"done"`
@@ -613,6 +642,10 @@ var (
 const bulkMaxItems = 5000
 
 func TriggerAllEnrichment(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 
 	var req struct {
@@ -640,7 +673,7 @@ func TriggerAllEnrichment(c *gin.Context) {
 		limit = bulkMaxItems
 	}
 
-	if enrichmentAutopilotAnyRunInFlight() {
+	if enrichmentAutopilotRunPersisted(db, principal.TenantID) {
 		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "an autopilot run is in flight; retry shortly"})
 		return
 	}
@@ -658,7 +691,7 @@ func TriggerAllEnrichment(c *gin.Context) {
 	// only load items that actually lack at least one of them.
 	missingParam := strings.Join(req.Types, ",")
 	var items []models.ContentItem
-	buildMissingQuery(db, missingParam, req.Type, "READY").
+	buildMissingQuery(db, principal.TenantID, missingParam, req.Type, "READY").
 		Order("created_at DESC").
 		Limit(limit).
 		Find(&items)
@@ -675,6 +708,7 @@ func TriggerAllEnrichment(c *gin.Context) {
 
 	now := time.Now()
 	bulkState = bulkEnrichStatus{
+		TenantID:    principal.TenantID,
 		Running:     true,
 		Total:       len(items),
 		Types:       req.Types,
@@ -714,9 +748,16 @@ func runBulkEnrich(db *gorm.DB, items []models.ContentItem, types []string) {
 }
 
 func GetBulkEnrichStatus(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
 	bulkMu.Lock()
 	snapshot := bulkState
 	bulkMu.Unlock()
+	if snapshot.TenantID != "" && snapshot.TenantID != principal.TenantID {
+		snapshot = bulkEnrichStatus{}
+	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -734,6 +775,12 @@ func bulkEnrichRunning() bool {
 	return bulkState.Running
 }
 
-func bulkLaneBusy() bool {
-	return bulkEnrichRunning() || enrichmentAutopilotAnyRunInFlight()
+func enrichmentAutopilotRunPersisted(db *gorm.DB, tenantID string) bool {
+	if db == nil || strings.TrimSpace(tenantID) == "" {
+		return false
+	}
+	var count int64
+	return db.Model(&models.EnrichmentAutopilotRun{}).
+		Where("tenant_id = ? AND status = ?", tenantID, models.EnrichmentAutopilotRunStatusRunning).
+		Count(&count).Error == nil && count > 0
 }

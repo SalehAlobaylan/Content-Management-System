@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
@@ -56,9 +57,9 @@ type PodsItem struct {
 }
 
 const (
-	podsMinDurationSec     = 4*60 + 30
+	podsMinDurationSec     = feedcontract.PodsMinDurationSec
 	podsSoftMaxDurationSec = 30 * 60
-	podsHardMaxDurationSec = 40 * 60
+	podsHardMaxDurationSec = feedcontract.PodsHardMaxDuration
 )
 
 func hasCursor(pagination *utils.CursorPagination) bool {
@@ -69,7 +70,12 @@ func hasCursor(pagination *utils.CursorPagination) bool {
 // GET /api/v1/feed/pods?cursor=xxx&limit=20
 func GetPodsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
-	availability := currentFeedAvailability(db, "default", "media")
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+		return
+	}
+	availability := currentFeedAvailability(db, tenantID, "media")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
 	}
@@ -99,11 +105,10 @@ func GetPodsFeed(c *gin.Context) {
 	// Pods: mobile sessions must not accidentally recycle watched inventory.
 	var seenIDs []uuid.UUID
 	if sessionID != "" || userIDStr != "" {
-		seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, "default"), time.Now().UTC())
+		seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, tenantID), time.Now().UTC())
 	}
 
-	// Load ranking config (uses "default" tenant for public feeds)
-	config := loadTenantConfig(db, "default")
+	config := loadTenantConfig(db, tenantID)
 	durationTargetMinutes := parseDurationPreference(c.Query("duration"))
 	atomizedFeedSchema := supportsAtomizedPodsSchema(db)
 
@@ -111,7 +116,7 @@ func GetPodsFeed(c *gin.Context) {
 	if config.IsActive {
 		// Fetch items for ranking — try time window first, then fall back to all
 		var allItems []models.ContentItem
-		baseQuery := podsEligibleMediaQuery(db, "default", atomizedFeedSchema)
+		baseQuery := podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema)
 		baseQuery = applyDeliveryLanguage(baseQuery, deliveryLanguage)
 		baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
 
@@ -132,15 +137,15 @@ func GetPodsFeed(c *gin.Context) {
 		if len(allItems) < 200 {
 			baseQuery.Session(&gorm.Session{}).Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allItems)
 		}
-		allItems = excludeCollapsedRedundancyMembers(db, "default", allItems)
+		allItems = excludeCollapsedRedundancyMembers(db, tenantID, allItems)
 
 		// Score items
 		contentIDs := extractPublicIDs(allItems)
-		flagMap := LoadContentFlags(db, "default", contentIDs)
+		flagMap := LoadContentFlags(db, tenantID, contentIDs)
 		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
-		scored, preferenceEligible := applyPreferenceFeedHook(db, "default", userIDStr, scored)
-		scored = applyIntelligenceFeedHooks(db, "default", scored)
+		scored, preferenceEligible := applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
+		scored = applyIntelligenceFeedHooks(db, tenantID, scored)
 		scored = spaceScoredSiblingChapters(scored)
 		unfilteredScored := append([]ScoredItem(nil), scored...)
 
@@ -228,7 +233,7 @@ func GetPodsFeed(c *gin.Context) {
 
 		c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination), Meta: availability})
 		if !isFeedIntegritySynthetic(c) {
-			recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
+			recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
 		}
 		boosted := int64(0)
 		for _, item := range pageItems {
@@ -237,7 +242,7 @@ func GetPodsFeed(c *gin.Context) {
 			}
 		}
 		if !isFeedIntegritySynthetic(c) {
-			recordPreferenceServes(db, "default", preferenceEligible, boosted, int64(len(items)))
+			recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(items)))
 		}
 		return
 	}
@@ -247,7 +252,7 @@ func GetPodsFeed(c *gin.Context) {
 	// Query for VIDEO and PODCAST content with a valid media URL.
 	// Use COALESCE(published_at, created_at) so items with NULL published_at
 	// are still ordered and reachable by cursor pagination.
-	query := applyDeliveryLanguage(podsEligibleMediaQuery(db, "default", atomizedFeedSchema), deliveryLanguage).
+	query := applyDeliveryLanguage(podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema), deliveryLanguage).
 		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
 	query = applyDurationPreference(query, durationTargetMinutes)
 
@@ -273,7 +278,7 @@ func GetPodsFeed(c *gin.Context) {
 		})
 		return
 	}
-	items = excludeCollapsedRedundancyMembers(db, "default", items)
+	items = excludeCollapsedRedundancyMembers(db, tenantID, items)
 
 	// Keep the cursor boundary chronological even when preferences reorder the
 	// returned page. That makes the cursor stable while allowing a deliberately
@@ -301,7 +306,7 @@ func GetPodsFeed(c *gin.Context) {
 		nextCursor = &cursor
 	}
 
-	items, boosted, preferenceEligible := applyChronologicalPreferenceOrder(db, "default", userIDStr, items)
+	items, boosted, preferenceEligible := applyChronologicalPreferenceOrder(db, tenantID, userIDStr, items)
 
 	// Get interaction status if session/user provided
 	likedMap := make(map[uuid.UUID]bool)
@@ -323,8 +328,8 @@ func GetPodsFeed(c *gin.Context) {
 		Meta:     availability,
 	})
 	if !isFeedIntegritySynthetic(c) {
-		recordPodsServe(db, items, pagination.Limit, durationTargetMinutes)
-		recordPreferenceServes(db, "default", preferenceEligible, int64(boosted), int64(len(items)))
+		recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
+		recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
 	}
 }
 
@@ -365,7 +370,7 @@ func excludeCollapsedRedundancyMembers(db *gorm.DB, tenantID string, items []mod
 // (impressions + demand stats) for one Pods response. Runs after the
 // response is written and in its own goroutine — the serve path never waits
 // on telemetry.
-func recordPodsServe(db *gorm.DB, items []models.ContentItem, requestedLimit, durationTargetMinutes int) {
+func recordPodsServe(db *gorm.DB, tenantID string, items []models.ContentItem, requestedLimit, durationTargetMinutes int) {
 	served := make([]models.ContentItem, len(items))
 	copy(served, items)
 	durationBucket := ""
@@ -373,7 +378,7 @@ func recordPodsServe(db *gorm.DB, items []models.ContentItem, requestedLimit, du
 		durationBucket = intelligence.BucketLabelForDuration(durationTargetMinutes * 60)
 	}
 	go intelligence.RecordServe(db, intelligence.ServeRecord{
-		TenantID:       "default",
+		TenantID:       tenantID,
 		Items:          served,
 		RequestedLimit: requestedLimit,
 		DurationBucket: durationBucket,
@@ -384,7 +389,12 @@ func recordPodsServe(db *gorm.DB, items []models.ContentItem, requestedLimit, du
 // GET /api/v1/feed/news?window=today|week|month&cursor=xxx&limit=10
 func GetNewsFeed(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
-	availability := currentFeedAvailability(db, "default", "news")
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+		return
+	}
+	availability := currentFeedAvailability(db, tenantID, "news")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
 	}
@@ -427,8 +437,8 @@ func GetNewsFeed(c *gin.Context) {
 
 	// Load ranking config (in-process cached; also carries the Phase-13 story
 	// + feed-mode knobs).
-	config := loadTenantConfig(db, "default")
-	circ := circulationContextFor(db, "default", c.Query("window"), time.Now())
+	config := loadTenantConfig(db, tenantID)
+	circ := circulationContextFor(db, tenantID, c.Query("window"), time.Now())
 
 	// News feed = story-slides, assembled LIVE by default ("write-time
 	// intelligence, read-time freshness") behind a freshness-bounded
@@ -439,7 +449,7 @@ func GetNewsFeed(c *gin.Context) {
 		return seenIDs
 	}
 	slides, nextCursor, serveMeta := serveStoryNewsFeed(
-		db, "default", config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
+		db, tenantID, config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
 	)
 	// A story snapshot is shared across viewers, while like/bookmark state is
 	// identity-specific. Hydrate only the lead content IDs after assembly so a
@@ -572,51 +582,15 @@ func applyDurationPreference(query *gorm.DB, targetMinutes int) *gorm.DB {
 }
 
 func supportsAtomizedPodsSchema(db *gorm.DB) bool {
-	return db.Migrator().HasColumn(&models.ContentItem{}, "is_feed_unit") &&
-		db.Migrator().HasColumn(&models.ContentItem{}, "feed_visibility") &&
-		db.Migrator().HasColumn(&models.ContentItem{}, "playback_url")
+	return feedcontract.SupportsAtomizedPodsSchema(db)
 }
 
 func supportsStorageStateSchema(db *gorm.DB) bool {
-	// Query-shape tests use a DryRun sqlmock without a real information_schema.
-	// Keep the compatibility predicate disabled for that compile-only path; the
-	// live request path still checks the column before adding the filter.
-	if db != nil && db.Statement != nil && db.Statement.DryRun {
-		return false
-	}
-	return db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
+	return feedcontract.SupportsStorageStateSchema(db)
 }
 
 func podsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema bool) *gorm.DB {
-	storageUnavailableStates := []string{
-		models.StorageStateRecoverableDeleted,
-		models.StorageStateMissing,
-		models.StorageStateRecoveryPending,
-		models.StorageStateUnrecoverable,
-	}
-	if !atomizedFeedSchema {
-		q := db.Model(&models.ContentItem{}).
-			Where("tenant_id = ?", tenantID).
-			Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-			Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-			Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", podsMinDurationSec, podsHardMaxDurationSec).
-			Where("media_url IS NOT NULL AND media_url != '' AND (LOWER(media_url) LIKE '%.mp4' OR LOWER(media_url) LIKE '%.mp4?%') AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
-		if supportsStorageStateSchema(db) {
-			q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
-		}
-		return q
-	}
-
-	q := db.Model(&models.ContentItem{}).
-		Where("tenant_id = ?", tenantID).
-		Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
-		Where("status IN ?", []models.ContentStatus{models.ContentStatusReady, models.ContentStatusArchived}).
-		Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", podsMinDurationSec, podsHardMaxDurationSec).
-		Where("is_feed_unit = TRUE AND feed_visibility = ?", feedVisibilityVisible).
-		Where("COALESCE(playback_url, media_url) IS NOT NULL AND COALESCE(playback_url, media_url) != '' AND thumbnail_url IS NOT NULL AND thumbnail_url != ''")
-	if supportsStorageStateSchema(db) {
-		q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
-	}
+	q := feedcontract.PodsEligibleMediaQuery(db, tenantID, atomizedFeedSchema)
 	return applyActiveGenerationMembership(db, q, tenantID, "media", "feed_unit", "content_items.public_id")
 }
 

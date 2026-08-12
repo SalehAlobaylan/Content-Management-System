@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/artifacts"
 	"content-management-system/src/models"
 	"encoding/json"
 	"net/http"
@@ -19,14 +20,15 @@ type internalCreateTranscriptRequest struct {
 	Summary        *string                  `json:"summary"`
 	WordTimestamps []map[string]interface{} `json:"word_timestamps"`
 	// Caption-first additions (all optional for backward compat):
-	Segments            []map[string]interface{} `json:"segments"` // [{start,end,text}]
-	Chapters            []map[string]interface{} `json:"chapters"` // [{start,end,title,source}]
-	Source              *string                  `json:"source"`   // youtube_human|youtube_auto|stt_deepgram|stt_whisper
-	Provider            *string                  `json:"provider"` // concrete engine name
-	Language            *string                  `json:"language"`
-	TranscriptionJobID  *string                  `json:"transcription_job_id"`
-	LanguageProbability *float64                 `json:"language_probability"`
-	DurationSec         *float64                 `json:"duration_sec"`
+	Segments            []map[string]interface{}            `json:"segments"` // [{start,end,text}]
+	Chapters            []map[string]interface{}            `json:"chapters"` // [{start,end,title,source}]
+	Source              *string                             `json:"source"`   // youtube_human|youtube_auto|stt_deepgram|stt_whisper
+	Provider            *string                             `json:"provider"` // concrete engine name
+	Language            *string                             `json:"language"`
+	TranscriptionJobID  *string                             `json:"transcription_job_id"`
+	LanguageProbability *float64                            `json:"language_probability"`
+	DurationSec         *float64                            `json:"duration_sec"`
+	ArtifactRecovery    *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
 }
 
 type internalCreateTranscriptResponse struct {
@@ -62,6 +64,19 @@ func InternalCreateTranscript(c *gin.Context) {
 
 	var item models.ContentItem
 	haveItem := db.Where("public_id = ?", contentUUID).First(&item).Error == nil
+	var recoveryRequest models.ArtifactCoverageRequest
+	var recoveryAttempt models.ArtifactCoverageAttempt
+	if req.ArtifactRecovery != nil {
+		if !haveItem {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+			return
+		}
+		recoveryRequest, recoveryAttempt, err = artifacts.AuthorizeWriteback(db, contentUUID, artifacts.MediaOwner, artifacts.ArtifactTranscript, req.ArtifactRecovery.correlation())
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
+			return
+		}
+	}
 
 	source := models.TranscriptSourceSTTDeepgram
 	if req.Source != nil && *req.Source != "" {
@@ -230,6 +245,12 @@ func InternalCreateTranscript(c *gin.Context) {
 					}
 				}()
 			}
+		}
+	}
+	if req.ArtifactRecovery != nil {
+		if err := artifacts.RecordPersistence(db, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"transcript_id": transcript.PublicID.String(), "provider": req.Provider}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Transcript persisted but recovery receipt could not be recorded"})
+			return
 		}
 	}
 

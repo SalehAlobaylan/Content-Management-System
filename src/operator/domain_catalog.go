@@ -1,6 +1,26 @@
 package operator
 
-import "strings"
+import (
+	"strings"
+
+	"content-management-system/src/supply"
+)
+
+// OperatorSupplyRecoveryToolKeys is deliberately explicit. Studio clearance
+// is a chained verifier-owned step and therefore cannot be initiated directly
+// by Operator even though it exists in the native Supply registry.
+func OperatorSupplyRecoveryToolKeys() []string {
+	return []string{
+		supply.SupplyActionRepairMissedAdmission, supply.SupplyActionReclaimDispatchClaim,
+		supply.SupplyActionTransferUnitLease, supply.SupplyActionAdoptUnitJob,
+		supply.SupplyActionRedeliverReceipt, supply.SupplyActionVerifyEffect,
+		supply.SupplyActionFinalizeVerifiedNoChange, supply.SupplyActionCancelUnstarted,
+		supply.SupplyActionPipelineResumeExactStage, supply.SupplyActionArtifactRequestTranscript,
+		supply.SupplyActionArtifactRequestImageEmbedding, supply.SupplyActionArtifactRequestTextEmbedding,
+		supply.SupplyActionArtifactRequestLLMMetadata, supply.SupplyActionAtomizationExecuteExactParent,
+		supply.SupplyActionFeedGenerationAttachVerifiedMember,
+	}
+}
 
 // DomainActionAdmission is the reviewed, code-owned action boundary for a
 // Console domain. A domain may intentionally expose only manual work; that is
@@ -32,7 +52,7 @@ func DefaultDomainActionCatalog() []DomainActionAdmission {
 		{Domain: "news_circulation", ToolKeys: []string{"news_circulation.pause.24h"}, ManualOnly: []string{"generate", "apply", "dismiss", "revert"}, NoToolReason: "recommendation eligibility is native"},
 		{Domain: "media_sources", ToolKeys: []string{"media_sources.run_once", "media_sources.pause", "media_sources.resume"}, ManualOnly: []string{"suggestion_decision"}},
 		{Domain: "atomization", ManualOnly: []string{"atomize", "reatomize", "chapter_decision", "sweep"}, NoToolReason: "media policy and review gates require dedicated admission"},
-		{Domain: "media_circulation", ToolKeys: []string{"media_circulation.pause.24h"}, ManualOnly: []string{"generate", "apply", "dismiss", "revert", "override"}, NoToolReason: "circulation proof and projected state are native"},
+		{Domain: "media_circulation", ToolKeys: append([]string{"media_circulation.pause.24h", "media_circulation.supply.disable_evaluator"}, OperatorSupplyRecoveryToolKeys()...), ManualOnly: []string{"generate", "apply", "dismiss", "revert", "override"}, NoToolReason: "circulation proof and projected state are native"},
 		{Domain: "redundancy", ToolKeys: []string{"redundancy.pause.24h"}, ManualOnly: []string{"confirm_pair", "reject_pair", "canonical_decision"}, NoToolReason: "pair evidence must be revalidated by native workflow"},
 		{Domain: "media_library", ToolKeys: []string{"media_library.pause.24h"}, ManualOnly: []string{"transcribe", "enrichment_trigger", "metadata_repair"}, NoToolReason: "artifact operations require item-level policy admission"},
 		{Domain: "storage_quality", ManualOnly: []string{"restore", "reconcile", "probe", "archive", "reencode"}, NoToolReason: "storage ownership and playback dependency checks are native"},
@@ -45,6 +65,32 @@ func DefaultDomainActionCatalog() []DomainActionAdmission {
 		{Domain: "auth_center", ManualOnly: []string{"iam_mutation"}, NoToolReason: "IAM mutations are permanently manual-only"},
 		{Domain: "operator", ToolKeys: []string{"operator.schedule.create.hourly", "operator.schedule.create.daily", "operator.schedule.create.weekly", "operator.schedule.pause", "operator.schedule.resume", "operator.schedule.takeover", "operator.share.create", "operator.share.revoke", "operator.recommendation.snooze.15m", "operator.recommendation.snooze.1h", "operator.recommendation.snooze.1d", "operator.recommendation.snooze.7d", "operator.recommendation.dismiss", "operator.recommendation.subject_override", "operator.control.disable.read", "operator.control.disable.llm", "operator.control.disable.execution", "operator.control.disable.schedules", "operator.control.disable.adapter", "operator.control.disable.tool"}},
 	}
+}
+
+// ToolAdmittedForDomain is the single action-admission boundary used by both
+// eligible-action rendering and plan creation. It prevents callers from
+// bypassing the CMS read model by submitting an otherwise registered tool from
+// an unrelated investigation context.
+func ToolAdmittedForDomain(domain, toolKey string) bool {
+	for _, key := range ToolKeysForDomain(domain) {
+		if key == strings.TrimSpace(toolKey) {
+			return true
+		}
+	}
+	return false
+}
+
+// ToolKeysForDomain returns the code-owned action admission list for one
+// Console context. A fresh copy prevents callers from mutating the catalog and
+// makes the same list available to eligible-action responses and signed-plan
+// creation.
+func ToolKeysForDomain(domain string) []string {
+	for _, admission := range DefaultDomainActionCatalog() {
+		if admission.Domain == strings.TrimSpace(domain) {
+			return append([]string(nil), admission.ToolKeys...)
+		}
+	}
+	return []string{}
 }
 
 // PermanentlyForbiddenOperatorCapabilities is deliberately broader than the

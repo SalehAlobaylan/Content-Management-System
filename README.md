@@ -46,7 +46,7 @@ Inspect or apply canonical CMS SQL migrations explicitly:
 ./scripts/cms-migrate.sh apply --allow-destructive
 ```
 
-For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. Run `check` before a release to checksum the ledger and lint every pending migration. Normal `apply` advances the ordered safe prefix and stops before the first destructive migration; it never skips that boundary. Continue with `apply --allow-destructive` only after reviewing the blocked migration and satisfying its own readiness guards. Pending updates to the large live `content_items` or `stories` tables are rejected unless the migration declares a reviewed bounded-backfill or operator-maintenance strategy.
+For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. Run `check` before a release to checksum the ledger and lint every pending migration. Normal `apply` advances the ordered safe prefix and stops before the first destructive migration; it never skips that boundary. Continue with `apply --allow-destructive` only after reviewing the blocked migration and satisfying its own readiness guards. Pending updates to the large live `content_items` or `stories` tables are rejected unless the migration declares a reviewed bounded-backfill or operator-maintenance strategy. New canonical migrations must not include top-level `BEGIN`/`COMMIT`: the runner owns the transaction and ledger write; only audited historical exceptions may retain their original transaction wrappers.
 
 ### Go API docs (terminal)
 
@@ -74,7 +74,7 @@ Copy `.env.example` to `.env` and fill in the values. `DATABASE_URL` is the only
 | `JWT_ALLOWED_ISSUERS` | no | `cms-service,iam-authorization-service` | Accepted token issuers. Empty-issuer tokens are rejected (`iss` must be listed) |
 | `JWT_ALLOWED_AUDIENCES` | no | — (disabled) | Optional `aud` allowlist (comma-separated); when unset, audience checks are skipped |
 | `JWT_REQUIRE_TENANT_ID` | no | false | Enforce tenant claim |
-| `DEFAULT_TENANT_ID` | no | default | Fallback tenant |
+| `DEFAULT_TENANT_ID` | required for public feeds | — | Server-owned public feed tenant; Pods/News and frozen sessions fail closed when unset |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_ROLE` | no | — | Seed a dev admin user |
 | `CMS_SERVICE_TOKEN` | **yes** | — | Bearer token Aggregation/Media/Enrichment use for `/internal/*` |
 | `IAM_BASE_URL` | no | http://localhost:4003 | IAM base URL for live Operator access snapshots |

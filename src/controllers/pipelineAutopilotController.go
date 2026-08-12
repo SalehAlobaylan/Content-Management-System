@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,35 +27,6 @@ var (
 	errPipelineAutopilotDisabled       = errors.New("pipeline autopilot is not enabled for this tenant")
 	errPipelineAutopilotAlreadyRunning = errors.New("pipeline autopilot is already running for this tenant")
 )
-
-var (
-	pipelineAutopilotRunMu       sync.Mutex
-	pipelineAutopilotRunInFlight = map[string]bool{}
-)
-
-func tryStartPipelineAutopilotRun(tenantID string) bool {
-	pipelineAutopilotRunMu.Lock()
-	defer pipelineAutopilotRunMu.Unlock()
-	if pipelineAutopilotRunInFlight[tenantID] {
-		return false
-	}
-	pipelineAutopilotRunInFlight[tenantID] = true
-	return true
-}
-
-func finishPipelineAutopilotRun(tenantID string) {
-	pipelineAutopilotRunMu.Lock()
-	defer pipelineAutopilotRunMu.Unlock()
-	delete(pipelineAutopilotRunInFlight, tenantID)
-}
-
-type pipelineRetryResponse struct {
-	Success  bool     `json:"success"`
-	Message  string   `json:"message"`
-	Requeued int      `json:"requeued"`
-	Total    int      `json:"total"`
-	Errors   []string `json:"errors"`
-}
 
 type pipelineHealthSnapshot struct {
 	Timestamp          string               `json:"timestamp"`
@@ -143,9 +113,10 @@ func sanitizePipelineAutopilotPolicy(p models.PipelineAutopilotPolicy) models.Pi
 	if strings.TrimSpace(p.TenantID) == "" {
 		p.TenantID = defaultCirculationTenant
 	}
-	if p.Mode != models.PipelineAutopilotModeSafeAuto {
-		p.Mode = models.PipelineAutopilotModeObserve
-	}
+	// WP-09 cutover: legacy Pipeline Autopilot may observe and persist a
+	// diagnostic candidate ledger, but it can never acquire mutation authority.
+	// Exact stage repair is only available through the signed Supply action.
+	p.Mode = models.PipelineAutopilotModeObserve
 	p.IntervalMinutes = clampIntOrDefault(p.IntervalMinutes, 15, 1440, 180)
 	p.MaxItemsPerRun = clampIntOrDefault(p.MaxItemsPerRun, 1, 500, 200)
 	p.MaxBatchesPerRun = clampIntOrDefault(p.MaxBatchesPerRun, 1, 100, 4)
@@ -239,12 +210,13 @@ func computePipelineTrust(db *gorm.DB, tenantID string, policy models.PipelineAu
 
 func runPipelineAutopilot(db *gorm.DB, tenantID string, opts pipelineAutopilotRunOptions) (models.PipelineAutopilotRun, []models.PipelineAutopilotAction, error) {
 	if strings.TrimSpace(tenantID) == "" {
-		tenantID = defaultCirculationTenant
+		return models.PipelineAutopilotRun{}, nil, fmt.Errorf("pipeline autopilot requires an explicit tenant")
 	}
-	if !tryStartPipelineAutopilotRun(tenantID) {
+	releaseLock, acquired := tryAcquireTenantAutopilotLock(db, "pipeline-autopilot", tenantID)
+	if !acquired {
 		return models.PipelineAutopilotRun{}, nil, errPipelineAutopilotAlreadyRunning
 	}
-	defer finishPipelineAutopilotRun(tenantID)
+	defer releaseLock()
 
 	policy := loadPipelineAutopilotPolicy(db, tenantID)
 	if !policy.Enabled {
@@ -254,7 +226,10 @@ func runPipelineAutopilot(db *gorm.DB, tenantID string, opts pipelineAutopilotRu
 	if trigger == "" {
 		trigger = "scheduled"
 	}
-	observe := policy.Mode != models.PipelineAutopilotModeSafeAuto
+	// sanitizePipelineAutopilotPolicy forces Observe for historical rows too.
+	// Keep this explicit at the execution boundary so a future policy/model
+	// change cannot quietly re-enable an aggregate retry path.
+	observe := true
 	now := time.Now()
 	execPolicy := pipelineAutopilotElevatedCaps(policy)
 
@@ -653,83 +628,21 @@ func (r *pipelineAutopilotRunner) dispatchBatch(batch pipelineBatch) {
 		return
 	}
 
-	if batch.Lane == models.PipelineLaneProcessingStuck {
-		_ = r.db.Model(&models.ContentItem{}).
-			Where("tenant_id = ? AND public_id IN ? AND status = ?", r.run.TenantID, ids, models.ContentStatusProcessing).
-			Update("status", models.ContentStatusPending).Error
-	}
-
-	endpoint := "/internal/retry-pending"
-	if batch.Lane == models.PipelineLaneFailedRetryable {
-		endpoint = "/internal/retry-failed"
-	}
-	resp, err := callAggregationPipelineRetry(endpoint, ids)
+	// WP-09 hard cutover: this historical Autopilot remains a diagnostic
+	// candidate reporter. It must never reset PROCESSING, call an aggregate
+	// retry endpoint, or allocate queue work. Exact repairs are instead
+	// separately admitted through pipeline.resume_exact_stage.
 	finishedAt := time.Now()
-	errorSet := map[string]string{}
-	if resp != nil {
-		for _, raw := range resp.Errors {
-			for _, id := range ids {
-				if strings.Contains(raw, id) {
-					errorSet[id] = raw
-				}
-			}
-		}
-	}
-	if err != nil {
-		r.errors++
-		r.writeAction(models.PipelineAutopilotAction{
-			Lane: batch.Lane, Verdict: batch.Verdict, SourceFilter: batch.SourceKey, TargetQueue: batch.TargetQueue,
-			Status: models.PipelineAutopilotActionStatusError, Reason: err.Error(),
-			RequestedCount: len(ids), ErrorCount: len(ids), Output: marshalAutopilotJSON(resp),
-			StartedAt: startedAt, FinishedAt: &finishedAt,
-		})
-		return
-	}
-	// Aggregation reports an aggregate requeued count and per-id error strings, not
-	// a per-id success list. Credit success (which consumes an attempt and starts an
-	// outcome) only up to the reported requeued count: if an id was silently dropped
-	// (its status changed between selection and dispatch, so CMS's list didn't return
-	// it) it never actually ran and must not burn an attempt toward the cap.
-	requeuedBudget := 0
-	if resp != nil {
-		requeuedBudget = resp.Requeued
-	}
 	for _, item := range batch.Items {
 		id := item.PublicID
-		if msg, failed := errorSet[id.String()]; failed {
-			r.errors++
-			r.writeAction(models.PipelineAutopilotAction{
-				Lane: batch.Lane, Verdict: batch.Verdict, SourceFilter: batch.SourceKey,
-				TargetQueue: batch.TargetQueue, ContentItemID: &id,
-				Status: models.PipelineAutopilotActionStatusError, Reason: msg,
-				RequestedCount: 1, ErrorCount: 1, Output: marshalAutopilotJSON(resp),
-				StartedAt: startedAt, FinishedAt: &finishedAt,
-			})
-			continue
-		}
-		if requeuedBudget <= 0 {
-			r.skipped++
-			r.writeAction(models.PipelineAutopilotAction{
-				Lane: batch.Lane, Verdict: batch.Verdict, SourceFilter: batch.SourceKey,
-				TargetQueue: batch.TargetQueue, ContentItemID: &id,
-				Status: models.PipelineAutopilotActionStatusSkipped, Guardrail: models.PipelineAutopilotGuardStale,
-				Reason:         "Aggregation did not requeue this id (its status changed before dispatch); no attempt consumed.",
-				RequestedCount: 1, Output: marshalAutopilotJSON(resp),
-				StartedAt: startedAt, FinishedAt: &finishedAt,
-			})
-			continue
-		}
-		requeuedBudget--
-		r.usedItems++
-		r.enqueued++
+		r.skipped++
 		r.writeAction(models.PipelineAutopilotAction{
 			Lane: batch.Lane, Verdict: batch.Verdict, SourceFilter: batch.SourceKey,
 			TargetQueue: batch.TargetQueue, ContentItemID: &id,
-			Status:         models.PipelineAutopilotActionStatusSuccess,
-			Outcome:        models.PipelineAutopilotOutcomePending,
-			Reason:         "Requeued through Aggregation by explicit ids.",
-			RequestedCount: 1, EnqueuedCount: 1, Output: marshalAutopilotJSON(resp),
-			StartedAt: startedAt, FinishedAt: &finishedAt,
+			Status: models.PipelineAutopilotActionStatusSkipped, Guardrail: models.PipelineAutopilotGuardStale,
+			Reason:         "Legacy Pipeline Autopilot is diagnostic-only; create a signed exact-stage repair when authoritative evidence is available.",
+			RequestedCount: 1,
+			StartedAt:      startedAt, FinishedAt: &finishedAt,
 		})
 	}
 }
@@ -748,24 +661,6 @@ func (r *pipelineAutopilotRunner) headline() string {
 		return models.PipelineAutopilotHeadlineClogged
 	}
 	return models.PipelineAutopilotHeadlineFlowing
-}
-
-func callAggregationPipelineRetry(path string, ids []string) (*pipelineRetryResponse, error) {
-	if len(ids) == 0 {
-		return &pipelineRetryResponse{Success: true, Message: "No ids", Requeued: 0, Total: 0}, nil
-	}
-	body, status, err := callAggregationInternal(http.MethodPost, path, map[string]interface{}{"ids": ids, "limit": len(ids)})
-	if err != nil {
-		return nil, err
-	}
-	var decoded pipelineRetryResponse
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &decoded)
-	}
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return &decoded, fmt.Errorf("aggregation %s responded with %d: %s", path, status, string(body))
-	}
-	return &decoded, nil
 }
 
 func buildPipelineHealthSnapshot(db *gorm.DB, tenantID string, queues []autopilotQueueStat) pipelineHealthSnapshot {
@@ -1006,7 +901,7 @@ func buildPipelineAutopilotStatus(db *gorm.DB, tenantID string, policy models.Pi
 	case !policy.Enabled:
 		block.RecommendedAction = "Enable Observe mode to start dry-run repair ledgers with zero side effects."
 	case policy.Mode == models.PipelineAutopilotModeObserve:
-		block.RecommendedAction = "Review Observe runs, then promote to Safe Auto when cohort selection looks calm."
+		block.RecommendedAction = "Review Observe candidates, then use a CMS-derived exact-stage signed repair where current evidence admits one."
 	case len(block.Attention) > 0:
 		block.RecommendedAction = "Review the attention lane for exhausted items, broken sources, or DLQ growth."
 	default:

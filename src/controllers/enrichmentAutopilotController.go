@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,33 +64,6 @@ var (
 	errEnrichmentAutopilotAlreadyRunning = errors.New("enrichment autopilot is already running for this tenant")
 	errEnrichmentAutopilotBusy           = errors.New("a manual bulk enrichment run is in flight; autopilot deferred")
 )
-
-var (
-	enrichmentAutopilotRunMu       sync.Mutex
-	enrichmentAutopilotRunInFlight = map[string]bool{}
-)
-
-func tryStartEnrichmentAutopilotRun(tenantID string) bool {
-	enrichmentAutopilotRunMu.Lock()
-	defer enrichmentAutopilotRunMu.Unlock()
-	if enrichmentAutopilotRunInFlight[tenantID] {
-		return false
-	}
-	enrichmentAutopilotRunInFlight[tenantID] = true
-	return true
-}
-
-func finishEnrichmentAutopilotRun(tenantID string) {
-	enrichmentAutopilotRunMu.Lock()
-	defer enrichmentAutopilotRunMu.Unlock()
-	delete(enrichmentAutopilotRunInFlight, tenantID)
-}
-
-func enrichmentAutopilotAnyRunInFlight() bool {
-	enrichmentAutopilotRunMu.Lock()
-	defer enrichmentAutopilotRunMu.Unlock()
-	return len(enrichmentAutopilotRunInFlight) > 0
-}
 
 // ----------------------------------------------------------------
 // Policy load + sanitize (mirrors the media/news clamp pattern)
@@ -373,12 +345,13 @@ type enrichmentAutopilotRunOptions struct {
 
 func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopilotRunOptions) (models.EnrichmentAutopilotRun, []models.EnrichmentAutopilotAction, error) {
 	if strings.TrimSpace(tenantID) == "" {
-		tenantID = defaultCirculationTenant
+		return models.EnrichmentAutopilotRun{}, nil, fmt.Errorf("enrichment autopilot requires an explicit tenant")
 	}
-	if !tryStartEnrichmentAutopilotRun(tenantID) {
+	releaseLock, acquired := tryAcquireTenantAutopilotLock(db, "enrichment-autopilot", tenantID)
+	if !acquired {
 		return models.EnrichmentAutopilotRun{}, nil, errEnrichmentAutopilotAlreadyRunning
 	}
-	defer finishEnrichmentAutopilotRun(tenantID)
+	defer releaseLock()
 
 	policy := loadEnrichmentAutopilotPolicy(db, tenantID)
 	if !policy.Enabled {
@@ -397,7 +370,7 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 	policy = enrichmentAutopilotElevatedCaps(policy)
 	now := time.Now()
 
-	statsBefore, _ := computeEnrichmentStats(db)
+	statsBefore, _ := computeEnrichmentStats(db, tenantID)
 	run := models.EnrichmentAutopilotRun{
 		TenantID:     tenantID,
 		Trigger:      trigger,
@@ -422,11 +395,13 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 	}
 	serviceDown := map[string]error{"enrichment": enrichErr, "media": mediaErr}
 
-	// Queue depth is advisory: Aggregation being unreachable does not stop
-	// triggers (they go direct to Enrichment/Media), so treat unknown as 0.
+	// Queue evidence is optional for Observe but never becomes an inferred zero
+	// for queue-sensitive Safe Auto work. An Aggregation outage is `unknown`.
 	queueDepth := 0
+	queueKnown := false
 	if stats, err := fetchAggregationQueueStats(); err == nil {
 		queueDepth = enrichmentAIQueueDepth(stats)
+		queueKnown = true
 	}
 
 	if err := db.Create(&run).Error; err != nil {
@@ -440,11 +415,11 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 		if runner.breakerFired || runner.usedTotal >= policy.MaxItemsPerRun {
 			break
 		}
-		runner.runArtifactClass(artifact, trust[artifact], serviceDown, queueDepth, statsBefore)
+		runner.runArtifactClass(artifact, trust[artifact], serviceDown, queueDepth, queueKnown, statsBefore)
 	}
 
 	finishedAt := time.Now()
-	statsAfter, _ := computeEnrichmentStats(db)
+	statsAfter, _ := computeEnrichmentStats(db, tenantID)
 	status := models.EnrichmentAutopilotRunStatusCompleted
 	if runner.errored > 0 && runner.success == 0 {
 		status = models.EnrichmentAutopilotRunStatusFailed
@@ -500,7 +475,7 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 
 // runArtifactClass evaluates the class-level gates, then per-item triggers under
 // caps + the failure breaker.
-func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enrichmentTrustStat, serviceDown map[string]error, queueDepth int, statsBefore enrichmentStatsResponse) {
+func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enrichmentTrustStat, serviceDown map[string]error, queueDepth int, queueKnown bool, statsBefore enrichmentStatsResponse) {
 	// Service gate.
 	if err := serviceDown[enrichmentArtifactService(artifact)]; err != nil {
 		r.serviceGated = true
@@ -515,7 +490,13 @@ func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enri
 				artifact, trust.FailurePct, trust.Attempts, r.policy.TrustMaxFailurePct))
 		return
 	}
-	// Queue-depth gate (embedding + image ride the ai-queue/embedder).
+	// Queue-depth gate (embedding + image ride the ai-queue/embedder). Unknown
+	// evidence blocks only Safe Auto; Observe keeps producing an honest ledger.
+	if artifact != models.EnrichmentArtifactTranscript && !queueKnown && !r.observe {
+		r.classBlock(artifact, models.EnrichmentAutopilotGuardQueueDepth,
+			"Aggregation ai-queue state is unknown; Safe Auto cannot trigger queue-sensitive work.")
+		return
+	}
 	if artifact != models.EnrichmentArtifactTranscript && queueDepth > r.policy.MaxQueueDepth {
 		r.classBlock(artifact, models.EnrichmentAutopilotGuardQueueDepth,
 			fmt.Sprintf("Aggregation ai-queue depth %d exceeds the %d cap — pipeline is already saturating the embedder.", queueDepth, r.policy.MaxQueueDepth))
@@ -533,7 +514,7 @@ func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enri
 
 	if artifact == models.EnrichmentArtifactTranscript {
 		var excluded int64
-		_ = buildMissingQuery(r.db, artifact, "VIDEO,PODCAST", "READY").Where("duration_sec > 2400").Count(&excluded).Error
+		_ = buildMissingQuery(r.db, r.run.TenantID, artifact, "VIDEO,PODCAST", "READY").Where("duration_sec > 2400").Count(&excluded).Error
 		if excluded > 0 {
 			status := models.EnrichmentAutopilotActionStatusSkipped
 			if r.observe {
@@ -574,7 +555,7 @@ func (r *enrichmentAutopilotRunner) selectClassCandidates(artifact string) []mod
 	if artifact == models.EnrichmentArtifactTranscript {
 		contentType = "VIDEO,PODCAST"
 	}
-	query := buildMissingQuery(r.db, artifact, contentType, "READY")
+	query := buildMissingQuery(r.db, r.run.TenantID, artifact, contentType, "READY")
 	if artifact == models.EnrichmentArtifactTranscript {
 		query = query.Where("(duration_sec IS NULL OR duration_sec <= 2400)")
 	}
@@ -874,7 +855,7 @@ func buildEnrichmentAutopilotStatus(db *gorm.DB, tenantID string, policy models.
 			trusted = append(trusted, a)
 		}
 	}
-	stats, _ := computeEnrichmentStats(db)
+	stats, _ := computeEnrichmentStats(db, tenantID)
 	for _, a := range enrichmentManagedArtifacts {
 		if classStuckOverWindow(db, tenantID, a, missingForArtifact(stats, a), policy.StallWindowRuns) {
 			block.Attention = append(block.Attention, enrichmentAttentionItem{Kind: "stuck_class", Artifact: a,

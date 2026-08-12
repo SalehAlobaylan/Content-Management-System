@@ -200,8 +200,10 @@ func mapToContentItemResponse(item models.ContentItem, isLiked, isBookmarked boo
 }
 
 // -----------------------------------------------------------------------------
-// Public restore-request — archived items can be re-fetched on demand by users.
-// Debounced per content_id to prevent re-ingest floods on popular archived content.
+// Public restore-request — archived items may be flagged for a human-owned
+// recovery workflow. It deliberately does not resurrect the item or enqueue a
+// generic Pipeline retry: the durable exact-stage protocol is the only repair
+// admission authority.
 // -----------------------------------------------------------------------------
 
 const restoreRequestCooldown = 24 * time.Hour
@@ -218,7 +220,7 @@ type requestRestoreResponse struct {
 }
 
 // RequestRestore handles POST /api/v1/content/:id/request-restore
-// Triggers Aggregation to re-ingest an archived item. Rate-limited per content_id.
+// Records a bounded review request for an archived item. Rate-limited per item.
 func RequestRestore(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	id, err := uuid.Parse(c.Param("id"))
@@ -260,76 +262,23 @@ func RequestRestore(c *gin.Context) {
 	restoreRequestLastSeen[item.PublicID] = now
 	restoreRequestMu.Unlock()
 
-	item.Status = models.ContentStatusPending
-	item.ArchivedAt = nil
-	item.LastRestoredAt = &now
-	item.StorageState = models.StorageStateRecoveryPending
-	reason := "restore_requested"
-	item.StorageStateReason = &reason
-	item.StorageRecoveryStatus = models.StorageRecoveryPending
-	if err := db.Save(&item).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to flip status"})
-		return
-	}
 	_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
 		TenantID:              item.TenantID,
 		ContentItemID:         item.PublicID,
 		ParentContentItemID:   item.ParentContentItemID,
 		EventType:             models.StorageArtifactEventRestoreRequested,
 		Status:                models.StorageArtifactEventStatusSuccess,
-		Reason:                "Public restore requested",
+		Reason:                "Public restore requested; exact recovery requires operator review",
 		Trigger:               "user",
 		Source:                "platform",
 		RecoveryPayload:       storageRecoveryPayloadForItem(item),
-		StorageState:          models.StorageStateRecoveryPending,
-		StorageStateReason:    "restore_requested",
-		StorageRecoveryStatus: models.StorageRecoveryPending,
+		StorageState:          item.StorageState,
+		StorageStateReason:    derefStr(item.StorageStateReason),
+		StorageRecoveryStatus: item.StorageRecoveryStatus,
 	})
 
-	go func() {
-		if _, err := callAggregationRetryPending("", 1, item.PublicID.String()); err != nil {
-			failReason := "reingest_queue_failed"
-			_ = db.Model(&models.ContentItem{}).
-				Where("public_id = ?", item.PublicID).
-				Updates(map[string]interface{}{
-					"storage_state_reason":    failReason,
-					"storage_recovery_status": models.StorageRecoveryFailed,
-				}).Error
-			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-				TenantID:              item.TenantID,
-				ContentItemID:         item.PublicID,
-				ParentContentItemID:   item.ParentContentItemID,
-				EventType:             models.StorageArtifactEventRecoveryFailed,
-				Status:                models.StorageArtifactEventStatusError,
-				Reason:                "Failed to queue public best-effort re-ingestion",
-				Trigger:               "user",
-				Source:                "platform",
-				Error:                 err.Error(),
-				RecoveryPayload:       storageRecoveryPayloadForItem(item),
-				StorageState:          models.StorageStateRecoveryPending,
-				StorageStateReason:    "reingest_queue_failed",
-				StorageRecoveryStatus: models.StorageRecoveryFailed,
-			})
-			return
-		}
-		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-			TenantID:              item.TenantID,
-			ContentItemID:         item.PublicID,
-			ParentContentItemID:   item.ParentContentItemID,
-			EventType:             models.StorageArtifactEventReingestQueued,
-			Status:                models.StorageArtifactEventStatusSuccess,
-			Reason:                "Public best-effort re-ingestion queued",
-			Trigger:               "user",
-			Source:                "platform",
-			RecoveryPayload:       storageRecoveryPayloadForItem(item),
-			StorageState:          models.StorageStateRecoveryPending,
-			StorageStateReason:    "reingest_queued",
-			StorageRecoveryStatus: models.StorageRecoveryPending,
-		})
-	}()
-
-	c.JSON(http.StatusOK, requestRestoreResponse{
-		Status:  "pending",
-		Message: "Restore requested. The content will be re-fetched shortly.",
+	c.JSON(http.StatusAccepted, requestRestoreResponse{
+		Status:  "manual_review",
+		Message: "Restore was recorded for operator review. Content remains unavailable until an approved recovery is verified.",
 	})
 }

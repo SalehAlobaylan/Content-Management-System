@@ -129,6 +129,20 @@ func GetDefaultTenantID() string {
 	return "default"
 }
 
+// GetConfiguredPublicTenantID resolves the single server-owned tenant exposed
+// by unauthenticated consumer feeds. Unlike GetDefaultTenantID it has no
+// compatibility fallback: a public feed must never guess its isolation scope.
+func GetConfiguredPublicTenantID() (string, error) {
+	tenantID := strings.TrimSpace(os.Getenv("DEFAULT_TENANT_ID"))
+	if tenantID == "" {
+		return "", fmt.Errorf("DEFAULT_TENANT_ID is required for public feeds")
+	}
+	if len(tenantID) > 64 || strings.ContainsAny(tenantID, "\x00\r\n\t /\\") {
+		return "", fmt.Errorf("DEFAULT_TENANT_ID is invalid")
+	}
+	return tenantID, nil
+}
+
 func ParseJWT(tokenString string, secret []byte) (*JWTClaims, error) {
 	claims := &JWTClaims{}
 	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {

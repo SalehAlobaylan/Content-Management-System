@@ -32,6 +32,22 @@ type ContentSource struct {
 	FetchIntervalMinutes int        `gorm:"default:60" json:"fetch_interval_minutes"`
 	LastFetchedAt        *time.Time `gorm:"type:timestamp" json:"last_fetched_at,omitempty"`
 
+	// Supply-continuity checkpoints never infer provider success from a claim,
+	// enqueue, or HTTP acceptance. LastFetchedAt remains a legacy read model;
+	// new scheduling is driven exclusively by the explicit evidence-backed
+	// fields below.
+	LastClaimedAt          *time.Time `gorm:"type:timestamptz" json:"last_claimed_at,omitempty"`
+	LastAttemptedAt        *time.Time `gorm:"type:timestamptz" json:"last_attempted_at,omitempty"`
+	LastProviderSuccessAt  *time.Time `gorm:"type:timestamptz" json:"last_provider_success_at,omitempty"`
+	LastUpstreamObservedAt *time.Time `gorm:"type:timestamptz" json:"last_upstream_observed_at,omitempty"`
+	LastNoChangeAt         *time.Time `gorm:"type:timestamptz" json:"last_no_change_at,omitempty"`
+	LastNewItemAt          *time.Time `gorm:"type:timestamptz" json:"last_new_item_at,omitempty"`
+	LastDeliveryVerifiedAt *time.Time `gorm:"type:timestamptz" json:"last_delivery_verified_at,omitempty"`
+	NextDueAt              *time.Time `gorm:"type:timestamptz;index" json:"next_due_at,omitempty"`
+	FailureStreak          int        `gorm:"not null;default:0" json:"failure_streak"`
+	IntakeCircuitUntil     *time.Time `gorm:"type:timestamptz" json:"intake_circuit_until,omitempty"`
+	SourceConfigVersion    int64      `gorm:"not null;default:1" json:"source_config_version"`
+
 	// DiscoveryProfileID links a source to the discovery profile it was
 	// approved from, so the News Feeds hub can group active sources by interest.
 	// NULL = manually-added / ungrouped.

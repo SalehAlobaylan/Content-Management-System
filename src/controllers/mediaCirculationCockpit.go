@@ -2,11 +2,13 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -71,6 +73,81 @@ type mediaCirculationCockpitResponse struct {
 	Policy               models.MediaCirculationPolicy           `json:"policy"`
 	Recommendations      []mediaCirculationCockpitRecommendation `json:"recommendations"`
 	Autopilot            mediaAutopilotStatusBlock               `json:"autopilot"`
+	Delivery             mediaCirculationDeliveryProof           `json:"delivery"`
+	Schedules            mediaCirculationSourceScheduleProof     `json:"schedules"`
+}
+
+const (
+	mediaCirculationDeliveryRequestLimit = 24
+	// One ingest event plus at most 24 bounded Pods observations per request.
+	// Keep the ledger query bounded while preserving the newest event for every
+	// displayed request, even when a recent run consumes its full retry budget.
+	mediaCirculationDeliveryEventLimit  = mediaCirculationDeliveryRequestLimit * 25
+	mediaCirculationSourceScheduleLimit = 24
+)
+
+// mediaCirculationDeliveryProof is an evidence-only view of the current media
+// source-run delivery boundary. It never reads queues, retries work, or turns
+// an absent observation into a retry permission.
+type mediaCirculationDeliveryProof struct {
+	GeneratedAt    time.Time                           `json:"generated_at"`
+	Verified       int                                 `json:"verified"`
+	Pending        int                                 `json:"pending"`
+	Degraded       int                                 `json:"degraded"`
+	NotObserved    int                                 `json:"not_observed"`
+	LastVerifiedAt *time.Time                          `json:"last_verified_at,omitempty"`
+	Items          []mediaCirculationDeliveryProofItem `json:"items"`
+}
+
+type mediaCirculationDeliveryProofItem struct {
+	RequestID           uuid.UUID  `json:"request_id"`
+	SourceID            uuid.UUID  `json:"source_id"`
+	SourceName          string     `json:"source_name"`
+	RequestState        string     `json:"request_state"`
+	TerminalOutcome     string     `json:"terminal_outcome,omitempty"`
+	EvidenceState       string     `json:"evidence_state"`
+	DeliveryState       string     `json:"delivery_state"`
+	Reason              string     `json:"reason"`
+	IngestVerdict       string     `json:"ingest_verdict,omitempty"`
+	PodsVerdict         string     `json:"pods_verdict,omitempty"`
+	ObservationAttempts int        `json:"observation_attempts"`
+	RequestedAt         time.Time  `json:"requested_at"`
+	IngestObservedAt    *time.Time `json:"ingest_observed_at,omitempty"`
+	PodsObservedAt      *time.Time `json:"pods_observed_at,omitempty"`
+	NextObservationAt   *time.Time `json:"next_observation_at,omitempty"`
+}
+
+// mediaCirculationSourceScheduleProof shows source-scheduling facts before a
+// source run exists. It deliberately keeps "due but unadmitted" distinct from
+// failure: the scheduler may still create a request on its next bounded pass.
+type mediaCirculationSourceScheduleProof struct {
+	GeneratedAt       time.Time                                 `json:"generated_at"`
+	Available         bool                                      `json:"available"`
+	UnavailableReason string                                    `json:"unavailable_reason,omitempty"`
+	DueUnadmitted     int                                       `json:"due_unadmitted"`
+	InFlight          int                                       `json:"in_flight"`
+	Scheduled         int                                       `json:"scheduled"`
+	Paused            int                                       `json:"paused"`
+	Unknown           int                                       `json:"unknown"`
+	Items             []mediaCirculationSourceScheduleProofItem `json:"items"`
+}
+
+type mediaCirculationSourceScheduleProofItem struct {
+	SourceID               uuid.UUID  `json:"source_id"`
+	SourceName             string     `json:"source_name"`
+	ScheduleState          string     `json:"schedule_state"`
+	Reason                 string     `json:"reason"`
+	NextDueAt              *time.Time `json:"next_due_at,omitempty"`
+	LastClaimedAt          *time.Time `json:"last_claimed_at,omitempty"`
+	LastAttemptedAt        *time.Time `json:"last_attempted_at,omitempty"`
+	LastProviderSuccessAt  *time.Time `json:"last_provider_success_at,omitempty"`
+	LastUpstreamObservedAt *time.Time `json:"last_upstream_observed_at,omitempty"`
+	LastNoChangeAt         *time.Time `json:"last_no_change_at,omitempty"`
+	LastNewItemAt          *time.Time `json:"last_new_item_at,omitempty"`
+	LastDeliveryVerifiedAt *time.Time `json:"last_delivery_verified_at,omitempty"`
+	IntakeCircuitUntil     *time.Time `json:"intake_circuit_until,omitempty"`
+	LatestRequestID        *uuid.UUID `json:"latest_request_id,omitempty"`
+	LatestRequestState     string     `json:"latest_request_state,omitempty"`
 }
 
 func GetMediaCirculationCockpit(c *gin.Context) {
@@ -98,9 +175,213 @@ func GetMediaCirculationCockpit(c *gin.Context) {
 		Policy:               health.Policy,
 		Recommendations:      rows,
 		Autopilot:            buildMediaAutopilotStatus(db, principal.TenantID, health.Policy),
+		Delivery:             loadMediaCirculationDeliveryProof(db, principal.TenantID),
+		Schedules:            loadMediaCirculationSourceScheduleProof(db, principal.TenantID),
 	}
 	resp.Summary = summarizeCockpitRecommendations(rows)
 	c.JSON(http.StatusOK, resp)
+}
+
+func loadMediaCirculationSourceScheduleProof(db *gorm.DB, tenantID string) mediaCirculationSourceScheduleProof {
+	now := time.Now().UTC()
+	proof := mediaCirculationSourceScheduleProof{GeneratedAt: now, Available: true, Items: []mediaCirculationSourceScheduleProofItem{}}
+	var sources []models.ContentSource
+	if err := db.Where("tenant_id = ? AND category = ?", tenantID, models.SourceCategoryMedia).
+		Order("CASE WHEN next_due_at IS NULL THEN 1 ELSE 0 END, next_due_at ASC, public_id ASC").Limit(mediaCirculationSourceScheduleLimit).Find(&sources).Error; err != nil {
+		proof.Available = false
+		proof.UnavailableReason = "CMS could not read media source schedule facts."
+		return proof
+	}
+
+	for _, source := range sources {
+		var latest models.SourceRunRequest
+		err := db.Where("tenant_id = ? AND content_source_id = ? AND lane = ?", tenantID, source.PublicID, models.SourceCategoryMedia).
+			Order("requested_at DESC, public_id DESC").First(&latest).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			proof.Available = false
+			proof.UnavailableReason = "CMS could not read the latest source-run state."
+			proof.Items = []mediaCirculationSourceScheduleProofItem{}
+			return proof
+		}
+		hasLatest := err == nil
+		state, reason := mediaSourceScheduleState(source, hasLatest, latest, now)
+		item := mediaCirculationSourceScheduleProofItem{
+			SourceID: source.PublicID, SourceName: source.Name, ScheduleState: state, Reason: reason,
+			NextDueAt: source.NextDueAt, LastClaimedAt: source.LastClaimedAt, LastAttemptedAt: source.LastAttemptedAt,
+			LastProviderSuccessAt: source.LastProviderSuccessAt, LastNewItemAt: source.LastNewItemAt,
+			LastUpstreamObservedAt: source.LastUpstreamObservedAt, LastNoChangeAt: source.LastNoChangeAt,
+			LastDeliveryVerifiedAt: source.LastDeliveryVerifiedAt, IntakeCircuitUntil: source.IntakeCircuitUntil,
+		}
+		if hasLatest {
+			requestID := latest.PublicID
+			item.LatestRequestID, item.LatestRequestState = &requestID, latest.State
+		}
+		switch state {
+		case "due_unadmitted":
+			proof.DueUnadmitted++
+		case "in_flight":
+			proof.InFlight++
+		case "scheduled":
+			proof.Scheduled++
+		case "paused":
+			proof.Paused++
+		default:
+			proof.Unknown++
+		}
+		proof.Items = append(proof.Items, item)
+	}
+	return proof
+}
+
+func mediaSourceScheduleState(source models.ContentSource, hasLatest bool, latest models.SourceRunRequest, now time.Time) (string, string) {
+	if !source.IsActive {
+		return "paused", "This source is inactive; no scheduling admission is expected."
+	}
+	if source.NextDueAt == nil {
+		return "unknown", "CMS has no explicit next-due checkpoint for this active source."
+	}
+	if hasLatest && sourceRunRequestActive(latest.State) {
+		return "in_flight", "A durable source run is active; CMS will verify it before treating delivery as complete."
+	}
+	if now.Before(*source.NextDueAt) {
+		return "scheduled", "The source is not due yet under its current CMS schedule."
+	}
+	return "due_unadmitted", "The source is due and has no active CMS source run; this is an admission fact, not a provider failure."
+}
+
+func sourceRunRequestActive(state string) bool {
+	switch state {
+	case models.SourceRunRequested, models.SourceRunAccepted, models.SourceRunRunning, models.SourceRunVerificationRequired:
+		return true
+	default:
+		return false
+	}
+}
+
+func loadMediaCirculationDeliveryProof(db *gorm.DB, tenantID string) mediaCirculationDeliveryProof {
+	proof := mediaCirculationDeliveryProof{GeneratedAt: time.Now().UTC(), Items: []mediaCirculationDeliveryProofItem{}}
+	var requests []models.SourceRunRequest
+	if err := db.Where("tenant_id = ? AND lane = ?", tenantID, models.SourceCategoryMedia).
+		Order("requested_at DESC, public_id DESC").Limit(mediaCirculationDeliveryRequestLimit).Find(&requests).Error; err != nil || len(requests) == 0 {
+		return proof
+	}
+	requestIDs := make([]uuid.UUID, 0, len(requests))
+	sourceIDs := make([]uuid.UUID, 0, len(requests))
+	for _, request := range requests {
+		requestIDs = append(requestIDs, request.PublicID)
+		sourceIDs = append(sourceIDs, request.ContentSourceID)
+	}
+
+	sources := map[uuid.UUID]models.ContentSource{}
+	var sourceRows []models.ContentSource
+	if err := db.Where("tenant_id = ? AND public_id IN ?", tenantID, sourceIDs).Find(&sourceRows).Error; err == nil {
+		for _, source := range sourceRows {
+			sources[source.PublicID] = source
+		}
+	}
+
+	var tasks []models.SourceRunVerificationTask
+	_ = db.Where("tenant_id = ? AND source_run_request_id IN ? AND causation_id LIKE ?", tenantID, requestIDs, "consumer_pods_delivery:%").
+		Order("created_at DESC, public_id DESC").Find(&tasks).Error
+	podsTasks := map[uuid.UUID]models.SourceRunVerificationTask{}
+	for _, task := range tasks {
+		if _, exists := podsTasks[task.SourceRunRequestID]; !exists {
+			podsTasks[task.SourceRunRequestID] = task
+		}
+	}
+	var coordinatorUnits []models.SourceRunExecutionUnit
+	_ = db.Where("tenant_id=? AND source_run_request_id IN ? AND unit_type=?", tenantID, requestIDs, "coordinator").Find(&coordinatorUnits).Error
+	terminalOutcomes := map[uuid.UUID]string{}
+	for _, unit := range coordinatorUnits {
+		terminalOutcomes[unit.SourceRunRequestID] = unit.TerminalOutcome
+	}
+
+	var events []models.SourceRunReconciliationEvent
+	_ = db.Where("tenant_id = ? AND source_run_request_id IN ? AND (causation_id = ? OR causation_id LIKE ?)", tenantID, requestIDs, "consumer_delivery", "consumer_pods_delivery:%").
+		Order("observed_at DESC, public_id DESC").Limit(mediaCirculationDeliveryEventLimit).Find(&events).Error
+	ingestEvents := map[uuid.UUID]models.SourceRunReconciliationEvent{}
+	podsEvents := map[uuid.UUID]models.SourceRunReconciliationEvent{}
+	for _, event := range events {
+		if event.CausationID == "consumer_delivery" {
+			if _, exists := ingestEvents[event.SourceRunRequestID]; !exists {
+				ingestEvents[event.SourceRunRequestID] = event
+			}
+			continue
+		}
+		if strings.HasPrefix(event.CausationID, "consumer_pods_delivery:") {
+			if _, exists := podsEvents[event.SourceRunRequestID]; !exists {
+				podsEvents[event.SourceRunRequestID] = event
+			}
+		}
+	}
+
+	for _, request := range requests {
+		source := sources[request.ContentSourceID]
+		ingest, hasIngest := ingestEvents[request.PublicID]
+		pods, hasPods := podsEvents[request.PublicID]
+		task, hasTask := podsTasks[request.PublicID]
+		item := mediaCirculationDeliveryProofItem{
+			RequestID: request.PublicID, SourceID: request.ContentSourceID, SourceName: source.Name,
+			RequestState: request.State, TerminalOutcome: terminalOutcomes[request.PublicID], EvidenceState: request.EvidenceState, RequestedAt: request.RequestedAt,
+		}
+		if hasIngest {
+			item.IngestVerdict, item.IngestObservedAt = ingest.Verdict, &ingest.ObservedAt
+		}
+		if hasPods {
+			item.PodsVerdict, item.PodsObservedAt = pods.Verdict, &pods.ObservedAt
+		}
+		if hasTask {
+			item.ObservationAttempts, item.NextObservationAt = task.AttemptCount, task.NotBeforeAt
+		}
+		item.DeliveryState, item.Reason = mediaDeliveryState(request, item.TerminalOutcome, hasIngest, ingest, hasTask, task, hasPods, pods)
+		switch item.DeliveryState {
+		case "verified":
+			proof.Verified++
+			if item.PodsObservedAt != nil && (proof.LastVerifiedAt == nil || item.PodsObservedAt.After(*proof.LastVerifiedAt)) {
+				observed := *item.PodsObservedAt
+				proof.LastVerifiedAt = &observed
+			}
+		case "pending":
+			proof.Pending++
+		case "degraded":
+			proof.Degraded++
+		default:
+			proof.NotObserved++
+		}
+		proof.Items = append(proof.Items, item)
+	}
+	return proof
+}
+
+func mediaDeliveryState(request models.SourceRunRequest, terminalOutcome string, hasIngest bool, ingest models.SourceRunReconciliationEvent, hasTask bool, task models.SourceRunVerificationTask, hasPods bool, pods models.SourceRunReconciliationEvent) (string, string) {
+	if terminalOutcome == string(supply.OutcomeNoChange) {
+		return "not_applicable", "The provider reported a verified no-change outcome; no downstream Pods item was expected."
+	}
+	if terminalOutcome == string(supply.OutcomeUpstreamChangeDeferred) {
+		return "deferred", "Upstream identities were preserved for bounded later materialization; Pods delivery is not yet expected."
+	}
+	if terminalOutcome == string(supply.OutcomeObservationBlockedByIntake) || terminalOutcome == string(supply.OutcomeConfigurationBlocked) {
+		return "blocked", "The source observation reached an explicit intake or configuration block and did not advance the provider cursor."
+	}
+	if hasPods && pods.Verdict == string(supply.VerdictPresent) {
+		return "verified", "CMS confirmed every source-run media item is currently eligible for Pods, directly or through an atomized child."
+	}
+	if hasPods && pods.Verdict == string(supply.VerdictUnknown) && hasTask && task.State == models.SourceRunVerificationTaskTerminal {
+		return "degraded", "Pods delivery evidence remained unknown after the bounded observation budget."
+	}
+	if hasTask && task.State != models.SourceRunVerificationTaskTerminal {
+		return "pending", "CMS is waiting for the next bounded Pods delivery observation; source execution will not be replayed."
+	}
+	if request.State == models.SourceRunVerificationRequired || (hasIngest && ingest.Verdict == string(supply.VerdictUnknown)) {
+		return "pending", "CMS ingest proof is still verification-required."
+	}
+	if request.State == models.SourceRunFailed || request.State == models.SourceRunPartial || request.State == models.SourceRunCancelled || request.State == models.SourceRunExpired {
+		return "not_observed", "The source run did not reach a successful ingest proof."
+	}
+	if request.State == models.SourceRunSucceeded && hasIngest && ingest.Verdict == string(supply.VerdictPresent) {
+		return "pending", "CMS ingest is verified; the read-only Pods delivery task is awaiting its first observation."
+	}
+	return "not_observed", "No authoritative Pods delivery observation exists yet."
 }
 
 func loadMediaCirculationCockpitRows(db *gorm.DB, tenantID string) []mediaCirculationCockpitRecommendation {

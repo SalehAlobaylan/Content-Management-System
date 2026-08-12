@@ -8,7 +8,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -292,6 +291,9 @@ func decideMediaAutopilotRec(rec models.MediaCirculationRecommendation, g *media
 		return mediaAutopilotDecision{Kind: mediaAutopilotDecisionApply, Executes: false,
 			Reason: "Acknowledge-only verdict; no side effect."}
 	}
+	// Source pulls now create CMS-owned bounded source-run requests. Their
+	// provider effect remains fenced in Aggregation and verified from receipts;
+	// this decision only admits that durable request after the normal trust gate.
 	if stat, ok := g.Trust[rec.Verdict]; !ok || !stat.Earned {
 		return mediaAutopilotDecision{Kind: mediaAutopilotDecisionSkip, Guardrail: models.MediaAutopilotGuardTrustGate,
 			Reason: fmt.Sprintf("Verdict %q has not earned trust yet (need ≥ %d successful human applies with revert rate < %d%%; have %d applies / %d decisions at %.0f%%).",
@@ -571,35 +573,15 @@ type mediaAutopilotRunOptions struct {
 var errMediaAutopilotDisabled = errors.New("media circulation autopilot is not enabled for this tenant")
 var errMediaAutopilotAlreadyRunning = errors.New("media circulation autopilot is already running for this tenant")
 
-var (
-	mediaAutopilotRunMu       sync.Mutex
-	mediaAutopilotRunInFlight = map[string]bool{}
-)
-
-func tryStartMediaAutopilotRun(tenantID string) bool {
-	mediaAutopilotRunMu.Lock()
-	defer mediaAutopilotRunMu.Unlock()
-	if mediaAutopilotRunInFlight[tenantID] {
-		return false
-	}
-	mediaAutopilotRunInFlight[tenantID] = true
-	return true
-}
-
-func finishMediaAutopilotRun(tenantID string) {
-	mediaAutopilotRunMu.Lock()
-	defer mediaAutopilotRunMu.Unlock()
-	delete(mediaAutopilotRunInFlight, tenantID)
-}
-
 func runMediaCirculationAutopilot(db *gorm.DB, tenantID string, opts mediaAutopilotRunOptions) (models.MediaCirculationRun, []models.MediaCirculationAction, error) {
 	if strings.TrimSpace(tenantID) == "" {
-		tenantID = defaultCirculationTenant
+		return models.MediaCirculationRun{}, nil, fmt.Errorf("media circulation autopilot requires an explicit tenant")
 	}
-	if !tryStartMediaAutopilotRun(tenantID) {
+	releaseLock, acquired := tryAcquireTenantAutopilotLock(db, "media-circulation-autopilot", tenantID)
+	if !acquired {
 		return models.MediaCirculationRun{}, nil, errMediaAutopilotAlreadyRunning
 	}
-	defer finishMediaAutopilotRun(tenantID)
+	defer releaseLock()
 
 	policy := loadEffectiveMediaCirculationPolicy(db, tenantID)
 	if !policy.Enabled || !policy.AutopilotEnabled {

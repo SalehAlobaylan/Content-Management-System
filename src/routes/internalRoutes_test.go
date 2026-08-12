@@ -2,6 +2,7 @@ package routes
 
 import (
 	"content-management-system/src/utils"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -29,5 +30,27 @@ func TestInternalRoutesExactlyMatchCapabilityMatrix(t *testing.T) {
 	}
 	for key := range registered {
 		t.Fatalf("registered internal route lacks policy: %s", key)
+	}
+}
+
+func TestSourceRunDispatchRoutesAreAggregationOnlyAndRejectLegacyBridge(t *testing.T) {
+	for _, path := range []string{
+		"/source-runs/claim",
+		"/media-supply-actions/unit-adoptions/claim",
+		"/media-supply-actions/unit-adoptions/:action/prepare",
+		"/media-supply-actions/unit-adoptions/:action/acknowledge",
+		"/media-supply-actions/receipt-redeliveries/claim",
+		"/media-supply-actions/receipt-redeliveries/:action/prepare",
+		"/media-supply-actions/receipt-redeliveries/:action/complete",
+		"/source-runs/:request/attempts/:attempt/units",
+		"/source-runs/:request/attempts/:attempt/units/:unit/begin",
+		"/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations",
+		"/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations/:observation/disposition",
+		"/source-run-verification-tasks/:task/terminal",
+	} {
+		policy, ok := utils.FindInternalRoutePolicy(http.MethodPost, path)
+		if !ok || policy.LegacySharedAllowed || !policy.Allows(utils.MachinePrincipalAggregation) || policy.Allows(utils.MachinePrincipalMedia) {
+			t.Fatalf("source-run route %s must be aggregation-only without the legacy bridge", path)
+		}
 	}
 }

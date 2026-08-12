@@ -3,6 +3,9 @@ package controllers
 import (
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -240,7 +244,8 @@ func markCirculationAtomizationRunFailed(db *gorm.DB, runID uint, message string
 		}).Error
 }
 
-// triggerMediaSourcePull reuses the same aggregation-trigger path as RunContentSource.
+// triggerMediaSourcePull creates the bounded CMS request consumed by the
+// durable Aggregation dispatcher; it does not invoke Aggregation directly.
 func triggerMediaSourcePull(db *gorm.DB, tenantID string, sourceID uuid.UUID, authorization string, allowedIntake int) (string, error) {
 	var source models.ContentSource
 	if err := db.Where("public_id = ? AND tenant_id = ?", sourceID, tenantID).First(&source).Error; err != nil {
@@ -249,30 +254,27 @@ func triggerMediaSourcePull(db *gorm.DB, tenantID string, sourceID uuid.UUID, au
 	if allowedIntake <= 0 {
 		return "", errors.New("circulation recommendation has no allowed intake")
 	}
-	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
-	if aggregationBaseURL == "" {
-		return "", errors.New("aggregation service URL is not configured")
+	// A recommendation creates a CMS request only. Aggregation later receives
+	// its selected source and immutable cap through the fenced source-run
+	// dispatcher; CMS never invokes a legacy admin handler over HTTP here.
+	now := time.Now().UTC()
+	version := source.SourceConfigVersion
+	if version < 1 {
+		version = 1
 	}
-	sourceURL, err := extractSourceRunURL(source)
-	if err != nil {
-		return "", err
-	}
-	settings, _ := parseSourceAPIConfig(source.APIConfig)
-	settings = limitSourceRunSettings(settings, allowedIntake)
-	res, err := triggerAggregationSourceRun(aggregationBaseURL, authorization, aggregationTriggerRequest{
-		SourceType: string(source.Type),
-		URL:        sourceURL,
-		Name:       source.Name,
-		Settings:   settings,
-		SourceID:   source.PublicID.String(),
+	arguments := sha256.Sum256([]byte(fmt.Sprintf("media-circulation/v1\n%s\n%d\n%d", source.PublicID, version, allowedIntake)))
+	policy := sha256.Sum256([]byte(fmt.Sprintf("media-circulation-policy/v1\n%d", allowedIntake)))
+	request, _, err := supply.CreateRequest(db, supply.CreateRequestInput{
+		Source:              source,
+		Identity:            supply.RequestIdentity{TenantID: tenantID, ContentSourceID: source.PublicID.String(), Lane: models.SourceCategoryMedia, Purpose: "circulation", CadenceWindowStart: now.Truncate(time.Minute), SourceConfigVersion: version, PolicyFingerprint: hex.EncodeToString(policy[:]), ArgumentFingerprint: hex.EncodeToString(arguments[:])},
+		RequestedBy:         "system",
+		EvidenceFingerprint: fmt.Sprintf("media-circulation-rec:%s", sourceID),
+		Metadata:            datatypes.JSON([]byte(fmt.Sprintf(`{"max_results":%d,"maxResults":%d,"initial_atomization_limit":%d,"initialAtomizationLimit":%d}`, allowedIntake, allowedIntake, allowedIntake, allowedIntake))),
 	})
 	if err != nil {
 		return "", err
 	}
-	now := time.Now().UTC()
-	source.LastFetchedAt = &now
-	_ = db.Save(&source).Error
-	return res.JobID, nil
+	return request.PublicID.String(), nil
 }
 
 func recommendationAllowedIntake(rec models.MediaCirculationRecommendation) (int, error) {

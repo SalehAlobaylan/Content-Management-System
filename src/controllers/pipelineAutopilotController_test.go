@@ -48,8 +48,8 @@ func TestSanitizePipelineAutopilotPolicy(t *testing.T) {
 		ProcessingStuckHours: 999, RecoveryCooldownMinutes: -3, TrustMinSuccessPct: 250,
 		ElevatedMode: "bogus",
 	})
-	if wild.Mode != models.PipelineAutopilotModeSafeAuto {
-		t.Errorf("safe_auto mode should survive, got %q", wild.Mode)
+	if wild.Mode != models.PipelineAutopilotModeObserve {
+		t.Errorf("legacy safe_auto must sanitize to diagnostic observe mode, got %q", wild.Mode)
 	}
 	if wild.IntervalMinutes != 15 {
 		t.Errorf("interval 5 should clamp up to 15, got %d", wild.IntervalMinutes)
@@ -206,8 +206,8 @@ func TestPipelineAutopilotElevatedCaps(t *testing.T) {
 	}
 }
 
-// Retry routing mirrors Aggregation's enqueueRetryJob guard: only genuine A/V
-// (VIDEO/PODCAST/Telegram-photo) needs the media queue; everything else embeds.
+// Diagnostic queue classification remains read-only after the WP-09 cutover:
+// Pipeline Autopilot may describe the likely owner lane but cannot enqueue it.
 func TestPipelineTargetQueue(t *testing.T) {
 	video := models.ContentItem{Type: models.ContentTypeVideo}
 	if q := pipelineTargetQueue(video); q != "media-queue" {

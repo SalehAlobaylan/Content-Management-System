@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 
 	"github.com/gin-gonic/gin"
@@ -157,6 +159,12 @@ func IngestExperienceEvents(c *gin.Context) {
 			continue
 		}
 		row.TenantID = ruxDefaultTenant
+		if row.ContentID != nil {
+			var item models.ContentItem
+			if err := db.Select("public_id", "tenant_id", "source_run_request_id").Where("public_id=?", *row.ContentID).First(&item).Error; err == nil {
+				row.TenantID = item.TenantID
+			}
+		}
 		row.ReceivedAt = now
 		rows = append(rows, row)
 	}
@@ -177,6 +185,17 @@ func IngestExperienceEvents(c *gin.Context) {
 				duplicate++
 			} else {
 				accepted++
+				if rows[i].Surface == "pods" && rows[i].EventType == "feed_rendered" && rows[i].ContentID != nil {
+					var item models.ContentItem
+					if err := db.Select("public_id", "tenant_id", "source_run_request_id").Where("public_id=? AND tenant_id=?", *rows[i].ContentID, rows[i].TenantID).First(&item).Error; err == nil {
+						generationID, _, active := feedcontract.ActiveGeneration(db, item.TenantID, "media")
+						var generation *uuid.UUID
+						if active {
+							generation = &generationID
+						}
+						_ = supply.RecordPodsBoundaryObservation(db, models.PodsBoundaryObservation{TenantID: item.TenantID, ContentItemID: item.PublicID, GenerationID: generation, Boundary: "page_render", ProbeKind: "frozen_session", ProbeID: rows[i].PageLoadID.String(), SourceRunRequestID: item.SourceRunRequestID, Verdict: string(supply.VerdictPresent), ObservedAt: rows[i].OccurredAt.UTC()})
+					}
+				}
 			}
 		}
 	}

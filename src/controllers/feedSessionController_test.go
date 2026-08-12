@@ -63,7 +63,7 @@ func TestVisibleFrozenPodsPageQueriesContentItems(t *testing.T) {
 	mock.ExpectQuery(`SELECT .*public_id.*FROM "content_items"`).
 		WillReturnRows(sqlmock.NewRows([]string{"public_id"}).AddRow(visibleID))
 
-	page, nextOffset := visibleFrozenPodsPage(db, []PodsItem{
+	page, nextOffset := visibleFrozenPodsPage(db, "tenant-a", []PodsItem{
 		{ID: visibleID},
 		{ID: hiddenID},
 	}, 0, 10)

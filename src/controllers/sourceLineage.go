@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -32,8 +33,11 @@ func createSourceRunRequest(db *gorm.DB, source models.ContentSource, requestedB
 
 func createSourceRunRequestWithCorrelation(db *gorm.DB, source models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID, correlationInput SourceRunCorrelation) (models.SourceRunRequest, error) {
 	requestedBy = strings.TrimSpace(requestedBy)
-	if requestedBy != "approval_handoff" && requestedBy != "manual" && requestedBy != "operator" && requestedBy != "schedule" && requestedBy != "system" {
+	if requestedBy != "approval_handoff" && requestedBy != "manual" && requestedBy != "schedule" && requestedBy != "system" {
 		return models.SourceRunRequest{}, fmt.Errorf("invalid source-run requester")
+	}
+	if err := supply.RequireLegacyAdmission(db, source.TenantID, source.Category); err != nil {
+		return models.SourceRunRequest{}, err
 	}
 	correlation := uuid.NewString()
 	idempotencyKey := strings.TrimSpace(correlationInput.IdempotencyKey)
@@ -147,6 +151,11 @@ func appendContentProcessingEvent(db *gorm.DB, event models.ContentProcessingEve
 	}
 	if len(event.Payload) == 0 {
 		event.Payload = datatypes.JSON([]byte(`{}`))
+	}
+	if event.PipelineRepairRequestID != nil {
+		if event.PipelineRepairAttemptID == nil || event.PipelineRepairFenceToken == nil || event.ExpectedItemUpdatedAt == nil || event.ProducerEventID == nil || strings.TrimSpace(event.EffectInputDigest) == "" || strings.TrimSpace(event.ExecutionOwner) == "" {
+			return fmt.Errorf("pipeline repair processing event correlation is incomplete")
+		}
 	}
 	return db.Create(&event).Error
 }

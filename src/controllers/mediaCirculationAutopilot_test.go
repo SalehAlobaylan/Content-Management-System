@@ -200,7 +200,7 @@ func TestGateTrustGateBlocksUnearnedVerdicts(t *testing.T) {
 	rec := autopilotTestRec(models.MediaCirculationUnitSource, mediaCircVerdictPullNow)
 	d := decideMediaAutopilotRec(rec, autopilotTestGates(nil)) // no trust at all
 	if d.Kind != mediaAutopilotDecisionSkip || d.Guardrail != models.MediaAutopilotGuardTrustGate {
-		t.Fatalf("unearned pull_now must skip on trust_gate, got %+v", d)
+		t.Fatalf("unearned source pull must stop at the trust gate, got %+v", d)
 	}
 }
 
@@ -266,8 +266,8 @@ func TestGateQueueDepthBlocksQueueLoadVerdicts(t *testing.T) {
 	g.QueueDepth = 500
 	g.MaxQueueDepth = 100
 	d := decideMediaAutopilotRec(rec, g)
-	if d.Guardrail != models.MediaAutopilotGuardQueueDepth {
-		t.Fatalf("over-cap queue must skip queue_depth, got %+v", d)
+	if d.Kind != mediaAutopilotDecisionSkip || d.Guardrail != models.MediaAutopilotGuardQueueDepth {
+		t.Fatalf("source pull must stop at the queue-depth gate, got %+v", d)
 	}
 	// But a non-queue verdict (rank_down with a good score) is unaffected.
 	rd := autopilotTestRec(models.MediaCirculationUnitItemFamily, mediaCircVerdictRankDown)
@@ -409,7 +409,7 @@ func TestGateIntakePausedUnderStorageRelief(t *testing.T) {
 	rec := autopilotTestRec(models.MediaCirculationUnitSource, mediaCircVerdictPullNow)
 	d := decideMediaAutopilotRec(rec, g)
 	if d.Kind != mediaAutopilotDecisionSkip || d.Guardrail != models.MediaAutopilotGuardElevatedMode {
-		t.Fatalf("intake must pause under storage_relief, got %+v", d)
+		t.Fatalf("source pull must stop under storage_relief, got %+v", d)
 	}
 	// Evict side is unaffected.
 	rd := autopilotTestRec(models.MediaCirculationUnitItemFamily, mediaCircVerdictRankDown)
@@ -467,8 +467,8 @@ func TestTrustGateReasonIncludesThreshold(t *testing.T) {
 		Status:    models.MediaCirculationRecStatusPending,
 	}
 	d := decideMediaAutopilotRec(rec, g)
-	if d.Guardrail != models.MediaAutopilotGuardTrustGate {
-		t.Fatalf("expected trust_gate, got %q", d.Guardrail)
+	if d.Kind != mediaAutopilotDecisionSkip || d.Guardrail != models.MediaAutopilotGuardTrustGate {
+		t.Fatalf("source pull must stop at the trust gate, got %+v", d)
 	}
 	if !strings.Contains(d.Reason, "20") {
 		t.Fatalf("trust-gate reason must name the 20-decision threshold, got: %s", d.Reason)

@@ -1,14 +1,14 @@
 package controllers
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
-	"time"
 
 	"content-management-system/src/models"
 	operatorpkg "content-management-system/src/operator"
+	"content-management-system/src/supply"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -17,19 +17,16 @@ import (
 // operatorSourceRunResult is deliberately small. Aggregation owns queue work;
 // CMS owns the handoff record and all state exposed to Operator.
 type operatorSourceRunResult struct {
-	RequestID string
-	JobID     string
+	RequestID      string
+	IdempotencyKey string
+	Created        bool
 }
 
-type operatorSourceRunDispatchResponse struct {
-	Data struct {
-		JobID string `json:"job_id"`
-	} `json:"data"`
-}
-
-// runOperatorSourceOnce is the tenant-aware mutation extracted from the legacy
-// source controller. It accepts only a persisted plan/step and re-loads the
-// source under the asserted tenant before it creates a durable handoff.
+// runOperatorSourceOnce is a durable CMS admission, not a queue handoff. The
+// signed plan creates one exact source-run request; the CMS-claimed dispatcher
+// later decides whether and when its coordinator can be enqueued. This keeps
+// browser approval, plan execution, queue acceptance, provider I/O, and
+// downstream delivery as distinct evidence boundaries.
 func runOperatorSourceOnce(db *gorm.DB, tenantID, toolKey string, plan models.OperatorActionPlan, step models.OperatorActionStep, canonical operatorpkg.CanonicalPlan) (operatorSourceRunResult, map[string]any, error) {
 	if len(canonical.TargetIDs) != 1 {
 		return operatorSourceRunResult{}, nil, fmt.Errorf("operator source run requires one target")
@@ -52,44 +49,60 @@ func runOperatorSourceOnce(db *gorm.DB, tenantID, toolKey string, plan models.Op
 	if source.Category != expectedCategory || !source.IsActive {
 		return operatorSourceRunResult{}, map[string]any{"source_id": source.PublicID.String(), "category": source.Category, "active": source.IsActive}, fmt.Errorf("source no longer passes the registered preflight")
 	}
-	sourceURL, err := extractSourceRunURL(source)
-	if err != nil {
-		return operatorSourceRunResult{}, nil, err
-	}
-	settings, err := parseSourceAPIConfig(source.APIConfig)
-	if err != nil {
-		return operatorSourceRunResult{}, nil, err
-	}
 	if plan.PublicID == uuid.Nil || step.PublicID == uuid.Nil || strings.TrimSpace(plan.IdempotencyKey) == "" {
 		return operatorSourceRunResult{}, nil, fmt.Errorf("operator plan correlation is incomplete")
 	}
-	lineage, err := createSourceRunRequestWithCorrelation(db, source, "operator", plan.ActorID, nil, SourceRunCorrelation{
-		OperatorPlanID: &plan.PublicID, OperatorStepID: &step.PublicID, IdempotencyKey: plan.IdempotencyKey,
+	identity, err := operatorSourceRunIdentity(source, plan, step, toolKey)
+	if err != nil {
+		return operatorSourceRunResult{}, nil, err
+	}
+	metadata, err := json.Marshal(map[string]any{
+		"schema_version":   supply.ContractVersion,
+		"origin":           "operator_plan",
+		"operator_plan_id": plan.PublicID.String(),
+		"operator_step_id": step.PublicID.String(),
+		"tool_key":         toolKey,
 	})
 	if err != nil {
 		return operatorSourceRunResult{}, nil, err
 	}
-	before := map[string]any{"source_id": source.PublicID.String(), "category": source.Category, "active": source.IsActive, "source_run_request_id": lineage.PublicID.String(), "state": lineage.State}
-	payload := map[string]any{
-		"source_type": string(source.Type), "url": sourceURL, "name": source.Name, "settings": settings,
-		"source_id": source.PublicID.String(), "source_run_request_id": lineage.PublicID.String(), "tenant_id": tenantID,
-		"operator_plan_id": plan.PublicID.String(), "operator_step_id": step.PublicID.String(), "idempotency_key": plan.IdempotencyKey,
-	}
-	body, status, err := callAggregationInternal(http.MethodPost, "/internal/operator/source-runs", payload)
+	request, created, err := supply.CreateRequest(db, supply.CreateRequestInput{
+		Source: source, Identity: identity, RequestedBy: "approval_handoff", RequestedByActorID: plan.ActorID,
+		OperatorPlanID: &plan.PublicID, OperatorStepID: &step.PublicID,
+		EvidenceFingerprint: "operator-plan:" + plan.PublicID.String() + ":" + step.PublicID.String(), Metadata: metadata,
+	})
 	if err != nil {
-		markSourceRunDispatchFailed(db, lineage.PublicID, err)
-		return operatorSourceRunResult{}, before, err
+		return operatorSourceRunResult{}, nil, err
 	}
-	var dispatched operatorSourceRunDispatchResponse
-	if err := json.Unmarshal(body, &dispatched); err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices || strings.TrimSpace(dispatched.Data.JobID) == "" {
-		dispatchErr := fmt.Errorf("aggregation rejected registered source run")
-		markSourceRunDispatchFailed(db, lineage.PublicID, dispatchErr)
-		return operatorSourceRunResult{}, before, dispatchErr
+	before := map[string]any{"source_id": source.PublicID.String(), "category": source.Category, "active": source.IsActive}
+	return operatorSourceRunResult{RequestID: request.PublicID.String(), IdempotencyKey: request.IdempotencyKey, Created: created}, before, nil
+}
+
+func operatorSourceRunIdentity(source models.ContentSource, plan models.OperatorActionPlan, step models.OperatorActionStep, toolKey string) (supply.RequestIdentity, error) {
+	if source.PublicID == uuid.Nil || strings.TrimSpace(source.TenantID) == "" || plan.PublicID == uuid.Nil || step.PublicID == uuid.Nil {
+		return supply.RequestIdentity{}, fmt.Errorf("operator source-run identity is incomplete")
 	}
-	if err := markSourceRunAccepted(db, lineage.PublicID, dispatched.Data.JobID); err != nil {
-		return operatorSourceRunResult{}, before, err
+	version := source.SourceConfigVersion
+	if version < 1 {
+		version = 1
 	}
-	now := time.Now().UTC()
-	_ = db.Model(&source).Update("last_fetched_at", now).Error
-	return operatorSourceRunResult{RequestID: lineage.PublicID.String(), JobID: dispatched.Data.JobID}, before, nil
+	window := plan.CreatedAt.UTC()
+	if window.IsZero() {
+		return supply.RequestIdentity{}, fmt.Errorf("operator plan has no durable creation time")
+	}
+	arguments := sha256.Sum256([]byte(strings.Join([]string{string(source.Type), source.Category, operatorSourceFeedURL(source.FeedURL), string(source.APIConfig)}, "\n")))
+	policy := sha256.Sum256([]byte(strings.Join([]string{supply.ContractVersion, "operator_source_run", toolKey, source.Category, fmt.Sprintf("%d", version)}, "\n")))
+	return supply.RequestIdentity{
+		TenantID: source.TenantID, ContentSourceID: source.PublicID.String(), Lane: source.Category, Purpose: "operator_run_once",
+		CadenceWindowStart: window, SourceConfigVersion: version,
+		PolicyFingerprint: fmt.Sprintf("%x", policy[:]), ArgumentFingerprint: fmt.Sprintf("%x", arguments[:]),
+		PlanStepToolTarget: strings.Join([]string{plan.PublicID.String(), step.PublicID.String(), toolKey, source.PublicID.String()}, ":"),
+	}, nil
+}
+
+func operatorSourceFeedURL(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }

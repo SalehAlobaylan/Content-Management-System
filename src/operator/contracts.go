@@ -16,7 +16,7 @@ import (
 // and effects can be persisted for days, so this boundary must not rely on a
 // renderer to reject protocol-relative or malformed navigation values.
 func IsInternalDeepLink(value string) bool {
-	if !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") || strings.Contains(value, "\\") {
+	if value == "" || strings.TrimSpace(value) != value || !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") || strings.Contains(value, "\\") {
 		return false
 	}
 	for _, character := range value {
@@ -25,7 +25,29 @@ func IsInternalDeepLink(value string) bool {
 		}
 	}
 	parsed, err := url.ParseRequestURI(value)
-	return err == nil && !parsed.IsAbs() && parsed.Host == "" && parsed.Path != ""
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.Opaque != "" || parsed.Path == "" || !strings.HasPrefix(parsed.Path, "/platform/") {
+		return false
+	}
+	rawPath := value
+	if queryAt := strings.IndexAny(rawPath, "?#"); queryAt >= 0 {
+		rawPath = rawPath[:queryAt]
+	}
+	// Registered route templates have no reason to carry encoded separators or
+	// dot segments. Reject router-normalized forms rather than persisting a
+	// value that means something different when the UI later navigates it.
+	if parsed.EscapedPath() != rawPath {
+		return false
+	}
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil || strings.Contains(decodedPath, "\\") || strings.Contains(decodedPath, "//") {
+		return false
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 const ContractVersion = "wahb-operator/v1"

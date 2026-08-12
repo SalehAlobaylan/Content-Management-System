@@ -288,6 +288,27 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// ranking, atomization; owns intake). Slice 1: health read model + tenant policy.
 	adminGroup.GET("/media/circulation/health", perm("aggregation", "read"), controllers.GetMediaCirculationHealth)
 	adminGroup.GET("/media/circulation/cockpit", perm("aggregation", "read"), controllers.GetMediaCirculationCockpit)
+	// Supply Continuity is a separate, read-only CMS verdict over the bounded
+	// source schedule and Pods delivery proofs. It has no queue or retry API.
+	adminGroup.GET("/media/circulation/supply", perm("aggregation", "read"), controllers.GetMediaSupplyStatus)
+	adminGroup.POST("/media/circulation/supply/evaluate", perm("aggregation", "read"), controllers.EvaluateMediaSupplyNow)
+	adminGroup.GET("/media/circulation/supply/episodes", perm("aggregation", "read"), controllers.ListMediaSupplyEpisodes)
+	adminGroup.GET("/media/circulation/supply/episodes/:id", perm("aggregation", "read"), controllers.GetMediaSupplyEpisode)
+	adminGroup.GET("/media/circulation/supply/episodes/:id/actions", perm("aggregation", "read"), controllers.ListMediaSupplyEpisodeActions)
+	adminGroup.POST("/media/circulation/supply/action-keys/:key/preview", perm("aggregation", "manage"), controllers.CreateMediaSupplyActionPreview)
+	adminGroup.POST("/media/circulation/supply/action-previews/:id/confirm", perm("aggregation", "manage"), controllers.ConfirmMediaSupplyActionPreview)
+	adminGroup.GET("/media/circulation/supply/actions/:id", perm("aggregation", "read"), controllers.GetMediaSupplyAction)
+	adminGroup.GET("/media/circulation/supply/actions/:id/events", perm("aggregation", "read"), controllers.ListMediaSupplyActionEvents)
+	adminGroup.POST("/media/circulation/supply/actions/:id/cancel", perm("aggregation", "manage"), controllers.CancelMediaSupplyAction)
+	adminGroup.GET("/media/circulation/supply/events", perm("aggregation", "read"), controllers.ListMediaSupplyEpisodeEvents)
+	adminGroup.GET("/media/circulation/supply/qualification", perm("aggregation", "read"), controllers.ListMediaSupplyQualificationState)
+	adminGroup.POST("/media/circulation/supply/qualification/cases/:id/decision", perm("aggregation", "manage"), controllers.DecideMediaSupplyQualificationCase)
+	adminGroup.POST("/media/circulation/supply/qualification/action-keys/:key/reports", perm("aggregation", "manage"), controllers.CreateMediaSupplyQualificationReport)
+	adminGroup.POST("/media/circulation/supply/qualification/reports/:id/signoffs/:role", perm("aggregation", "manage"), controllers.SignoffMediaSupplyQualificationReport)
+	adminGroup.POST("/media/circulation/supply/qualification/reports/:id/seal", perm("aggregation", "manage"), controllers.SealMediaSupplyQualificationReport)
+	adminGroup.POST("/media/circulation/supply/qualification/reports/:id/promote", perm("aggregation", "manage"), controllers.PromoteMediaSupplyQualificationReport)
+	adminGroup.POST("/media/circulation/supply/qualification/action-keys/:key/demote", perm("aggregation", "manage"), controllers.DemoteMediaSupplyActionPromotion)
+	adminGroup.GET("/media/circulation/source-runs/:id/trace", perm("aggregation", "read"), controllers.GetMediaCirculationSourceRunTrace)
 	adminGroup.GET("/media/circulation/intelligence", perm("aggregation", "read"), controllers.GetMediaIntelligenceDiagnostics)
 	// Ranking/Intelligence control room — media-value engine tuning + refresh.
 	adminGroup.GET("/media/intelligence/config", perm("aggregation", "read"), controllers.GetMediaIntelligenceConfig)

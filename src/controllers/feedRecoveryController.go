@@ -3,6 +3,7 @@ package controllers
 import (
 	"bytes"
 	"compress/gzip"
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"crypto/sha256"
@@ -2184,55 +2185,24 @@ func currentFeedAvailability(db *gorm.DB, tenant, lane string) *feedAvailability
 // boundary. During the migration window (before the recovery tables exist) it
 // is a no-op so older installations keep their existing live query behavior.
 func applyActiveGenerationMembership(db *gorm.DB, query *gorm.DB, tenant, lane, memberType, memberColumn string) *gorm.DB {
-	// DryRun callers compile feed SQL with sqlmock and do not have the recovery
-	// tables available for information_schema probing. Runtime requests still
-	// perform the table checks below.
-	if db != nil && db.Statement != nil && db.Statement.DryRun {
-		return query
-	}
-	if !db.Migrator().HasTable(&models.FeedGenerationHead{}) || !db.Migrator().HasTable(&models.FeedGenerationMembership{}) {
-		return query
-	}
-	var head models.FeedGenerationHead
-	if err := db.Where("tenant_id=? AND lane=?", tenant, lane).First(&head).Error; err != nil || head.ActiveGenerationID == nil {
-		return query
-	}
-	return query.Where(`EXISTS (
-        SELECT 1
-        FROM feed_generation_heads generation_head
-        JOIN feed_generation_memberships generation_membership
-          ON generation_membership.generation_id = generation_head.active_generation_id
-        WHERE generation_head.tenant_id = ?
-          AND generation_head.lane = ?
-          AND generation_membership.member_type = ?
-          AND generation_membership.member_id = `+memberColumn+`
-    )`, tenant, lane, memberType)
+	return feedcontract.ApplyActiveGenerationMembership(db, query, tenant, lane, memberType, memberColumn)
 }
 
-// attachReadyContentToFeedGenerations is the single dual-write primitive for
-// future Safe Cutover. Normal serving remains live; this only records which
-// active/candidate namespaces have seen a newly eligible item.
-func attachReadyContentToFeedGenerations(db *gorm.DB, item models.ContentItem) {
-	if item.Status != models.ContentStatusReady {
-		return
-	}
-	lane, memberType, memberID := "media", "feed_unit", item.PublicID
-	if item.Type == models.ContentTypeNews {
-		if item.StoryID == nil {
-			return
-		}
-		lane, memberType, memberID = "news", "story", *item.StoryID
-	} else if !item.IsFeedUnit || item.FeedVisibility != "visible" {
+// attachReadyNewsStoryToGeneration retains the News-side write path. Media
+// units use feedstate.SyncMediaMembership in the same transaction as their
+// lifecycle mutation; News membership remains story-classifier owned.
+func attachReadyNewsStoryToGeneration(db *gorm.DB, item models.ContentItem) {
+	if item.Type != models.ContentTypeNews || item.Status != models.ContentStatusReady || item.StoryID == nil {
 		return
 	}
 	var head models.FeedGenerationHead
-	if err := db.Where("tenant_id=? AND lane=?", item.TenantID, lane).First(&head).Error; err != nil {
+	if err := db.Where("tenant_id=? AND lane=?", item.TenantID, "news").First(&head).Error; err != nil {
 		return
 	}
 	for _, generationID := range []*uuid.UUID{head.ActiveGenerationID, head.CandidateGenerationID} {
-		if generationID == nil {
+		if generationID == nil || *generationID == uuid.Nil {
 			continue
 		}
-		_ = db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", *generationID, memberType, memberID).Error
+		_ = db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", *generationID, "story", *item.StoryID).Error
 	}
 }

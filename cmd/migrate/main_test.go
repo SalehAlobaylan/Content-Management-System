@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -36,6 +37,24 @@ func TestListMigrationFilesRejectsEmptyFiles(t *testing.T) {
 	}
 	if _, err := listMigrationFiles(dir); err == nil {
 		t.Fatal("empty migration was accepted")
+	}
+}
+
+func TestCanonicalMigrationsUseRunnerTransactionContract(t *testing.T) {
+	files, err := listMigrationFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topLevelTransaction := regexp.MustCompile(`(?im)^\s*(BEGIN|COMMIT|ROLLBACK)\s*;`)
+	for _, file := range files {
+		sql, err := os.ReadFile(file.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, historicalException := legacyTransactionalMigrations[file.Version]
+		if topLevelTransaction.Match(sql) && !historicalException {
+			t.Fatalf("%s contains top-level transaction control but is not an audited historical exception", file.Version)
+		}
 	}
 }
 

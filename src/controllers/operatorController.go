@@ -15,6 +15,7 @@ import (
 
 	"content-management-system/src/models"
 	operatorpkg "content-management-system/src/operator"
+	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 
 	"github.com/gin-gonic/gin"
@@ -75,6 +76,15 @@ type operatorPlanApprovalRequest struct {
 	Confirmation string `json:"confirmation"`
 }
 
+func isOperatorSupplyRecoveryTool(key string) bool {
+	for _, registered := range operatorpkg.OperatorSupplyRecoveryToolKeys() {
+		if key == registered {
+			return true
+		}
+	}
+	return false
+}
+
 // ListOperatorEligibleActions is an owner-bound CMS read model for action UI.
 // It never grants authority: the subsequent signed-plan preview repeats all
 // current IAM, policy, freshness, target, and control checks.
@@ -127,15 +137,31 @@ func ListOperatorEligibleActions(c *gin.Context) {
 	}
 	catalog := operatorpkg.DefaultToolCatalog()
 	items := make([]gin.H, 0)
-	for _, descriptor := range catalog.ListForDomain(input.VisibleContext.Domain) {
+	for _, toolKey := range operatorpkg.ToolKeysForDomain(input.VisibleContext.Domain) {
+		descriptor, found := catalog.Lookup(toolKey)
+		if !found {
+			// The static manifest is validated at startup/tests, but fail closed
+			// if a skewed build ever returns an unknown descriptor.
+			continue
+		}
 		if !access.HasPermission(descriptor.RequiredPermission) || operatorpkg.EnsureToolCapabilityEnabled(db, tenantID, descriptor.Key, time.Now().UTC()) != nil {
 			continue
 		}
 		targets := make([]string, 0, len(input.VisibleContext.Selection.IDs))
 		for _, targetID := range input.VisibleContext.Selection.IDs {
-			if _, deriveErr := catalog.DeriveArguments(descriptor.Key, []string{targetID}); deriveErr == nil {
-				targets = append(targets, targetID)
+			if _, deriveErr := catalog.DeriveArguments(descriptor.Key, []string{targetID}); deriveErr != nil {
+				continue
 			}
+			if isOperatorSupplyRecoveryTool(descriptor.Key) {
+				episodeID, parseErr := uuid.Parse(targetID)
+				if parseErr != nil {
+					continue
+				}
+				if _, _, eligibilityErr := operatorSupplyEligibleCandidate(db, tenantID, episodeID, descriptor.Key); eligibilityErr != nil {
+					continue
+				}
+			}
+			targets = append(targets, targetID)
 		}
 		if len(targets) == 0 {
 			continue
@@ -717,6 +743,21 @@ func CreateOperatorPlan(c *gin.Context) {
 		return
 	}
 	catalog := operatorpkg.DefaultToolCatalog()
+	if isOperatorSupplyRecoveryTool(body.ToolKey) {
+		if len(body.TargetIDs) != 1 {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Requested Supply recovery is ambiguous"})
+			return
+		}
+		episodeID, parseErr := uuid.Parse(body.TargetIDs[0])
+		if parseErr != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Requested Supply episode is invalid"})
+			return
+		}
+		if _, _, eligibilityErr := operatorSupplyEligibleCandidate(db, tenantID, episodeID, body.ToolKey); eligibilityErr != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Requested Supply recovery is no longer eligible"})
+			return
+		}
+	}
 	arguments, err := catalog.DeriveArguments(body.ToolKey, body.TargetIDs)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Requested Operator action is not admitted"})
@@ -886,9 +927,13 @@ func operatorExecutionPolicy(db *gorm.DB, tenantID string) (operatorpkg.LaunchMo
 	}
 	var persisted models.OperatorPolicy
 	var row *models.OperatorPolicy
-	if err := db.Where("tenant_id=?", tenantID).First(&persisted).Error; err == nil {
+	// A missing row is the normal state for a tenant that relies on the
+	// operational-by-default policy. Use Find instead of First so GORM does
+	// not emit a record-not-found error for every Operator request; the
+	// capability-control overlay below remains the authoritative kill switch.
+	if err := db.Where("tenant_id=?", tenantID).Limit(1).Find(&persisted).Error; err == nil && persisted.TenantID != "" {
 		row = &persisted
-	} else if err != gorm.ErrRecordNotFound {
+	} else if err != nil {
 		return "", operatorpkg.RuntimePolicy{}, err
 	}
 	policy, err := operatorpkg.ResolveRuntimePolicy(bootMode, row)
@@ -975,7 +1020,7 @@ func operatorPlanDeepLinks(toolKey string, targets []string) []string {
 		return []string{"/platform/economics"}
 	case "news_circulation.pause.24h":
 		return []string{"/platform/news/circulation"}
-	case "media_circulation.pause.24h":
+	case "media_circulation.pause.24h", "media_circulation.supply.disable_evaluator":
 		return []string{"/platform/media/circulation"}
 	case "redundancy.pause.24h":
 		return []string{"/platform/media/redundancy"}
@@ -1130,6 +1175,30 @@ func executeRegisteredOperatorPlan(ctx context.Context, db *gorm.DB, tenantID st
 		return afterFound && !afterSnapshot.Dirty && afterSnapshot.SlideCount == count, before, after, verified
 	case "feed_integrity.suppress_episode.1h", "feed_integrity.revoke_suppression", "real_experience.suppress_incident.1h", "real_experience.revoke_suppression":
 		return executeOperatorDomainSafetyPlan(ctx, db, tenantID, toolKey, plan, canonical)
+	case "media_circulation.supply.disable_evaluator":
+		return executeOperatorMediaSupplyEvaluatorDisablePlan(ctx, db, tenantID, plan, canonical)
+	case supply.SupplyActionRepairMissedAdmission, supply.SupplyActionReclaimDispatchClaim, supply.SupplyActionTransferUnitLease,
+		supply.SupplyActionAdoptUnitJob, supply.SupplyActionRedeliverReceipt, supply.SupplyActionVerifyEffect,
+		supply.SupplyActionFinalizeVerifiedNoChange, supply.SupplyActionCancelUnstarted, supply.SupplyActionPipelineResumeExactStage,
+		supply.SupplyActionArtifactRequestTranscript, supply.SupplyActionArtifactRequestImageEmbedding,
+		supply.SupplyActionArtifactRequestTextEmbedding, supply.SupplyActionArtifactRequestLLMMetadata,
+		supply.SupplyActionAtomizationExecuteExactParent, supply.SupplyActionFeedGenerationAttachVerifiedMember:
+		if len(canonical.TargetIDs) != 1 || len(canonical.NormalizedArguments) != 1 {
+			return false, nil, map[string]any{"error_class": "invalid_supply_episode"}, nil
+		}
+		episodeID, err := uuid.Parse(canonical.TargetIDs[0])
+		argumentEpisode, argumentOK := canonical.NormalizedArguments["episode_id"].(string)
+		if err != nil || !argumentOK || argumentEpisode != canonical.TargetIDs[0] {
+			return false, nil, map[string]any{"error_class": "invalid_supply_episode"}, nil
+		}
+		before := map[string]any{"schema_version": "operator-supply-handoff/v1", "episode_id": episodeID, "action_key": toolKey, "native_action_queued": false}
+		request, err := queueOperatorMediaSupplyRecovery(db, tenantID, access.UserID, access, toolKey, episodeID)
+		if err != nil {
+			return false, before, map[string]any{"error_class": "native_supply_handoff_failed"}, nil
+		}
+		after := map[string]any{"schema_version": "operator-supply-handoff/v1", "episode_id": episodeID, "action_key": toolKey, "native_action_id": request.PublicID, "native_action_state": request.State}
+		verified := map[string]any{"signed_native_action_queued": request.State == models.MediaSupplyActionRequestQueued, "native_action_id": request.PublicID, "affected_domains": request.AffectedDomains, "affected_subjects": request.AffectedSubjects, "deep_links": request.DeepLinks}
+		return request.State == models.MediaSupplyActionRequestQueued, before, after, verified
 	case "feed_integrity.pause.24h", "real_experience.pause.24h", "retention.pause.24h", "ai_economics.pause.24h", "news_circulation.pause.24h", "media_circulation.pause.24h", "redundancy.pause.24h", "pipeline.pause.24h", "enrichment.pause.24h", "embeddings.pause_campaigns.24h", "topics_preferences.pause.24h", "media_library.pause.24h":
 		return executeOperatorDomainPausePlan(ctx, db, tenantID, toolKey, canonical)
 	case "sources.pause", "sources.resume", "media_sources.pause", "media_sources.resume":
@@ -1137,13 +1206,13 @@ func executeRegisteredOperatorPlan(ctx context.Context, db *gorm.DB, tenantID st
 	case "sources.run_once", "media_sources.run_once":
 		result, before, err := runOperatorSourceOnce(db, tenantID, toolKey, plan, step, canonical)
 		if err != nil {
-			return false, before, map[string]any{"error_class": "source_run_handoff_failed"}, nil
+			return false, before, map[string]any{"error_class": "source_run_admission_failed"}, nil
 		}
 		var request models.SourceRunRequest
-		accepted := db.Where("public_id=? AND tenant_id=?", result.RequestID, tenantID).First(&request).Error == nil && request.State == models.SourceRunAccepted && request.AggregationJobID == result.JobID && request.OperatorPlanID != nil && *request.OperatorPlanID == plan.PublicID && request.OperatorStepID != nil && *request.OperatorStepID == step.PublicID && request.IdempotencyKey == plan.IdempotencyKey
-		after := map[string]any{"source_run_request_id": result.RequestID, "job_id": result.JobID, "state": request.State}
-		verified := map[string]any{"accepted": accepted, "plan_correlation": request.OperatorPlanID != nil && *request.OperatorPlanID == plan.PublicID, "step_correlation": request.OperatorStepID != nil && *request.OperatorStepID == step.PublicID, "idempotency_correlation": request.IdempotencyKey == plan.IdempotencyKey}
-		return accepted, before, after, verified
+		admitted := db.Where("public_id=? AND tenant_id=?", result.RequestID, tenantID).First(&request).Error == nil && request.State == models.SourceRunRequested && request.OperatorPlanID != nil && *request.OperatorPlanID == plan.PublicID && request.OperatorStepID != nil && *request.OperatorStepID == step.PublicID && request.IdempotencyKey == result.IdempotencyKey
+		after := map[string]any{"source_run_request_id": result.RequestID, "state": request.State, "admission_created": result.Created}
+		verified := map[string]any{"durable_admission": admitted, "queue_acceptance_is_not_completion": true, "plan_correlation": request.OperatorPlanID != nil && *request.OperatorPlanID == plan.PublicID, "step_correlation": request.OperatorStepID != nil && *request.OperatorStepID == step.PublicID, "request_idempotency": request.IdempotencyKey == result.IdempotencyKey}
+		return admitted, before, after, verified
 	default:
 		return false, nil, map[string]any{"error_class": "unregistered_executor"}, nil
 	}

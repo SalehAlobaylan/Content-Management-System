@@ -191,17 +191,10 @@ func TestInFlightSTTGuardrailConstant(t *testing.T) {
 }
 
 func TestBulkLane(t *testing.T) {
-	if !tryStartEnrichmentAutopilotRun("bulk-lane-test") {
-		t.Fatal("fresh tenant should acquire")
-	}
-	if !enrichmentAutopilotAnyRunInFlight() {
-		t.Fatal("autopilot must mark lane busy")
-	}
-	finishEnrichmentAutopilotRun("bulk-lane-test")
 	bulkMu.Lock()
 	bulkState.Running = true
 	bulkMu.Unlock()
-	if !bulkLaneBusy() {
+	if !bulkEnrichRunning() {
 		t.Fatal("manual run must mark lane busy")
 	}
 	bulkMu.Lock()

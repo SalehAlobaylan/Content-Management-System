@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/base64"
@@ -81,7 +82,7 @@ func frozenSessionLimit(c *gin.Context) int {
 func activeFeedGeneration(db *gorm.DB, tenantID, lane string) int64 {
 	var head models.FeedGenerationHead
 	if err := db.Where("tenant_id=? AND lane=?", tenantID, lane).First(&head).Error; err != nil || head.Generation < 1 {
-		return 1
+		return 0
 	}
 	return head.Generation
 }
@@ -107,6 +108,9 @@ func snapshotCurrentPodsFeed(c *gin.Context, db *gorm.DB) ([]PodsItem, error) {
 	if userID, ok := c.Get("user_id"); ok {
 		snapshotContext.Set("user_id", userID)
 	}
+	if tenantID, ok := c.Get("tenant_id"); ok {
+		snapshotContext.Set("tenant_id", tenantID)
+	}
 
 	GetPodsFeed(snapshotContext)
 	if recorder.Code != http.StatusOK {
@@ -124,7 +128,7 @@ func cloneURL(source *url.URL) *url.URL {
 	return &copy
 }
 
-func visibleFrozenPodsPage(db *gorm.DB, items []PodsItem, offset, limit int) ([]PodsItem, int) {
+func visibleFrozenPodsPage(db *gorm.DB, tenantID string, items []PodsItem, offset, limit int) ([]PodsItem, int) {
 	if offset >= len(items) {
 		return []PodsItem{}, len(items)
 	}
@@ -133,7 +137,10 @@ func visibleFrozenPodsPage(db *gorm.DB, items []PodsItem, offset, limit int) ([]
 		ids = append(ids, item.ID)
 	}
 	var visibleIDs []uuid.UUID
-	_ = publicContentQuery(db.Model(&models.ContentItem{})).
+	// Preserve the frozen membership across later generation rotations while
+	// still removing items that become unsafe or canonically ineligible.
+	query := feedcontract.PodsEligibleMediaQuery(db, tenantID, supportsAtomizedPodsSchema(db))
+	_ = query.
 		Where("content_items.public_id IN ?", ids).
 		Pluck("content_items.public_id", &visibleIDs).Error
 	visible := make(map[uuid.UUID]struct{}, len(visibleIDs))
@@ -155,9 +162,18 @@ func visibleFrozenPodsPage(db *gorm.DB, items []PodsItem, offset, limit int) ([]
 // caller's six-hour active session.
 func CreatePodsFeedSession(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+		return
+	}
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication or session_id required"})
+		return
+	}
+	if _, supported, active := feedcontract.ActiveGeneration(db, tenantID, "media"); supported && !active {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Pods generation authority is unavailable"})
 		return
 	}
 
@@ -174,10 +190,11 @@ func CreatePodsFeedSession(c *gin.Context) {
 	now := time.Now().UTC()
 	session := models.ConsumerFeedSession{
 		ID:            uuid.New(),
+		TenantID:      tenantID,
 		IdentityScope: identityScope,
 		FeedType:      "pods",
 		Snapshot:      datatypes.JSON(snapshot),
-		Generation:    activeFeedGeneration(db, "default", "media"),
+		Generation:    activeFeedGeneration(db, tenantID, "media"),
 		ExpiresAt:     now.Add(consumerFeedSessionLifetime),
 	}
 	if err := db.Create(&session).Error; err != nil {
@@ -185,13 +202,18 @@ func CreatePodsFeedSession(c *gin.Context) {
 		return
 	}
 
-	page, nextOffset := visibleFrozenPodsPage(db, items, 0, frozenSessionLimit(c))
+	page, nextOffset := visibleFrozenPodsPage(db, tenantID, items, 0, frozenSessionLimit(c))
 	c.JSON(http.StatusCreated, frozenPodsSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: len(items) == 0})
 }
 
 // GetPodsFeedSessionPage serves only the persisted ordering for the session.
 func GetPodsFeedSessionPage(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+		return
+	}
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication or session_id required"})
@@ -203,16 +225,12 @@ func GetPodsFeedSessionPage(c *gin.Context) {
 		return
 	}
 	var session models.ConsumerFeedSession
-	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "pods").First(&session).Error; err != nil {
+	if err := db.Where("id = ? AND tenant_id = ? AND identity_scope = ? AND feed_type = ?", sessionID, tenantID, identityScope, "pods").First(&session).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
 		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
-		return
-	}
-	if session.Generation != activeFeedGeneration(db, "default", "media") {
-		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session was refreshed; create a new session"})
 		return
 	}
 	offset, err := parseFrozenSessionCursor(c.Query("cursor"))
@@ -225,7 +243,7 @@ func GetPodsFeedSessionPage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Stored Pods session is invalid"})
 		return
 	}
-	page, nextOffset := visibleFrozenPodsPage(db, items, offset, frozenSessionLimit(c))
+	page, nextOffset := visibleFrozenPodsPage(db, tenantID, items, offset, frozenSessionLimit(c))
 	c.JSON(http.StatusOK, frozenPodsSessionResponse{SessionID: session.ID.String(), ExpiresAt: session.ExpiresAt, Cursor: frozenSessionCursor(nextOffset, len(items)), Items: page, CaughtUp: offset >= len(items)})
 }
 
@@ -235,6 +253,11 @@ func GetPodsFeedSessionPage(c *gin.Context) {
 // deliberate client action through session creation.
 func GetPodsFeedSessionFreshness(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+		return
+	}
 	identityScope, ok := consumerFeedIdentityScope(c)
 	if !ok {
 		c.JSON(http.StatusUnauthorized, utils.HTTPError{Code: http.StatusUnauthorized, Message: "Authentication or session_id required"})
@@ -246,7 +269,7 @@ func GetPodsFeedSessionFreshness(c *gin.Context) {
 		return
 	}
 	var session models.ConsumerFeedSession
-	if err := db.Where("id = ? AND identity_scope = ? AND feed_type = ?", sessionID, identityScope, "pods").First(&session).Error; err != nil {
+	if err := db.Where("id = ? AND tenant_id = ? AND identity_scope = ? AND feed_type = ?", sessionID, tenantID, identityScope, "pods").First(&session).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Pods session not found"})
 		return
 	}

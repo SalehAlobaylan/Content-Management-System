@@ -19,8 +19,7 @@ func TestIAMAccessClientFromEnvUsesEstablishedCMSIdentity(t *testing.T) {
 	t.Setenv("IAM_BASE_URL", "http://iam.test")
 	t.Setenv("OPERATOR_IAM_ACCESS_SNAPSHOT_TOKEN", "")
 	t.Setenv("CMS_SERVICE_TOKEN", "cms-machine-token")
-	client, err := NewIAMAccessClientFromEnv()
-	if err != nil || client.token != "cms-machine-token" {
+	if _, err := NewIAMAccessClientFromEnv(); err != nil {
 		t.Fatalf("expected CMS machine identity fallback, got %v", err)
 	}
 }

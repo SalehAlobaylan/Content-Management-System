@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 	"content-management-system/src/tests/testdb"
 
 	"github.com/google/uuid"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -19,9 +21,10 @@ func fabricTestDB(t *testing.T) *gorm.DB {
 	db := testdb.Open(t)
 	if err := db.AutoMigrate(
 		&models.OperatorCapabilityControl{}, &models.OperatorRecommendation{}, &models.OperatorRecommendationFeedback{},
-		&models.ContentSource{}, &models.SourceRunRequest{}, &models.ContentProcessingEvent{}, &models.ContentItem{},
+		&models.ContentSource{}, &models.SourceRunRequest{}, &models.SourceRunAttempt{}, &models.SourceRunExecutionUnit{}, &models.SourceRunReceipt{}, &models.SourceRunVerificationTask{}, &models.SourceRunReconciliationEvent{}, &models.ContentProcessingEvent{}, &models.ContentItem{},
 		&models.DiscoveryProfile{}, &models.SourceSuggestion{},
 		&models.MediaCirculationPolicy{}, &models.MediaCirculationRun{}, &models.MediaCirculationRecommendation{},
+		&models.MediaSupplyControl{}, &models.MediaSupplyEvaluationCheckpoint{}, &models.MediaSupplyEpisode{}, &models.MediaSupplyEpisodeEvent{},
 		&models.NewsSnapshot{},
 		&models.FeedRecoveryPlan{}, &models.FeedRecoveryRun{}, &models.FeedRecoveryAction{}, &models.FeedRecoveryLaneLease{}, &models.FeedRecoveryArtifact{}, &models.FeedAvailabilityState{}, &models.FeedGeneration{},
 		&models.RetentionPolicy{}, &models.RetentionExecutionControl{}, &models.RetentionDBSample{}, &models.RetentionRun{}, &models.RetentionAction{}, &models.RetentionHold{}, &models.RetentionCompactionManifest{}, &models.RetentionHistoricalManifest{}, &models.RetentionRecoveryArtifact{}, &models.RetentionHistoricalRecoveryArtifact{}, &models.NewsMonthArchive{}, &models.RetentionOwnerRequest{}, &models.RetentionMaintenanceReport{},
@@ -55,11 +58,20 @@ func fabricTestDB(t *testing.T) *gorm.DB {
 		_ = db.Exec("DELETE FROM media_circulation_recommendations").Error
 		_ = db.Exec("DELETE FROM media_circulation_runs").Error
 		_ = db.Exec("DELETE FROM media_circulation_policies").Error
+		_ = db.Exec("DELETE FROM media_supply_episode_events").Error
+		_ = db.Exec("DELETE FROM media_supply_episodes").Error
+		_ = db.Exec("DELETE FROM media_supply_evaluation_checkpoints").Error
+		_ = db.Exec("DELETE FROM media_supply_controls").Error
 		_ = db.Exec("DELETE FROM news_snapshots").Error
 		_ = db.Exec("DELETE FROM content_processing_events").Error
 		_ = db.Exec("DELETE FROM source_suggestions").Error
 		_ = db.Exec("DELETE FROM discovery_profiles").Error
 		_ = db.Exec("DELETE FROM content_items").Error
+		_ = db.Exec("DELETE FROM source_run_reconciliation_events").Error
+		_ = db.Exec("DELETE FROM source_run_verification_tasks").Error
+		_ = db.Exec("DELETE FROM source_run_receipts").Error
+		_ = db.Exec("DELETE FROM source_run_execution_units").Error
+		_ = db.Exec("DELETE FROM source_run_attempts").Error
 		_ = db.Exec("DELETE FROM source_run_requests").Error
 		_ = db.Exec("DELETE FROM content_sources").Error
 	}
@@ -264,7 +276,7 @@ func TestMediaCirculationFabricUsesBoundedPersistedCMSFacts(t *testing.T) {
 	if err := packet.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if len(packet.Facts) != 4 || len(packet.Evidence) != 4 || packet.Completeness != "complete" {
+	if len(packet.Facts) != 8 || len(packet.Evidence) != 8 || packet.Completeness != "complete" {
 		t.Fatalf("unexpected circulation packet: %+v", packet)
 	}
 	if len(packet.Recommendations) != 1 || packet.Recommendations[0].ManualOnly {
@@ -283,6 +295,78 @@ func TestMediaCirculationFabricUsesBoundedPersistedCMSFacts(t *testing.T) {
 				t.Fatalf("unexpected evidence-bound score trend: %#v", value)
 			}
 		}
+	}
+}
+
+func TestMediaCirculationFabricIncludesBoundedSourceContinuityEvidence(t *testing.T) {
+	db := fabricTestDB(t)
+	now := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Minute)
+	source := models.ContentSource{TenantID: "tenant-a", Name: "Due podcast", Type: models.SourceTypePodcast, Category: models.SourceCategoryMedia, NextDueAt: &past}
+	if err := db.Create(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	request := models.SourceRunRequest{TenantID: "tenant-a", ContentSourceID: source.PublicID, Lane: models.SourceCategoryMedia, Purpose: "circulation", RequestedBy: "schedule", State: models.SourceRunSucceeded, EvidenceState: "verified", RequestedAt: now.Add(-time.Hour)}
+	if err := db.Create(&request).Error; err != nil {
+		t.Fatal(err)
+	}
+	task := models.SourceRunVerificationTask{TenantID: "tenant-a", TaskKey: "delivery", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", EvidenceBoundary: "pods", CausationID: "consumer_pods_delivery:test", VerifierName: "cms", VerifierSchemaVersion: "v1", State: models.SourceRunVerificationTaskTerminal, TerminalVerdict: string(supply.VerdictPresent)}
+	if err := db.Create(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	event := models.SourceRunReconciliationEvent{TenantID: "tenant-a", EventKey: "pods-present", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", Verdict: string(supply.VerdictPresent), EvidenceSnapshot: "snapshot", VerifierSchemaVersion: "v1", VerificationTaskID: task.PublicID, CausationID: "consumer_pods_delivery:test", ProvenanceDigest: "digest", ObservedAt: now}
+	if err := db.Create(&event).Error; err != nil {
+		t.Fatal(err)
+	}
+	digest := "evaluation-digest"
+	checkpoint := models.MediaSupplyEvaluationCheckpoint{TenantID: "tenant-a", LastTrigger: models.MediaSupplyEvaluationTriggerScheduled, LastOutcome: models.MediaSupplyEvaluationOutcomeEvaluated, LastObservedAt: now, LastEvaluatedAt: &now, EvaluationDigest: &digest}
+	if err := db.Create(&checkpoint).Error; err != nil {
+		t.Fatal(err)
+	}
+	episode := models.MediaSupplyEpisode{PublicID: uuid.New(), TenantID: "tenant-a", Fingerprint: "supply-fingerprint", FirstFailedBoundary: "cms_admission", Verdict: string(supply.SupplyVerdictSourceDueNotAdmitted), Severity: "major", Owner: "CMS source-run scheduler", State: models.MediaSupplyEpisodeOpen, Summary: "Due source has no active run.", AffectedSubjects: datatypes.JSON([]byte(`[]`)), EvidenceDigest: digest, EvidenceCompleteness: "complete", Evidence: datatypes.JSON([]byte(`{}`)), FirstSeenAt: now.Add(-time.Minute), LastSeenAt: now}
+	if err := db.Create(&episode).Error; err != nil {
+		t.Fatal(err)
+	}
+	fabric := NewContextFabric(db, DefaultAdapterRegistry())
+	fabric.now = func() time.Time { return now }
+	packet, err := fabric.BuildMediaCirculationStatePacket(context.Background(), mediaCirculationVisibleContext(), approvalAccess())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var continuity, headline, evaluator, attention map[string]any
+	for _, fact := range packet.Facts {
+		if fact.Key == "media_circulation.source_continuity" {
+			continuity = fact.Value.(map[string]any)
+		}
+		if fact.Key == "media_circulation.supply_continuity" {
+			headline = fact.Value.(map[string]any)
+		}
+		if fact.Key == "media_circulation.supply_evaluator" {
+			evaluator = fact.Value.(map[string]any)
+		}
+		if fact.Key == "media_circulation.supply_attention" {
+			attention = fact.Value.(map[string]any)
+		}
+	}
+	if continuity == nil || continuity["sampled_count"] != 1 || continuity["legacy_last_fetched_is_not_provider_success"] != true {
+		t.Fatalf("missing source continuity fact: %#v", continuity)
+	}
+	rows := continuity["sources"].([]map[string]any)
+	if rows[0]["schedule_state"] != "due_unadmitted" || rows[0]["delivery_state"] != "verified" || rows[0]["pods_verdict"] != string(supply.VerdictPresent) {
+		t.Fatalf("unexpected source continuity row: %#v", rows[0])
+	}
+	if headline == nil || headline["verdict"] != string(supply.SupplyVerdictSourceDueNotAdmitted) || headline["read_only"] != true {
+		t.Fatalf("missing deterministic supply headline: %#v", headline)
+	}
+	if evaluator == nil || evaluator["checkpoint_present"] != true || evaluator["checkpoint_last_outcome"] != models.MediaSupplyEvaluationOutcomeEvaluated {
+		t.Fatalf("missing evaluator checkpoint evidence: %#v", evaluator)
+	}
+	if attention == nil || attention["sampled_count"] != 1 || attention["truncated"] != false {
+		t.Fatalf("missing bounded supply attention evidence: %#v", attention)
+	}
+	attentionRows := attention["episodes"].([]map[string]any)
+	if len(attentionRows) != 1 || attentionRows[0]["episode_id"] != episode.PublicID.String() || attentionRows[0]["state"] != models.MediaSupplyEpisodeOpen {
+		t.Fatalf("unexpected attention episode projection: %#v", attentionRows)
 	}
 }
 

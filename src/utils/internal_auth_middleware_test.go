@@ -92,3 +92,13 @@ func TestInternalPolicyTableHasUniqueExplicitRoutes(t *testing.T) {
 		}
 	}
 }
+
+func TestPipelineRepairTerminalReceiptIsAggregationOnly(t *testing.T) {
+	policy, ok := FindInternalRoutePolicy(http.MethodPost, "/pipeline-repairs/:id/terminal")
+	if !ok || policy.Capability != "pipeline-repairs.terminal" {
+		t.Fatalf("pipeline terminal policy is missing or wrong: %#v", policy)
+	}
+	if !policy.Allows(MachinePrincipalAggregation) || policy.Allows(MachinePrincipalEnrichment) || policy.Allows(MachinePrincipalMedia) {
+		t.Fatalf("pipeline terminal receipt must be Aggregation-only: %#v", policy.Principals)
+	}
+}

@@ -79,6 +79,7 @@ func (ConsumerRequestIdempotency) TableName() string {
 // ledger but must not invent ranking continuity by itself.
 type ConsumerFeedSession struct {
 	ID            uuid.UUID      `gorm:"column:id;type:uuid;primaryKey"`
+	TenantID      string         `gorm:"column:tenant_id;type:varchar(64);not null;index"`
 	IdentityScope string         `gorm:"column:identity_scope;type:varchar(320);not null;index"`
 	FeedType      string         `gorm:"column:feed_type;type:varchar(24);not null"`
 	Snapshot      datatypes.JSON `gorm:"column:snapshot_json;type:jsonb;not null"`
