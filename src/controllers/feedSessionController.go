@@ -21,6 +21,7 @@ import (
 
 const consumerFeedSessionLifetime = 6 * time.Hour
 const consumerFeedSnapshotLimit = 50
+const podsRecycleSuppressedContextKey = "pods_recycle_suppressed"
 
 type frozenPodsSessionResponse struct {
 	SessionID string     `json:"session_id"`
@@ -105,6 +106,10 @@ func snapshotCurrentPodsFeed(c *gin.Context, db *gorm.DB) ([]PodsItem, error) {
 	request.Header.Set(feedIntegritySyntheticHdr, feedIntegrityCapability)
 	snapshotContext.Request = request
 	snapshotContext.Set("db", db)
+	// Frozen sessions must remain useful when a small corpus has been consumed.
+	// GetPodsFeed keeps unseen items first, then recycles only soft-suppressed
+	// inventory; explicit hides remain excluded.
+	snapshotContext.Set(podsRecycleSuppressedContextKey, true)
 	if userID, ok := c.Get("user_id"); ok {
 		snapshotContext.Set("user_id", userID)
 	}

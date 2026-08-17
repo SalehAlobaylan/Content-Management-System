@@ -52,6 +52,8 @@ type OperatorThread struct {
 	LastActivityAt time.Time  `json:"last_activity_at"`
 	ExpiresAt      time.Time  `json:"expires_at"`
 	DeletedAt      *time.Time `json:"deleted_at,omitempty"`
+	PinnedAt       *time.Time `json:"pinned_at,omitempty"`
+	ArchivedAt     *time.Time `json:"archived_at,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 }
@@ -62,14 +64,17 @@ func (OperatorThread) TableName() string { return "operator_threads" }
 // relationship to action plans, approvals, or plan events: deleting a chat
 // must never erase the permanent execution ledger.
 type OperatorMessage struct {
-	ID        uint           `gorm:"primaryKey" json:"-"`
-	PublicID  uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	ThreadID  uint           `json:"-"`
-	TenantID  string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	ActorType string         `json:"actor_type"`
-	ActorID   string         `json:"actor_id,omitempty"`
-	Content   datatypes.JSON `gorm:"type:jsonb" json:"content"`
-	CreatedAt time.Time      `json:"created_at"`
+	ID              uint           `gorm:"primaryKey" json:"-"`
+	PublicID        uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	ThreadID        uint           `json:"-"`
+	TenantID        string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ActorType       string         `json:"actor_type"`
+	ActorID         string         `json:"actor_id,omitempty"`
+	MessageKind     string         `json:"message_kind"`
+	InvestigationID *uint          `json:"-"`
+	PlanID          *uint          `json:"-"`
+	Content         datatypes.JSON `gorm:"type:jsonb" json:"content"`
+	CreatedAt       time.Time      `json:"created_at"`
 }
 
 func (OperatorMessage) TableName() string { return "operator_messages" }

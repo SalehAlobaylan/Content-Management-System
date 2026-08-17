@@ -131,6 +131,19 @@ func (store *InvestigationStore) Create(ctx context.Context, tenantID, actorID, 
 		if err := tx.Create(&investigation).Error; err != nil {
 			return err
 		}
+		if threadID != nil {
+			content, encodeErr := json.Marshal(map[string]any{"text": request.Message, "intent": request.Intent})
+			if encodeErr != nil {
+				return encodeErr
+			}
+			message := models.OperatorMessage{ThreadID: *threadID, TenantID: tenantID, ActorType: "admin", ActorID: actorID, MessageKind: "question", InvestigationID: &investigation.ID, Content: datatypes.JSON(content)}
+			if err := tx.Create(&message).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&models.OperatorThread{}).Where("id=?", *threadID).Updates(map[string]any{"last_activity_at": now, "expires_at": now.Add(conversationRetention)}).Error; err != nil {
+				return err
+			}
+		}
 		return appendInvestigationEvent(tx, investigation.ID, tenantID, "accepted", map[string]any{"domain": visible.Domain, "view": visible.View, "credential_redactions": request.CredentialRedactionCount})
 	})
 	return investigation, err
@@ -308,6 +321,19 @@ func (store *InvestigationStore) Complete(ctx context.Context, investigationID u
 		}
 		if err := tx.Model(&investigation).Updates(map[string]any{"state": "completed", "finished_at": now, "claim_token": nil, "claim_expires_at": nil}).Error; err != nil {
 			return err
+		}
+		if investigation.ThreadID != nil {
+			content, encodeErr := json.Marshal(map[string]any{"blocks": blocks, "packet_fingerprint": investigation.PacketFingerprint})
+			if encodeErr != nil {
+				return encodeErr
+			}
+			message := models.OperatorMessage{ThreadID: *investigation.ThreadID, TenantID: tenantID, ActorType: "operator", MessageKind: "response", InvestigationID: &investigation.ID, Content: datatypes.JSON(content)}
+			if err := tx.Create(&message).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&models.OperatorThread{}).Where("id=?", *investigation.ThreadID).Updates(map[string]any{"last_activity_at": now, "expires_at": now.Add(conversationRetention)}).Error; err != nil {
+				return err
+			}
 		}
 		return appendInvestigationEvent(tx, investigation.ID, tenantID, "done", map[string]any{"state": "completed"})
 	})

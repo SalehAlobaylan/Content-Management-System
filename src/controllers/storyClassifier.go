@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
 	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
@@ -157,7 +158,7 @@ func holdStoryClassification(db *gorm.DB, tenantID, itemSpaceID string) bool {
 func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID, emb []float32) {
 	alreadyMember := item.StoryID != nil && *item.StoryID == topicID
 
-	_ = db.Transaction(func(tx *gorm.DB) error {
+	if err := db.Transaction(func(tx *gorm.DB) error {
 		if item.StoryID != nil && *item.StoryID != topicID {
 			tx.Model(&models.Story{}).
 				Where("public_id = ?", *item.StoryID).
@@ -200,14 +201,14 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 			UpdateColumn("story_id", topicID).Error; err != nil {
 			return err
 		}
-		return nil
-	})
+		membershipItem := *item
+		membershipItem.StoryID = &topicID
+		return feedstate.AttachReadyNewsStory(tx, membershipItem)
+	}); err != nil {
+		return
+	}
 
 	item.StoryID = &topicID
-	// A News item can become READY before its classification completes. Attach
-	// here as well as the generic READY transition so a candidate generation
-	// receives the item at the exact "classification ready" boundary.
-	attachReadyNewsStoryToGeneration(db, *item)
 
 	if !alreadyMember {
 		// A story just gained a member — a news event the feed must reflect.
@@ -280,6 +281,12 @@ func StartClassificationBackfill(db *gorm.DB) {
 	}
 	go func() {
 		defer classificationBackfillRunning.Store(false)
+		if attached, err := feedstate.ReconcileNewsMembership(db, "default"); err != nil {
+			log.Printf("[classification-backfill] news generation reconciliation failed: %v", err)
+		} else if attached > 0 {
+			log.Printf("[classification-backfill] attached %d existing stories to serving generations", attached)
+			markNewsSnapshotDirty(db, "default")
+		}
 
 		const batchSize = 50
 		total := 0

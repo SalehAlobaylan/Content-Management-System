@@ -10,14 +10,74 @@ import (
 )
 
 func cachedSlide(storyID uuid.UUID, leadPublishedAt, lastMemberAt time.Time) StorySlide {
+	leadID := uuid.New()
 	return StorySlide{
 		Featured: StoryFeatured{
 			StorySummary: StorySummary{
 				StoryID:      storyID,
+				LeadID:       leadID,
 				PublishedAt:  leadPublishedAt,
 				LastMemberAt: lastMemberAt,
 			},
+			Members: []StoryMember{{ID: leadID}},
 		},
+	}
+}
+
+func TestCirculationPolicyLaneSupportsMediaCutoverOwnership(t *testing.T) {
+	tests := []struct {
+		raw   string
+		want  string
+		valid bool
+	}{
+		{raw: "", want: models.SourceCategoryNews, valid: true},
+		{raw: " MEDIA ", want: models.SourceCategoryMedia, valid: true},
+		{raw: "news", want: models.SourceCategoryNews, valid: true},
+		{raw: "pods", want: "", valid: false},
+	}
+	for _, test := range tests {
+		got, valid := circulationPolicyLane(test.raw)
+		if got != test.want || valid != test.valid {
+			t.Fatalf("lane %q = (%q, %v), want (%q, %v)", test.raw, got, valid, test.want, test.valid)
+		}
+	}
+}
+
+func TestPaginateStorySlidesKeepsUnseenSlides(t *testing.T) {
+	seenStory := cachedSlide(uuid.New(), time.Now().Add(-time.Minute), time.Now().Add(-time.Minute))
+	unseenStory := cachedSlide(uuid.New(), time.Now(), time.Now())
+	seenID := seenStory.Featured.Members[0].ID
+
+	page, _ := paginateStorySlides([]StorySlide{unseenStory, seenStory}, time.Time{}, uuid.Nil, 10, []uuid.UUID{seenID})
+	if len(page) != 1 || page[0].Featured.StoryID != unseenStory.Featured.StoryID {
+		t.Fatalf("expected only the unseen story, got %#v", page)
+	}
+}
+
+func TestPaginateStorySlidesRecyclesExhaustedNewsWindow(t *testing.T) {
+	first := cachedSlide(uuid.New(), time.Now(), time.Now())
+	second := cachedSlide(uuid.New(), time.Now().Add(-time.Minute), time.Now().Add(-time.Minute))
+	seenIDs := []uuid.UUID{first.Featured.Members[0].ID, second.Featured.Members[0].ID}
+
+	page, _ := paginateStorySlides([]StorySlide{first, second}, time.Time{}, uuid.Nil, 10, seenIDs)
+	if len(page) != 2 {
+		t.Fatalf("exhausted News inventory must recycle instead of returning empty, got %d slides", len(page))
+	}
+}
+
+func TestDiversifyStoryOrderBreaksSourceMonopolyAfterStoryRanking(t *testing.T) {
+	sourceA := "source-a"
+	sourceB := "source-b"
+	storyA1, storyA2, storyB := uuid.New(), uuid.New(), uuid.New()
+	order := []*storyAgg{
+		{storyID: storyA1, members: []models.ContentItem{{PublicID: uuid.New(), SourceName: &sourceA}}},
+		{storyID: storyA2, members: []models.ContentItem{{PublicID: uuid.New(), SourceName: &sourceA}}},
+		{storyID: storyB, members: []models.ContentItem{{PublicID: uuid.New(), SourceName: &sourceB}}},
+	}
+
+	got := diversifyStoryOrder(order, map[uuid.UUID]models.Story{})
+	if got[0].storyID != storyA1 || got[1].storyID != storyB || got[2].storyID != storyA2 {
+		t.Fatalf("source-diverse order = [%s %s %s], want [%s %s %s]", got[0].storyID, got[1].storyID, got[2].storyID, storyA1, storyB, storyA2)
 	}
 }
 

@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 	"encoding/json"
 	"math"
@@ -442,7 +443,11 @@ func PreviewCirculation(c *gin.Context) {
 		policy := sanitizeCirculationPolicy(*req.Policy)
 		ctx = circulationContextFromPolicy(policy, window, time.Now())
 	}
-	slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, limit, nil, "", false)
+	slides, _, err := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, limit, nil, "", false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assemble circulation preview", Code: "ASSEMBLY_FAILED"})
+		return
+	}
 	c.JSON(http.StatusOK, StoryNewsResponse{Cursor: nil, Slides: slides})
 }
 
@@ -470,7 +475,11 @@ func GetCirculationMetrics(c *gin.Context) {
 	metrics := make([]windowMetric, 0, 3)
 	for _, w := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
 		ctx := circulationContextFromPolicy(policy, w, now)
-		slides, _ := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, 60, nil, "", false)
+		slides, _, err := assembleStoryNewsFeed(db, principal.TenantID, config, ctx, time.Time{}, uuid.Nil, 60, nil, "", false)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assemble circulation metrics", Code: "ASSEMBLY_FAILED"})
+			return
+		}
 		m := windowMetric{Window: w, PrimaryFrom: ctx.Window.PrimaryStart.Format(time.RFC3339)}
 		for _, slide := range slides {
 			story := slide.Featured.StorySummary
@@ -693,13 +702,43 @@ func RunCirculationSweepNow(c *gin.Context) {
 
 // ─── Internal API used by Aggregation ──────────────────────────────────────
 
+func circulationPolicyLane(raw string) (string, bool) {
+	lane := strings.ToLower(strings.TrimSpace(raw))
+	if lane == "" {
+		return models.SourceCategoryNews, true
+	}
+	if lane != models.SourceCategoryNews && lane != models.SourceCategoryMedia {
+		return "", false
+	}
+	return lane, true
+}
+
 func InternalGetCirculationPolicy(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID := strings.TrimSpace(c.Query("tenant_id"))
 	if tenantID == "" {
 		tenantID = defaultCirculationTenant
 	}
-	c.JSON(http.StatusOK, loadCirculationPolicy(db, tenantID))
+	lane, validLane := circulationPolicyLane(c.Query("lane"))
+	if !validLane {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Source admission lane is invalid"})
+		return
+	}
+	mode, err := supply.ResolveAdmissionMode(db, tenantID, lane)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Source admission mode is unavailable"})
+		return
+	}
+	type response struct {
+		models.NewsCirculationPolicy
+		Lane                   string               `json:"lane"`
+		SourceRunAdmissionMode supply.AdmissionMode `json:"source_run_admission_mode"`
+	}
+	c.JSON(http.StatusOK, response{
+		NewsCirculationPolicy:  loadCirculationPolicy(db, tenantID),
+		Lane:                   lane,
+		SourceRunAdmissionMode: mode,
+	})
 }
 
 // boundedIntakeAllocation divides a cycle budget fairly and deterministically.
@@ -727,6 +766,44 @@ func boundedIntakeAllocation(total, maxPerSource, sourceCount int) []int {
 		remaining -= allocation
 	}
 	return allocations
+}
+
+const podsMinFeedDurationMinutes = 4.5
+
+func numericProviderSetting(settings map[string]interface{}, keys ...string) float64 {
+	maximum := float64(0)
+	for _, key := range keys {
+		candidate := float64(0)
+		switch value := settings[key].(type) {
+		case float64:
+			candidate = value
+		case float32:
+			candidate = float64(value)
+		case int:
+			candidate = float64(value)
+		case int64:
+			candidate = float64(value)
+		}
+		if candidate > maximum {
+			maximum = candidate
+		}
+	}
+	return maximum
+}
+
+// applyMediaProviderBounds canonicalizes aliases before handing settings to
+// Aggregation. This prevents a source-level camel-case value from bypassing
+// the CMS intake cap and keeps media below the Pods visibility floor out of
+// the expensive download/transcription pipeline.
+func applyMediaProviderBounds(settings map[string]interface{}, maxResults int) {
+	configuredMinimum := numericProviderSetting(settings, "minDurationMinutes", "min_duration_minutes")
+	if configuredMinimum < podsMinFeedDurationMinutes {
+		configuredMinimum = podsMinFeedDurationMinutes
+	}
+	delete(settings, "maxResults")
+	delete(settings, "minDurationMinutes")
+	settings["max_results"] = maxResults
+	settings["min_duration_minutes"] = configuredMinimum
 }
 
 func InternalClaimCirculationSources(c *gin.Context) {
@@ -831,7 +908,10 @@ func InternalClaimCirculationSources(c *gin.Context) {
 	// them. A manual `force` run can pull sources early, but still respects the
 	// min-interval floor, so repeated clicks cannot hammer a provider or run up
 	// fetch bills.
-	err := db.Transaction(func(tx *gorm.DB) error {
+	err := db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
+		if err := supply.RequireLegacyAdmission(tx, tenantID, lane); err != nil {
+			return err
+		}
 		q := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, category, true).
 			Where("feed_url IS NOT NULL AND feed_url <> ''")
@@ -853,6 +933,18 @@ func InternalClaimCirculationSources(c *gin.Context) {
 			return err
 		}
 
+		requestedBy := "schedule"
+		if force {
+			requestedBy = "manual"
+		}
+		if preserveCheckpoints {
+			requestedBy = "system"
+		}
+		requests, err := createLegacySourceRunRequests(tx, sources, requestedBy)
+		if err != nil {
+			return err
+		}
+
 		ids := make([]uuid.UUID, 0, len(sources))
 		mediaAllocations := boundedIntakeAllocation(mediaMaxPerCycle, mediaMaxPerSource, len(sources))
 		for sourceIndex, source := range sources {
@@ -866,18 +958,7 @@ func InternalClaimCirculationSources(c *gin.Context) {
 				// The policy owns the bounded media intake. A source configuration
 				// cannot widen it through its provider settings, and the cycle
 				// total is divided deterministically among all claimed sources.
-				settings["max_results"] = mediaAllocations[sourceIndex]
-			}
-			requestedBy := "schedule"
-			if force {
-				requestedBy = "manual"
-			}
-			if preserveCheckpoints {
-				requestedBy = "system"
-			}
-			request, err := createSourceRunRequest(tx, source, requestedBy, "", nil)
-			if err != nil {
-				return err
+				applyMediaProviderBounds(settings, mediaAllocations[sourceIndex])
 			}
 			claims = append(claims, sourceClaim{
 				ID:                   source.PublicID.String(),
@@ -886,7 +967,7 @@ func InternalClaimCirculationSources(c *gin.Context) {
 				URL:                  *source.FeedURL,
 				FetchIntervalMinutes: interval,
 				Settings:             settings,
-				SourceRunRequestID:   request.PublicID.String(),
+				SourceRunRequestID:   requests[sourceIndex].PublicID.String(),
 			})
 			ids = append(ids, source.PublicID)
 		}
@@ -924,6 +1005,10 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "legacy source-run admission") || strings.Contains(err.Error(), "source-run admission protocol") {
+			c.JSON(http.StatusConflict, gin.H{"message": "Legacy source admission is not active for this lane"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to claim sources"})
 		return
 	}

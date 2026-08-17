@@ -304,10 +304,27 @@ func normalizeIdempotencyKey(key string) string {
 }
 
 func setFeedUnitDurationBucket(item *models.ContentItem) {
-	if item == nil || item.DurationSec == nil || *item.DurationSec <= 0 || !item.IsFeedUnit {
+	if item == nil || item.DurationSec == nil || *item.DurationSec <= 0 {
 		return
 	}
 	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+		return
+	}
+	// Ingested parents begin hidden until Media writes the authoritative
+	// duration. Raw media inside the Pods duration contract does not need
+	// atomization and must become a feed unit; long parents and undersized clips
+	// remain hidden. Child visibility is owned by the atomization workflow.
+	if item.ParentContentItemID == nil && item.ChapteringStatus != nil && *item.ChapteringStatus == "waiting_media" {
+		if *item.DurationSec >= podsMinDurationSec && *item.DurationSec <= podsHardMaxDurationSec {
+			item.IsFeedUnit = true
+			item.FeedVisibility = "visible"
+		} else {
+			item.IsFeedUnit = false
+			item.FeedVisibility = "hidden"
+		}
+	}
+	if !item.IsFeedUnit {
+		item.DurationBucket = nil
 		return
 	}
 	bucket := durationBucketLabel(*item.DurationSec * 1000)
@@ -598,6 +615,9 @@ func InternalUpdateContentStatus(c *gin.Context) {
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		if err := feedstate.AttachReadyNewsStory(tx, item); err != nil {
 			return err
 		}
 		if err := feedstate.SyncMediaMembership(tx, item); err != nil {

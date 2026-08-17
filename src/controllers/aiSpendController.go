@@ -25,15 +25,22 @@ const aiSpendTenant = "default"
 var aiSpendRunMu sync.Mutex
 
 type aiSpendEventInput struct {
-	EventID                                                           string         `json:"event_id"`
-	OccurredAt                                                        time.Time      `json:"occurred_at"`
-	SpendClass                                                        string         `json:"spend_class"`
-	Operation                                                         string         `json:"operation"`
-	Provider                                                          string         `json:"provider"`
-	Model                                                             string         `json:"model"`
-	Units                                                             map[string]any `json:"units"`
-	Cached, Estimated, AvoidedCostEstimated, Backfilled, OverCapHuman bool
-	TriggerSource, SystemRunID, TenantID, SourceService               string
+	EventID              string         `json:"event_id"`
+	OccurredAt           time.Time      `json:"occurred_at"`
+	SpendClass           string         `json:"spend_class"`
+	Operation            string         `json:"operation"`
+	Provider             string         `json:"provider"`
+	Model                string         `json:"model"`
+	Units                map[string]any `json:"units"`
+	Cached               bool           `json:"cached"`
+	Estimated            bool           `json:"estimated"`
+	AvoidedCostEstimated bool           `json:"avoided_cost_estimated"`
+	Backfilled           bool           `json:"backfilled"`
+	OverCapHuman         bool           `json:"over_cap_human"`
+	TriggerSource        string         `json:"trigger_source"`
+	SystemRunID          string         `json:"system_run_id"`
+	TenantID             string         `json:"tenant_id"`
+	SourceService        string         `json:"source_service"`
 }
 type aiSpendIngestRequest struct {
 	Events                                    []aiSpendEventInput `json:"events"`
@@ -231,7 +238,20 @@ func GetAISpendStatus(c *gin.Context) {
 	var episodes []models.AISpendEpisode
 	db.Where("tenant_id = ?", aiSpendTenant).Find(&budgets)
 	db.Where("tenant_id = ? AND status = 'open'", aiSpendTenant).Find(&episodes)
-	c.JSON(200, gin.H{"policy": p, "budgets": budgets, "episodes": episodes})
+	var eventCount, rollupCount, runCount int64
+	db.Model(&models.AISpendEvent{}).Count(&eventCount)
+	db.Model(&models.AISpendRollup{}).Count(&rollupCount)
+	db.Model(&models.AISpendRun{}).Count(&runCount)
+	var lastEventAt, lastRollupAt *time.Time
+	db.Model(&models.AISpendEvent{}).Select("max(occurred_at)").Scan(&lastEventAt)
+	db.Model(&models.AISpendRollup{}).Select("max(updated_at)").Scan(&lastRollupAt)
+	c.JSON(200, gin.H{
+		"policy": p, "budgets": budgets, "episodes": episodes,
+		"evidence": gin.H{
+			"event_count": eventCount, "rollup_count": rollupCount, "run_count": runCount,
+			"last_event_at": lastEventAt, "last_rollup_at": lastRollupAt,
+		},
+	})
 }
 func GetAISpendPolicy(c *gin.Context) {
 	p, err := getAISpendPolicy(c.MustGet("db").(*gorm.DB))
@@ -386,28 +406,40 @@ func CreateAIPriceBook(c *gin.Context) {
 
 func StartAISpendGovernorHeartbeat(db *gorm.DB) {
 	go func() {
+		// Metering is always on, including observe mode. Governance (verdicts,
+		// caps, and episodes) remains gated by policy.enabled, but raw events
+		// must become rollups without an operator having to enable enforcement.
+		runMetering := func() {
+			if !aiSpendRunMu.TryLock() {
+				return
+			}
+			defer aiSpendRunMu.Unlock()
+			started := time.Now()
+			folded, foldErr := foldAndAccumulate(db)
+			now := time.Now()
+			run := models.AISpendRun{TenantID: aiSpendTenant, Trigger: "scheduled", Status: "completed", Headline: "ledger_updated", EventsFolded: folded, StartedAt: started, CompletedAt: &now, DurationMS: now.Sub(started).Milliseconds()}
+			if foldErr != nil {
+				run.Status = "failed"
+				run.Error = foldErr.Error()
+				run.ErrorClass = "ledger_fold"
+			}
+			_ = db.Create(&run).Error
+			_ = db.Model(&models.AISpendPolicy{}).Where("tenant_id = ?", aiSpendTenant).Update("last_run_at", now).Error
+		}
+		// Prime the read model on boot so the cockpit never waits for the first
+		// ticker interval to reveal already-ingested events.
+		runMetering()
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
 			p, err := getAISpendPolicy(db)
-			if err != nil || !p.Enabled || (p.PausedUntil != nil && p.PausedUntil.After(time.Now())) {
+			if err != nil {
 				continue
 			}
 			if p.LastRunAt != nil && time.Since(*p.LastRunAt) < time.Duration(p.AggregationIntervalMinutes)*time.Minute {
 				continue
 			}
-			aiSpendRunMu.Lock()
-			folded, err := foldAndAccumulate(db)
-			now := time.Now()
-			run := models.AISpendRun{TenantID: aiSpendTenant, Trigger: "scheduled", Status: "completed", Headline: "ledger_updated", EventsFolded: folded, StartedAt: now, CompletedAt: &now}
-			if err != nil {
-				run.Status = "failed"
-				run.Error = err.Error()
-				run.ErrorClass = "ledger_fold"
-			}
-			db.Create(&run)
-			db.Model(&models.AISpendPolicy{}).Where("tenant_id = ?", aiSpendTenant).Update("last_run_at", now)
-			aiSpendRunMu.Unlock()
+			runMetering()
 		}
 	}()
 }

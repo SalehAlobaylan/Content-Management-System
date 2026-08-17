@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 
@@ -90,6 +91,7 @@ var feedIntegrityChecks = []feedIntegrityCheck{
 	{"inv_news_empty_story", "Active story has no ready members", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "major"},
 	{"inv_news_unlabeled_stale", "Feed-eligible story remains unlabeled", "inventory", "news", models.FeedIntegrityAxisReadiness, "enrichment", "info"},
 	{"inv_news_cache_rebuild_debt", "News snapshot remains stale beyond cache ceiling", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "minor"},
+	{"inv_news_generation_membership_drift", "Eligible News stories are absent from the active serving generation", "inventory", "news", models.FeedIntegrityAxisReadiness, "news", "major"},
 	{"edge_pods_http", "Pods CMS endpoint is unavailable", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "critical"},
 	{"edge_pods_latency", "Pods page exceeded its latency budget", "edge", "pods", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_pods_empty", "Pods page is empty despite eligible inventory", "edge", "pods", models.FeedIntegrityAxisConsumer, "media-circulation", "critical"},
@@ -102,6 +104,8 @@ var feedIntegrityChecks = []feedIntegrityCheck{
 	{"edge_news_http", "News CMS endpoint is unavailable", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "critical"},
 	{"edge_news_latency", "News page exceeded its latency budget", "edge", "news", models.FeedIntegrityAxisConsumer, "content", "major"},
 	{"edge_news_empty", "News page is empty despite active stories", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "critical"},
+	{"edge_news_thin", "News first page is below the circulation floor", "edge", "news", models.FeedIntegrityAxisConsumer, "news-circulation", "major"},
+	{"edge_news_source_monopoly", "News first page is monopolized by one source", "edge", "news", models.FeedIntegrityAxisConsumer, "news-circulation", "minor"},
 	{"edge_news_shape", "News slide has an invalid shape", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
 	{"edge_news_dup", "News cursor walk repeats a story", "edge", "news", models.FeedIntegrityAxisConsumer, "news", "major"},
 	{"edge_news_cache_stale", "News served a snapshot beyond its stale ceiling", "edge", "news", models.FeedIntegrityAxisConsumer, "news-circulation", "major"},
@@ -449,6 +453,21 @@ func runFeedIntegrityInventory(db *gorm.DB, tenant string, add integrityAdd) {
 			}
 		}
 	}
+	if activeGenerationID, supported, active := feedcontract.ActiveGeneration(db, tenant, "news"); supported && active {
+		var missing int64
+		db.Raw(`SELECT COUNT(DISTINCT content.story_id)
+			FROM content_items content
+			WHERE content.tenant_id=? AND content.type='NEWS' AND content.status='READY' AND content.story_id IS NOT NULL
+			  AND COALESCE(content.published_at, content.created_at) >= ?
+			  AND (COALESCE(content.news_retention_state, 'full')='full' OR content.news_feed_role IN ('lead','representative'))
+			  AND NOT EXISTS (
+			    SELECT 1 FROM feed_generation_memberships membership
+			    WHERE membership.generation_id=? AND membership.member_type='story' AND membership.member_id=content.story_id
+			  )`, tenant, time.Now().Add(-7*24*time.Hour), activeGenerationID).Scan(&missing)
+		if missing > 0 {
+			add("inv_news_generation_membership_drift", "inventory", "news", "today", models.FeedIntegrityAxisReadiness, "major", "violation", "generation", activeGenerationID.String(), int(missing), map[string]interface{}{"missing_story_count": missing})
+		}
+	}
 	var snaps []models.NewsSnapshot
 	db.Where("tenant_id = ?", tenant).Find(&snaps)
 	for _, snap := range snaps {
@@ -471,6 +490,25 @@ func feedIntegritySelfURL() string {
 		port = "8080"
 	}
 	return "http://127.0.0.1:" + port
+}
+
+func expectedNewsFirstPageFloor(db *gorm.DB, policy models.FeedIntegrityPolicy, window string) int {
+	floor := policy.ExpectedMinNewsSlides
+	if window == models.NewsWindowToday {
+		circulationFloor := loadCirculationPolicy(db, policy.TenantID).MinTodayStories
+		if circulationFloor > floor {
+			floor = circulationFloor
+		}
+	}
+	if floor < 1 {
+		floor = 1
+	}
+	// The integrity probe requests ten slides. A larger inventory objective is
+	// proven by cursor walking, not by demanding an impossible first page.
+	if floor > 10 {
+		floor = 10
+	}
+	return floor
 }
 
 func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIntegrityPolicy, tier string, add integrityAdd) []string {
@@ -641,6 +679,7 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 					StoryID string            `json:"story_id"`
 					Title   string            `json:"title"`
 					Label   string            `json:"label"`
+					Source  string            `json:"source_name"`
 					Members []json.RawMessage `json:"members"`
 				} `json:"featured"`
 				Related []json.RawMessage `json:"related"`
@@ -675,9 +714,15 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 				sev = "info"
 			}
 			add("edge_news_empty", "edge", "news", variant, models.FeedIntegrityAxisConsumer, sev, "violation", "page", variant, int(active), nil)
+		} else if expected := expectedNewsFirstPageFloor(db, policy, window); len(payload.Slides) < expected {
+			add("edge_news_thin", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "page", variant, len(payload.Slides), map[string]interface{}{"actual": len(payload.Slides), "expected": expected})
 		}
 		seen := map[string]bool{}
+		sources := map[string]bool{}
 		for _, slide := range payload.Slides {
+			if source := strings.TrimSpace(slide.Featured.Source); source != "" {
+				sources[source] = true
+			}
 			if seen[slide.Featured.StoryID] {
 				add("edge_news_dup", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, nil)
 			}
@@ -685,6 +730,9 @@ func runFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIn
 			if slide.Featured.StoryID == "" || (slide.Featured.Title == "" && slide.Featured.Label == "") || len(slide.Featured.Members) == 0 || len(slide.Related) > 3 {
 				add("edge_news_shape", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "major", "violation", "story", slide.Featured.StoryID, 1, nil)
 			}
+		}
+		if len(payload.Slides) >= 4 && len(sources) <= 1 {
+			add("edge_news_source_monopoly", "edge", "news", variant, models.FeedIntegrityAxisConsumer, "minor", "violation", "page", variant, len(payload.Slides), map[string]interface{}{"slides": len(payload.Slides), "distinct_sources": len(sources)})
 		}
 		cursor := payload.Cursor
 		for page := 1; page < policy.EdgePagesPerFeed && cursor != nil && *cursor != ""; page++ {

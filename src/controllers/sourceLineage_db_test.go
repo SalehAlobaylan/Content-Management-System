@@ -126,3 +126,39 @@ func TestSourceRunRequestPreservesOptionalOperatorPlanCorrelation(t *testing.T) 
 		t.Fatalf("operator correlation was not persisted: %+v", request)
 	}
 }
+
+func TestLegacySourceRunBatchPersistsLinkedRequestsAndEvents(t *testing.T) {
+	db := openSourceLineageTestDB(t)
+	sources := []models.ContentSource{
+		{TenantID: "tenant-a", Name: "Source A", Type: models.SourceTypeRSS, Category: models.SourceCategoryNews},
+		{TenantID: "tenant-a", Name: "Source B", Type: models.SourceTypeRSS, Category: models.SourceCategoryNews},
+	}
+	if err := db.Create(&sources).Error; err != nil {
+		t.Fatal(err)
+	}
+	var requests []models.SourceRunRequest
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		requests, err = createLegacySourceRunRequests(tx, sources, "schedule")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != len(sources) {
+		t.Fatalf("request count = %d, want %d", len(requests), len(sources))
+	}
+	for _, request := range requests {
+		if request.ID == 0 || request.PublicID == uuid.Nil {
+			t.Fatalf("batch request did not receive database identity: %+v", request)
+		}
+		var count int64
+		if err := db.Model(&models.ContentProcessingEvent{}).
+			Where("source_run_request_id = ? AND event_class = ?", request.ID, "source_run_requested").
+			Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("request %d has %d requested events, want 1", request.ID, count)
+		}
+	}
+}

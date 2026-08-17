@@ -219,22 +219,26 @@ func assembleStoryNewsFeed(
 	seenIDs []uuid.UUID,
 	userIDStr string,
 	recordTelemetry bool,
-) ([]StorySlide, *string) {
+) ([]StorySlide, *string, error) {
 	config = applyLatestPlusPolicy(config, circ.Policy)
 	now := circ.Window.Now
 	// 1. Pull a recent pool of classified NEWS members and score them with the
 	//    existing ranking engine (freshness/engagement/velocity/trending).
 	// Topic metadata is independent of the member pool — overlap the two WAN
 	// round-trips (each is the better part of a second against a remote DB).
-	topicsCh := make(chan map[uuid.UUID]models.Story, 1)
+	type topicsResult struct {
+		byID map[uuid.UUID]models.Story
+		err  error
+	}
+	topicsCh := make(chan topicsResult, 1)
 	go func() {
 		var topics []models.Story
-		db.Select(topicMetaColumns).Where("tenant_id = ?", tenantID).Find(&topics)
+		result := db.Select(topicMetaColumns).Where("tenant_id = ?", tenantID).Find(&topics)
 		byID := make(map[uuid.UUID]models.Story, len(topics))
 		for _, t := range topics {
 			byID[t.PublicID] = t
 		}
-		topicsCh <- byID
+		topicsCh <- topicsResult{byID: byID, err: result.Error}
 	}()
 
 	windowStart := circ.Window.QueryStart
@@ -247,15 +251,21 @@ func assembleStoryNewsFeed(
 		Order("COALESCE(published_at, created_at) DESC").
 		Limit(storyMemberPoolLimit)
 	membersQuery = applyActiveGenerationMembership(db, membersQuery, tenantID, "news", "story", "content_items.story_id")
-	membersQuery.Find(&members)
+	if err := membersQuery.Find(&members).Error; err != nil {
+		return nil, nil, err
+	}
 
 	if len(members) == 0 {
-		return []StorySlide{}, nil
+		return []StorySlide{}, nil, nil
 	}
 	// Retention state is part of the story read contract. Fetch it before any
 	// window/seen filtering so compact stories use their frozen lead identity
 	// and original last-member cursor, not the newest retained row.
-	topicByID := <-topicsCh
+	topics := <-topicsCh
+	if topics.err != nil {
+		return nil, nil, topics.err
+	}
+	topicByID := topics.byID
 
 	contentIDs := extractPublicIDs(members)
 	flagMap := LoadContentFlags(db, tenantID, contentIDs)
@@ -404,10 +414,11 @@ func assembleStoryNewsFeed(
 	}
 
 	// 3b. Drop already-seen slides (the client reports views against the slide's
-	//     lead member id = the story's newest member). When the session has
-	//     seen EVERYTHING, recycle on a fresh load instead of serving an empty
-	//     feed (mirrors the Pods ShowWatchedWhenUnseenExhausted behavior) —
-	//     a blank News tab is never the right answer.
+	//     rendered lead member id). News is a bounded editorial
+	//     window, not the infinite organic Pods stream: after the viewer exhausts
+	//     the window, recycle it instead of turning valid inventory into an empty
+	//     state. The deprecated organic-feed recycle flag intentionally does not
+	//     control News.
 	if len(seenIDs) > 0 {
 		seenSet := make(map[uuid.UUID]bool, len(seenIDs))
 		for _, id := range seenIDs {
@@ -415,68 +426,22 @@ func assembleStoryNewsFeed(
 		}
 		filtered := make([]*storyAgg, 0, len(order))
 		for _, a := range order {
-			if !seenSet[a.newestID] {
+			if !seenSet[storyAggLeadID(topicByID[a.storyID], a)] {
 				filtered = append(filtered, a)
 			}
 		}
-		// A fully-empty filter means literally every pooled story is seen
-		// (a partially-seen corpus always leaves unseen entries) — recycle on
-		// ANY page, not just the first, so a recycled feed can paginate past
-		// slide 10 instead of dead-ending; unfiltered cursor pagination then
-		// terminates naturally at the corpus end.
-		exhausted := len(filtered) == 0
-		if !exhausted || !config.ShowWatchedWhenUnseenExhausted {
+		if len(filtered) > 0 {
 			order = filtered
 		}
 	}
 
-	// 3c. Inter-slide diversity: sibling stories (stories in each other's
-	//     related sets — i.e. ≥storyRelatedMinSimilarity apart) must not stack
-	//     adjacently. A burst (e.g. five Iran-conflict sub-stories) interleaves
-	//     with other news instead of monopolizing consecutive slides. Greedy
-	//     single-lookahead: pick the highest-ranked candidate that isn't a
-	//     sibling of the previous slide; if everything left is a sibling, give
-	//     up gracefully (don't bury content). Uses the stored related sets —
-	//     no extra queries. topicByID arrives here (fetched concurrently with
-	//     the pool).
-	if len(order) > 2 {
-		siblingSets := make(map[uuid.UUID]map[uuid.UUID]bool, len(order))
-		siblings := func(id uuid.UUID) map[uuid.UUID]bool {
-			if s, ok := siblingSets[id]; ok {
-				return s
-			}
-			s := make(map[uuid.UUID]bool)
-			if t, ok := topicByID[id]; ok {
-				if ids, computed := storedRelatedIDs(t); computed {
-					for _, rid := range ids {
-						s[rid] = true
-					}
-				}
-			}
-			siblingSets[id] = s
-			return s
-		}
-		reordered := make([]*storyAgg, 0, len(order))
-		pool := append([]*storyAgg(nil), order...)
-		var prev *storyAgg
-		for len(pool) > 0 {
-			pick := 0
-			if prev != nil {
-				prevSibs := siblings(prev.storyID)
-				for i, c := range pool {
-					if prevSibs[c.storyID] || siblings(c.storyID)[prev.storyID] {
-						continue
-					}
-					pick = i
-					break
-				}
-			}
-			prev = pool[pick]
-			reordered = append(reordered, prev)
-			pool = append(pool[:pick], pool[pick+1:]...)
-		}
-		order = reordered
-	}
+	// 3c. Inter-slide diversity: prefer both a different lead source and a
+	//     non-sibling story from the previous slide. This operates after the
+	//     final story-score sort; item-level diversity cannot protect the slide
+	//     order because aggregation sorts stories again. It falls back through
+	//     each constraint without hiding inventory when only one source/topic
+	//     remains.
+	order = diversifyStoryOrder(order, topicByID)
 
 	// 4. Cursor pagination over the ranked story list.
 	startIdx := 0
@@ -506,7 +471,7 @@ func assembleStoryNewsFeed(
 		endIdx = len(order)
 	}
 	if startIdx >= len(order) {
-		return []StorySlide{}, nil
+		return []StorySlide{}, nil, nil
 	}
 	page := order[startIdx:endIdx]
 
@@ -531,14 +496,16 @@ func assembleStoryNewsFeed(
 		maxHydrate = 500
 	}
 	var pageMembers []models.ContentItem
-	db.Select(storyFeedColumns).
+	if err := db.Select(storyFeedColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IN ?",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady, pageStoryIDs).
 		Where(newsRetentionFeedPredicate).
 		Where("COALESCE(published_at, created_at) > ?", windowStart).
 		Order("COALESCE(published_at, created_at) DESC").
 		Limit(maxHydrate).
-		Find(&pageMembers)
+		Find(&pageMembers).Error; err != nil {
+		return nil, nil, err
+	}
 	membersByStory := make(map[uuid.UUID][]models.ContentItem, len(page))
 	for _, m := range pageMembers {
 		if m.StoryID != nil {
@@ -606,7 +573,7 @@ func assembleStoryNewsFeed(
 		recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(page)))
 	}
 
-	return slides, nextCursor
+	return slides, nextCursor, nil
 }
 
 // topMember returns the highest-engagement item from a story's members.
@@ -619,6 +586,111 @@ func topMember(members []models.ContentItem) models.ContentItem {
 		}
 	}
 	return best
+}
+
+func storyAggLeadID(topic models.Story, ag *storyAgg) uuid.UUID {
+	member, ok := storyAggLeadMember(topic, ag)
+	if !ok {
+		return uuid.Nil
+	}
+	return member.PublicID
+}
+
+func storyAggLeadMember(topic models.Story, ag *storyAgg) (models.ContentItem, bool) {
+	if ag == nil || len(ag.members) == 0 {
+		return models.ContentItem{}, false
+	}
+	top := topMember(ag.members)
+	if topic.NewsRetentionState != "full" {
+		for _, member := range ag.members {
+			if derefStr(member.NewsFeedRole) == "lead" {
+				return member, true
+			}
+		}
+	}
+	return top, true
+}
+
+func storyAggSourceKey(topic models.Story, ag *storyAgg) string {
+	member, ok := storyAggLeadMember(topic, ag)
+	if !ok {
+		return ""
+	}
+	for _, raw := range []string{derefStr(member.SourceName), derefStr(member.SourceFeedURL), string(member.Source)} {
+		if key := strings.ToLower(strings.TrimSpace(raw)); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+func diversifyStoryOrder(order []*storyAgg, topicByID map[uuid.UUID]models.Story) []*storyAgg {
+	if len(order) <= 2 {
+		return order
+	}
+	siblingSets := make(map[uuid.UUID]map[uuid.UUID]bool, len(order))
+	siblings := func(id uuid.UUID) map[uuid.UUID]bool {
+		if set, ok := siblingSets[id]; ok {
+			return set
+		}
+		set := make(map[uuid.UUID]bool)
+		if topic, ok := topicByID[id]; ok {
+			if ids, computed := storedRelatedIDs(topic); computed {
+				for _, relatedID := range ids {
+					set[relatedID] = true
+				}
+			}
+		}
+		siblingSets[id] = set
+		return set
+	}
+
+	reordered := make([]*storyAgg, 0, len(order))
+	pool := append([]*storyAgg(nil), order...)
+	var previous *storyAgg
+	for len(pool) > 0 {
+		pick := 0
+		if previous != nil {
+			previousSource := storyAggSourceKey(topicByID[previous.storyID], previous)
+			previousSiblings := siblings(previous.storyID)
+			pick = -1
+			// Preserve ranking as much as possible while satisfying both guards.
+			for i, candidate := range pool {
+				candidateSource := storyAggSourceKey(topicByID[candidate.storyID], candidate)
+				sameSource := previousSource != "" && candidateSource == previousSource
+				sibling := previousSiblings[candidate.storyID] || siblings(candidate.storyID)[previous.storyID]
+				if !sameSource && !sibling {
+					pick = i
+					break
+				}
+			}
+			// If topic diversity is impossible, still break a source monopoly.
+			if pick < 0 && previousSource != "" {
+				for i, candidate := range pool {
+					if storyAggSourceKey(topicByID[candidate.storyID], candidate) != previousSource {
+						pick = i
+						break
+					}
+				}
+			}
+			// If source diversity is impossible, preserve topic diversity.
+			if pick < 0 {
+				for i, candidate := range pool {
+					if !previousSiblings[candidate.storyID] && !siblings(candidate.storyID)[previous.storyID] {
+						pick = i
+						break
+					}
+				}
+			}
+			if pick < 0 {
+				pick = 0
+			}
+		}
+		previous = pool[pick]
+		reordered = append(reordered, previous)
+		pool = append(pool[:pick], pool[pick+1:]...)
+	}
+	return reordered
 }
 
 func buildStoryFeatured(topic models.Story, ag *storyAgg, members []models.ContentItem, sourceImageByFeedURL map[string]string) StoryFeatured {
@@ -1029,7 +1101,10 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error)
 	if err != nil {
 		return 0, err
 	}
-	slides, _ := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "", false)
+	slides, _, err := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "", false)
+	if err != nil {
+		return 0, err
+	}
 	if slides == nil {
 		slides = []StorySlide{}
 	}
@@ -1211,8 +1286,8 @@ func startSnapshotRebuild(db *gorm.DB, tenantID string, window string) {
 // cached slide list. Shared by the read-through fresh-cache path and the
 // cached_only emergency mode.
 func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.UUID, slideLimit int, seenIDs []uuid.UUID) ([]StorySlide, *string) {
-	// Drop already-seen slides (client tracks views against the lead member id,
-	// which is the first member of the featured story).
+	// Drop already-seen slides using the rendered lead identity. Legacy cached
+	// rows without lead_id fall back to the first hydrated member.
 	if len(seenIDs) > 0 {
 		seenSet := make(map[uuid.UUID]bool, len(seenIDs))
 		for _, id := range seenIDs {
@@ -1220,12 +1295,18 @@ func paginateStorySlides(all []StorySlide, lastTimestamp time.Time, lastID uuid.
 		}
 		filtered := make([]StorySlide, 0, len(all))
 		for _, s := range all {
-			if len(s.Featured.Members) > 0 && seenSet[s.Featured.Members[0].ID] {
+			leadID := s.Featured.LeadID
+			if leadID == uuid.Nil && len(s.Featured.Members) > 0 {
+				leadID = s.Featured.Members[0].ID
+			}
+			if seenSet[leadID] {
 				continue
 			}
 			filtered = append(filtered, s)
 		}
-		all = filtered
+		if len(filtered) > 0 {
+			all = filtered
+		}
 	}
 
 	start := 0
@@ -1320,7 +1401,7 @@ func serveStoryNewsFeed(
 	waitSeen func() []uuid.UUID,
 	userIDStr string,
 	recordTelemetry bool,
-) ([]StorySlide, *string, newsServeMeta) {
+) ([]StorySlide, *string, newsServeMeta, error) {
 	if config.NewsFeedMode == "cached_only" {
 		slides, cursor := serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
 		_, builtAt, _, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
@@ -1329,14 +1410,17 @@ func serveStoryNewsFeed(
 			meta.SnapshotAge = time.Since(builtAt)
 			meta.SnapshotBuiltAt = builtAt
 		}
-		return slides, cursor, meta
+		return slides, cursor, meta, nil
 	}
 	if shouldPersonalizeNews(db, tenantID, userIDStr) {
-		slides, nextCursor := assembleStoryNewsFeed(
+		slides, nextCursor, err := assembleStoryNewsFeed(
 			db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr, recordTelemetry,
 		)
+		if err != nil {
+			return nil, nil, newsServeMeta{Source: "live", Window: circ.Window.Name}, err
+		}
 		startSnapshotRebuild(db, tenantID, circ.Window.Name)
-		return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}
+		return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}, nil
 	}
 
 	// Live mode (default; legacy "precompute"/"on_demand" values fold in here).
@@ -1370,7 +1454,7 @@ func serveStoryNewsFeed(
 			if cursorCovered {
 				slides, nextCursor := paginateStorySlides(all, lastTimestamp, lastID, slideLimit, waitSeen())
 				if len(slides) > 0 {
-					return slides, nextCursor, newsServeMeta{Source: "cache", SnapshotAge: age, Window: circ.Window.Name, SnapshotBuiltAt: builtAt, SnapshotDirty: dirty}
+					return slides, nextCursor, newsServeMeta{Source: "cache", SnapshotAge: age, Window: circ.Window.Name, SnapshotBuiltAt: builtAt, SnapshotDirty: dirty}, nil
 				}
 			}
 		}
@@ -1378,11 +1462,14 @@ func serveStoryNewsFeed(
 
 	// Cache can't serve this request (cold, idle past the stale ceiling, deep
 	// cursor, or seen-exhausted page) — assemble inline from the full corpus.
-	slides, nextCursor := assembleStoryNewsFeed(
+	slides, nextCursor, err := assembleStoryNewsFeed(
 		db, tenantID, config, circ, lastTimestamp, lastID, slideLimit, waitSeen(), userIDStr, recordTelemetry,
 	)
+	if err != nil {
+		return nil, nil, newsServeMeta{Source: "live", Window: circ.Window.Name}, err
+	}
 	startSnapshotRebuild(db, tenantID, circ.Window.Name)
-	return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}
+	return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}, nil
 }
 
 // ─── Write-time related-story computation ──────────────────────────────────

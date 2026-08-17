@@ -2187,22 +2187,3 @@ func currentFeedAvailability(db *gorm.DB, tenant, lane string) *feedAvailability
 func applyActiveGenerationMembership(db *gorm.DB, query *gorm.DB, tenant, lane, memberType, memberColumn string) *gorm.DB {
 	return feedcontract.ApplyActiveGenerationMembership(db, query, tenant, lane, memberType, memberColumn)
 }
-
-// attachReadyNewsStoryToGeneration retains the News-side write path. Media
-// units use feedstate.SyncMediaMembership in the same transaction as their
-// lifecycle mutation; News membership remains story-classifier owned.
-func attachReadyNewsStoryToGeneration(db *gorm.DB, item models.ContentItem) {
-	if item.Type != models.ContentTypeNews || item.Status != models.ContentStatusReady || item.StoryID == nil {
-		return
-	}
-	var head models.FeedGenerationHead
-	if err := db.Where("tenant_id=? AND lane=?", item.TenantID, "news").First(&head).Error; err != nil {
-		return
-	}
-	for _, generationID := range []*uuid.UUID{head.ActiveGenerationID, head.CandidateGenerationID} {
-		if generationID == nil || *generationID == uuid.Nil {
-			continue
-		}
-		_ = db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING", *generationID, "story", *item.StoryID).Error
-	}
-}

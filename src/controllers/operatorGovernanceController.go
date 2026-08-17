@@ -54,8 +54,8 @@ func operatorGovernancePrincipal(c *gin.Context) (utils.AdminPrincipal, string, 
 		return utils.AdminPrincipal{}, "", nil, false
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	_, policy, err := operatorExecutionPolicy(db, tenantID)
-	if err != nil || !policy.LaunchMode.AdminSurfaceEnabled() {
+	_, _, err = operatorExecutionPolicy(db, tenantID)
+	if err != nil {
 		c.Status(http.StatusNotFound)
 		return utils.AdminPrincipal{}, "", nil, false
 	}

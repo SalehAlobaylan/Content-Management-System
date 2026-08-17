@@ -16,6 +16,54 @@ const (
 	admissionModeDurable        = "durable"
 )
 
+type AdmissionMode string
+
+const (
+	AdmissionModeCompatibility AdmissionMode = "compatibility"
+	AdmissionModeDurable       AdmissionMode = "durable"
+)
+
+// ResolveAdmissionMode reports which normal-operation source admission path
+// owns one tenant lane. Missing pre-cutover schema/authority is compatibility;
+// once the global epoch is durable, the lane must also be explicitly
+// provisioned or the result is unknown and returned as an error.
+func ResolveAdmissionMode(db *gorm.DB, tenantID, lane string) (AdmissionMode, error) {
+	if db == nil || strings.TrimSpace(tenantID) == "" || (lane != "news" && lane != "media") {
+		return "", fmt.Errorf("source-run admission mode requires explicit database, tenant, and lane")
+	}
+	if !db.Migrator().HasTable(&models.SourceRunAdmissionProtocol{}) {
+		return AdmissionModeCompatibility, nil
+	}
+	var protocol models.SourceRunAdmissionProtocol
+	if err := db.Where("protocol_key = ?", admissionProtocolKey).First(&protocol).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return AdmissionModeCompatibility, nil
+		}
+		return "", fmt.Errorf("source-run admission protocol is unavailable: %w", err)
+	}
+	mode, requiresLaneProof, err := classifyAdmissionEpoch(protocol.Epoch)
+	if err != nil {
+		return "", err
+	}
+	if requiresLaneProof {
+		if err := RequireDurableAdmission(db, tenantID, lane); err != nil {
+			return "", err
+		}
+	}
+	return mode, nil
+}
+
+func classifyAdmissionEpoch(epoch string) (AdmissionMode, bool, error) {
+	switch epoch {
+	case admissionEpochCompatibility:
+		return AdmissionModeCompatibility, false, nil
+	case admissionEpochDurable:
+		return AdmissionModeDurable, true, nil
+	default:
+		return "", false, fmt.Errorf("source-run admission protocol has an invalid epoch")
+	}
+}
+
 // RequireDurableAdmission makes the cutover contract explicit at every new
 // CMS admission/claim boundary. In compatibility the durable writer remains
 // off; after the epoch moves to durable_required every tenant/lane must have

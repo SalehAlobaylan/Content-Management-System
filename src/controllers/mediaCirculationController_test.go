@@ -120,3 +120,37 @@ func TestBoundedIntakeAllocation(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyMediaProviderBoundsCanonicalizesAliasesAndEnforcesFeedFloor(t *testing.T) {
+	settings := map[string]interface{}{
+		"maxResults":         float64(50),
+		"max_results":        float64(40),
+		"minDurationMinutes": float64(1),
+	}
+
+	applyMediaProviderBounds(settings, 3)
+
+	if _, exists := settings["maxResults"]; exists {
+		t.Fatal("maxResults alias must be removed so it cannot bypass the CMS cap")
+	}
+	if got := settings["max_results"]; got != 3 {
+		t.Fatalf("max_results = %v, want 3", got)
+	}
+	if _, exists := settings["minDurationMinutes"]; exists {
+		t.Fatal("minDurationMinutes alias must be canonicalized")
+	}
+	if got := settings["min_duration_minutes"]; got != 4.5 {
+		t.Fatalf("min_duration_minutes = %v, want 4.5", got)
+	}
+}
+
+func TestApplyMediaProviderBoundsPreservesStricterDurationMinimum(t *testing.T) {
+	settings := map[string]interface{}{
+		"minDurationMinutes":   float64(1),
+		"min_duration_minutes": float64(12),
+	}
+	applyMediaProviderBounds(settings, 2)
+	if got := settings["min_duration_minutes"]; got != float64(12) {
+		t.Fatalf("min_duration_minutes = %v, want source's stricter 12", got)
+	}
+}

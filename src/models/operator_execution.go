@@ -14,6 +14,7 @@ type OperatorActionPlan struct {
 	PublicID            uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
 	TenantID            string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
 	ActorID             string         `json:"actor_id"`
+	InvestigationID     *uint          `json:"-"`
 	ToolKey             string         `json:"tool_key"`
 	ToolVersion         string         `json:"tool_version"`
 	State               string         `json:"state"`

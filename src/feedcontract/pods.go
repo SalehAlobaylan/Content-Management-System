@@ -85,16 +85,24 @@ func ApplyActiveGenerationMembership(db *gorm.DB, query *gorm.DB, tenant, lane, 
 	if !active {
 		return query.Where("1 = 0")
 	}
-	return query.Where(`EXISTS (
-        SELECT 1
+	// Join a derived membership set that exposes only member_id. Joining the
+	// generation tables directly leaked their tenant_id into the outer query and
+	// made established feed filters such as `tenant_id = ?` ambiguous. Starting
+	// from the bounded active membership set keeps the efficient plan without
+	// changing the namespace of the caller's content query.
+	return query.Joins(activeGenerationMembershipJoin(memberColumn), tenant, lane, memberType)
+}
+
+func activeGenerationMembershipJoin(memberColumn string) string {
+	return `JOIN (
+        SELECT generation_membership.member_id
         FROM feed_generation_heads generation_head
         JOIN feed_generation_memberships generation_membership
           ON generation_membership.generation_id = generation_head.active_generation_id
         WHERE generation_head.tenant_id = ?
           AND generation_head.lane = ?
           AND generation_membership.member_type = ?
-          AND generation_membership.member_id = `+memberColumn+`
-	)`, tenant, lane, memberType)
+    ) active_generation_member ON active_generation_member.member_id = ` + memberColumn
 }
 
 // ActiveGeneration separates the pre-schema compatibility window from a

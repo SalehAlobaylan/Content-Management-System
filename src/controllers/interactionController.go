@@ -1297,6 +1297,31 @@ func fetchPodsSuppressedIDs(db *gorm.DB, sessionID, userIDStr string, config mod
 	return ids
 }
 
+// fetchPodsHardHiddenIDs returns only explicit, non-expiring delivery hides.
+// A starved frozen session may recycle time-bounded view/playback suppression,
+// but it must never override an explicit hide.
+func fetchPodsHardHiddenIDs(db *gorm.DB, sessionID, userIDStr string) []uuid.UUID {
+	query := db.Model(&models.UserInteraction{}).
+		Select("DISTINCT content_item_id").
+		Where("type = ?", models.InteractionTypeHide)
+	if userIDStr != "" {
+		uid, err := uuid.Parse(userIDStr)
+		if err != nil {
+			return nil
+		}
+		query = query.Where("user_id = ?", uid)
+	} else if sessionID != "" {
+		query = query.Where("session_id = ?", sessionID)
+	} else {
+		return nil
+	}
+	var ids []uuid.UUID
+	if err := query.Pluck("content_item_id", &ids).Error; err != nil {
+		return nil
+	}
+	return ids
+}
+
 func clampRepeatWindow(value, fallback int) int {
 	if value < 1 {
 		return fallback

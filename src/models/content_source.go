@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 )
 
 // ContentSource represents a content ingestion source configuration
@@ -62,4 +63,23 @@ type ContentSource struct {
 // TableName returns the table name for ContentSource
 func (ContentSource) TableName() string {
 	return "content_sources"
+}
+
+// EnsureInitialSchedule gives a newly active Media source an explicit first
+// poll. Media circulation no longer has a legacy fallback scheduler, and the
+// durable source-run scheduler deliberately ignores NULL next_due_at values.
+// News remains on its separate circulation path during this cutover.
+func (source *ContentSource) EnsureInitialSchedule(now time.Time) {
+	if source == nil || !source.IsActive || source.Category != SourceCategoryMedia || source.NextDueAt != nil {
+		return
+	}
+	due := now.UTC()
+	source.NextDueAt = &due
+}
+
+// BeforeCreate enforces the Media scheduling invariant at every creation
+// boundary, including admin creation and approved discovery suggestions.
+func (source *ContentSource) BeforeCreate(_ *gorm.DB) error {
+	source.EnsureInitialSchedule(time.Now())
+	return nil
 }

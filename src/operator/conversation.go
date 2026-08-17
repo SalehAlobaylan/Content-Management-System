@@ -56,7 +56,7 @@ func (store *ConversationStore) AppendMessage(ctx context.Context, threadID uint
 		return models.OperatorMessage{}, fmt.Errorf("%w: encode conversation content", ErrInvalidContract)
 	}
 	now := store.now()
-	message := models.OperatorMessage{ThreadID: threadID, TenantID: tenantID, ActorType: actorType, ActorID: actorID, Content: datatypes.JSON(raw)}
+	message := models.OperatorMessage{ThreadID: threadID, TenantID: tenantID, ActorType: actorType, ActorID: actorID, MessageKind: "note", Content: datatypes.JSON(raw)}
 	err = store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var thread models.OperatorThread
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=? AND tenant_id=? AND creator_id=?", threadID, tenantID, creatorID).First(&thread).Error; err != nil {

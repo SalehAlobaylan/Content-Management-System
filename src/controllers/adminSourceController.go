@@ -939,6 +939,10 @@ func UpdateContentSource(c *gin.Context) {
 		source.FetchIntervalMinutes = *req.FetchIntervalMinutes
 	}
 
+	// Reactivation (and category changes into Media) must restore the explicit
+	// schedule consumed by the CMS source-run admission loop.
+	source.EnsureInitialSchedule(time.Now())
+
 	if err := db.Save(&source).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to update source",

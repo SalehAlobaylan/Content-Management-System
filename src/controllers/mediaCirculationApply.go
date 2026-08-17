@@ -350,7 +350,7 @@ func revertRecommendation(db *gorm.DB, tenantID string, rec models.MediaCirculat
 	case mediaCircOutcomePaused:
 		return db.Model(&models.ContentSource{}).
 			Where("public_id = ? AND tenant_id = ?", rec.SubjectID, tenantID).
-			Update("is_active", true).Error
+			Updates(map[string]any{"is_active": true, "next_due_at": time.Now().UTC()}).Error
 	default:
 		return errors.New("recommendation outcome is not revertible")
 	}

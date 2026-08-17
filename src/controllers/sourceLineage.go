@@ -32,35 +32,75 @@ func createSourceRunRequest(db *gorm.DB, source models.ContentSource, requestedB
 }
 
 func createSourceRunRequestWithCorrelation(db *gorm.DB, source models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID, correlationInput SourceRunCorrelation) (models.SourceRunRequest, error) {
+	if err := supply.RequireLegacyAdmission(db, source.TenantID, source.Category); err != nil {
+		return models.SourceRunRequest{}, err
+	}
+	request, err := newLegacySourceRunRequest(source, requestedBy, actorID, suggestionID, correlationInput)
+	if err != nil {
+		return models.SourceRunRequest{}, err
+	}
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&request).Error; err != nil {
+			return err
+		}
+		return appendContentProcessingEvent(tx, sourceRunRequestedEvent(request))
+	})
+	return request, err
+}
+
+func newLegacySourceRunRequest(source models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID, correlationInput SourceRunCorrelation) (models.SourceRunRequest, error) {
 	requestedBy = strings.TrimSpace(requestedBy)
 	if requestedBy != "approval_handoff" && requestedBy != "manual" && requestedBy != "schedule" && requestedBy != "system" {
 		return models.SourceRunRequest{}, fmt.Errorf("invalid source-run requester")
-	}
-	if err := supply.RequireLegacyAdmission(db, source.TenantID, source.Category); err != nil {
-		return models.SourceRunRequest{}, err
 	}
 	correlation := uuid.NewString()
 	idempotencyKey := strings.TrimSpace(correlationInput.IdempotencyKey)
 	if idempotencyKey == "" {
 		idempotencyKey = "source-run:" + correlation
 	}
-	request := models.SourceRunRequest{
+	return models.SourceRunRequest{
 		TenantID: source.TenantID, ContentSourceID: source.PublicID, SourceSuggestionID: suggestionID,
 		RequestedBy: requestedBy, RequestedByActorID: strings.TrimSpace(actorID), State: models.SourceRunRequested,
 		OperatorPlanID: correlationInput.OperatorPlanID, OperatorStepID: correlationInput.OperatorStepID,
 		CorrelationID: correlation, IdempotencyKey: idempotencyKey, RequestedAt: time.Now().UTC(), Metadata: datatypes.JSON([]byte(`{}`)),
+	}, nil
+}
+
+func sourceRunRequestedEvent(request models.SourceRunRequest) models.ContentProcessingEvent {
+	return models.ContentProcessingEvent{
+		TenantID: request.TenantID, ContentSourceID: &request.ContentSourceID, SourceRunRequestID: &request.ID,
+		Stage: lineageStageSourceRun, State: models.SourceRunRequested, Producer: "cms", CorrelationID: request.CorrelationID,
+		IdempotencyKey: request.IdempotencyKey, EventClass: "source_run_requested", Payload: datatypes.JSON([]byte(`{}`)), OccurredAt: request.RequestedAt,
 	}
-	err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&request).Error; err != nil {
-			return err
+}
+
+// createLegacySourceRunRequests persists one circulation claim batch with two
+// bounded writes: one for requests and one for their immutable lineage events.
+// The caller owns the surrounding transaction so source row locks, admissions,
+// and last_fetched_at updates commit or roll back together.
+func createLegacySourceRunRequests(db *gorm.DB, sources []models.ContentSource, requestedBy string) ([]models.SourceRunRequest, error) {
+	requests := make([]models.SourceRunRequest, 0, len(sources))
+	for _, source := range sources {
+		request, err := newLegacySourceRunRequest(source, requestedBy, "", nil, SourceRunCorrelation{})
+		if err != nil {
+			return nil, err
 		}
-		return appendContentProcessingEvent(tx, models.ContentProcessingEvent{
-			TenantID: request.TenantID, ContentSourceID: &request.ContentSourceID, SourceRunRequestID: &request.ID,
-			Stage: lineageStageSourceRun, State: models.SourceRunRequested, Producer: "cms", CorrelationID: request.CorrelationID,
-			IdempotencyKey: request.IdempotencyKey, EventClass: "source_run_requested", Payload: datatypes.JSON([]byte(`{}`)), OccurredAt: request.RequestedAt,
-		})
-	})
-	return request, err
+		requests = append(requests, request)
+	}
+	if len(requests) == 0 {
+		return requests, nil
+	}
+	if err := db.Create(&requests).Error; err != nil {
+		return nil, err
+	}
+	events := make([]models.ContentProcessingEvent, 0, len(requests))
+	for _, request := range requests {
+		events = append(events, sourceRunRequestedEvent(request))
+	}
+	if err := db.Create(&events).Error; err != nil {
+		return nil, err
+	}
+	return requests, nil
 }
 
 func markSourceRunAccepted(db *gorm.DB, requestID uuid.UUID, aggregationJobID string) error {

@@ -100,13 +100,15 @@ func GetPodsFeed(c *gin.Context) {
 	// session_id. A client-supplied ?user_id is never trusted, and an
 	// authenticated caller cannot pass ?session_id to read someone else's state.
 	userIDStr, sessionID := readIdentity(c)
-	// Repetition suppression is always applied while an identity is present.
-	// The old opt-in exclude_seen query parameter is intentionally ignored for
-	// Pods: mobile sessions must not accidentally recycle watched inventory.
+	// Repetition suppression is applied while an identity is present. Frozen
+	// sessions may deliberately place soft-suppressed items after unseen items
+	// when the corpus is exhausted; explicit hides are never recycled.
 	var seenIDs []uuid.UUID
 	if sessionID != "" || userIDStr != "" {
 		seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, tenantID), time.Now().UTC())
 	}
+	recycleSuppressed, _ := c.Get(podsRecycleSuppressedContextKey)
+	allowSuppressedRecycle, _ := recycleSuppressed.(bool)
 
 	config := loadTenantConfig(db, tenantID)
 	durationTargetMinutes := parseDurationPreference(c.Query("duration"))
@@ -147,24 +149,14 @@ func GetPodsFeed(c *gin.Context) {
 		scored, preferenceEligible := applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
 		scored = applyIntelligenceFeedHooks(db, tenantID, scored)
 		scored = spaceScoredSiblingChapters(scored)
-		unfilteredScored := append([]ScoredItem(nil), scored...)
-
 		// Filter out already-seen items
 		if len(seenIDs) > 0 {
-			seenSet := make(map[uuid.UUID]bool, len(seenIDs))
-			for _, id := range seenIDs {
-				seenSet[id] = true
+			if allowSuppressedRecycle && !hasCursor(pagination) {
+				scored = prioritizeScoredPodsForSession(scored, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
+			} else {
+				scored = filterScoredPodsByIDs(scored, seenIDs)
 			}
-			filtered := scored[:0]
-			for _, s := range scored {
-				if !seenSet[s.Item.PublicID] {
-					filtered = append(filtered, s)
-				}
-			}
-			scored = filtered
 		}
-		_ = unfilteredScored // retained for scoring diagnostics; never recycle it.
-
 		// Apply cursor-based pagination over scored results
 		startIdx := 0
 		if !pagination.Timestamp.IsZero() {
@@ -265,7 +257,7 @@ func GetPodsFeed(c *gin.Context) {
 	}
 
 	// Exclude already-seen items
-	if len(seenIDs) > 0 {
+	if len(seenIDs) > 0 && !(allowSuppressedRecycle && !hasCursor(pagination)) {
 		query = query.Where("public_id NOT IN ?", seenIDs)
 	}
 
@@ -279,6 +271,9 @@ func GetPodsFeed(c *gin.Context) {
 		return
 	}
 	items = excludeCollapsedRedundancyMembers(db, tenantID, items)
+	if allowSuppressedRecycle && !hasCursor(pagination) && len(seenIDs) > 0 {
+		items = prioritizePodsForSession(items, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
+	}
 
 	// Keep the cursor boundary chronological even when preferences reorder the
 	// returned page. That makes the cursor stable while allowing a deliberately
@@ -331,6 +326,64 @@ func GetPodsFeed(c *gin.Context) {
 		recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
 		recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
 	}
+}
+
+func uuidMembership(ids []uuid.UUID) map[uuid.UUID]struct{} {
+	set := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	return set
+}
+
+func filterScoredPodsByIDs(items []ScoredItem, excludedIDs []uuid.UUID) []ScoredItem {
+	excluded := uuidMembership(excludedIDs)
+	filtered := make([]ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, skip := excluded[item.Item.PublicID]; !skip {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+// prioritizePodsForSession preserves unseen-first delivery while allowing a
+// frozen session to fill from softly suppressed inventory after the current
+// corpus is exhausted. Explicit hides are always removed.
+func prioritizePodsForSession(items []models.ContentItem, suppressedIDs, hardHiddenIDs []uuid.UUID) []models.ContentItem {
+	suppressed := uuidMembership(suppressedIDs)
+	hardHidden := uuidMembership(hardHiddenIDs)
+	ordered := make([]models.ContentItem, 0, len(items))
+	deferred := make([]models.ContentItem, 0, len(items))
+	for _, item := range items {
+		if _, hidden := hardHidden[item.PublicID]; hidden {
+			continue
+		}
+		if _, seen := suppressed[item.PublicID]; seen {
+			deferred = append(deferred, item)
+		} else {
+			ordered = append(ordered, item)
+		}
+	}
+	return append(ordered, deferred...)
+}
+
+func prioritizeScoredPodsForSession(items []ScoredItem, suppressedIDs, hardHiddenIDs []uuid.UUID) []ScoredItem {
+	suppressed := uuidMembership(suppressedIDs)
+	hardHidden := uuidMembership(hardHiddenIDs)
+	ordered := make([]ScoredItem, 0, len(items))
+	deferred := make([]ScoredItem, 0, len(items))
+	for _, item := range items {
+		if _, hidden := hardHidden[item.Item.PublicID]; hidden {
+			continue
+		}
+		if _, seen := suppressed[item.Item.PublicID]; seen {
+			deferred = append(deferred, item)
+		} else {
+			ordered = append(ordered, item)
+		}
+	}
+	return append(ordered, deferred...)
 }
 
 // excludeCollapsedRedundancyMembers is deliberately an inventory filter, not
@@ -448,9 +501,13 @@ func GetNewsFeed(c *gin.Context) {
 		<-seenDone
 		return seenIDs
 	}
-	slides, nextCursor, serveMeta := serveStoryNewsFeed(
+	slides, nextCursor, serveMeta, err := serveStoryNewsFeed(
 		db, tenantID, config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
 	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "News feed is temporarily unavailable"})
+		return
+	}
 	// A story snapshot is shared across viewers, while like/bookmark state is
 	// identity-specific. Hydrate only the lead content IDs after assembly so a
 	// cached News slide never leaks another viewer's interaction state.
