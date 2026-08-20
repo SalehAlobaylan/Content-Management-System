@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -767,7 +768,8 @@ func chaptersFromAtomizationRequest(tenantID string, transcriptID uuid.UUID, cha
 }
 
 type createAtomizedChildrenRequest struct {
-	Chapters []atomizationChapterRequest `json:"chapters"`
+	Chapters     []atomizationChapterRequest     `json:"chapters"`
+	ContentStage *contentStageCorrelationRequest `json:"content_stage,omitempty"`
 }
 
 type reportAtomizationRunRequest struct {
@@ -792,9 +794,25 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
 		return
 	}
+	if err := requireNormalStageCorrelation(db, *parent, models.ContentStagePodsAtomization, req.ContentStage, false); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
 	policy := atomizationPolicyForItem(db, parent)
 	children := []map[string]interface{}{}
 	err := db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		if req.ContentStage != nil {
+			var err error
+			stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(tx, parent.PublicID, req.ContentStage.correlation(), models.ContentStagePodsAtomization)
+			if err != nil {
+				return err
+			}
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", parent.TenantID, parent.PublicID).First(parent).Error; err != nil {
+			return err
+		}
 		if !policy.ParentFeedVisible {
 			parent.IsFeedUnit = false
 			parent.FeedVisibility = feedVisibilityHidden
@@ -819,14 +837,30 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 			if err != nil {
 				return err
 			}
-			children = append(children, map[string]interface{}{"id": child.PublicID.String(), "status": child.Status, "feed_visibility": child.FeedVisibility})
+			deliveryMode, err := contentstage.DeliveryMode(tx, child.TenantID, child.Type)
+			if err != nil {
+				return err
+			}
+			children = append(children, map[string]interface{}{"id": child.PublicID.String(), "status": child.Status, "feed_visibility": child.FeedVisibility, "delivery_mode": deliveryMode})
 		}
 		final := "completed"
 		if hasReviewChapters(req.Chapters, policy) {
 			final = "needs_review"
 		}
 		parent.ChapteringStatus = &final
-		return tx.Save(parent).Error
+		if err := tx.Save(parent).Error; err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			childIDs := make([]string, 0, len(children))
+			for _, child := range children {
+				if id, ok := child["id"].(string); ok {
+					childIDs = append(childIDs, id)
+				}
+			}
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerAggregationPods, strings.Join(childIDs, ","), map[string]any{"child_ids": childIDs, "child_count": len(childIDs)})
+		}
+		return nil
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create atomized children: " + err.Error()})
@@ -1086,6 +1120,14 @@ func upsertAtomizedChild(tx *gorm.DB, parent *models.ContentItem, parentTranscri
 				item.TranscriptID = &transcript.PublicID
 				_ = tx.Save(&item).Error
 			}
+		}
+	}
+	if published {
+		if _, err := contentstage.EnsureManifest(tx, &item); err != nil {
+			return nil, err
+		}
+		if err := contentstage.AdoptPresentStages(tx, item, "atomization_child_transaction"); err != nil {
+			return nil, err
 		}
 	}
 	chapterStatus := chapterStatusReview

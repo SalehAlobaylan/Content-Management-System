@@ -135,6 +135,13 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	assignTopicToItem(db, &item, topic.PublicID, emb)
 }
 
+// ClassifyContentStage exposes the deterministic CMS-owned classification
+// effect to the durable normal-stage worker. Keeping the wrapper here avoids
+// moving story clustering or LLM-label fallback ownership out of CMS.
+func ClassifyContentStage(db *gorm.DB, contentID uuid.UUID) {
+	classifyContentTopic(db, contentID)
+}
+
 func holdStoryClassification(db *gorm.DB, tenantID, itemSpaceID string) bool {
 	var c models.EmbeddingCampaign
 	if err := db.Where("space = ? AND state IN ?", EmbeddingSpaceText,

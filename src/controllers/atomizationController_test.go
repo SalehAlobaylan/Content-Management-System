@@ -114,6 +114,23 @@ func TestHasReviewChaptersFlagsLowConfidenceAndExplicitReasons(t *testing.T) {
 	}
 }
 
+func TestCanSettleAtomizationNotRequired(t *testing.T) {
+	shortDuration := atomizationMinParentDurationSec
+	longDuration := atomizationMinParentDurationSec + 1
+	if !canSettleAtomizationNotRequired(models.ContentItem{DurationSec: &longDuration}, atomizationPolicy{ChapteringEnabled: false}) {
+		t.Fatal("disabled policy must settle even for a long parent")
+	}
+	if !canSettleAtomizationNotRequired(models.ContentItem{DurationSec: &shortDuration}, atomizationPolicy{ChapteringEnabled: true}) {
+		t.Fatal("a parent at the 40-minute boundary must settle as raw")
+	}
+	if canSettleAtomizationNotRequired(models.ContentItem{DurationSec: &longDuration}, atomizationPolicy{ChapteringEnabled: true}) {
+		t.Fatal("enabled atomization for a long parent must remain required")
+	}
+	if canSettleAtomizationNotRequired(models.ContentItem{}, atomizationPolicy{ChapteringEnabled: true}) {
+		t.Fatal("missing duration must fail closed while chaptering is enabled")
+	}
+}
+
 func TestChaptersFromAtomizationRequestForcesOverHardMaxToReview(t *testing.T) {
 	policy := defaultAtomizationPolicy()
 	rows := chaptersFromAtomizationRequest("tenant-test", uuid.New(), []atomizationChapterRequest{{

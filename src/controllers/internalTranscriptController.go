@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/artifacts"
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"encoding/json"
 	"net/http"
@@ -29,6 +30,7 @@ type internalCreateTranscriptRequest struct {
 	LanguageProbability *float64                            `json:"language_probability"`
 	DurationSec         *float64                            `json:"duration_sec"`
 	ArtifactRecovery    *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	ContentStage        *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
 }
 
 type internalCreateTranscriptResponse struct {
@@ -66,6 +68,25 @@ func InternalCreateTranscript(c *gin.Context) {
 	haveItem := db.Where("public_id = ?", contentUUID).First(&item).Error == nil
 	var recoveryRequest models.ArtifactCoverageRequest
 	var recoveryAttempt models.ArtifactCoverageAttempt
+	var stageRequest models.ContentStageRequest
+	var stageAttempt models.ContentStageAttempt
+	if haveItem {
+		if err := requireNormalStageCorrelation(db, item, models.ContentStagePodsTranscript, req.ContentStage, req.ArtifactRecovery != nil); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.ContentStage != nil {
+		if !haveItem {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+			return
+		}
+		stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(db, contentUUID, req.ContentStage.correlation(), models.ContentStagePodsTranscript)
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Content-stage transcript correlation is stale"})
+			return
+		}
+	}
 	if req.ArtifactRecovery != nil {
 		if !haveItem {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
@@ -76,6 +97,10 @@ func InternalCreateTranscript(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Artifact recovery correlation is stale"})
 			return
 		}
+	}
+	if req.ArtifactRecovery != nil && req.ContentStage != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Normal stage and recovery correlations are exclusive"})
+		return
 	}
 
 	source := models.TranscriptSourceSTTDeepgram
@@ -116,6 +141,50 @@ func InternalCreateTranscript(c *gin.Context) {
 		if raw, err := json.Marshal(req.Chapters); err == nil {
 			transcript.Chapters = datatypes.JSON(raw)
 		}
+	}
+
+	if req.ContentStage != nil {
+		captionState := models.CaptionStateForSource(source)
+		producerEventID, parseErr := uuid.Parse(req.ContentStage.ProducerEventID)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content-stage producer event"})
+			return
+		}
+		err = db.Transaction(func(tx *gorm.DB) error {
+			// A caller that lost the response reuses the producer event. Return the
+			// first durable effect instead of creating a duplicate transcript.
+			var existingReceipt models.ContentStageReceipt
+			if findErr := tx.Where("tenant_id=? AND owner=? AND producer_event_id=?", item.TenantID, models.ContentStageOwnerMedia, producerEventID).First(&existingReceipt).Error; findErr == nil {
+				existingID, idErr := uuid.Parse(existingReceipt.ArtifactDigest)
+				if idErr != nil {
+					return idErr
+				}
+				return tx.Where("public_id=? AND content_item_id=?", existingID, contentUUID).First(&transcript).Error
+			} else if findErr != gorm.ErrRecordNotFound {
+				return findErr
+			}
+			stageRequest, stageAttempt, authErr := contentstage.AuthorizeWriteback(tx, contentUUID, req.ContentStage.correlation(), models.ContentStagePodsTranscript)
+			if authErr != nil {
+				return authErr
+			}
+			if createErr := tx.Create(&transcript).Error; createErr != nil {
+				return createErr
+			}
+			if linkErr := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", item.TenantID, contentUUID).Updates(map[string]any{"transcript_id": transcript.PublicID, "caption_state": captionState, "transcript_source": source}).Error; linkErr != nil {
+				return linkErr
+			}
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerMedia, transcript.PublicID.String(), map[string]any{"transcript_id": transcript.PublicID.String(), "provider": req.Provider})
+		})
+		if err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Durable transcript writeback rejected"})
+			return
+		}
+		item.TranscriptID = &transcript.PublicID
+		item.CaptionState = &captionState
+		item.TranscriptSource = &source
+		computeAndStoreTranscriptQuality(db, &item, &transcript, req.LanguageProbability)
+		c.JSON(http.StatusOK, internalCreateTranscriptResponse{ID: transcript.PublicID.String(), CreatedAt: transcript.CreatedAt.UTC().Format(time.RFC3339)})
+		return
 	}
 
 	if err := db.Create(&transcript).Error; err != nil {
@@ -250,6 +319,12 @@ func InternalCreateTranscript(c *gin.Context) {
 	if req.ArtifactRecovery != nil {
 		if err := artifacts.RecordPersistence(db, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"transcript_id": transcript.PublicID.String(), "provider": req.Provider}); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Transcript persisted but recovery receipt could not be recorded"})
+			return
+		}
+	}
+	if req.ContentStage != nil {
+		if err := contentstage.RecordPersistence(db, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerMedia, transcript.PublicID.String(), map[string]any{"transcript_id": transcript.PublicID.String(), "provider": req.Provider}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Transcript persisted but content-stage receipt could not be recorded"})
 			return
 		}
 	}

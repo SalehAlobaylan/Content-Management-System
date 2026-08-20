@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/artifacts"
+	"content-management-system/src/contentstage"
 	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
 	"content-management-system/src/pipeline"
@@ -54,11 +55,14 @@ type internalCreateContentItemRequest struct {
 }
 
 type internalCreateContentItemResponse struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	Created   bool   `json:"created"`
-	Retired   bool   `json:"retired,omitempty"`
-	CreatedAt string `json:"created_at"`
+	ID           string `json:"id"`
+	TenantID     string `json:"tenant_id"`
+	Status       string `json:"status"`
+	Created      bool   `json:"created"`
+	Retired      bool   `json:"retired,omitempty"`
+	CreatedAt    string `json:"created_at"`
+	DeliveryMode string `json:"delivery_mode"`
+	contentstage.ManifestDisposition
 }
 
 type internalUpdateContentItemRequest struct {
@@ -80,6 +84,7 @@ type internalUpdateContentItemRequest struct {
 type internalEnrichmentMetadataRequest struct {
 	Fields           map[string]interface{}              `json:"fields"`
 	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
 }
 
 type artifactRecoveryCorrelationRequest struct {
@@ -162,6 +167,26 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 	}
 	var rows int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		var item models.ContentItem
+		if err := tx.Where("public_id=?", id).First(&item).Error; err != nil {
+			return err
+		}
+		stage := models.ContentStagePodsLLMMetadata
+		if item.Type == models.ContentTypeNews {
+			stage = models.ContentStageNewsLLMMetadata
+		}
+		if err := requireNormalStageCorrelation(tx, item, stage, req.ContentStage, req.ArtifactRecovery != nil); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			var authErr error
+			stageRequest, stageAttempt, authErr = contentstage.AuthorizeWriteback(tx, id, req.ContentStage.correlation(), stage)
+			if authErr != nil {
+				return authErr
+			}
+		}
 		result := tx.Model(&models.ContentItem{}).Where("public_id = ?", id).UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
 		rows = result.RowsAffected
 		if result.Error != nil {
@@ -169,6 +194,9 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 		}
 		if req.ArtifactRecovery != nil {
 			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"fields": len(req.Fields)})
+		}
+		if req.ContentStage != nil {
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerEnrichment, "llm-metadata", map[string]any{"fields": len(req.Fields)})
 		}
 		return nil
 	})
@@ -219,7 +247,8 @@ type internalUpdateArtifactsRequest struct {
 	// ExpectedItemUpdatedAt is an optional owner-issued fence. Normal ingest
 	// leaves it empty; exact Pipeline repair writes must use it so a stale
 	// worker cannot attach an artifact to a newer item version.
-	ExpectedItemUpdatedAt *string `json:"expected_item_updated_at"`
+	ExpectedItemUpdatedAt *string                         `json:"expected_item_updated_at"`
+	ContentStage          *contentStageCorrelationRequest `json:"content_stage,omitempty"`
 }
 
 type internalUpdateEmbeddingRequest struct {
@@ -238,6 +267,27 @@ type internalUpdateEmbeddingRequest struct {
 	ProducerID       string                              `json:"producer_id"`
 	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
 	PipelineRepair   *pipelineRepairCorrelationRequest   `json:"pipeline_repair,omitempty"`
+	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
+}
+
+type contentStageCorrelationRequest struct {
+	RequestID        string `json:"request_id"`
+	AttemptID        string `json:"attempt_id"`
+	ClaimToken       string `json:"claim_token"`
+	FenceToken       string `json:"fence_token"`
+	InputFingerprint string `json:"input_fingerprint"`
+	ProducerEventID  string `json:"producer_event_id"`
+}
+
+func (value *contentStageCorrelationRequest) correlation() contentstage.Correlation {
+	if value == nil {
+		return contentstage.Correlation{}
+	}
+	return contentstage.Correlation{
+		RequestID: value.RequestID, AttemptID: value.AttemptID, ClaimToken: value.ClaimToken,
+		FenceToken: value.FenceToken, InputFingerprint: value.InputFingerprint,
+		ProducerEventID: value.ProducerEventID,
+	}
 }
 
 type pipelineRepairCorrelationRequest struct {
@@ -268,11 +318,28 @@ type internalUpdateImageEmbeddingRequest struct {
 	SpaceID          string                              `json:"space_id"`
 	ProducerID       string                              `json:"producer_id"`
 	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
 }
 
 type internalLinkTranscriptRequest struct {
 	TranscriptID     string                              `json:"transcript_id"`
 	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
+}
+
+func requireNormalStageCorrelation(db *gorm.DB, item models.ContentItem, stage string, correlation *contentStageCorrelationRequest, alternativeAuthorizedPath bool) error {
+	lane := models.ContentStageLaneNews
+	if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+		lane = models.ContentStageLanePods
+	}
+	mode, err := contentstage.CutoverMode(db, item.TenantID, lane)
+	if err != nil {
+		return err
+	}
+	if mode == models.ContentStageCutoverDurableRequired && correlation == nil && !alternativeAuthorizedPath {
+		return fmt.Errorf("durable content-stage correlation is required")
+	}
+	return nil
 }
 
 const maxIdempotencyKeyLength = 512
@@ -347,15 +414,64 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	idempotencyKey := normalizeIdempotencyKey(req.IdempotencyKey)
+	lineageTenantID := strings.TrimSpace(req.TenantID)
+	if lineageTenantID == "" {
+		lineageTenantID = defaultCirculationTenant
+	}
 
-	// Check for existing item by idempotency key
+	// Identity resolution is tenant-scoped. A matching provider key in another
+	// tenant must never expose or mutate that tenant's item or stage evidence.
 	var existing models.ContentItem
-	if err := db.Where("idempotency_key = ?", idempotencyKey).First(&existing).Error; err == nil {
+	if err := db.Where("tenant_id = ? AND idempotency_key = ?", lineageTenantID, idempotencyKey).First(&existing).Error; err == nil {
+		var requests []models.ContentStageRequest
+		disposition := "no_change"
+		if manifestErr := db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=?", existing.PublicID).First(&existing).Error; err != nil {
+				return err
+			}
+			previousDigest := ""
+			if existing.ProcessingInputDigest != nil {
+				previousDigest = *existing.ProcessingInputDigest
+			}
+			// The idempotency identity is stable, but source observations may carry
+			// corrected text or a replaced media reference. Compare those inputs in
+			// CMS; Redis and Aggregation must not guess whether work is current.
+			existing.Title = &req.Title
+			existing.BodyText = req.BodyText
+			existing.Excerpt = req.Excerpt
+			existing.ContentLanguage = normalizeContentLanguage(req.ContentLanguage)
+			existing.SourceFeedURL = req.SourceFeedURL
+			existing.OriginalURL = &req.OriginalURL
+			// media_url, thumbnail_url, and duration_sec are produced artifacts
+			// after materialization; duplicate intake must never overwrite them
+			// with the original provider reference.
+			if err := tx.Save(&existing).Error; err != nil {
+				return err
+			}
+			var changed bool
+			var reconcileErr error
+			requests, changed, reconcileErr = contentstage.ReconcileManifest(tx, &existing, previousDigest)
+			if changed {
+				disposition = "changed"
+			}
+			return reconcileErr
+		}); manifestErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile content stage manifest"})
+			return
+		}
+		deliveryMode, modeErr := contentstage.DeliveryMode(db, existing.TenantID, existing.Type)
+		if modeErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
+			return
+		}
 		c.JSON(http.StatusOK, internalCreateContentItemResponse{
-			ID:        existing.PublicID.String(),
-			Status:    string(existing.Status),
-			Created:   false,
-			CreatedAt: existing.CreatedAt.UTC().Format(time.RFC3339),
+			ID:                  existing.PublicID.String(),
+			TenantID:            existing.TenantID,
+			Status:              string(existing.Status),
+			Created:             false,
+			CreatedAt:           existing.CreatedAt.UTC().Format(time.RFC3339),
+			DeliveryMode:        deliveryMode,
+			ManifestDisposition: contentstage.SummarizeManifest(requests, existing.ProcessingGeneration, disposition),
 		})
 		return
 	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -371,10 +487,6 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	metadataJSON, _ := json.Marshal(req.Metadata)
-	lineageTenantID := strings.TrimSpace(req.TenantID)
-	if lineageTenantID == "" {
-		lineageTenantID = defaultCirculationTenant
-	}
 	var contentSourceID *uuid.UUID
 	var sourceRunRequestID *uint
 	if strings.TrimSpace(req.ContentSourceID) != "" || strings.TrimSpace(req.SourceRunRequestID) != "" {
@@ -478,6 +590,9 @@ func InternalCreateContentItem(c *gin.Context) {
 		if err := tx.Create(&item).Error; err != nil {
 			return err
 		}
+		if _, err := contentstage.EnsureManifest(tx, &item); err != nil {
+			return err
+		}
 		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
 			return err
 		}
@@ -494,11 +609,21 @@ func InternalCreateContentItem(c *gin.Context) {
 		return
 	}
 
+	var stageRequests []models.ContentStageRequest
+	_ = db.Where("tenant_id=? AND content_item_id=? AND processing_generation=?", item.TenantID, item.PublicID, item.ProcessingGeneration).Order("created_at").Find(&stageRequests).Error
+	deliveryMode, modeErr := contentstage.DeliveryMode(db, item.TenantID, item.Type)
+	if modeErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
+		return
+	}
 	c.JSON(http.StatusOK, internalCreateContentItemResponse{
-		ID:        item.PublicID.String(),
-		Status:    string(item.Status),
-		Created:   true,
-		CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339),
+		ID:                  item.PublicID.String(),
+		TenantID:            item.TenantID,
+		Status:              string(item.Status),
+		Created:             true,
+		CreatedAt:           item.CreatedAt.UTC().Format(time.RFC3339),
+		DeliveryMode:        deliveryMode,
+		ManifestDisposition: contentstage.SummarizeManifest(stageRequests, item.ProcessingGeneration, "created"),
 	})
 }
 
@@ -522,6 +647,10 @@ func InternalUpdateContentItem(c *gin.Context) {
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
+	}
+	previousDigest := ""
+	if item.ProcessingInputDigest != nil {
+		previousDigest = *item.ProcessingInputDigest
 	}
 	if req.Title != nil {
 		item.Title = req.Title
@@ -558,12 +687,20 @@ func InternalUpdateContentItem(c *gin.Context) {
 		}
 	}
 
-	if err := db.Save(&item).Error; err != nil {
+	changed := false
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		_, manifestChanged, err := contentstage.ReconcileManifest(tx, &item, previousDigest)
+		changed = manifestChanged
+		return err
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update content item"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	c.JSON(http.StatusOK, gin.H{"success": true, "disposition": map[bool]string{true: "changed", false: "no_change"}[changed], "processing_generation": item.ProcessingGeneration})
 }
 
 // InternalUpdateContentStatus handles PATCH /internal/content-items/:id/status
@@ -590,6 +727,15 @@ func InternalUpdateContentStatus(c *gin.Context) {
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+	deliveryMode, modeErr := contentstage.DeliveryMode(db, item.TenantID, item.Type)
+	if modeErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve lifecycle ownership"})
+		return
+	}
+	if deliveryMode == models.ContentStageCutoverDurableRequired {
+		c.JSON(http.StatusConflict, gin.H{"error": "CMS content-stage reducer owns lifecycle in durable mode"})
 		return
 	}
 	item.Status = models.ContentStatus(strings.ToUpper(req.Status))
@@ -668,6 +814,56 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 		expectedItemUpdatedAt = &parsed
 	}
 
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		if err := requireNormalStageCorrelation(tx, item, models.ContentStagePodsMediaArtifacts, req.ContentStage, false); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			var err error
+			stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(tx, id, req.ContentStage.correlation(), models.ContentStagePodsMediaArtifacts)
+			if err != nil {
+				return err
+			}
+		}
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=?", item.PublicID, item.TenantID)
+		if expectedItemUpdatedAt != nil {
+			query = query.Where("updated_at=?", *expectedItemUpdatedAt)
+		}
+		if err := query.First(&item).Error; err != nil {
+			if expectedItemUpdatedAt != nil {
+				return fmt.Errorf("artifact target version is stale: %w", err)
+			}
+			return err
+		}
+		applyArtifactRequest(&item, req)
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			artifactDigest := contentstage.ItemInputDigest(item)
+			if err := contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerAggregationPods, artifactDigest, map[string]any{"playback_ready": item.PlaybackURL != nil, "duration_sec": item.DurationSec}); err != nil {
+				return err
+			}
+		}
+		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
+	}); err != nil {
+		if strings.Contains(err.Error(), "artifact target version is stale") {
+			c.JSON(http.StatusConflict, gin.H{"error": "Artifact target version is stale"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update artifacts"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func applyArtifactRequest(item *models.ContentItem, req internalUpdateArtifactsRequest) {
 	if req.MediaURL != nil {
 		item.MediaURL = req.MediaURL
 	}
@@ -689,8 +885,7 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 		}
 	}
 	if req.MediaSuitability != nil {
-		verdict := normalizeMediaSuitability(*req.MediaSuitability)
-		item.MediaSuitability = verdict
+		item.MediaSuitability = normalizeMediaSuitability(*req.MediaSuitability)
 		if req.SuitabilityConfidence != nil {
 			conf := *req.SuitabilityConfidence
 			if conf < 0 {
@@ -713,78 +908,46 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if req.DurationSec != nil {
 		item.DurationSec = req.DurationSec
 	}
-	setFeedUnitDurationBucket(&item)
+	setFeedUnitDurationBucket(item)
 	if req.FileSizeBytes != nil {
 		item.FileSizeBytes = *req.FileSizeBytes
 	}
 	if req.StorageTier != nil {
-		val := strings.ToLower(strings.TrimSpace(*req.StorageTier))
-		if val == "" || val == "primary" {
+		value := strings.ToLower(strings.TrimSpace(*req.StorageTier))
+		if value == "" || value == "primary" {
 			item.StorageTier = nil
 		} else {
-			item.StorageTier = &val
+			item.StorageTier = &value
 		}
 	}
-
-	// Quality bookkeeping. Original* fields are write-once at first ingest.
-	// Current* fields and the profile pointer can be updated freely (e.g. by
-	// the quality re-encode worker).
 	if req.OriginalSizeBytes != nil && item.OriginalSizeBytes == nil {
-		v := *req.OriginalSizeBytes
-		item.OriginalSizeBytes = &v
+		value := *req.OriginalSizeBytes
+		item.OriginalSizeBytes = &value
 	}
 	if req.OriginalBitrateKbps != nil && item.OriginalBitrateKbps == nil {
-		v := *req.OriginalBitrateKbps
-		item.OriginalBitrateKbps = &v
+		value := *req.OriginalBitrateKbps
+		item.OriginalBitrateKbps = &value
 	}
 	if req.CurrentBitrateKbps != nil {
-		v := *req.CurrentBitrateKbps
-		item.CurrentBitrateKbps = &v
+		value := *req.CurrentBitrateKbps
+		item.CurrentBitrateKbps = &value
 	}
 	if req.CurrentQualityProfileID != nil {
-		v := *req.CurrentQualityProfileID
-		item.CurrentQualityProfileID = &v
+		value := *req.CurrentQualityProfileID
+		item.CurrentQualityProfileID = &value
 	}
-
-	// Merge download-time metadata keys without clobbering existing ones
-	// (same pattern as InternalUpdateContentStatus's failure_reason merge).
 	if len(req.Metadata) > 0 {
 		metadata := map[string]interface{}{}
 		if len(item.Metadata) > 0 {
 			_ = json.Unmarshal(item.Metadata, &metadata)
 		}
-		for k, v := range req.Metadata {
-			metadata[k] = v
+		for key, value := range req.Metadata {
+			metadata[key] = value
 		}
 		if raw, err := json.Marshal(metadata); err == nil {
 			item.Metadata = datatypes.JSON(raw)
 		}
 	}
-
-	if err := db.Transaction(func(tx *gorm.DB) error {
-		if expectedItemUpdatedAt != nil {
-			var current models.ContentItem
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=? AND updated_at=?", item.PublicID, item.TenantID, *expectedItemUpdatedAt).First(&current).Error; err != nil {
-				return fmt.Errorf("artifact target version is stale: %w", err)
-			}
-		}
-		if err := tx.Save(&item).Error; err != nil {
-			return err
-		}
-		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
-			return err
-		}
-		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
-	}); err != nil {
-		if strings.Contains(err.Error(), "artifact target version is stale") {
-			c.JSON(http.StatusConflict, gin.H{"error": "Artifact target version is stale"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update artifacts"})
-		}
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
 // InternalUpdateContentEmbedding handles PATCH /internal/content-items/:id/embedding
@@ -835,27 +998,51 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		}
 	}
 
-	vec := pgvector.NewVector(req.Embedding)
-	item.Embedding = &vec
-
-	// Provenance follows the write: set when the caller names its model, cleared
-	// otherwise so a provenance-less overwrite is visibly suspect (and gets
-	// re-embedded by the reconcile sweep) instead of silently inheriting the
-	// previous model name. SpaceID/ProducerID follow the same all-or-cleared
-	// rule so a legacy writer never leaves a half-stamped, uncomparable row.
-	item.EmbeddingModel = stampOrNil(req.Model)
-	item.EmbeddingSpaceID = stampOrNil(req.SpaceID)
-	item.EmbeddingProducerID = stampOrNil(req.ProducerID)
-
-	if len(req.TopicTags) > 0 {
-		item.TopicTags = req.TopicTags
-	}
-
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		stageKey := models.ContentStageNewsTextEmbedding
+		if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+			stageKey = models.ContentStagePodsTextEmbedding
+			if req.ContentStage != nil {
+				requestID, parseErr := uuid.Parse(req.ContentStage.RequestID)
+				if parseErr != nil {
+					return parseErr
+				}
+				var requestedStage models.ContentStageRequest
+				if err := tx.Where("public_id=? AND content_item_id=?", requestID, id).First(&requestedStage).Error; err != nil {
+					return err
+				}
+				if requestedStage.Stage == models.ContentStagePodsCaptionReembedding {
+					stageKey = models.ContentStagePodsCaptionReembedding
+				}
+			}
+		}
+		if err := requireNormalStageCorrelation(tx, item, stageKey, req.ContentStage, req.ArtifactRecovery != nil || req.PipelineRepair != nil); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			var err error
+			stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(tx, id, req.ContentStage.correlation(), stageKey)
+			if err != nil {
+				return err
+			}
+		}
 		if req.PipelineRepair != nil {
 			if err := pipeline.AuthorizeTextEmbeddingWriteback(tx, id, req.PipelineRepair.correlation()); err != nil {
 				return err
 			}
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
+			return err
+		}
+		vec := pgvector.NewVector(req.Embedding)
+		item.Embedding = &vec
+		item.EmbeddingModel = stampOrNil(req.Model)
+		item.EmbeddingSpaceID = stampOrNil(req.SpaceID)
+		item.EmbeddingProducerID = stampOrNil(req.ProducerID)
+		if len(req.TopicTags) > 0 {
+			item.TopicTags = req.TopicTags
 		}
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -865,6 +1052,9 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		}
 		if req.ArtifactRecovery != nil {
 			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"model": req.Model, "space_id": req.SpaceID})
+		}
+		if req.ContentStage != nil {
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerEnrichment, req.ProducerID, map[string]any{"model": req.Model, "space_id": req.SpaceID, "producer_id": req.ProducerID})
 		}
 		return nil
 	}); err != nil {
@@ -879,7 +1069,10 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	// Now that the dense embedding exists, classify the article into a
 	// first-class topic. Fire-and-forget — it calls Enrichment's LLM for new
 	// topic labels and must not block the embedding write-back.
-	go classifyContentTopic(db, item.PublicID)
+	laneMode, _ := contentstage.CutoverMode(db, item.TenantID, models.ContentStageLaneNews)
+	if item.Type == models.ContentTypeNews && laneMode != models.ContentStageCutoverDurableRequired {
+		go classifyContentTopic(db, item.PublicID)
+	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
@@ -931,13 +1124,27 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		}
 	}
 
-	vec := pgvector.NewVector(req.Embedding)
-	item.ImageEmbedding = &vec
-	item.ImageEmbeddingModel = stampOrNil(req.Model)
-	item.ImageEmbeddingSpaceID = stampOrNil(req.SpaceID)
-	item.ImageEmbeddingProducerID = stampOrNil(req.ProducerID)
-
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		if err := requireNormalStageCorrelation(tx, item, models.ContentStagePodsImageEmbedding, req.ContentStage, req.ArtifactRecovery != nil); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			var err error
+			stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(tx, id, req.ContentStage.correlation(), models.ContentStagePodsImageEmbedding)
+			if err != nil {
+				return err
+			}
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
+			return err
+		}
+		vec := pgvector.NewVector(req.Embedding)
+		item.ImageEmbedding = &vec
+		item.ImageEmbeddingModel = stampOrNil(req.Model)
+		item.ImageEmbeddingSpaceID = stampOrNil(req.SpaceID)
+		item.ImageEmbeddingProducerID = stampOrNil(req.ProducerID)
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
@@ -946,6 +1153,9 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		}
 		if req.ArtifactRecovery != nil {
 			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"model": req.Model, "space_id": req.SpaceID})
+		}
+		if req.ContentStage != nil {
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerMedia, req.ProducerID, map[string]any{"model": req.Model, "space_id": req.SpaceID})
 		}
 		return nil
 	}); err != nil {
@@ -1340,9 +1550,23 @@ func InternalLinkTranscript(c *gin.Context) {
 		}
 	}
 
-	item.TranscriptID = &transcriptUUID
-
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		var stageRequest models.ContentStageRequest
+		var stageAttempt models.ContentStageAttempt
+		if err := requireNormalStageCorrelation(tx, item, models.ContentStagePodsTranscript, req.ContentStage, req.ArtifactRecovery != nil); err != nil {
+			return err
+		}
+		if req.ContentStage != nil {
+			var err error
+			stageRequest, stageAttempt, err = contentstage.AuthorizeWriteback(tx, id, req.ContentStage.correlation(), models.ContentStagePodsTranscript)
+			if err != nil {
+				return err
+			}
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
+			return err
+		}
+		item.TranscriptID = &transcriptUUID
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
@@ -1351,6 +1575,9 @@ func InternalLinkTranscript(c *gin.Context) {
 		}
 		if req.ArtifactRecovery != nil {
 			return artifacts.RecordPersistence(tx, recoveryRequest, recoveryAttempt, req.ArtifactRecovery.correlation(), map[string]any{"transcript_id": transcriptUUID.String()})
+		}
+		if req.ContentStage != nil {
+			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerMedia, transcriptUUID.String(), map[string]any{"transcript_id": transcriptUUID.String()})
 		}
 		return nil
 	}); err != nil {

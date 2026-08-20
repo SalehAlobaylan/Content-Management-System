@@ -94,7 +94,7 @@ const (
 type ContentItem struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_content_items_public_id" json:"id"`
-	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_items_tenant_id" json:"tenant_id"`
+	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_items_tenant_id;uniqueIndex:idx_content_items_tenant_idempotency,priority:1" json:"tenant_id"`
 
 	// Classification
 	Type ContentType `gorm:"type:varchar(20);not null" json:"type"`
@@ -103,8 +103,13 @@ type ContentItem struct {
 	Format *string       `gorm:"type:varchar(20)" json:"format,omitempty"`
 	Source SourceType    `gorm:"type:varchar(20);not null" json:"source,omitempty"`
 	Status ContentStatus `gorm:"type:varchar(20);default:'READY'" json:"status,omitempty"`
+	// ProcessingGeneration versions only stage-relevant inputs. The durable
+	// normal-stage ledger uses it to fence stale attempts while preserving the
+	// previously verified generation until a replacement is ready.
+	ProcessingGeneration  int64   `gorm:"not null;default:1" json:"processing_generation"`
+	ProcessingInputDigest *string `gorm:"type:varchar(64)" json:"processing_input_digest,omitempty"`
 	// Idempotency
-	IdempotencyKey *string `gorm:"type:varchar(512);uniqueIndex:idx_content_items_idempotency_key" json:"-"`
+	IdempotencyKey *string `gorm:"type:varchar(512);uniqueIndex:idx_content_items_tenant_idempotency,priority:2" json:"-"`
 
 	// Content
 	Title    *string `gorm:"type:text" json:"title,omitempty"`

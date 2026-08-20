@@ -1,6 +1,7 @@
 package main
 
 import (
+	"content-management-system/src/contentstage"
 	"content-management-system/src/controllers"
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models" // needs it for automigrate
@@ -62,6 +63,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		supplyEvaluationHealthy := supply.MediaSupplyEvaluatorWorkerHealthy(now)
 		sourceRunSchedulerHealthy := supply.SourceRunSchedulerHealthy(now)
 		pipelineRepairHealthy := pipeline.WorkerHealthy(now)
+		contentStageHealthy := contentstage.WorkerHealthy(now)
 		artifactCoverageHealthy := controllers.ArtifactCoverageWorkerHealthy(now)
 		atomizationWorkHealthy := controllers.AtomizationWorkVerifierHealthy(now)
 		studioClearanceHealthy := controllers.StudioClearanceWorkerHealthy(now)
@@ -75,11 +77,11 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 			}
 		}
 		status := 200
-		if !projectionHealthy || !recoveryHealthy || !reconcilerHealthy || !supplyActionHealthy || !supplyEvaluationHealthy || !sourceRunSchedulerHealthy || !pipelineRepairHealthy || !artifactCoverageHealthy || !atomizationWorkHealthy || !studioClearanceHealthy || !upstreamObservationHealthy || !externalSupplyOwnersHealthy {
+		if !projectionHealthy || !recoveryHealthy || !reconcilerHealthy || !supplyActionHealthy || !supplyEvaluationHealthy || !sourceRunSchedulerHealthy || !pipelineRepairHealthy || !contentStageHealthy || !artifactCoverageHealthy || !atomizationWorkHealthy || !studioClearanceHealthy || !upstreamObservationHealthy || !externalSupplyOwnersHealthy {
 			status = 503
 		}
 		c.JSON(status, gin.H{
-			"status":                       map[bool]string{true: "ok", false: "degraded"}[projectionHealthy && recoveryHealthy && reconcilerHealthy && supplyActionHealthy && supplyEvaluationHealthy && sourceRunSchedulerHealthy && pipelineRepairHealthy && artifactCoverageHealthy && atomizationWorkHealthy && studioClearanceHealthy && upstreamObservationHealthy && externalSupplyOwnersHealthy],
+			"status":                       map[bool]string{true: "ok", false: "degraded"}[projectionHealthy && recoveryHealthy && reconcilerHealthy && supplyActionHealthy && supplyEvaluationHealthy && sourceRunSchedulerHealthy && pipelineRepairHealthy && contentStageHealthy && artifactCoverageHealthy && atomizationWorkHealthy && studioClearanceHealthy && upstreamObservationHealthy && externalSupplyOwnersHealthy],
 			"source_run_projection_ready":  projectionHealthy,
 			"source_run_recovery_ready":    recoveryHealthy,
 			"source_run_reconciler_ready":  reconcilerHealthy,
@@ -87,6 +89,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 			"media_supply_evaluator_ready": supplyEvaluationHealthy,
 			"source_run_scheduler_ready":   sourceRunSchedulerHealthy,
 			"pipeline_repair_ready":        pipelineRepairHealthy,
+			"content_stage_ready":          contentStageHealthy,
 			"artifact_coverage_ready":      artifactCoverageHealthy,
 			"atomization_work_ready":       atomizationWorkHealthy,
 			"studio_clearance_ready":       studioClearanceHealthy,
@@ -407,6 +410,7 @@ func main() {
 	// Pipeline repair is verification/recovery only; Aggregation remains the
 	// sole owner of its declared stage effect.
 	pipeline.StartWorker(db)
+	contentstage.StartWorker(db, controllers.ClassifyContentStage)
 	controllers.StartArtifactCoverageWorker(db)
 	controllers.StartAtomizationWorkVerifier(db)
 	controllers.StartStudioClearanceWorker(db)
