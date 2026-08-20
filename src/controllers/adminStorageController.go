@@ -1207,7 +1207,7 @@ func ReconcileStorage(c *gin.Context) {
 
 func loadEffectiveStoragePolicy(db *gorm.DB, tenantID string) models.StoragePolicy {
 	var p models.StoragePolicy
-	result := db.Where("tenant_id = ?", tenantID).Limit(1).Find(&p)
+	result := db.Where("tenant_id = ?", tenantID).Order("updated_at DESC, id DESC").Limit(1).Find(&p)
 	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}
@@ -1216,7 +1216,10 @@ func loadEffectiveStoragePolicy(db *gorm.DB, tenantID string) models.StoragePoli
 
 func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 	var p models.StoragePolicy
-	result := db.Where("tenant_id IS NULL").Limit(1).Find(&p)
+	// PostgreSQL unique indexes permit multiple NULLs. Historic global rows
+	// therefore require deterministic selection until a deliberate data
+	// consolidation migration is applied.
+	result := db.Where("tenant_id IS NULL").Order("updated_at DESC, id DESC").Limit(1).Find(&p)
 	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}
@@ -1248,7 +1251,7 @@ func loadOrCreateGlobalPolicy(db *gorm.DB) models.StoragePolicy {
 
 func loadOrCreateTenantPolicy(db *gorm.DB, tenantID string) models.StoragePolicy {
 	var p models.StoragePolicy
-	result := db.Where("tenant_id = ?", tenantID).Limit(1).Find(&p)
+	result := db.Where("tenant_id = ?", tenantID).Order("updated_at DESC, id DESC").Limit(1).Find(&p)
 	if result.Error == nil && result.RowsAffected > 0 {
 		return p
 	}

@@ -398,6 +398,45 @@ func setFeedUnitDurationBucket(item *models.ContentItem) {
 	item.DurationBucket = &bucket
 }
 
+func mediaDurationBelowAdmission(kind models.ContentType, duration *int) bool {
+	return (kind == models.ContentTypeVideo || kind == models.ContentTypePodcast) && duration != nil && *duration < podsMinDurationSec
+}
+
+func mediaArtifactDurationInvalid(kind models.ContentType, duration *int) bool {
+	return (kind == models.ContentTypeVideo || kind == models.ContentTypePodcast) && (duration == nil || *duration < podsMinDurationSec)
+}
+
+func durationVerificationMatches(value interface{}, duration int) bool {
+	verification, ok := value.(map[string]interface{})
+	if !ok || verification["source"] != "ffprobe" {
+		return false
+	}
+	switch verified := verification["duration_sec"].(type) {
+	case float64:
+		return verified == float64(duration)
+	case int:
+		return verified == duration
+	case int64:
+		return verified == int64(duration)
+	default:
+		return false
+	}
+}
+
+func mediaArtifactDurationVerified(item models.ContentItem, incoming map[string]interface{}, duration int) bool {
+	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+		return true
+	}
+	if value, exists := incoming["duration_verification"]; exists {
+		return durationVerificationMatches(value, duration)
+	}
+	existing := map[string]interface{}{}
+	if len(item.Metadata) > 0 && json.Unmarshal(item.Metadata, &existing) == nil {
+		return durationVerificationMatches(existing["duration_verification"], duration)
+	}
+	return false
+}
+
 // InternalCreateContentItem handles POST /internal/content-items
 func InternalCreateContentItem(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -527,6 +566,10 @@ func InternalCreateContentItem(c *gin.Context) {
 			format = &f
 		}
 		kind = models.ContentTypeNews
+	}
+	if mediaDurationBelowAdmission(kind, req.DurationSec) {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Media duration is below the Pods minimum", "code": "PODS_DURATION_BELOW_MINIMUM"})
+		return
 	}
 	if kind == models.ContentTypeNews {
 		identity, identityErr := retentionTombstoneIdentityForIngest(retentionV1Tenant, idempotencyKey, req.OriginalURL)
@@ -803,6 +846,21 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
+	}
+	hasServingMediaWrite := req.MediaURL != nil || req.PlaybackURL != nil || req.FallbackPlaybackURL != nil || len(req.MediaRenditions) > 0
+	if hasServingMediaWrite {
+		effectiveDuration := req.DurationSec
+		if effectiveDuration == nil {
+			effectiveDuration = item.DurationSec
+		}
+		if mediaArtifactDurationInvalid(item.Type, effectiveDuration) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Media artifact duration is missing or below the Pods minimum", "code": "PODS_DURATION_NOT_ADMISSIBLE"})
+			return
+		}
+		if effectiveDuration != nil && !mediaArtifactDurationVerified(item, req.Metadata, *effectiveDuration) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "Media artifact duration is not authoritatively verified", "code": "PODS_DURATION_NOT_VERIFIED"})
+			return
+		}
 	}
 	var expectedItemUpdatedAt *time.Time
 	if req.ExpectedItemUpdatedAt != nil {

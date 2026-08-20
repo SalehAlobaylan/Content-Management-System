@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
 
@@ -605,12 +606,15 @@ func artifactPresent(tx *gorm.DB, item models.ContentItem, stage string) (bool, 
 	case models.ContentStageNewsStoryClassification:
 		return item.StoryID != nil, map[string]any{"story_id": item.StoryID}, nil
 	case models.ContentStagePodsMediaArtifacts:
-		ok := item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" && item.DurationSec != nil && *item.DurationSec > 0
+		ok := item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" && item.DurationSec != nil && *item.DurationSec >= feedcontract.PodsMinDurationSec
 		return ok, map[string]any{"playback_url_present": ok, "duration_sec": item.DurationSec, "playback_type": item.PlaybackType}, nil
 	case models.ContentStagePodsTranscript:
 		return item.TranscriptID != nil, map[string]any{"transcript_id": item.TranscriptID, "transcript_source": item.TranscriptSource}, nil
 	case models.ContentStagePodsAtomization:
-		if item.DurationSec != nil && *item.DurationSec <= 2400 {
+		if item.DurationSec != nil && *item.DurationSec < feedcontract.PodsMinDurationSec {
+			return false, map[string]any{"invalid_duration": true, "duration_sec": *item.DurationSec}, nil
+		}
+		if item.DurationSec != nil && *item.DurationSec >= feedcontract.PodsMinDurationSec && *item.DurationSec <= feedcontract.PodsHardMaxDuration {
 			return true, map[string]any{"not_required": true, "duration_sec": *item.DurationSec}, nil
 		}
 		var count int64
@@ -674,7 +678,7 @@ func AdoptPresentStages(tx *gorm.DB, item models.ContentItem, provenance string)
 }
 
 func settleConditionalPodsStages(tx *gorm.DB, item models.ContentItem) error {
-	if item.DurationSec == nil || *item.DurationSec > 2400 {
+	if item.DurationSec == nil || *item.DurationSec < feedcontract.PodsMinDurationSec || *item.DurationSec > feedcontract.PodsHardMaxDuration {
 		return nil
 	}
 	now := time.Now().UTC()
