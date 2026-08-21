@@ -12,11 +12,12 @@ import (
 type MachinePrincipal string
 
 const (
-	MachinePrincipalAggregation MachinePrincipal = "aggregation"
-	MachinePrincipalEnrichment  MachinePrincipal = "enrichment"
-	MachinePrincipalMedia       MachinePrincipal = "media"
-	MachinePrincipalIAM         MachinePrincipal = "iam"
-	MachinePrincipalLegacy      MachinePrincipal = "legacy-shared"
+	MachinePrincipalAggregation          MachinePrincipal = "aggregation"
+	MachinePrincipalEnrichment           MachinePrincipal = "enrichment"
+	MachinePrincipalMedia                MachinePrincipal = "media"
+	MachinePrincipalIAM                  MachinePrincipal = "iam"
+	MachinePrincipalMigrationCoordinator MachinePrincipal = "migration-coordinator"
+	MachinePrincipalLegacy               MachinePrincipal = "legacy-shared"
 )
 
 const (
@@ -43,7 +44,11 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 	media := []MachinePrincipal{MachinePrincipalMedia}
 	receiptProducers := []MachinePrincipal{MachinePrincipalAggregation, MachinePrincipalEnrichment, MachinePrincipalMedia}
 	iam := []MachinePrincipal{MachinePrincipalIAM}
+	migrationCoordinator := []MachinePrincipal{MachinePrincipalMigrationCoordinator}
 	return []InternalRoutePolicy{
+		{http.MethodGet, "/database-migration/quiescence", "database-migration.quiescence.read", migrationCoordinator, false},
+		{http.MethodPost, "/database-migration/quiesce", "database-migration.quiescence.write", migrationCoordinator, false},
+		{http.MethodPost, "/database-migration/resume", "database-migration.quiescence.write", migrationCoordinator, false},
 		{http.MethodPost, "/source-suggestions", "discovery.write", agg, true},
 		{http.MethodGet, "/discovery/config", "discovery.read", agg, true},
 		{http.MethodGet, "/discovery/profiles", "discovery.read", agg, true},

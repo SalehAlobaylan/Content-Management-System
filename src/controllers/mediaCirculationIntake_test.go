@@ -51,7 +51,7 @@ func TestBucketDemandMatchMeasuredGap(t *testing.T) {
 	// Measured regime: the demand gap drives the weights; states are already
 	// gap-derived by the inventory read model.
 	health := map[string]libraryBucketHealth{
-		"30m": {Bucket: "30m", State: "thin", Measured: true, Gap: 0.6},       // starving
+		"30m": {Bucket: "30m", State: "thin", Measured: true, Gap: 0.6},      // starving
 		"5m":  {Bucket: "5m", State: "saturated", Measured: true, Gap: -0.5}, // over-supplied
 		"15m": {Bucket: "15m", State: "ok", Measured: true, Gap: 0},          // balanced
 	}

@@ -94,7 +94,7 @@ type prefRunHistoryEntry struct {
 
 type prefCoveragePoint struct {
 	StartedAt       time.Time `json:"started_at"`
-	PodsPct       float64   `json:"pods_pct"`
+	PodsPct         float64   `json:"pods_pct"`
 	NewsPct         float64   `json:"news_pct"`
 	StoryPct        float64   `json:"story_pct"`
 	UnmappedBacklog int64     `json:"unmapped_backlog"`
@@ -206,7 +206,7 @@ func GetPreferenceAutopilotInsights(c *gin.Context) {
 			entry.CoverageAfter = after.PodsCoveragePct
 			series = append(series, prefCoveragePoint{
 				StartedAt: r.StartedAt,
-				PodsPct: after.PodsCoveragePct, NewsPct: after.NewsCoveragePct, StoryPct: after.StoryCoveragePct,
+				PodsPct:   after.PodsCoveragePct, NewsPct: after.NewsCoveragePct, StoryPct: after.StoryCoveragePct,
 				UnmappedBacklog: after.UnmappedBacklog, Pending: after.PendingProposals, QueueDepth: after.RecomputeQueueDepth,
 			})
 		}

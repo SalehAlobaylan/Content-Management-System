@@ -48,12 +48,26 @@ func CheckSchemaReadiness(db *gorm.DB) error {
 	if missing != 2 {
 		return fmt.Errorf("required PostgreSQL extensions pgcrypto and vector are not installed; apply canonical CMS migrations")
 	}
-	var ledger bool
-	if err := db.Raw(`SELECT to_regclass('public.cms_schema_migrations') IS NOT NULL`).Scan(&ledger).Error; err != nil {
-		return fmt.Errorf("read migration ledger state: %w", err)
+	contract, err := ReadDatabaseContract(db, "migrations")
+	if err != nil {
+		return err
 	}
-	if !ledger {
-		return fmt.Errorf("CMS migration ledger is missing; apply canonical CMS migrations")
+	if contract.EnforcementMode == "enforce" && contract.LedgerState != "verified" {
+		return fmt.Errorf("CMS migration ledger is %s; apply and checksum-verify canonical CMS migrations", contract.LedgerState)
+	}
+	if contract.EnforcementMode == "enforce" && contract.IdentityState != "present" {
+		return fmt.Errorf("CMS database identity is %s while enforcement is active; adopt an explicit identity through a canonical migration", contract.IdentityState)
+	}
+	expectedID := strings.TrimSpace(os.Getenv("CMS_EXPECTED_DATABASE_ID"))
+	expectedEpoch := strings.TrimSpace(os.Getenv("CMS_EXPECTED_DATABASE_EPOCH"))
+	if contract.EnforcementMode == "enforce" && (expectedID == "" || expectedEpoch == "") {
+		return fmt.Errorf("CMS enforce mode requires CMS_EXPECTED_DATABASE_ID and CMS_EXPECTED_DATABASE_EPOCH")
+	}
+	if expectedID != "" && contract.DatabaseID != expectedID {
+		return fmt.Errorf("CMS database identity mismatch: expected %s, observed %s", expectedID, contract.DatabaseID)
+	}
+	if expectedEpoch != "" && fmt.Sprintf("%d", contract.Epoch) != expectedEpoch {
+		return fmt.Errorf("CMS database epoch mismatch: expected %s, observed %d", expectedEpoch, contract.Epoch)
 	}
 	return nil
 }

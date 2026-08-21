@@ -82,13 +82,17 @@ func main() {
 		log.Fatalf("connect database: %v", err)
 	}
 
-	if err := ensureLedger(db); err != nil {
-		log.Fatalf("ensure migration ledger: %v", err)
-	}
-
 	files, err := listMigrationFiles(*dir)
 	if err != nil {
 		log.Fatalf("list migrations: %v", err)
+	}
+
+	// Inspection must not turn an unknown database into a partially initialized
+	// one. Only effect-bearing commands may create or upgrade the ledger.
+	if !*status && !*check && !*verify {
+		if err := ensureLedger(db); err != nil {
+			log.Fatalf("ensure migration ledger: %v", err)
+		}
 	}
 
 	applied, err := appliedVersions(db)

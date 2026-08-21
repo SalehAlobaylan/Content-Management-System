@@ -1,5 +1,3 @@
-BEGIN;
-
 -- Preserve complete recovery evidence before consolidating historic global
 -- rows. The newest updated row is already the deterministic runtime winner.
 CREATE TABLE IF NOT EXISTS storage_policy_duplicate_archive (
@@ -38,5 +36,3 @@ WHERE p.id = r.id AND r.position > 1;
 DROP INDEX IF EXISTS idx_storage_policy_tenant;
 CREATE UNIQUE INDEX idx_storage_policy_tenant
     ON storage_policies (tenant_id) NULLS NOT DISTINCT;
-
-COMMIT;

@@ -10,6 +10,7 @@ import (
 	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -80,8 +81,16 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		if !projectionHealthy || !recoveryHealthy || !reconcilerHealthy || !supplyActionHealthy || !supplyEvaluationHealthy || !sourceRunSchedulerHealthy || !pipelineRepairHealthy || !contentStageHealthy || !artifactCoverageHealthy || !atomizationWorkHealthy || !studioClearanceHealthy || !upstreamObservationHealthy || !externalSupplyOwnersHealthy {
 			status = 503
 		}
+		contract, contractErr := utils.ReadDatabaseContract(db, "migrations")
+		if contractErr != nil {
+			status = 503
+		}
+		fence, fenceErr := utils.ReadWriterFence(db)
+		if fenceErr != nil {
+			status = 503
+		}
 		c.JSON(status, gin.H{
-			"status":                       map[bool]string{true: "ok", false: "degraded"}[projectionHealthy && recoveryHealthy && reconcilerHealthy && supplyActionHealthy && supplyEvaluationHealthy && sourceRunSchedulerHealthy && pipelineRepairHealthy && contentStageHealthy && artifactCoverageHealthy && atomizationWorkHealthy && studioClearanceHealthy && upstreamObservationHealthy && externalSupplyOwnersHealthy],
+			"status":                       map[bool]string{true: "ok", false: "degraded"}[status == 200],
 			"source_run_projection_ready":  projectionHealthy,
 			"source_run_recovery_ready":    recoveryHealthy,
 			"source_run_reconciler_ready":  reconcilerHealthy,
@@ -95,6 +104,10 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 			"studio_clearance_ready":       studioClearanceHealthy,
 			"upstream_observation_ready":   upstreamObservationHealthy,
 			"supply_owner_readiness":       supplyOwners,
+			"database_contract":            contract,
+			"database_contract_error":      contractErrorMessage(contractErr),
+			"writer_fence":                 fence,
+			"writer_fence_error":           contractErrorMessage(fenceErr),
 		})
 	})
 
@@ -102,6 +115,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		c.Set("db", db)
 		c.Next()
 	})
+	router.Use(databaseWriterFenceMiddleware(db))
 
 	v1 := router.Group("/api/v1")
 	routes.SetupPostRoutes(v1, db)
@@ -123,6 +137,39 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 
 }
 
+func contractErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "unavailable"
+}
+
+func databaseWriterFenceMiddleware(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		switch c.Request.Method {
+		case "POST", "PUT", "PATCH", "DELETE":
+		default:
+			c.Next()
+			return
+		}
+		if strings.HasPrefix(c.Request.URL.Path, "/internal/database-migration/") {
+			c.Next()
+			return
+		}
+		fence, err := utils.ReadWriterFence(db)
+		if err != nil {
+			c.AbortWithStatusJSON(503, gin.H{"error": "database writer authority is unavailable"})
+			return
+		}
+		if fence.State != "open" && fence.State != "successor_open" && fence.State != "compatibility_open" {
+			c.AbortWithStatusJSON(423, gin.H{"error": "database writes are fenced", "fence_state": fence.State, "epoch": fence.Epoch})
+			return
+		}
+		c.Header("X-Wahb-Database-Epoch", fmt.Sprintf("%d", fence.Epoch))
+		c.Next()
+	}
+}
+
 func main() {
 	log.Println("Starting Content Management System...")
 	log.Printf("Environment: %s", os.Getenv("ENV"))
@@ -140,6 +187,7 @@ func main() {
 	if err := utils.CheckSchemaReadiness(db); err != nil {
 		log.Fatalf("CMS schema is not ready: %v", err)
 	}
+	utils.InstallWriterFenceCallbacks(db)
 
 	sqlDB, err := db.DB()
 	if err != nil {

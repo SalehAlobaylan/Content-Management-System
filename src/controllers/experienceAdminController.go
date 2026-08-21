@@ -37,10 +37,10 @@ func GetExperienceStatus(c *gin.Context) {
 	fresh := isTelemetryFresh(db, tenantID, policy, now)
 
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
-		"policy":          policy,
-		"latest_run":      latestRun,
-		"telemetry_fresh": fresh,
-		"open_incidents":  openIncidents,
+		"policy":           policy,
+		"latest_run":       latestRun,
+		"telemetry_fresh":  fresh,
+		"open_incidents":   openIncidents,
 		"surface_verdicts": latestRunVerdicts(&latestRun),
 	}})
 }

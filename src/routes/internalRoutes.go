@@ -21,6 +21,9 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	}
 
 	route(http.MethodPost, "/source-suggestions", controllers.InternalCreateSourceSuggestions)
+	route(http.MethodGet, "/database-migration/quiescence", controllers.InternalGetDatabaseMigrationQuiescence)
+	route(http.MethodPost, "/database-migration/quiesce", controllers.InternalQuiesceDatabaseMigrationOwner)
+	route(http.MethodPost, "/database-migration/resume", controllers.InternalResumeDatabaseMigrationOwner)
 	route(http.MethodGet, "/discovery/config", controllers.InternalGetDiscoveryConfig)
 	route(http.MethodGet, "/discovery/profiles", controllers.InternalListEnabledProfiles)
 	route(http.MethodGet, "/circulation/policy", controllers.InternalGetCirculationPolicy)

@@ -101,7 +101,7 @@ func TestBuildFlipGate(t *testing.T) {
 func gates(podsEnabled bool, podsCov float64, newsEnabled bool, newsCov float64) map[string]preferenceFlipGate {
 	return map[string]preferenceFlipGate{
 		"pods_enabled": buildFlipGate("pods_enabled", podsEnabled, podsCov, 70, "ok"),
-		"news_enabled":   buildFlipGate("news_enabled", newsEnabled, newsCov, 60, "ok"),
+		"news_enabled": buildFlipGate("news_enabled", newsEnabled, newsCov, 60, "ok"),
 	}
 }
 

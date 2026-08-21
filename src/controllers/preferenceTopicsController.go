@@ -76,7 +76,7 @@ type preferenceSettingDomain struct {
 // a weight/discount/prior; half-life stays strictly positive so decay math is
 // always defined. Keep this table aligned with the Console and migration.
 var preferenceSettingDomains = map[string]preferenceSettingDomain{
-	"w_pods":             {Min: 0, Max: 1},
+	"w_pods":               {Min: 0, Max: 1},
 	"w_news":               {Min: 0, Max: 1},
 	"weight_complete":      {Min: 0, Max: 5},
 	"weight_bookmark":      {Min: 0, Max: 5},
@@ -92,7 +92,7 @@ var preferenceSettingDomains = map[string]preferenceSettingDomain{
 func defaultPreferenceSettings(tenantID string) models.PreferenceSettings {
 	return models.PreferenceSettings{
 		TenantID:          tenantID,
-		WPods:           0.30,
+		WPods:             0.30,
 		WNews:             0.15,
 		WeightComplete:    1.0,
 		WeightBookmark:    0.9,

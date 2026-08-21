@@ -94,10 +94,10 @@ type preferenceSnapshot struct {
 	OldestPendingAgeHours float64 `json:"oldest_pending_age_hours"`
 	HighConfidencePending int     `json:"high_confidence_pending"`
 
-	PodsCoveragePct float64 `json:"pods_coverage_pct"`
-	NewsCoveragePct   float64 `json:"news_coverage_pct"`
-	StoryCoveragePct  float64 `json:"story_coverage_pct"`
-	UnmappedBacklog   int64   `json:"unmapped_backlog"`
+	PodsCoveragePct  float64 `json:"pods_coverage_pct"`
+	NewsCoveragePct  float64 `json:"news_coverage_pct"`
+	StoryCoveragePct float64 `json:"story_coverage_pct"`
+	UnmappedBacklog  int64   `json:"unmapped_backlog"`
 
 	NearDuplicatePairs  int       `json:"near_duplicate_pairs"`
 	DuplicatePairs      []dupPair `json:"duplicate_pairs,omitempty"`

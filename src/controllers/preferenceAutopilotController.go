@@ -272,7 +272,7 @@ type updatePreferenceAutopilotRequest struct {
 	MaxMinedProposals    *int     `json:"max_mined_proposals"`
 	MaxCentroidRefresh   *int     `json:"max_centroid_refresh"`
 	MaxPendingProposals  *int     `json:"max_pending_proposals"`
-	CoverageFloorPods  *int     `json:"coverage_floor_pods_pct"`
+	CoverageFloorPods    *int     `json:"coverage_floor_pods_pct"`
 	CoverageFloorNews    *int     `json:"coverage_floor_news_pct"`
 	CoverageFloorStory   *int     `json:"coverage_floor_story_pct"`
 	FailureBreakerPct    *int     `json:"failure_breaker_pct"`

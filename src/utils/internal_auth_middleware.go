@@ -93,6 +93,7 @@ func configuredMachineCredentials() []machineCredential {
 	add(MachinePrincipalMedia, "CMS_MEDIA_SERVICE_TOKEN", "media/current")
 	add(MachinePrincipalMedia, "CMS_MEDIA_SERVICE_TOKEN_NEXT", "media/next")
 	add(MachinePrincipalIAM, "CMS_IAM_SERVICE_TOKEN", "iam/current")
+	add(MachinePrincipalMigrationCoordinator, "CMS_MIGRATION_COORDINATOR_SERVICE_TOKEN", "migration-coordinator/current")
 
 	// The old broad token is a migration bridge only. Production requires an
 	// explicit, future removal time; development remains convenient for the

@@ -26,15 +26,15 @@ type opClassSummary struct {
 }
 
 type opDailyPoint struct {
-	Date    string `json:"date"` // YYYY-MM-DD
-	ClassA  int64  `json:"class_a"`
-	ClassB  int64  `json:"class_b"`
+	Date   string `json:"date"` // YYYY-MM-DD
+	ClassA int64  `json:"class_a"`
+	ClassB int64  `json:"class_b"`
 }
 
 type opTypeBreakdownEntry struct {
-	OpType  string `json:"op_type"`
-	OpClass string `json:"op_class"`
-	Count   int64  `json:"count"`
+	OpType     string  `json:"op_type"`
+	OpClass    string  `json:"op_class"`
+	Count      int64   `json:"count"`
 	PctOfClass float64 `json:"pct_of_class"`
 }
 
@@ -44,13 +44,13 @@ type opSourceBreakdownEntry struct {
 }
 
 type storageOperationsResponse struct {
-	Month         string                   `json:"month"` // YYYY-MM
-	ClassA        opClassSummary           `json:"class_a"`
-	ClassB        opClassSummary           `json:"class_b"`
-	Daily         []opDailyPoint           `json:"daily"`
-	ByOpType      []opTypeBreakdownEntry   `json:"by_op_type"`
-	BySource      []opSourceBreakdownEntry `json:"by_source"`
-	GeneratedAt   string                   `json:"generated_at"`
+	Month       string                   `json:"month"` // YYYY-MM
+	ClassA      opClassSummary           `json:"class_a"`
+	ClassB      opClassSummary           `json:"class_b"`
+	Daily       []opDailyPoint           `json:"daily"`
+	ByOpType    []opTypeBreakdownEntry   `json:"by_op_type"`
+	BySource    []opSourceBreakdownEntry `json:"by_source"`
+	GeneratedAt string                   `json:"generated_at"`
 }
 
 // GetStorageOperations handles GET /admin/storage/operations?days=30
