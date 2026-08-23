@@ -833,7 +833,7 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 			return err
 		}
 		for i, ch := range req.Chapters {
-			child, err := upsertAtomizedChild(tx, parent, transcript, ch, i, policy)
+			child, err := upsertAtomizedChild(tx, parent, transcript, ch, i, policy, "")
 			if err != nil {
 				return err
 			}
@@ -1018,7 +1018,7 @@ func loadAtomizationParent(c *gin.Context, db *gorm.DB) (*models.ContentItem, *m
 	return &item, &transcript, true
 }
 
-func upsertAtomizedChild(tx *gorm.DB, parent *models.ContentItem, parentTranscript *models.Transcript, ch atomizationChapterRequest, idx int, policy atomizationPolicy) (*models.ContentItem, error) {
+func upsertAtomizedChild(tx *gorm.DB, parent *models.ContentItem, parentTranscript *models.Transcript, ch atomizationChapterRequest, idx int, policy atomizationPolicy, generationKey string) (*models.ContentItem, error) {
 	if strings.TrimSpace(ch.Title) == "" || ch.EndMs <= ch.StartMs {
 		return nil, errors.New("invalid chapter")
 	}
@@ -1041,7 +1041,11 @@ func upsertAtomizedChild(tx *gorm.DB, parent *models.ContentItem, parentTranscri
 	}
 	durationSec := int(math.Round(float64(ch.EndMs-ch.StartMs) / 1000.0))
 	bucket := durationBucketLabel(ch.EndMs - ch.StartMs)
-	idempotency := normalizeIdempotencyKey("atomized:" + parent.PublicID.String() + ":" + strconv.Itoa(idx))
+	idempotencyPrefix := "atomized:" + parent.PublicID.String()
+	if strings.TrimSpace(generationKey) != "" {
+		idempotencyPrefix += ":generation:" + strings.TrimSpace(generationKey)
+	}
+	idempotency := normalizeIdempotencyKey(idempotencyPrefix + ":" + strconv.Itoa(idx))
 	renditionsJSON, _ := json.Marshal(ch.MediaRenditions)
 	body := ch.TranscriptText
 	if body == "" && len(ch.TranscriptSegments) > 0 {

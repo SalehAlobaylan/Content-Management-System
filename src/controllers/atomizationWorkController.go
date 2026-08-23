@@ -3,6 +3,7 @@ package controllers
 import (
 	"net/http"
 	"strings"
+	"time"
 
 	"content-management-system/src/atomizationwork"
 	"github.com/gin-gonic/gin"
@@ -63,6 +64,28 @@ func InternalHeartbeatAtomizationWork(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+func InternalDeferAtomizationWork(c *gin.Context) {
+	var body struct {
+		ClaimToken    string `json:"claim_token"`
+		RetryAfterSec int    `json:"retry_after_sec"`
+		Summary       string `json:"summary"`
+	}
+	if err := decodeStrictJSON(c, &body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid atomization deferral"})
+		return
+	}
+	token, err := uuid.Parse(strings.TrimSpace(body.ClaimToken))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid atomization claim token"})
+		return
+	}
+	if err := atomizationwork.Defer(c.MustGet("db").(*gorm.DB), c.Param("id"), "aggregation-atomization", token, time.Duration(body.RetryAfterSec)*time.Second, body.Summary); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "atomization deferral rejected", "reason": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "state": "queued"})
 }
 func InternalCheckpointAtomizationWork(c *gin.Context) {
 	body, token, ok := bindAtomizationStep(c)

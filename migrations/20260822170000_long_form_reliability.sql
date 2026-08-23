@@ -1,0 +1,151 @@
+-- Durable ownership for long-form storage, transcription, and atomization.
+-- Startup never applies this migration; use scripts/cms-migrate.sh deliberately.
+
+CREATE TABLE IF NOT EXISTS media_artifact_manifests (
+  id BIGSERIAL PRIMARY KEY,
+  public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  tenant_id VARCHAR(64) NOT NULL,
+  content_item_id UUID,
+  parent_content_item_id UUID,
+  atomization_generation_id UUID,
+  atomization_chapter_unit_id UUID,
+  transcription_generation_id UUID,
+  transcription_segment_unit_id UUID,
+  attempt_id UUID,
+  artifact_role VARCHAR(32) NOT NULL CHECK (artifact_role IN ('source','analysis_audio','chapter_media','chapter_hls','thumbnail','transcript_segment')),
+  storage_tier VARCHAR(16) NOT NULL DEFAULT 'primary',
+  bucket VARCHAR(255) NOT NULL,
+  object_key TEXT NOT NULL,
+  public_url TEXT,
+  content_type VARCHAR(255),
+  size_bytes BIGINT NOT NULL DEFAULT 0,
+  etag VARCHAR(255),
+  sha256 CHAR(64),
+  duration_ms BIGINT,
+  creator_role VARCHAR(64) NOT NULL,
+  producer_event_id UUID NOT NULL,
+  fence_token UUID,
+  input_digest CHAR(64) NOT NULL,
+  state VARCHAR(24) NOT NULL CHECK (state IN ('uploading','uploaded','verified','active','cleanup_eligible','deleted','uncertain','failed')),
+  recovery_class VARCHAR(32) NOT NULL DEFAULT 'recoverable',
+  verification_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+  terminal_proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  cleanup_eligible_at TIMESTAMPTZ,
+  verified_at TIMESTAMPTZ,
+  deleted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, storage_tier, bucket, object_key),
+  UNIQUE (tenant_id, creator_role, producer_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_media_artifact_manifests_state ON media_artifact_manifests(tenant_id, state, cleanup_eligible_at);
+CREATE INDEX IF NOT EXISTS idx_media_artifact_manifests_content ON media_artifact_manifests(tenant_id, content_item_id, artifact_role);
+
+CREATE TABLE IF NOT EXISTS transcription_generations (
+  id BIGSERIAL PRIMARY KEY,
+  public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  tenant_id VARCHAR(64) NOT NULL,
+  content_item_id UUID NOT NULL,
+  transcription_job_id UUID,
+  input_digest CHAR(64) NOT NULL,
+  analysis_audio_manifest_id UUID,
+  provider VARCHAR(64) NOT NULL DEFAULT '',
+  model VARCHAR(128) NOT NULL DEFAULT '',
+  language VARCHAR(16) NOT NULL DEFAULT '',
+  state VARCHAR(24) NOT NULL CHECK (state IN ('queued','claimed','running','verifying','verified','deferred','uncertain','failed','superseded')),
+  total_segments INTEGER NOT NULL DEFAULT 0,
+  completed_segments INTEGER NOT NULL DEFAULT 0,
+  merged_transcript_id UUID,
+  claim_owner VARCHAR(128),
+  claim_token UUID,
+  fence_token UUID,
+  claim_expires_at TIMESTAMPTZ,
+  terminal_proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  failure_class VARCHAR(64),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, content_item_id, input_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_transcription_generations_state ON transcription_generations(tenant_id, state, created_at);
+
+CREATE TABLE IF NOT EXISTS transcription_segment_units (
+  id BIGSERIAL PRIMARY KEY,
+  public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  tenant_id VARCHAR(64) NOT NULL,
+  generation_id UUID NOT NULL REFERENCES transcription_generations(public_id) ON DELETE RESTRICT,
+  segment_index INTEGER NOT NULL,
+  start_ms BIGINT NOT NULL,
+  end_ms BIGINT NOT NULL,
+  overlap_ms BIGINT NOT NULL DEFAULT 0,
+  source_digest CHAR(64) NOT NULL,
+  segment_digest CHAR(64) NOT NULL,
+  artifact_manifest_id UUID,
+  state VARCHAR(24) NOT NULL CHECK (state IN ('queued','claimed','running','verifying','verified','deferred','uncertain','failed','superseded')),
+  not_before_at TIMESTAMPTZ,
+  claim_owner VARCHAR(128),
+  claim_token UUID,
+  fence_token UUID,
+  lease_expires_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  failure_class VARCHAR(64),
+  transcript_text TEXT NOT NULL DEFAULT '',
+  transcript_segments JSONB NOT NULL DEFAULT '[]'::jsonb,
+  result_digest CHAR(64),
+  terminal_proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, generation_id, segment_index)
+);
+CREATE INDEX IF NOT EXISTS idx_transcription_segment_claim ON transcription_segment_units(tenant_id, state, not_before_at, segment_index);
+
+CREATE TABLE IF NOT EXISTS atomization_generations (
+  id BIGSERIAL PRIMARY KEY,
+  public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  tenant_id VARCHAR(64) NOT NULL,
+  parent_content_item_id UUID NOT NULL,
+  work_request_id UUID NOT NULL,
+  generation_number INTEGER NOT NULL,
+  transcript_digest CHAR(64) NOT NULL,
+  policy_digest CHAR(64) NOT NULL,
+  input_digest CHAR(64) NOT NULL,
+  plan_digest CHAR(64) NOT NULL,
+  expected_units INTEGER NOT NULL DEFAULT 0,
+  completed_units INTEGER NOT NULL DEFAULT 0,
+  coverage_digest CHAR(64),
+  state VARCHAR(24) NOT NULL CHECK (state IN ('planning','running','verifying','active','superseded','failed')),
+  activation_at TIMESTAMPTZ,
+  terminal_proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, work_request_id, generation_number)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_atomization_active_generation ON atomization_generations(tenant_id, parent_content_item_id) WHERE state = 'active';
+CREATE INDEX IF NOT EXISTS idx_atomization_generations_state ON atomization_generations(tenant_id, state, created_at);
+
+CREATE TABLE IF NOT EXISTS atomization_chapter_units (
+  id BIGSERIAL PRIMARY KEY,
+  public_id UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+  tenant_id VARCHAR(64) NOT NULL,
+  generation_id UUID NOT NULL REFERENCES atomization_generations(public_id) ON DELETE RESTRICT,
+  unit_index INTEGER NOT NULL,
+  start_ms BIGINT NOT NULL,
+  end_ms BIGINT NOT NULL,
+  plan_digest CHAR(64) NOT NULL,
+  transcript_slice_digest CHAR(64) NOT NULL,
+  state VARCHAR(24) NOT NULL CHECK (state IN ('queued','claimed','running','verifying','verified','deferred','uncertain','failed','superseded')),
+  not_before_at TIMESTAMPTZ,
+  claim_owner VARCHAR(128),
+  claim_token UUID,
+  fence_token UUID,
+  lease_expires_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  failure_class VARCHAR(64),
+  artifact_manifest_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+  candidate_content_item_id UUID,
+  result JSONB NOT NULL DEFAULT '{}'::jsonb,
+  terminal_proof JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, generation_id, unit_index)
+);
+CREATE INDEX IF NOT EXISTS idx_atomization_chapter_claim ON atomization_chapter_units(tenant_id, state, not_before_at, unit_index);

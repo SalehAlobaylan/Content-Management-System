@@ -277,6 +277,11 @@ func main() {
 			&models.StorageSweepRun{},
 			&models.StorageOpMetric{},
 			&models.MediaStorageArtifactEvent{},
+			&models.MediaArtifactManifest{},
+			&models.TranscriptionGeneration{},
+			&models.TranscriptionSegmentUnit{},
+			&models.AtomizationGeneration{},
+			&models.AtomizationChapterUnit{},
 			// Media Circulation Engine — advisory verdict/recommendation layer
 			&models.MediaCirculationPolicy{},
 			&models.MediaCirculationRecommendation{},

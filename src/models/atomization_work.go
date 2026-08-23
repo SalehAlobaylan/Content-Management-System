@@ -24,6 +24,7 @@ type AtomizationWorkRequest struct {
 	FenceToken              *uuid.UUID     `json:"-"`
 	ClaimEpoch              int64          `json:"claim_epoch"`
 	ClaimExpiresAt          *time.Time     `json:"claim_expires_at,omitempty"`
+	NotBeforeAt             *time.Time     `json:"not_before_at,omitempty"`
 	EffectStartedAt         *time.Time     `json:"effect_started_at,omitempty"`
 	CancellationRequestedAt *time.Time     `json:"cancellation_requested_at,omitempty"`
 	Checkpoints             datatypes.JSON `json:"checkpoints"`

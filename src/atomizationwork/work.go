@@ -86,7 +86,7 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	var claim Claim
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var candidates []models.AtomizationWorkRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ?", "queued").Order("created_at").Limit(16).Find(&candidates).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ? AND (not_before_at IS NULL OR not_before_at <= ?)", "queued", now).Order("created_at").Limit(16).Find(&candidates).Error; err != nil {
 			return err
 		}
 		for _, request := range candidates {
@@ -102,7 +102,13 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 				continue
 			}
 			var attempts int64
-			if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=?", request.TenantID, request.PublicID).Count(&attempts).Error; err != nil {
+			// Capacity deferrals happen before a new media effect and therefore
+			// must not consume the bounded effect-attempt budget.
+			if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND state <> ?", request.TenantID, request.PublicID, "deferred").Count(&attempts).Error; err != nil {
+				return err
+			}
+			var totalAttempts int64
+			if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=?", request.TenantID, request.PublicID).Count(&totalAttempts).Error; err != nil {
 				return err
 			}
 			var latest models.AtomizationWorkAttempt
@@ -136,7 +142,8 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 					return err
 				}
 			} else {
-				attempt = models.AtomizationWorkAttempt{PublicID: uuid.New(), TenantID: request.TenantID, RequestID: request.PublicID, AttemptNumber: int(attempts) + 1, State: "claimed", ClaimToken: token, FenceToken: fence, DeterministicJobID: "atomize:" + request.InputFingerprint, LeaseExpiresAt: expires, HeartbeatAt: now}
+				attemptNumber := int(totalAttempts) + 1
+				attempt = models.AtomizationWorkAttempt{PublicID: uuid.New(), TenantID: request.TenantID, RequestID: request.PublicID, AttemptNumber: attemptNumber, State: "claimed", ClaimToken: token, FenceToken: fence, DeterministicJobID: fmt.Sprintf("atomize:%s:%d", request.InputFingerprint, attemptNumber), LeaseExpiresAt: expires, HeartbeatAt: now}
 				if err := tx.Create(&attempt).Error; err != nil {
 					return err
 				}
@@ -187,6 +194,33 @@ func Heartbeat(db *gorm.DB, requestID, owner string, token uuid.UUID) error {
 		return err
 	}
 	return leaseStep(db, requestID, owner, token, false)
+}
+
+// Defer returns a claimed/running work unit to the durable queue without
+// burning its attempt budget. It is used only before/after an admission check
+// proves no physical compute capacity is available.
+func Defer(db *gorm.DB, requestID, owner string, token uuid.UUID, retryAfter time.Duration, summary string) error {
+	if retryAfter < time.Second {
+		retryAfter = time.Second
+	}
+	if retryAfter > 5*time.Minute {
+		retryAfter = 5 * time.Minute
+	}
+	now := time.Now().UTC()
+	return db.Transaction(func(tx *gorm.DB) error {
+		var request models.AtomizationWorkRequest
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_owner=? AND claim_token=? AND state IN ?", requestID, owner, token, []string{"claimed", "running"}).First(&request).Error; err != nil {
+			return err
+		}
+		next := now.Add(retryAfter)
+		if err := tx.Model(&request).Updates(map[string]any{"state": "queued", "not_before_at": next, "claim_owner": "", "claim_token": nil, "fence_token": nil, "claim_expires_at": nil}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND claim_token=?", request.TenantID, request.PublicID, token).Updates(map[string]any{"state": "deferred", "finished_at": now}).Error; err != nil {
+			return err
+		}
+		return event(tx, request, "capacity_deferred", map[string]any{"not_before_at": next, "summary": summary})
+	})
 }
 
 func recheckAtomizationActionAccess(db *gorm.DB, requestID string) error {
@@ -312,12 +346,24 @@ func VerifyOne(db *gorm.DB) (bool, error) {
 		seen[id] = true
 		declared = append(declared, id)
 	}
-	if len(declared) == 0 || len(declared) > 100 {
+	// The old 100-child defensive bound was an accidental parent-duration
+	// limit. Read verification rows in pages instead; any valid number of
+	// legal chapters can then be proven without loading one giant SQL IN list.
+	if len(declared) == 0 {
 		return failVerificationIfExpired(db, request, "owner_child_set_not_declared")
 	}
 	var children []models.ContentItem
-	if err = db.Where("tenant_id=? AND parent_content_item_id=? AND public_id IN ? AND status<>?", request.TenantID, request.ParentContentItemID, declared, models.ContentStatusArchived).Find(&children).Error; err != nil {
-		return true, err
+	const childVerificationPage = 100
+	for start := 0; start < len(declared); start += childVerificationPage {
+		end := start + childVerificationPage
+		if end > len(declared) {
+			end = len(declared)
+		}
+		var page []models.ContentItem
+		if err = db.Where("tenant_id=? AND parent_content_item_id=? AND public_id IN ? AND status<>?", request.TenantID, request.ParentContentItemID, declared[start:end], models.ContentStatusArchived).Find(&page).Error; err != nil {
+			return true, err
+		}
+		children = append(children, page...)
 	}
 	if len(children) != len(declared) {
 		return failVerificationIfExpired(db, request, "declared_child_set_absent")

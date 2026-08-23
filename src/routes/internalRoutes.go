@@ -57,6 +57,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/atomization-work/claim", controllers.InternalClaimAtomizationWork)
 	route(http.MethodPost, "/atomization-work/:id/begin", controllers.InternalBeginAtomizationWork)
 	route(http.MethodPost, "/atomization-work/:id/heartbeat", controllers.InternalHeartbeatAtomizationWork)
+	route(http.MethodPost, "/atomization-work/:id/defer", controllers.InternalDeferAtomizationWork)
 	route(http.MethodPost, "/atomization-work/:id/checkpoint", controllers.InternalCheckpointAtomizationWork)
 	route(http.MethodGet, "/pipeline-repairs/:id/cancellation", controllers.InternalObservePipelineRepairCancellation)
 	route(http.MethodPost, "/media-supply-actions/unit-adoptions/claim", controllers.InternalClaimUnitAdoptionAction)
@@ -105,6 +106,27 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/content-items/:id/atomization/plan", controllers.InternalSaveAtomizationPlan)
 	route(http.MethodPost, "/content-items/:id/atomization/children", controllers.InternalCreateAtomizedChildren)
 	route(http.MethodPost, "/content-items/:id/atomization/runs", controllers.InternalReportAtomizationRun)
+	route(http.MethodPost, "/artifact-manifests", controllers.InternalCreateArtifactManifest)
+	route(http.MethodGet, "/artifact-manifests", controllers.InternalGetArtifactManifest)
+	route(http.MethodGet, "/artifact-manifests/:id", controllers.InternalGetArtifactManifest)
+	for _, state := range []string{"uploaded", "verified", "active", "cleanup-eligible", "deleted", "uncertain", "failed"} {
+		route(http.MethodPost, "/artifact-manifests/:id/"+state, controllers.InternalTransitionArtifactManifest)
+	}
+	route(http.MethodPost, "/transcription-generations", controllers.InternalCreateTranscriptionGeneration)
+	route(http.MethodPost, "/transcription-segments/claim", controllers.InternalClaimTranscriptionSegment)
+	for _, state := range []string{"running", "verifying", "verified", "deferred", "uncertain", "failed"} {
+		route(http.MethodPost, "/transcription-segments/:id/"+state, controllers.InternalTransitionTranscriptionSegment)
+	}
+	route(http.MethodPost, "/transcription-segments/:id/heartbeat", controllers.InternalHeartbeatTranscriptionSegment)
+	route(http.MethodPost, "/transcription-generations/:id/finalize", controllers.InternalFinalizeTranscriptionGeneration)
+	route(http.MethodPost, "/atomization-generations", controllers.InternalCreateAtomizationGeneration)
+	route(http.MethodPost, "/atomization-chapter-units/claim", controllers.InternalClaimAtomizationChapterUnit)
+	for _, state := range []string{"running", "verifying", "verified", "deferred", "uncertain", "failed"} {
+		route(http.MethodPost, "/atomization-chapter-units/:id/"+state, controllers.InternalTransitionAtomizationChapterUnit)
+	}
+	route(http.MethodPost, "/atomization-chapter-units/:id/heartbeat", controllers.InternalHeartbeatAtomizationChapterUnit)
+	route(http.MethodGet, "/atomization-generations/:id/units", controllers.InternalListAtomizationChapterUnits)
+	route(http.MethodPost, "/atomization-generations/:id/finalize", controllers.InternalFinalizeAtomizationGeneration)
 	route(http.MethodPost, "/content-items/:id/request-stt", controllers.InternalRequestSTT)
 	route(http.MethodPatch, "/transcription-jobs/:id", controllers.InternalUpdateTranscriptionJob)
 	route(http.MethodPost, "/transcription-jobs/:id/complete", controllers.InternalCompleteTranscriptionJob)

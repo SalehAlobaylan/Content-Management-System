@@ -404,7 +404,7 @@ type ClaimEnvelope struct {
 
 func boundedInput(item models.ContentItem, stage string) map[string]any {
 	input := map[string]any{
-		"title": item.Title, "excerpt": item.Excerpt, "body_text": item.BodyText,
+		"tenant_id": item.TenantID, "title": item.Title, "excerpt": item.Excerpt, "body_text": item.BodyText,
 		"content_language": item.ContentLanguage, "content_type": item.Type,
 	}
 	switch stage {
@@ -416,10 +416,20 @@ func boundedInput(item models.ContentItem, stage string) map[string]any {
 		input["playback_url"] = item.PlaybackURL
 		input["media_url"] = item.MediaURL
 		input["duration_sec"] = item.DurationSec
+		input["file_size_bytes"] = item.FileSizeBytes
 		input["transcript_id"] = item.TranscriptID
 		if stage == models.ContentStagePodsTranscript && len(item.Metadata) > 0 {
 			var metadata map[string]any
 			if json.Unmarshal(item.Metadata, &metadata) == nil {
+				if manifestID, ok := metadata["analysis_audio_manifest_id"].(string); ok {
+					input["analysis_audio_manifest_id"] = manifestID
+				}
+				if manifestID, ok := metadata["media_artifact_manifest_id"].(string); ok {
+					input["media_artifact_manifest_id"] = manifestID
+				}
+				if analysisURL, ok := metadata["analysis_audio_url"].(string); ok {
+					input["analysis_audio_url"] = analysisURL
+				}
 				if captionArtifact, ok := metadata["caption_artifact"].(map[string]any); ok {
 					input["caption_artifact"] = captionArtifact
 				}
