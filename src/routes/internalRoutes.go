@@ -155,5 +155,15 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 
 	route(http.MethodGet, "/quality/profiles/resolve", controllers.InternalResolveQualityProfile)
 	route(http.MethodGet, "/quality/profiles/:id", controllers.InternalGetQualityProfile)
+	route(http.MethodGet, "/media-delivery/policies/resolve", controllers.InternalResolveMediaDeliveryPolicy)
+	route(http.MethodPost, "/media-rendition-generations", controllers.InternalCreateMediaRenditionGeneration)
+	route(http.MethodGet, "/media-rendition-generations/:id", controllers.InternalGetMediaRenditionGeneration)
+	for _, state := range []string{"running", "verifying", "failed", "uncertain"} {
+		route(http.MethodPost, "/media-rendition-generations/:id/"+state, controllers.InternalTransitionMediaRenditionGeneration)
+	}
+	route(http.MethodPost, "/media-rendition-generations/:id/activate", controllers.InternalActivateMediaRenditionGeneration)
+	route(http.MethodPost, "/media-hls-packages", controllers.InternalCreateMediaHLSPackage)
+	route(http.MethodPost, "/media-hls-packages/:id/verify", controllers.InternalVerifyMediaHLSPackage)
+	route(http.MethodPost, "/media-hls-access-points", controllers.InternalCreateMediaHLSAccessPoint)
 	route(http.MethodPatch, "/content-items/:id/quality", controllers.InternalUpdateContentItemQuality)
 }

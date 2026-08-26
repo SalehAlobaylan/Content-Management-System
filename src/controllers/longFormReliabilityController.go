@@ -82,11 +82,13 @@ type artifactManifestRequest struct {
 	TranscriptionSegmentUnitID string         `json:"transcription_segment_unit_id"`
 	AttemptID                  string         `json:"attempt_id"`
 	ArtifactRole               string         `json:"artifact_role"`
+	PackageManifestID          string         `json:"package_manifest_id"`
 	StorageTier                string         `json:"storage_tier"`
 	Bucket                     string         `json:"bucket"`
 	ObjectKey                  string         `json:"object_key"`
 	PublicURL                  string         `json:"public_url"`
 	ContentType                string         `json:"content_type"`
+	CacheControl               string         `json:"cache_control"`
 	SizeBytes                  int64          `json:"size_bytes"`
 	ETag                       string         `json:"etag"`
 	SHA256                     string         `json:"sha256"`
@@ -112,7 +114,7 @@ func InternalCreateArtifactManifest(c *gin.Context) {
 		tenant = "default"
 	}
 	role := strings.TrimSpace(req.ArtifactRole)
-	allowedRoles := map[string]bool{"source": true, "analysis_audio": true, "chapter_media": true, "chapter_hls": true, "thumbnail": true, "transcript_segment": true}
+	allowedRoles := map[string]bool{"source": true, "analysis_audio": true, "chapter_media": true, "chapter_hls": true, "thumbnail": true, "transcript_segment": true, "playback_audio": true, "playback_mp4": true, "delivery_audio": true, "delivery_progressive": true, "hls_master": true, "hls_playlist": true, "hls_init": true, "hls_segment": true}
 	if !allowedRoles[role] || strings.TrimSpace(req.Bucket) == "" || strings.TrimSpace(req.ObjectKey) == "" || strings.TrimSpace(req.CreatorRole) == "" || strings.TrimSpace(req.InputDigest) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "artifact role, bucket, object_key, creator_role, and input_digest are required"})
 		return
@@ -162,7 +164,12 @@ func InternalCreateArtifactManifest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid fence_token"})
 		return
 	}
-	manifest := models.MediaArtifactManifest{PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID, ParentContentItemID: parentID, AtomizationGenerationID: atomGen, AtomizationChapterUnitID: atomUnit, TranscriptionGenerationID: transGen, TranscriptionSegmentUnitID: transUnit, AttemptID: attempt, ArtifactRole: role, StorageTier: strings.TrimSpace(req.StorageTier), Bucket: strings.TrimSpace(req.Bucket), ObjectKey: strings.TrimSpace(req.ObjectKey), PublicURL: strings.TrimSpace(req.PublicURL), ContentType: strings.TrimSpace(req.ContentType), SizeBytes: req.SizeBytes, ETag: strings.TrimSpace(req.ETag), SHA256: strings.TrimSpace(req.SHA256), DurationMs: req.DurationMs, CreatorRole: strings.TrimSpace(req.CreatorRole), ProducerEventID: *producer, FenceToken: fence, InputDigest: strings.TrimSpace(req.InputDigest), State: manifestStateUploading, RecoveryClass: strings.TrimSpace(req.RecoveryClass), VerificationEvidence: longFormJSON(req.VerificationEvidence), TerminalProof: longFormJSON(req.TerminalProof)}
+	packageManifest, err := longFormUUID(req.PackageManifestID, false)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid package_manifest_id"})
+		return
+	}
+	manifest := models.MediaArtifactManifest{PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID, ParentContentItemID: parentID, AtomizationGenerationID: atomGen, AtomizationChapterUnitID: atomUnit, TranscriptionGenerationID: transGen, TranscriptionSegmentUnitID: transUnit, AttemptID: attempt, ArtifactRole: role, PackageManifestID: packageManifest, StorageTier: strings.TrimSpace(req.StorageTier), Bucket: strings.TrimSpace(req.Bucket), ObjectKey: strings.TrimSpace(req.ObjectKey), PublicURL: strings.TrimSpace(req.PublicURL), ContentType: strings.TrimSpace(req.ContentType), CacheControl: strings.TrimSpace(req.CacheControl), SizeBytes: req.SizeBytes, ETag: strings.TrimSpace(req.ETag), SHA256: strings.TrimSpace(req.SHA256), DurationMs: req.DurationMs, CreatorRole: strings.TrimSpace(req.CreatorRole), ProducerEventID: *producer, FenceToken: fence, InputDigest: strings.TrimSpace(req.InputDigest), State: manifestStateUploading, RecoveryClass: strings.TrimSpace(req.RecoveryClass), VerificationEvidence: longFormJSON(req.VerificationEvidence), TerminalProof: longFormJSON(req.TerminalProof)}
 	if manifest.StorageTier == "" {
 		manifest.StorageTier = "primary"
 	}
@@ -1387,6 +1394,9 @@ func validateAtomizationGenerationUnits(db *gorm.DB, parent *models.ContentItem,
 		var result atomizationChapterRequest
 		if err := json.Unmarshal(unit.Result, &result); err != nil || result.PlaybackURL == nil || strings.TrimSpace(*result.PlaybackURL) == "" || result.MediaURL == nil || strings.TrimSpace(*result.MediaURL) == "" {
 			return fmt.Errorf("unit %d has no verified playback result", index)
+		}
+		if err := validateTypedAudioTierSet(result.MediaRenditions); err != nil {
+			return fmt.Errorf("unit %d has an invalid native-audio tier set", index)
 		}
 		manifestIDs = append(manifestIDs, atomizationUnitManifestIDs(unit)...)
 		cursor = unit.EndMs

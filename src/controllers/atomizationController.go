@@ -546,6 +546,13 @@ func InternalGetAtomizationInput(c *gin.Context) {
 	}
 	effective := effectiveAtomizationPolicyForItem(db, &item)
 	policy := effective.Policy
+	// Atomization is a generation-recovery workflow. It may only cut from an
+	// immutable source manifest, never a mutable playback URL or storage scan.
+	var sourceManifest models.MediaArtifactManifest
+	if err := db.Where("tenant_id=? AND content_item_id=? AND artifact_role='source' AND state IN ?", item.TenantID, item.PublicID, []string{"verified", "active"}).Order("created_at DESC").First(&sourceManifest).Error; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "Atomization requires a verified source manifest"})
+		return
+	}
 	var transcript *models.Transcript
 	if item.TranscriptID != nil {
 		var t models.Transcript
@@ -578,6 +585,9 @@ func InternalGetAtomizationInput(c *gin.Context) {
 			"has_video": item.HasVideo, "playback_url": item.PlaybackURL,
 			"fallback_playback_url": item.FallbackPlaybackURL,
 			"storage_tier":          item.StorageTier, "media_version": item.MediaVersion,
+			"source_manifest_id": sourceManifest.PublicID.String(), "source_manifest_url": sourceManifest.PublicURL,
+			"source_manifest_key": sourceManifest.ObjectKey, "source_manifest_content_type": sourceManifest.ContentType,
+			"source_manifest_storage_tier": sourceManifest.StorageTier,
 		},
 		Policy: policy, EffectivePolicy: policy, PolicySource: effective.PolicySource,
 		DisabledReason:  effective.DisabledReason,

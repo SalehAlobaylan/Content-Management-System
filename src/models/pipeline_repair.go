@@ -21,6 +21,7 @@ const (
 	PipelineStageMediaDownload  = "media_download"
 	PipelineStageMediaTranscode = "media_transcode"
 	PipelineStageMediaThumbnail = "media_thumbnail"
+	PipelineStageMediaDeliveryGeneration = "media_delivery_generation"
 	PipelineStageTextEmbedding  = "text_embedding"
 )
 

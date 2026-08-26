@@ -13,10 +13,10 @@ import (
 // formats, and hard limits.
 //
 // Resolution at ingest time picks the most-specific match:
-//   1. tenant_id=X AND source_type=Y    (most specific)
-//   2. tenant_id=X AND source_type=NULL (tenant default)
-//   3. tenant_id=NULL AND source_type=Y (per-source global)
-//   4. tenant_id=NULL AND source_type=NULL (global default)
+//  1. tenant_id=X AND source_type=Y    (most specific)
+//  2. tenant_id=X AND source_type=NULL (tenant default)
+//  3. tenant_id=NULL AND source_type=Y (per-source global)
+//  4. tenant_id=NULL AND source_type=NULL (global default)
 //
 // Profiles are also referenced by storage policies whose archive_action is
 // 're_encode' — the storage worker shrinks eligible items down to the
@@ -36,12 +36,24 @@ type QualityProfile struct {
 	Preset            string `gorm:"type:varchar(16);default:'fast'" json:"preset"`      // ultrafast..veryslow
 
 	// Audio parameters
-	AudioCodec       string `gorm:"type:varchar(16);default:'aac'" json:"audio_codec"` // aac | opus
-	AudioBitrateKbps int    `gorm:"default:128" json:"audio_bitrate_kbps"`
+	AudioCodec        string `gorm:"type:varchar(16);default:'aac'" json:"audio_codec"` // aac | opus
+	AudioBitrateKbps  int    `gorm:"default:128" json:"audio_bitrate_kbps"`
+	AudioChannels     int    `gorm:"default:0" json:"audio_channels"`
+	AudioSampleRateHz int    `gorm:"default:0" json:"audio_sample_rate_hz"`
 
 	// Output container — drives file extension and container-specific flags.
 	// HLS / DASH listed for forward-compat but unsupported by the v1 pipeline.
-	OutputContainer string `gorm:"type:varchar(8);default:'mp4'" json:"output_container"` // mp4 | webm | mov
+	OutputContainer    string  `gorm:"type:varchar(8);default:'mp4'" json:"output_container"` // mp4 | webm | mov
+	MediaKind          string  `gorm:"type:varchar(16);default:'video'" json:"media_kind"`
+	MaxWidth           int     `gorm:"default:0" json:"max_width"`
+	MaxFrameRate       float64 `gorm:"default:0" json:"max_frame_rate"`
+	VideoProfile       string  `gorm:"type:varchar(32);default:''" json:"video_profile"`
+	VideoLevel         string  `gorm:"type:varchar(32);default:''" json:"video_level"`
+	QualityTier        string  `gorm:"type:varchar(16);default:'standard'" json:"quality_tier"`
+	ProfilePurpose     string  `gorm:"type:varchar(16);default:'delivery'" json:"profile_purpose"`
+	PassthroughAllowed bool    `gorm:"default:true" json:"passthrough_allowed"`
+	RemuxAllowed       bool    `gorm:"default:true" json:"remux_allowed"`
+	SchemaVersion      int     `gorm:"default:1" json:"schema_version"`
 
 	// Thumbnail extraction params used by extractThumbnail in Aggregation.
 	ThumbnailOffsetSeconds int `gorm:"default:2" json:"thumbnail_offset_seconds"`

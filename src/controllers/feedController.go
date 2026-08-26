@@ -25,35 +25,39 @@ type PodsResponse struct {
 
 // PodsItem represents a single item in the Pods feed
 type PodsItem struct {
-	ID                   uuid.UUID  `json:"id"`
-	Type                 string     `json:"type"`
-	Title                string     `json:"title"`
-	MediaURL             string     `json:"media_url"`
-	ThumbnailURL         string     `json:"thumbnail_url,omitempty"`
-	DurationSec          int        `json:"duration_sec,omitempty"`
-	ParentID             *string    `json:"parent_id,omitempty"`
-	ChapterIndex         *int       `json:"chapter_index,omitempty"`
-	ChapterStartMs       *int       `json:"chapter_start_ms,omitempty"`
-	ChapterEndMs         *int       `json:"chapter_end_ms,omitempty"`
-	DurationBucket       *string    `json:"duration_bucket,omitempty"`
-	PlaybackURL          *string    `json:"playback_url,omitempty"`
-	PlaybackType         *string    `json:"playback_type,omitempty"`
-	FallbackPlaybackURL  *string    `json:"fallback_playback_url,omitempty"`
-	FallbackPlaybackType *string    `json:"fallback_playback_type,omitempty"`
-	FallbackHasVideo     *bool      `json:"fallback_has_video,omitempty"`
-	HasVideo             *bool      `json:"has_video,omitempty"`
-	MediaRenditions      any        `json:"media_renditions,omitempty"`
-	Author               string     `json:"author,omitempty"`
-	SourceName           string     `json:"source_name,omitempty"`
-	LikeCount            int        `json:"like_count"`
-	CommentCount         int        `json:"comment_count"`
-	ShareCount           int        `json:"share_count"`
-	PublishedAt          time.Time  `json:"published_at"`
-	BookmarkedAt         *time.Time `json:"bookmarked_at,omitempty"`
-	IsLiked              bool       `json:"is_liked"`
-	IsBookmarked         bool       `json:"is_bookmarked"`
-	IsArchived           bool       `json:"is_archived"`
-	TranscriptID         *string    `json:"transcript_id,omitempty"`
+	ID                          uuid.UUID  `json:"id"`
+	Type                        string     `json:"type"`
+	Title                       string     `json:"title"`
+	MediaURL                    string     `json:"media_url"`
+	ThumbnailURL                string     `json:"thumbnail_url,omitempty"`
+	DurationSec                 int        `json:"duration_sec,omitempty"`
+	ParentID                    *string    `json:"parent_id,omitempty"`
+	ChapterIndex                *int       `json:"chapter_index,omitempty"`
+	ChapterStartMs              *int       `json:"chapter_start_ms,omitempty"`
+	ChapterEndMs                *int       `json:"chapter_end_ms,omitempty"`
+	DurationBucket              *string    `json:"duration_bucket,omitempty"`
+	PlaybackURL                 *string    `json:"playback_url,omitempty"`
+	PlaybackType                *string    `json:"playback_type,omitempty"`
+	FallbackPlaybackURL         *string    `json:"fallback_playback_url,omitempty"`
+	FallbackPlaybackType        *string    `json:"fallback_playback_type,omitempty"`
+	FallbackHasVideo            *bool      `json:"fallback_has_video,omitempty"`
+	HasVideo                    *bool      `json:"has_video,omitempty"`
+	ActiveRenditionGenerationID *uuid.UUID `json:"active_rendition_generation_id,omitempty"`
+	RenditionSetVersion         int        `json:"rendition_set_version,omitempty"`
+	RenditionDigest             string     `json:"rendition_digest,omitempty"`
+	DeliveryClass               string     `json:"delivery_class,omitempty"`
+	MediaRenditions             any        `json:"media_renditions,omitempty"`
+	Author                      string     `json:"author,omitempty"`
+	SourceName                  string     `json:"source_name,omitempty"`
+	LikeCount                   int        `json:"like_count"`
+	CommentCount                int        `json:"comment_count"`
+	ShareCount                  int        `json:"share_count"`
+	PublishedAt                 time.Time  `json:"published_at"`
+	BookmarkedAt                *time.Time `json:"bookmarked_at,omitempty"`
+	IsLiked                     bool       `json:"is_liked"`
+	IsBookmarked                bool       `json:"is_bookmarked"`
+	IsArchived                  bool       `json:"is_archived"`
+	TranscriptID                *string    `json:"transcript_id,omitempty"`
 }
 
 const (
@@ -738,6 +742,10 @@ func mapToPodsItem(item models.ContentItem, isLiked, isBookmarked bool) PodsItem
 	result.PlaybackType = item.PlaybackType
 	result.FallbackPlaybackURL = item.FallbackPlaybackURL
 	result.HasVideo = item.HasVideo
+	result.ActiveRenditionGenerationID = item.ActiveMediaRenditionGenerationID
+	result.RenditionSetVersion = item.RenditionSetVersion
+	result.RenditionDigest = item.RenditionDigest
+	result.DeliveryClass = item.DeliveryClass
 	if len(item.MediaRenditions) > 0 {
 		var renditions any
 		if json.Unmarshal(item.MediaRenditions, &renditions) == nil {

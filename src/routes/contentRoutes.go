@@ -12,6 +12,8 @@ func SetupContentRoutes(group *gin.RouterGroup, db *gorm.DB) {
 	// User-submitted content (JWT-authenticated). Registered BEFORE the
 	// /content/:id catch-all so Gin matches the literal segments first.
 	group.GET("/content/mine", controllers.UserAuthMiddleware(), controllers.GetMyContent)
+	group.GET("/content/:id/playback", controllers.OptionalUserAuthMiddleware(), controllers.GetContentPlayback)
+	group.POST("/content/:id/playback-health", controllers.OptionalUserAuthMiddleware(), controllers.RecordPlaybackHealth)
 	group.POST("/content/submit", controllers.UserAuthMiddleware(), controllers.SubmitUserContent)
 
 	// Get a single content item by ID. OptionalUserAuth lets the per-user

@@ -22,11 +22,13 @@ type MediaArtifactManifest struct {
 	TranscriptionSegmentUnitID *uuid.UUID     `gorm:"type:uuid;index" json:"transcription_segment_unit_id,omitempty"`
 	AttemptID                  *uuid.UUID     `gorm:"type:uuid;index" json:"attempt_id,omitempty"`
 	ArtifactRole               string         `gorm:"type:varchar(32);not null;index" json:"artifact_role"`
+	PackageManifestID          *uuid.UUID     `gorm:"type:uuid;index" json:"package_manifest_id,omitempty"`
 	StorageTier                string         `gorm:"type:varchar(16);not null;default:'primary'" json:"storage_tier"`
 	Bucket                     string         `gorm:"type:varchar(255);not null" json:"bucket"`
 	ObjectKey                  string         `gorm:"type:text;not null" json:"object_key"`
 	PublicURL                  string         `gorm:"type:text" json:"public_url,omitempty"`
 	ContentType                string         `gorm:"type:varchar(255)" json:"content_type,omitempty"`
+	CacheControl               string         `gorm:"type:varchar(255)" json:"cache_control,omitempty"`
 	SizeBytes                  int64          `gorm:"type:bigint;not null;default:0" json:"size_bytes"`
 	ETag                       string         `gorm:"type:varchar(255)" json:"etag,omitempty"`
 	SHA256                     string         `gorm:"type:char(64)" json:"sha256,omitempty"`

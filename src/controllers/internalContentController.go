@@ -228,6 +228,8 @@ type internalUpdateArtifactsRequest struct {
 	PlaybackType          *string                  `json:"playback_type"`
 	FallbackPlaybackURL   *string                  `json:"fallback_playback_url"`
 	HasVideo              *bool                    `json:"has_video"`
+	VisualAvailable       *bool                    `json:"visual_available"`
+	RenditionSetVersion   *int                     `json:"rendition_set_version"`
 	MediaRenditions       []map[string]interface{} `json:"media_renditions"`
 	MediaSuitability      *string                  `json:"media_suitability"`
 	SuitabilityConfidence *float64                 `json:"media_suitability_confidence"`
@@ -936,6 +938,12 @@ func applyArtifactRequest(item *models.ContentItem, req internalUpdateArtifactsR
 	}
 	if req.HasVideo != nil {
 		item.HasVideo = req.HasVideo
+	}
+	if req.VisualAvailable != nil {
+		item.VisualAvailable = *req.VisualAvailable
+	}
+	if req.RenditionSetVersion != nil && *req.RenditionSetVersion > 0 {
+		item.RenditionSetVersion = *req.RenditionSetVersion
 	}
 	if req.MediaRenditions != nil {
 		if raw, err := json.Marshal(req.MediaRenditions); err == nil {

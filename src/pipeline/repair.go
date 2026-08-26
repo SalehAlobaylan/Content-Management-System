@@ -37,6 +37,28 @@ type Claim struct {
 	ClaimToken uuid.UUID                    `json:"claim_token"`
 }
 
+const mediaDeliveryRepairClass = "media_delivery_generation"
+
+func isDirectMediaDeliveryRepair(request models.PipelineRepairRequest) bool {
+	return request.Stage == models.PipelineStageMediaDeliveryGeneration && request.RepairClass == mediaDeliveryRepairClass
+}
+
+// MediaDeliveryCandidate is deliberately independent from the failed-stage
+// event heuristic. A generation replacement may repair a READY legacy item;
+// its fence is the immutable source manifest plus the exact item version.
+func MediaDeliveryCandidate(db *gorm.DB, tenantID string, itemID uuid.UUID) (Candidate, models.MediaArtifactManifest, error) {
+	var item models.ContentItem
+	if err := db.Where("public_id=? AND tenant_id=?", itemID, tenantID).First(&item).Error; err != nil { return Candidate{}, models.MediaArtifactManifest{}, err }
+	var source models.MediaArtifactManifest
+	if err := db.Where("tenant_id=? AND content_item_id=? AND artifact_role='source' AND state IN ?", tenantID, itemID, []string{"verified", "active"}).Order("created_at DESC").First(&source).Error; err != nil {
+		return Candidate{}, models.MediaArtifactManifest{}, fmt.Errorf("delivery repair has no proven source manifest: %w", err)
+	}
+	var active models.MediaRenditionGeneration
+	_ = db.Where("tenant_id=? AND content_item_id=? AND state='active'", tenantID, itemID).First(&active).Error
+	evidence := sha256.Sum256([]byte(strings.Join([]string{"media-delivery-repair-preview/v1", tenantID, itemID.String(), item.UpdatedAt.UTC().Format(time.RFC3339Nano), source.PublicID.String(), active.PublicID.String(), active.RenditionDigest}, "\n")))
+	return Candidate{Item: item, Stage: models.PipelineStageMediaDeliveryGeneration, EvidenceDigest: hex.EncodeToString(evidence[:])}, source, nil
+}
+
 // EffectReceipt is the only owner-written completion record for a pipeline
 // repair. It deliberately contains proof identifiers, never an arbitrary
 // target, queue name, provider URL, or caller-selected stage.
@@ -105,7 +127,7 @@ func AuthorizeTextEmbeddingWriteback(tx *gorm.DB, contentItemID uuid.UUID, input
 
 func isStage(stage string) bool {
 	switch stage {
-	case models.PipelineStageMediaDownload, models.PipelineStageMediaTranscode, models.PipelineStageMediaThumbnail, models.PipelineStageTextEmbedding:
+	case models.PipelineStageMediaDownload, models.PipelineStageMediaTranscode, models.PipelineStageMediaThumbnail, models.PipelineStageMediaDeliveryGeneration, models.PipelineStageTextEmbedding:
 		return true
 	}
 	return false
@@ -130,7 +152,7 @@ func CandidateForItem(db *gorm.DB, tenantID string, itemID uuid.UUID) (Candidate
 	}
 	stage := ""
 	switch event.Stage {
-	case "media_download", "media_transcode", "media_thumbnail":
+	case "media_download", "media_transcode", "media_thumbnail", "media_delivery_generation":
 		stage = event.Stage
 	case "text_embedding":
 		stage = models.PipelineStageTextEmbedding
@@ -171,6 +193,12 @@ func checkCandidate(db *gorm.DB, c Candidate, currentRepair *uuid.UUID) error {
 	if c.Stage == models.PipelineStageMediaThumbnail && pipelineRepairArtifactURL(c.Item, "pipeline_repair_processed_url") == "" {
 		return fmt.Errorf("pipeline repair has no verified processed rendition")
 	}
+	if c.Stage == models.PipelineStageMediaDeliveryGeneration && pipelineRepairArtifactURL(c.Item, "source_artifact_manifest_id") == "" {
+		var source models.MediaArtifactManifest
+		if err := db.Where("tenant_id=? AND content_item_id=? AND artifact_role='source' AND state IN ?", c.Item.TenantID, c.Item.PublicID, []string{"verified", "active"}).First(&source).Error; err != nil {
+			return fmt.Errorf("delivery repair has no proven source manifest")
+		}
+	}
 	var live models.PipelineStageLease
 	err = db.Where("tenant_id = ? AND content_item_id = ? AND item_updated_at = ? AND stage = ? AND state IN ? AND lease_expires_at > ?", c.Item.TenantID, c.Item.PublicID, c.Item.UpdatedAt, c.Stage, []string{"claimed", "running", "verifying"}, time.Now().UTC()).First(&live).Error
 	if err == nil {
@@ -192,6 +220,29 @@ func checkCandidate(db *gorm.DB, c Candidate, currentRepair *uuid.UUID) error {
 		return err
 	}
 	return nil
+}
+
+// CreateMediaDeliveryRepair turns an immutable, operator-reviewed preview
+// into one CMS-fenced Pipeline Repair request. It never selects a queue or
+// accepts a source URL from the caller.
+func CreateMediaDeliveryRepair(db *gorm.DB, tenantID string, itemID uuid.UUID, previewDigest, actor string) (models.PipelineRepairRequest, error) {
+	candidate, source, err := MediaDeliveryCandidate(db, tenantID, itemID)
+	if err != nil { return models.PipelineRepairRequest{}, err }
+	if strings.TrimSpace(previewDigest) == "" || previewDigest != candidate.EvidenceDigest { return models.PipelineRepairRequest{}, fmt.Errorf("delivery repair preview is stale or invalid") }
+	if err := CheckCandidate(db, candidate); err != nil { return models.PipelineRepairRequest{}, err }
+	now := time.Now().UTC()
+	idemSum := sha256.Sum256([]byte(strings.Join([]string{"media-delivery-repair/v1", tenantID, itemID.String(), candidate.Item.UpdatedAt.UTC().Format(time.RFC3339Nano), source.PublicID.String(), previewDigest}, "\n")))
+	idem := hex.EncodeToString(idemSum[:])
+	effectSum := sha256.Sum256([]byte(strings.Join([]string{"media-delivery-repair-effect/v1", idem, previewDigest}, "\n")))
+	request := models.PipelineRepairRequest{PublicID: uuid.New(), TenantID: tenantID, ContentItemID: itemID, ExpectedItemUpdatedAt: candidate.Item.UpdatedAt, ExpectedStatus: string(candidate.Item.Status), Stage: models.PipelineStageMediaDeliveryGeneration, PriorStageEvidenceDigest: previewDigest, RepairClass: mediaDeliveryRepairClass, IdempotencyKey: idem, DeterministicJobID: "pipeline-repair:" + idem, EffectInputDigest: hex.EncodeToString(effectSum[:]), State: models.PipelineRepairQueued, ApprovedBy: actor, ApprovedAt: &now, PlannedEffects: jsonValue(map[string]any{"stage": models.PipelineStageMediaDeliveryGeneration, "source_manifest_id": source.PublicID.String(), "preview_digest": previewDigest, "rollback": "previous_verified_generation"}), AffectedSubjects: jsonValue([]map[string]string{{"type":"content_item", "id":itemID.String()}, {"type":"source_manifest", "id":source.PublicID.String()}}), DeepLinks: datatypes.JSON([]byte(`["/platform/storage?section=delivery"]`))}
+	err = db.Transaction(func(tx *gorm.DB) error {
+		current, _, candidateErr := MediaDeliveryCandidate(tx, tenantID, itemID)
+		if candidateErr != nil || current.EvidenceDigest != previewDigest { return fmt.Errorf("delivery repair target changed before request") }
+		if err := checkCandidate(tx, current, nil); err != nil { return err }
+		if err := tx.Create(&request).Error; err != nil { return err }
+		return appendEvent(tx, request, nil, "queued", map[string]any{"stage": request.Stage, "preview_digest": previewDigest, "source_manifest_id": source.PublicID.String()})
+	})
+	return request, err
 }
 
 func pipelineRepairArtifactURL(item models.ContentItem, key string) string {
@@ -252,7 +303,13 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			return err
 		}
 		for _, r := range requests {
-			c, err := CandidateForItem(tx, r.TenantID, r.ContentItemID)
+			var c Candidate
+			var err error
+			if isDirectMediaDeliveryRepair(r) {
+				c, _, err = MediaDeliveryCandidate(tx, r.TenantID, r.ContentItemID)
+			} else {
+				c, err = CandidateForItem(tx, r.TenantID, r.ContentItemID)
+			}
 			if err != nil || c.Stage != r.Stage || !c.Item.UpdatedAt.Equal(r.ExpectedItemUpdatedAt) || c.EvidenceDigest != r.PriorStageEvidenceDigest {
 				continue
 			}
@@ -307,8 +364,10 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	if err != nil || claim.Request.PublicID == uuid.Nil {
 		return claim, false, err
 	}
-	if accessErr := recheckLinkedSupplyActionAccess(db, claim.Request.TenantID, claim.Request.ActionRequestID); accessErr != nil {
+	if !isDirectMediaDeliveryRepair(claim.Request) {
+		if accessErr := recheckLinkedSupplyActionAccess(db, claim.Request.TenantID, claim.Request.ActionRequestID); accessErr != nil {
 		return Claim{}, false, accessErr
+		}
 	}
 	return claim, true, nil
 }
@@ -379,9 +438,10 @@ func Heartbeat(db *gorm.DB, requestID, owner string, token uuid.UUID) error {
 
 func recheckPipelineRepairActionAccess(db *gorm.DB, requestID string) error {
 	var request models.PipelineRepairRequest
-	if err := db.Select("tenant_id", "action_request_id").Where("public_id = ?", requestID).First(&request).Error; err != nil {
+	if err := db.Select("tenant_id", "action_request_id", "stage", "repair_class").Where("public_id = ?", requestID).First(&request).Error; err != nil {
 		return err
 	}
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	return recheckLinkedSupplyActionAccess(db, request.TenantID, request.ActionRequestID)
 }
 
@@ -432,7 +492,9 @@ func transition(db *gorm.DB, requestID, owner string, token uuid.UUID, kind stri
 			if r.State != models.PipelineRepairClaimed {
 				return fmt.Errorf("pipeline repair cannot begin")
 			}
-			current, candidateErr := CandidateForItem(tx, r.TenantID, r.ContentItemID)
+			var current Candidate
+			var candidateErr error
+			if isDirectMediaDeliveryRepair(r) { current, _, candidateErr = MediaDeliveryCandidate(tx, r.TenantID, r.ContentItemID) } else { current, candidateErr = CandidateForItem(tx, r.TenantID, r.ContentItemID) }
 			if candidateErr != nil || current.Stage != r.Stage || !current.Item.UpdatedAt.Equal(r.ExpectedItemUpdatedAt) || current.EvidenceDigest != r.PriorStageEvidenceDigest {
 				return fmt.Errorf("pipeline repair target evidence changed before effect")
 			}
@@ -655,6 +717,12 @@ func observePersistedStageEffect(db *gorm.DB, request models.PipelineRepairReque
 		return url != "" && item.ThumbnailURL != nil && *item.ThumbnailURL == url, nil
 	case models.PipelineStageTextEmbedding:
 		return item.Embedding != nil && item.EmbeddingModel != nil && strings.TrimSpace(*item.EmbeddingModel) != "", nil
+	case models.PipelineStageMediaDeliveryGeneration:
+		generationID, _ := payload.Output["generation_id"].(string)
+		if generationID == "" || item.ActiveMediaRenditionGenerationID == nil || item.ActiveMediaRenditionGenerationID.String() != generationID { return false, nil }
+		var generation models.MediaRenditionGeneration
+		if err := db.Where("tenant_id=? AND public_id=? AND content_item_id=? AND state='active'", request.TenantID, generationID, request.ContentItemID).First(&generation).Error; err != nil { return false, err }
+		return generation.RenditionDigest != "", nil
 	default:
 		return false, fmt.Errorf("pipeline repair stage is not registered")
 	}
@@ -697,6 +765,7 @@ func RecoverExpired(db *gorm.DB) error {
 }
 
 func claimLinkedAction(tx *gorm.DB, request models.PipelineRepairRequest, attempt models.PipelineRepairAttempt, token uuid.UUID, expires time.Time) error {
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	if request.ActionRequestID == nil {
 		return fmt.Errorf("pipeline repair is not linked to a signed action")
 	}
@@ -738,6 +807,7 @@ func linkedActionAttempt(tx *gorm.DB, request models.PipelineRepairRequest, atte
 }
 
 func updateLinkedActionLease(tx *gorm.DB, request models.PipelineRepairRequest, attempt models.PipelineRepairAttempt, token uuid.UUID, expires time.Time, begin bool, now time.Time) error {
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	action, linked, err := linkedActionAttempt(tx, request, attempt)
 	if err != nil {
 		return err
@@ -761,6 +831,7 @@ func updateLinkedActionLease(tx *gorm.DB, request models.PipelineRepairRequest, 
 }
 
 func markLinkedActionVerifying(tx *gorm.DB, request models.PipelineRepairRequest, attempt models.PipelineRepairAttempt, token uuid.UUID, now time.Time) error {
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	action, linked, err := linkedActionAttempt(tx, request, attempt)
 	if err != nil {
 		return err
@@ -777,6 +848,7 @@ func markLinkedActionVerifying(tx *gorm.DB, request models.PipelineRepairRequest
 }
 
 func completeLinkedAction(tx *gorm.DB, request models.PipelineRepairRequest, evidence models.ContentProcessingEvent, now time.Time) error {
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	if request.ActionRequestID == nil {
 		return fmt.Errorf("pipeline repair is not linked to a signed action")
 	}
@@ -795,6 +867,7 @@ func completeLinkedAction(tx *gorm.DB, request models.PipelineRepairRequest, evi
 }
 
 func recoverLinkedAction(tx *gorm.DB, request models.PipelineRepairRequest, next string, now time.Time) error {
+	if isDirectMediaDeliveryRepair(request) { return nil }
 	if request.ActionRequestID == nil {
 		return fmt.Errorf("pipeline repair is not linked to a signed action")
 	}

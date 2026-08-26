@@ -12,6 +12,8 @@ func SetupPreferenceRoutes(group *gin.RouterGroup, db *gorm.DB) {
 
 	group.GET("/topics/picker", controllers.GetTopicPicker)
 	group.GET("/preferences", auth, controllers.GetPreferences)
+	group.GET("/preferences/playback", auth, controllers.GetPlaybackPreferences)
+	group.PUT("/preferences/playback", auth, controllers.UpdatePlaybackPreferences)
 	group.PUT("/preferences/topics", auth, controllers.PutPreferenceTopics)
 	group.POST("/preferences/topics/:id/mute", auth, controllers.MutePreferenceTopic)
 	group.DELETE("/preferences/topics/:id/mute", auth, controllers.UnmutePreferenceTopic)
