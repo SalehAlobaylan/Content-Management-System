@@ -162,7 +162,7 @@ func main() {
 		return
 	}
 	if *bootstrapEmpty {
-		if err := requireEmptyDisposableBootstrap(db); err != nil {
+		if err := requireEmptyBootstrap(db); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -182,42 +182,75 @@ func main() {
 		}
 		log.Printf("Applied %s", file.Version)
 	}
+	if *bootstrapEmpty {
+		if err := activateEmptyBootstrapContentStages(db); err != nil {
+			log.Fatalf("activate empty-bootstrap content stages: %v", err)
+		}
+		log.Printf("Activated durable content-stage execution for the empty bootstrap.")
+	}
 	if blockedAt != "" {
 		log.Printf("Stopped before destructive migration %s; safe preceding migrations were applied. Re-run with --allow-destructive only after reviewing that migration and satisfying its readiness guards.", blockedAt)
 	}
 }
 
-const disposableBootstrapMarker = "I_UNDERSTAND_THIS_DATABASE_IS_DISPOSABLE"
+// An explicitly acknowledged empty bootstrap has no compatibility traffic to
+// shadow. Leaving its lanes in legacy mode strands every newly admitted durable
+// request: workers are forbidden to claim it, while no legacy pipeline exists
+// to produce the artifacts that shadow verification would observe.
+func activateEmptyBootstrapContentStages(db *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		for _, table := range []string{"content_items", "content_sources"} {
+			var count int64
+			if err := tx.Table(table).Count(&count).Error; err != nil {
+				return fmt.Errorf("count %s before durable activation: %w", table, err)
+			}
+			if count != 0 {
+				return fmt.Errorf("empty-bootstrap durable activation refused: %s contains %d row(s)", table, count)
+			}
+		}
+		now := time.Now().UTC()
+		for _, lane := range []string{"news", "pods"} {
+			sum := sha256.Sum256([]byte("content-stage/v1|empty-bootstrap|default|" + lane))
+			if err := tx.Exec(`UPDATE content_stage_cutovers
+				SET mode='durable_required', protocol_version='content-stage/v1', promoted_by='cms-migrate-empty-bootstrap',
+				    promoted_at=?, verification_digest=?, updated_at=?
+				WHERE tenant_id='default' AND lane=? AND mode='legacy'`, now, hex.EncodeToString(sum[:]), now, lane).Error; err != nil {
+				return fmt.Errorf("activate %s content-stage lane: %w", lane, err)
+			}
+		}
+		return nil
+	})
+}
 
-// requireEmptyDisposableBootstrap is deliberately stricter than the normal
-// migration guard. It exists only to replay historical migrations into a new
-// local fixture whose old files predate the large-table safety marker. It must
-// never be usable against a managed provider or a non-test database.
-func requireEmptyDisposableBootstrap(db *gorm.DB) error {
-	if os.Getenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") != disposableBootstrapMarker {
-		return fmt.Errorf("--bootstrap-empty requires CMS_MIGRATION_BOOTSTRAP_DISPOSABLE=%s", disposableBootstrapMarker)
-	}
-	raw := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
-		return fmt.Errorf("--bootstrap-empty requires a PostgreSQL DATABASE_URL")
-	}
-	host := strings.ToLower(u.Hostname())
-	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-		return fmt.Errorf("--bootstrap-empty is restricted to localhost PostgreSQL targets")
-	}
-	database := strings.TrimPrefix(u.Path, "/")
-	if !strings.HasPrefix(database, "wahb_cms_test_") {
-		return fmt.Errorf("--bootstrap-empty requires a database named wahb_cms_test_<suffix>")
+const disposableBootstrapMarker = "I_UNDERSTAND_THIS_DATABASE_IS_DISPOSABLE"
+const neonBootstrapMarker = "I_UNDERSTAND_THIS_NEON_DATABASE_IS_EMPTY"
+
+// requireEmptyBootstrap is deliberately stricter than the normal migration
+// guard. It exists only to replay historical migrations into a new empty local
+// fixture or an exactly identified empty Neon database whose old files predate
+// the large-table safety marker.
+func requireEmptyBootstrap(db *gorm.DB) error {
+	if err := validateEmptyBootstrapTarget(); err != nil {
+		return err
 	}
 	var tables []string
 	if err := db.Raw("SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'cms_schema_migrations' ORDER BY tablename").Scan(&tables).Error; err != nil {
 		return fmt.Errorf("inspect bootstrap schema: %w", err)
 	}
-	if len(tables) > 0 {
-		return fmt.Errorf("--bootstrap-empty refused: database already contains public tables (%s)", strings.Join(tables, ", "))
+	var ledgerRows int64
+	if err := db.Table("cms_schema_migrations").Count(&ledgerRows).Error; err != nil {
+		return fmt.Errorf("inspect bootstrap migration ledger: %w", err)
 	}
-	for _, table := range []string{"content_items", "stories"} {
+	if ledgerRows == 0 {
+		if len(tables) > 0 {
+			return fmt.Errorf("--bootstrap-empty refused: unledgered public tables exist (%s)", strings.Join(tables, ", "))
+		}
+		return nil
+	}
+	// A canonical bootstrap may be resumed after a transactional migration
+	// failure. Checksum verification has already validated every ledger row;
+	// core ingest tables must still contain no user or source data.
+	for _, table := range []string{"content_items", "content_sources"} {
 		var exists bool
 		if err := db.Raw("SELECT to_regclass(?) IS NOT NULL", "public."+table).Scan(&exists).Error; err != nil {
 			return fmt.Errorf("inspect bootstrap table %s: %w", table, err)
@@ -230,8 +263,42 @@ func requireEmptyDisposableBootstrap(db *gorm.DB) error {
 			return fmt.Errorf("count bootstrap table %s: %w", table, err)
 		}
 		if count != 0 {
-			return fmt.Errorf("--bootstrap-empty refused: %s contains %d rows", table, count)
+			return fmt.Errorf("--bootstrap-empty refused: %s contains %d row(s)", table, count)
 		}
+	}
+	return nil
+}
+
+func validateEmptyBootstrapTarget() error {
+	raw := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		return fmt.Errorf("--bootstrap-empty requires a PostgreSQL DATABASE_URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	database := strings.TrimPrefix(u.Path, "/")
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		if os.Getenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") != disposableBootstrapMarker {
+			return fmt.Errorf("--bootstrap-empty requires CMS_MIGRATION_BOOTSTRAP_DISPOSABLE=%s for localhost", disposableBootstrapMarker)
+		}
+		if !strings.HasPrefix(database, "wahb_cms_test_") {
+			return fmt.Errorf("--bootstrap-empty requires a local database named wahb_cms_test_<suffix>")
+		}
+		return nil
+	}
+	if !strings.HasSuffix(host, ".neon.tech") {
+		return fmt.Errorf("--bootstrap-empty supports only localhost or explicitly identified Neon targets")
+	}
+	if os.Getenv("CMS_MIGRATION_BOOTSTRAP_NEON") != neonBootstrapMarker {
+		return fmt.Errorf("--bootstrap-empty on Neon requires CMS_MIGRATION_BOOTSTRAP_NEON=%s", neonBootstrapMarker)
+	}
+	expectedHost := strings.ToLower(strings.TrimSpace(os.Getenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_HOST")))
+	expectedDatabase := strings.TrimSpace(os.Getenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_DATABASE"))
+	if expectedHost == "" || expectedDatabase == "" {
+		return fmt.Errorf("--bootstrap-empty on Neon requires CMS_MIGRATION_BOOTSTRAP_EXPECTED_HOST and CMS_MIGRATION_BOOTSTRAP_EXPECTED_DATABASE")
+	}
+	if host != expectedHost || database != expectedDatabase {
+		return fmt.Errorf("--bootstrap-empty target does not match the explicitly expected Neon host/database")
 	}
 	return nil
 }
@@ -411,6 +478,13 @@ func baselineThrough(db *gorm.DB, files []migrationFile, applied map[string]migr
 }
 
 func appliedVersions(db *gorm.DB) (map[string]migrationRecord, error) {
+	var ledgerExists bool
+	if err := db.Raw("SELECT to_regclass('public.cms_schema_migrations') IS NOT NULL").Scan(&ledgerExists).Error; err != nil {
+		return nil, err
+	}
+	if !ledgerExists {
+		return map[string]migrationRecord{}, nil
+	}
 	rows, err := db.Raw("SELECT version, applied_at, COALESCE(checksum_sha256, '') FROM cms_schema_migrations").Rows()
 	if err != nil {
 		return nil, err

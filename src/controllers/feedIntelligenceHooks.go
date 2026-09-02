@@ -51,8 +51,16 @@ func applyIntelligenceFeedHooks(db *gorm.DB, tenantID string, scored []ScoredIte
 		}
 	}
 	if demoted {
-		sort.SliceStable(scored, func(i, j int) bool { return scored[i].FinalScore > scored[j].FinalScore })
-		scored = applyDiversityPenalty(scored)
+		sort.SliceStable(scored, func(i, j int) bool {
+			if scored[i].FinalScore != scored[j].FinalScore {
+				return scored[i].FinalScore > scored[j].FinalScore
+			}
+			left, right := podsPublicationTime(scored[i].Item), podsPublicationTime(scored[j].Item)
+			if !left.Equal(right) {
+				return left.After(right)
+			}
+			return scored[i].Item.PublicID.String() < scored[j].Item.PublicID.String()
+		})
 	}
 
 	// Hook 2 — exploration slice: walk the page order; every Nth slot pops the

@@ -30,7 +30,7 @@ type MediaArtifactManifest struct {
 	ContentType                string         `gorm:"type:varchar(255)" json:"content_type,omitempty"`
 	CacheControl               string         `gorm:"type:varchar(255)" json:"cache_control,omitempty"`
 	SizeBytes                  int64          `gorm:"type:bigint;not null;default:0" json:"size_bytes"`
-	ETag                       string         `gorm:"type:varchar(255)" json:"etag,omitempty"`
+	ETag                       string         `gorm:"column:etag;type:varchar(255)" json:"etag,omitempty"`
 	SHA256                     string         `gorm:"type:char(64)" json:"sha256,omitempty"`
 	DurationMs                 *int64         `gorm:"type:bigint" json:"duration_ms,omitempty"`
 	CreatorRole                string         `gorm:"type:varchar(64);not null" json:"creator_role"`

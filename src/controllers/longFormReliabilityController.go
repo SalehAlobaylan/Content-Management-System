@@ -311,18 +311,31 @@ func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifa
 		} else if !errors.Is(contentStageResult.Error, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("content-stage attempt lookup failed")
 		} else {
-			// Atomization work attempts also materialize artifacts. AttemptID is
-			// intentionally polymorphic so a manifest can carry the durable
-			// attempt that owns it without inventing a duplicate correlation ID.
+			// Atomization and pipeline-repair attempts also materialize artifacts.
+			// AttemptID is intentionally polymorphic so a manifest can carry the
+			// durable attempt that owns it without inventing a duplicate
+			// correlation ID.
 			var atomizationAttempt models.AtomizationWorkAttempt
-			if err := db.Where("public_id=? AND tenant_id=?", *manifest.AttemptID, manifest.TenantID).First(&atomizationAttempt).Error; err != nil {
+			atomizationResult := db.Where("public_id=? AND tenant_id=?", *manifest.AttemptID, manifest.TenantID).First(&atomizationAttempt)
+			if atomizationResult.Error == nil {
+				if manifest.FenceToken != nil && atomizationAttempt.FenceToken != *manifest.FenceToken {
+					return fmt.Errorf("atomization attempt fence mismatch")
+				}
+				return nil
+			}
+			if !errors.Is(atomizationResult.Error, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("atomization attempt lookup failed")
+			}
+
+			var repairAttempt models.PipelineRepairAttempt
+			if err := db.Where("public_id=? AND tenant_id=?", *manifest.AttemptID, manifest.TenantID).First(&repairAttempt).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return fmt.Errorf("artifact attempt owner not found")
 				}
-				return fmt.Errorf("atomization attempt lookup failed")
+				return fmt.Errorf("pipeline-repair attempt lookup failed")
 			}
-			if manifest.FenceToken != nil && atomizationAttempt.FenceToken != *manifest.FenceToken {
-				return fmt.Errorf("atomization attempt fence mismatch")
+			if manifest.FenceToken != nil && repairAttempt.FenceToken != *manifest.FenceToken {
+				return fmt.Errorf("pipeline-repair attempt fence mismatch")
 			}
 		}
 	}
@@ -350,9 +363,9 @@ func manifestTransitionAllowed(from, to string) bool {
 	}
 	switch from {
 	case manifestStateUploading:
-		return to == manifestStateUploaded
+		return to == manifestStateUploaded || to == manifestStateCleanupEligible
 	case manifestStateUploaded:
-		return to == manifestStateVerified || to == manifestStateUncertain || to == manifestStateFailed
+		return to == manifestStateVerified || to == manifestStateUncertain || to == manifestStateFailed || to == manifestStateCleanupEligible
 	case manifestStateVerified:
 		return to == manifestStateActive || to == manifestStateCleanupEligible
 	case manifestStateActive:
@@ -360,7 +373,7 @@ func manifestTransitionAllowed(from, to string) bool {
 	case manifestStateCleanupEligible:
 		return to == manifestStateDeleted
 	case manifestStateUncertain:
-		return to == manifestStateUploaded || to == manifestStateVerified || to == manifestStateFailed
+		return to == manifestStateUploaded || to == manifestStateVerified || to == manifestStateFailed || to == manifestStateCleanupEligible
 	case manifestStateFailed:
 		return to == manifestStateUploaded || to == manifestStateUncertain
 	default:
@@ -464,7 +477,10 @@ func InternalTransitionArtifactManifest(c *gin.Context) {
 func InternalGetArtifactManifest(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var manifest models.MediaArtifactManifest
-	query := db.Where("tenant_id=?", strings.TrimSpace(c.DefaultQuery("tenant_id", "default")))
+	query := db.Model(&models.MediaArtifactManifest{})
+	if tenant := strings.TrimSpace(c.Query("tenant_id")); tenant != "" {
+		query = query.Where("tenant_id=?", tenant)
+	}
 	if id := strings.TrimSpace(c.Param("id")); id != "" {
 		query = query.Where("public_id=?", id)
 	}
@@ -478,7 +494,7 @@ func InternalGetArtifactManifest(c *gin.Context) {
 		query = query.Where("storage_tier=?", tier)
 	}
 	if state := strings.TrimSpace(c.Query("state")); state != "" {
-		query = query.Where("state=?", state)
+		query = query.Where("state IN ?", strings.Split(state, ","))
 	}
 	if strings.EqualFold(strings.TrimSpace(c.Query("stale")), "true") {
 		query = query.Where("state IN ? AND updated_at < ?", []string{manifestStateUploading, manifestStateUploaded, manifestStateUncertain}, time.Now().UTC().Add(-15*time.Minute))
@@ -897,6 +913,38 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		}
 		if err := tx.Model(&generation).Updates(map[string]any{"state": unitStateVerified, "merged_transcript_id": transcript.PublicID, "completed_segments": len(units), "terminal_proof": longFormJSON(map[string]any{"verified": true, "segment_count": len(units)})}).Error; err != nil {
 			return err
+		}
+		if generation.TranscriptionJobID != nil {
+			var job models.TranscriptionJob
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND content_item_id=?", *generation.TranscriptionJobID, item.PublicID).First(&job).Error; err != nil && err != gorm.ErrRecordNotFound {
+				return err
+			} else if err == nil {
+				status, writebackStatus := models.TranscriptionJobStatusSucceeded, "ok"
+				duration := 0.0
+				if item.DurationSec != nil {
+					duration = float64(*item.DurationSec)
+				}
+				jobUpdate := internalUpdateTranscriptionJobRequest{
+					Status: &status, TranscriptID: ptrString(transcript.PublicID.String()),
+					Provider: ptrString(generation.Provider), Model: ptrString(generation.Model),
+					Language: ptrString(generation.Language), DurationSec: &duration,
+					WritebackStatus: &writebackStatus,
+					Metadata:        map[string]interface{}{"write_back_status": "ok", "segment_count": len(units)},
+				}
+				wasTerminal := terminalTranscriptionStatus(job.Status) && job.CompletedAt != nil
+				updateTranscriptionJobFromRequest(tx, &job, jobUpdate)
+				if err := tx.Save(&job).Error; err != nil {
+					return err
+				}
+				if !wasTerminal {
+					actual := job.ActualCostUsd
+					if actual == 0 {
+						actual = job.EstimatedCostUsd
+					}
+					settleTranscriptionBudget(tx, job.TenantID, job.ReservedCostUsd, actual)
+					updateBatchItemForJob(tx, &job)
+				}
+			}
 		}
 		if stageCorrelation != nil {
 			if err := contentstage.RecordPersistence(tx, stageRequest, stageAttempt, stageCorrelation.correlation(), models.ContentStageOwnerMedia, transcript.PublicID.String(), map[string]any{"transcript_id": transcript.PublicID.String(), "segment_count": len(units)}); err != nil {

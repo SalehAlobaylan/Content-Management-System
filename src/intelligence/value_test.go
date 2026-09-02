@@ -14,10 +14,10 @@ func mediaItem(mut func(*models.ContentItem)) models.ContentItem {
 	dur := 600
 	thumb := "https://cdn/thumb.jpg"
 	item := models.ContentItem{
-		Type:        models.ContentTypeVideo,
-		Source:      models.SourceTypeYouTube,
-		Status:      models.ContentStatusReady,
-		DurationSec: &dur,
+		Type:         models.ContentTypeVideo,
+		Source:       models.SourceTypeYouTube,
+		Status:       models.ContentStatusReady,
+		DurationSec:  &dur,
 		ThumbnailURL: &thumb,
 	}
 	if mut != nil {

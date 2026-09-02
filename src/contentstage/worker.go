@@ -51,6 +51,9 @@ func StartWorker(db *gorm.DB, classify ClassifyFunc) {
 }
 
 func recoverStaleCMSStages(db *gorm.DB) error {
+	if !SchemaAvailable(db) {
+		return nil
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		var requests []models.ContentStageRequest
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
@@ -78,6 +81,10 @@ func WorkerHealthy(now time.Time) bool {
 }
 
 func runWorkerOnce(db *gorm.DB, classify ClassifyFunc) {
+	if !SchemaAvailable(db) {
+		workerHeartbeat.Store(time.Now().UTC().UnixNano())
+		return
+	}
 	if err := RecoverExpired(db); err != nil {
 		log.Printf("content-stage lease recovery failed: %v", err)
 		return
@@ -118,6 +125,9 @@ func runWorkerOnce(db *gorm.DB, classify ClassifyFunc) {
 }
 
 func runCMSStageOne(db *gorm.DB, classify ClassifyFunc) (bool, error) {
+	if !SchemaAvailable(db) {
+		return false, nil
+	}
 	var request models.ContentStageRequest
 	claimed := false
 	err := db.Transaction(func(tx *gorm.DB) error {

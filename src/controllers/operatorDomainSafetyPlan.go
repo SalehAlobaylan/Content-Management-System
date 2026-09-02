@@ -146,7 +146,17 @@ func executeOperatorSourceStatePlan(ctx context.Context, db *gorm.DB, tenantID, 
 		if source.IsActive == targetActive {
 			return nil
 		}
-		return tx.Model(&source).Update("is_active", targetActive).Error
+		updates := map[string]any{"is_active": targetActive}
+		// Reactivation is a scheduling boundary. Preserve an existing future
+		// schedule, but never leave a newly active News/Media source with a
+		// NULL durable due time when the additive source-reliability schema is
+		// present. The column check keeps older compatibility schemas writable.
+		if targetActive && source.NextDueAt == nil &&
+			(source.Category == models.SourceCategoryNews || source.Category == models.SourceCategoryMedia) &&
+			tx.Migrator().HasColumn(&models.ContentSource{}, "next_due_at") {
+			updates["next_due_at"] = time.Now().UTC()
+		}
+		return tx.Model(&source).Updates(updates).Error
 	})
 	if err != nil {
 		return false, map[string]any{"source_id": id.String(), "eligible": false}, map[string]any{"error_class": "source_missing_or_category_changed"}, nil

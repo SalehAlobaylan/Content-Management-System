@@ -119,7 +119,7 @@ type mediaSourceRunTraceVerification struct {
 	AttemptCount     int        `json:"attempt_count"`
 	NotBeforeAt      *time.Time `json:"not_before_at,omitempty"`
 	DeadlineAt       *time.Time `json:"deadline_at,omitempty"`
-	TerminalVerdict  string     `json:"terminal_verdict,omitempty"`
+	TerminalVerdict  *string    `json:"terminal_verdict,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 }
 

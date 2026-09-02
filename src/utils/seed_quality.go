@@ -16,8 +16,8 @@ import (
 //   - global-default       : everyday recipe matched to historical pipeline.
 //   - global-mobile-720p   : 720p cap / CRF 26 / AAC 96k. Sweet spot for phones.
 //   - global-archival-480p : 480p cap / CRF 28 / AAC 64k. Aggressive shrink
-//                            target — the storage system uses this for
-//                            archive_action='re_encode'.
+//     target — the storage system uses this for
+//     archive_action='re_encode'.
 func SeedDefaultQualityProfiles(db *gorm.DB) error {
 	var count int64
 	if err := db.Model(&models.QualityProfile{}).Count(&count).Error; err != nil {

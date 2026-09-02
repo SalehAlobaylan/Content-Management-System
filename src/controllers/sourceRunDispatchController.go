@@ -382,10 +382,7 @@ func dispatchClaimResponse(claim supply.DispatchClaim) gin.H {
 	_ = json.Unmarshal(claim.Source.APIConfig, &settings)
 	metadata := map[string]any{}
 	_ = json.Unmarshal(claim.Request.Metadata, &metadata)
-	url := ""
-	if claim.Source.FeedURL != nil {
-		url = *claim.Source.FeedURL
-	}
+	url, _ := extractSourceRunURL(claim.Source)
 	return gin.H{"request": gin.H{"id": claim.Request.PublicID, "tenant_id": claim.Request.TenantID, "source_id": claim.Request.ContentSourceID, "lane": claim.Request.Lane, "purpose": claim.Request.Purpose, "correlation_id": claim.Request.CorrelationID, "metadata": metadata, "item_cap": claim.Request.ItemCap, "byte_cap": claim.Request.ByteCap, "provider_call_cap": claim.Request.ProviderCallCap, "workload_cap": claim.Request.WorkloadCap}, "source": gin.H{"id": claim.Source.PublicID, "type": claim.Source.Type, "name": claim.Source.Name, "url": url, "settings": settings, "fetch_interval_minutes": claim.Source.FetchIntervalMinutes, "source_config_version": claim.Source.SourceConfigVersion}, "attempt": gin.H{"id": claim.Attempt.PublicID, "fence_token": claim.Attempt.FenceToken, "dispatcher_token": claim.DispatcherToken, "dispatcher_lease_expires_at": claim.Attempt.DispatcherLeaseExpiresAt}, "unit": gin.H{"id": claim.RootUnit.PublicID, "job_id": claim.RootUnit.JobID, "execution_lease_token": claim.ExecutionToken, "execution_lease_expires_at": claim.RootUnit.ExecutionLeaseExpiresAt, "unit_type": claim.RootUnit.UnitType}}
 }
 

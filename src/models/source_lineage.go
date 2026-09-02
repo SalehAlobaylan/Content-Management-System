@@ -25,6 +25,23 @@ const (
 	SourceRunManifestSealed  = "sealed"
 )
 
+var SourceRunActiveStates = []string{
+	SourceRunRequested,
+	SourceRunAccepted,
+	SourceRunRunning,
+	SourceRunVerificationRequired,
+}
+
+func IsSourceRunTerminal(state string) bool {
+	switch state {
+	case SourceRunCompleted, SourceRunSucceeded, SourceRunPartial, SourceRunBlocked,
+		SourceRunFailed, SourceRunCancelled, SourceRunExpired:
+		return true
+	default:
+		return false
+	}
+}
+
 // SourceRunRequest is the CMS-owned handoff record. It is created before CMS
 // asks Aggregation to enqueue work, so a missing acceptance is observable and
 // never inferred from a dashboard label or a direct BullMQ read.

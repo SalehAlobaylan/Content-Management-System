@@ -9,6 +9,7 @@ package supply
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,12 +63,17 @@ func StartSupplyOwnerReadinessObserver() {
 	}()
 }
 
+// RefreshSupplyOwnerReadiness performs one bounded authenticated observation.
+// Operator CLIs use it because they do not run the CMS background observer.
+// It does not mutate queues or source state.
+func RefreshSupplyOwnerReadiness(now time.Time) {
+	observeSupplyOwners(now.UTC())
+}
+
 func observeSupplyOwners(now time.Time) {
-	observations := map[string]SupplyOwnerReadiness{
-		"aggregation": observeAggregationSupplyOwner(now),
-		"media":       observeMediaSupplyOwner(now),
-		"enrichment":  observeEnrichmentSupplyOwner(now),
-	}
+	observations := observeAggregationSupplyOwners(now)
+	observations["media"] = observeMediaSupplyOwner(now)
+	observations["enrichment"] = observeEnrichmentSupplyOwner(now)
 	supplyOwnerReadinessState.Lock()
 	supplyOwnerReadinessState.snapshot.owners = observations
 	supplyOwnerReadinessState.Unlock()
@@ -86,7 +92,12 @@ func SupplyOwnerReadinessAt(now time.Time) map[string]SupplyOwnerReadiness {
 		}
 		result[owner] = item
 	}
-	for _, owner := range []string{"aggregation", "media", "enrichment"} {
+	for _, owner := range []string{
+		"aggregation", "aggregation_dispatcher", "aggregation_receipt",
+		"aggregation_pipeline", "aggregation_atomization", "news_processing",
+		"pods_processing", "pods_media_execution", "legacy_drain",
+		"media", "enrichment",
+	} {
 		if _, exists := result[owner]; !exists {
 			result[owner] = SupplyOwnerReadiness{State: "not_started", Detail: "owner readiness has not been observed in this CMS process"}
 		}
@@ -102,30 +113,137 @@ func SupplyActionOwnerReady(owner string, now time.Time) bool {
 	if owner == "cms" || owner == "cms_studio" {
 		return SupplyActionWorkerHealthy(now)
 	}
-	// Protocol names remain intentionally specific in the action registry.
-	// This map only identifies their static service authority for readiness; it
-	// does not give one protocol permission to claim another protocol's work.
-	switch owner {
-	case "aggregation_dispatcher", "aggregation_receipt", "aggregation_pipeline", "aggregation_atomization":
-		owner = "aggregation"
-	}
 	item, exists := SupplyOwnerReadinessAt(now)[owner]
 	return exists && item.State == "ready"
 }
 
-func observeAggregationSupplyOwner(now time.Time) SupplyOwnerReadiness {
-	body, err := getStaticSupplyOwnerJSON("AGGREGATION_BASE_URL", "/ready")
+const aggregationTopologyReadinessSchema = "aggregation-topology-readiness/v1"
+
+type aggregationCapabilityReadiness struct {
+	Ready         bool     `json:"ready"`
+	RequiredRoles []string `json:"required_roles"`
+	Reasons       []string `json:"reasons"`
+}
+
+type aggregationTopologyReadiness struct {
+	SchemaVersion  string                                    `json:"schema_version"`
+	TopologyDigest string                                    `json:"topology_digest"`
+	CapturedAt     time.Time                                 `json:"captured_at"`
+	Status         string                                    `json:"status"`
+	Capabilities   map[string]aggregationCapabilityReadiness `json:"capabilities"`
+}
+
+func observeAggregationSupplyOwners(now time.Time) map[string]SupplyOwnerReadiness {
+	owners := []string{
+		"aggregation_dispatcher", "aggregation_receipt", "aggregation_pipeline",
+		"aggregation_atomization", "news_processing", "pods_processing",
+		"pods_media_execution", "legacy_drain",
+	}
+	result := make(map[string]SupplyOwnerReadiness, len(owners)+1)
+	body, err := getAuthenticatedAggregationTopology()
 	if err != nil {
-		return supplyOwnerNotReady(err)
+		for _, owner := range append([]string{"aggregation"}, owners...) {
+			result[owner] = supplyOwnerNotReady(err)
+		}
+		return result
 	}
-	// CMS needs proof that Aggregation's queue backbone and mandatory owner
-	// workers can accept a handoff. It must not depend on Aggregation's view of
-	// CMS health: doing so feeds CMS claim refusals back into Aggregation's CMS
-	// circuit and creates a circular readiness lock.
-	if nestedStringField(body, "dependencies", "redis") != "connected" || nestedStringField(body, "dependencies", "workers") != "healthy" {
-		return supplyOwnerNotReady(fmt.Errorf("Aggregation /ready did not report a connected queue backbone and healthy mandatory workers"))
+	if body.SchemaVersion != aggregationTopologyReadinessSchema || !validTopologyDigest(body.TopologyDigest) {
+		err = fmt.Errorf("Aggregation topology readiness contract is incompatible")
+	} else if body.CapturedAt.IsZero() || now.Sub(body.CapturedAt.UTC()) > 45*time.Second || body.CapturedAt.UTC().After(now.Add(5*time.Second)) {
+		err = fmt.Errorf("Aggregation topology readiness evidence is stale")
+	} else if body.Status != "healthy" && body.Status != "degraded" {
+		err = fmt.Errorf("Aggregation topology readiness verdict is invalid")
 	}
-	return supplyOwnerReady(now)
+	if err != nil {
+		for _, owner := range append([]string{"aggregation"}, owners...) {
+			result[owner] = supplyOwnerNotReady(err)
+		}
+		return result
+	}
+	if body.Status == "healthy" {
+		result["aggregation"] = supplyOwnerReady(now)
+	} else {
+		result["aggregation"] = supplyOwnerNotReady(fmt.Errorf("one or more required Aggregation roles are unavailable"))
+	}
+	for _, owner := range owners {
+		capability, ok := body.Capabilities[owner]
+		if !ok || len(capability.RequiredRoles) == 0 && owner != "legacy_drain" {
+			result[owner] = supplyOwnerNotReady(fmt.Errorf("Aggregation topology omitted capability %s", owner))
+			continue
+		}
+		if capability.Ready {
+			result[owner] = supplyOwnerReady(now)
+			continue
+		}
+		detail := strings.Join(capability.Reasons, "; ")
+		if detail == "" {
+			detail = "required Aggregation role is unavailable"
+		}
+		result[owner] = supplyOwnerNotReady(fmt.Errorf("%s", detail))
+	}
+	return result
+}
+
+func validTopologyDigest(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+// Retained for focused tests and diagnostics that need the global verdict.
+func observeAggregationSupplyOwner(now time.Time) SupplyOwnerReadiness {
+	return observeAggregationSupplyOwners(now)["aggregation"]
+}
+
+func getAuthenticatedAggregationTopology() (aggregationTopologyReadiness, error) {
+	var result aggregationTopologyReadiness
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
+	if base == "" {
+		return result, fmt.Errorf("AGGREGATION_BASE_URL is not configured")
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" {
+		return result, fmt.Errorf("AGGREGATION_BASE_URL is not a valid service base URL")
+	}
+	token := aggregationReadinessToken()
+	if token == "" {
+		return result, fmt.Errorf("Aggregation readiness service token is not configured")
+	}
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, base+"/internal/readiness/topology", nil)
+	if err != nil {
+		return result, fmt.Errorf("could not construct Aggregation topology request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	response, err := supplyOwnerReadinessHTTPClient.Do(request)
+	if err != nil {
+		return result, fmt.Errorf("Aggregation topology request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return result, fmt.Errorf("Aggregation topology returned HTTP %d", response.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, supplyOwnerReadinessBodyMax+1))
+	if err != nil {
+		return result, fmt.Errorf("could not read Aggregation topology response: %w", err)
+	}
+	if len(raw) > supplyOwnerReadinessBodyMax {
+		return result, fmt.Errorf("Aggregation topology response exceeds limit")
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return result, fmt.Errorf("Aggregation topology response is malformed")
+	}
+	return result, nil
+}
+
+func aggregationReadinessToken() string {
+	for _, key := range []string{"AGGREGATION_CMS_SERVICE_TOKEN", "AGGREGATION_SERVICE_TOKEN", "INTERNAL_SERVICE_TOKEN", "SERVICE_AUTH_TOKEN", "CMS_SERVICE_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(key)); token != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 func observeMediaSupplyOwner(now time.Time) SupplyOwnerReadiness {

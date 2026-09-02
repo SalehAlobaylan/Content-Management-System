@@ -1,6 +1,7 @@
 package supply
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -192,6 +193,9 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 		return nil
 	}
 	now := receipt.ObservedAt.UTC()
+	if err := applySourceYieldReceipt(tx, receipt, now); err != nil {
+		return err
+	}
 	if receipt.EventType == string(ReceiptEventProviderRequestStarted) {
 		if err := tx.Model(&models.ContentSource{}).Where("public_id = ? AND tenant_id = ?", receipt.ContentSourceID, receipt.TenantID).Updates(map[string]any{"last_attempted_at": now}).Error; err != nil {
 			return err
@@ -231,6 +235,62 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 		return err
 	}
 	return reconcileAttemptAndRequest(tx, receipt.TenantID, unit.SourceRunAttemptID, unit.SourceRunRequestID)
+}
+
+func applySourceYieldReceipt(tx *gorm.DB, receipt models.SourceRunReceipt, observedAt time.Time) error {
+	if !tx.Migrator().HasTable(&models.MediaSourceYieldDaily{}) ||
+		(receipt.EventType != string(ReceiptEventProviderTerminal) && receipt.EventType != string(ReceiptEventNormalizeTerminal)) {
+		return nil
+	}
+	dayStart := time.Date(observedAt.UTC().Year(), observedAt.UTC().Month(), observedAt.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	var receipts []struct {
+		EventType string
+		Payload   []byte
+	}
+	if err := tx.Model(&models.SourceRunReceipt{}).
+		Select("event_type, payload").
+		Where("tenant_id=? AND content_source_id=? AND observed_at>=? AND observed_at<? AND event_type IN ?", receipt.TenantID, receipt.ContentSourceID, dayStart, dayStart.Add(24*time.Hour), []string{string(ReceiptEventProviderTerminal), string(ReceiptEventNormalizeTerminal)}).
+		Order("observed_at ASC, public_id ASC").Limit(2049).Scan(&receipts).Error; err != nil {
+		return err
+	}
+	if len(receipts) > 2048 {
+		return fmt.Errorf("source yield receipt set exceeds bounded daily projection")
+	}
+	var fetched, legal, filtered, materialized int
+	for _, row := range receipts {
+		var payload struct {
+			Fetched                 int `json:"fetched"`
+			LegalDurationCandidates int `json:"legal_duration_candidates"`
+			Filtered                int `json:"filtered"`
+			CMSUpserted             int `json:"cms_upserted"`
+		}
+		if err := json.Unmarshal(row.Payload, &payload); err != nil {
+			return fmt.Errorf("source yield receipt payload is invalid: %w", err)
+		}
+		if row.EventType == string(ReceiptEventProviderTerminal) && payload.Fetched > 0 {
+			fetched += payload.Fetched
+		}
+		if row.EventType == string(ReceiptEventNormalizeTerminal) {
+			if payload.LegalDurationCandidates > 0 {
+				legal += payload.LegalDurationCandidates
+			}
+			if payload.Filtered > 0 {
+				filtered += payload.Filtered
+			}
+			if payload.CMSUpserted > 0 {
+				materialized += payload.CMSUpserted
+			}
+		}
+	}
+	return tx.Exec(`INSERT INTO media_source_yield_daily
+		(tenant_id, content_source_id, yield_date, fetched_candidates, legal_duration_candidates, filtered_candidates, materialized_items, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, now())
+		ON CONFLICT (tenant_id, content_source_id, yield_date) DO UPDATE SET
+		fetched_candidates=EXCLUDED.fetched_candidates,
+		legal_duration_candidates=EXCLUDED.legal_duration_candidates,
+		filtered_candidates=EXCLUDED.filtered_candidates,
+		materialized_items=EXCLUDED.materialized_items,
+		updated_at=now()`, receipt.TenantID, receipt.ContentSourceID, dayStart.Format("2006-01-02"), fetched, legal, filtered, materialized).Error
 }
 
 func applySourceFailureCheckpoint(tx *gorm.DB, receipt models.SourceRunReceipt) error {

@@ -18,7 +18,26 @@ const (
 	maxTenantReservedWorkload            = 2048
 	defaultRequestProviderCalls          = 20
 	defaultRequestBytes            int64 = 64 << 20
+	defaultPodsSourceRunItemLimit        = 10
 )
+
+// PodsSourceRunItemLimit is the tenant policy for metadata previews admitted
+// by one media source run. It is deliberately independent from provider page
+// size: providers may return more candidates, but only this many can become
+// durable preview items in the current run.
+func PodsSourceRunItemLimit(db *gorm.DB, tenantID string) int {
+	if db == nil || tenantID == "" || !db.Migrator().HasTable(&models.MediaAcquisitionConfig{}) {
+		return defaultPodsSourceRunItemLimit
+	}
+	var config models.MediaAcquisitionConfig
+	if err := db.Select("pods_source_run_item_limit").Where("tenant_id=?", tenantID).First(&config).Error; err != nil {
+		return defaultPodsSourceRunItemLimit
+	}
+	if config.PodsSourceRunItemLimit < 1 || config.PodsSourceRunItemLimit > 50 {
+		return defaultPodsSourceRunItemLimit
+	}
+	return config.PodsSourceRunItemLimit
+}
 
 type sourceRunBudget struct {
 	ProviderCalls int

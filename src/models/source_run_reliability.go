@@ -210,7 +210,7 @@ type SourceRunVerificationTask struct {
 	AttemptCount          int        `gorm:"not null;default:0" json:"attempt_count"`
 	NotBeforeAt           *time.Time `gorm:"type:timestamptz;index" json:"not_before_at,omitempty"`
 	DeadlineAt            *time.Time `gorm:"type:timestamptz;index" json:"deadline_at,omitempty"`
-	TerminalVerdict       string     `gorm:"type:varchar(16)" json:"terminal_verdict,omitempty"`
+	TerminalVerdict       *string    `gorm:"type:varchar(16)" json:"terminal_verdict,omitempty"`
 	TerminalEventID       *uuid.UUID `gorm:"type:uuid" json:"terminal_event_id,omitempty"`
 	CreatedAt             time.Time  `json:"created_at"`
 	UpdatedAt             time.Time  `json:"updated_at"`

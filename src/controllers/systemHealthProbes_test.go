@@ -35,6 +35,7 @@ func TestSystemHTTPProbeRejectsMalformedJSON(t *testing.T) {
 }
 
 func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	cases := []struct {
 		name        string
 		readyStatus int
@@ -44,7 +45,7 @@ func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testi
 	}{
 		{name: "liveness only", readyStatus: http.StatusOK, readyBody: `{}`, observed: false},
 		{name: "malformed readiness", readyStatus: http.StatusOK, readyBody: `{"status":`, observed: false},
-		{name: "not ready with dependency evidence", readyStatus: http.StatusServiceUnavailable, readyBody: `{"status":"not_ready","dependencies":{"redis":"disconnected"}}`, observed: true, wantVerdict: models.SystemVerdictDependencyDown},
+		{name: "degraded role topology", readyStatus: http.StatusOK, readyBody: `{"schema_version":"aggregation-topology-readiness/v1","topology_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","captured_at":"` + now + `","status":"degraded","roles":{"media-maintenance":{"required":true,"ready":false,"reasons":["no live instance lease"]}},"capabilities":{"aggregation_pipeline":{"ready":false}}}`, observed: true, wantVerdict: models.SystemVerdictDependencyDown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -52,7 +53,11 @@ func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testi
 				switch r.URL.Path {
 				case "/health":
 					_, _ = w.Write([]byte(`{"status":"ok"}`))
-				case "/ready":
+				case "/internal/readiness/topology":
+					if r.Header.Get("Authorization") != "Bearer system-probe-test" {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
 					w.WriteHeader(tc.readyStatus)
 					_, _ = w.Write([]byte(tc.readyBody))
 				case "/internal/queues":
@@ -81,8 +86,13 @@ func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testi
 			if len(probe.Verdicts) != 1 || probe.Verdicts[0] != tc.wantVerdict {
 				t.Fatalf("verdicts = %+v, want %q", probe.Verdicts, tc.wantVerdict)
 			}
-			if len(probe.Deps) != 1 || probe.Deps[0].Status != "unhealthy" {
-				t.Fatalf("503 readiness dependency evidence was lost: %+v", probe.Deps)
+			if len(probe.Deps) == 0 {
+				t.Fatalf("topology dependency evidence was lost: %+v", probe.Deps)
+			}
+			for _, dependency := range probe.Deps {
+				if dependency.Status != "unhealthy" {
+					t.Fatalf("degraded topology dependency was not preserved: %+v", probe.Deps)
+				}
 			}
 		})
 	}

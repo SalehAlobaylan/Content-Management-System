@@ -167,6 +167,15 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 	}
 	var rows int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// The legacy enrichment endpoint remains a compatibility path when no
+		// durable stage correlation is supplied. Do not introduce a read of the
+		// content row here: older callers intentionally rely on the atomic
+		// UPDATE's affected-row result as their not-found check.
+		if req.ContentStage == nil && req.ArtifactRecovery == nil {
+			result := tx.Model(&models.ContentItem{}).Where("public_id = ?", id).UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
+			rows = result.RowsAffected
+			return result.Error
+		}
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
 		var item models.ContentItem
@@ -270,6 +279,14 @@ type internalUpdateEmbeddingRequest struct {
 	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
 	PipelineRepair   *pipelineRepairCorrelationRequest   `json:"pipeline_repair,omitempty"`
 	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
+}
+
+// Topic tags are optional enrichment metadata. They deliberately have a
+// separate write contract from embeddings so a slow/failing LLM call cannot
+// keep the required embedding stage claimed or require a second correlated
+// stage writeback.
+type internalUpdateTopicTagsRequest struct {
+	TopicTags []string `json:"topic_tags"`
 }
 
 type contentStageCorrelationRequest struct {
@@ -512,7 +529,7 @@ func InternalCreateContentItem(c *gin.Context) {
 			Created:             false,
 			CreatedAt:           existing.CreatedAt.UTC().Format(time.RFC3339),
 			DeliveryMode:        deliveryMode,
-			ManifestDisposition: contentstage.SummarizeManifest(requests, existing.ProcessingGeneration, disposition),
+			ManifestDisposition: contentstage.SummarizeForItem(db, existing, requests, disposition),
 		})
 		return
 	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -655,7 +672,12 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	var stageRequests []models.ContentStageRequest
-	_ = db.Where("tenant_id=? AND content_item_id=? AND processing_generation=?", item.TenantID, item.PublicID, item.ProcessingGeneration).Order("created_at").Find(&stageRequests).Error
+	if contentstage.SchemaAvailable(db) {
+		if err := db.Where("tenant_id=? AND content_item_id=? AND processing_generation=?", item.TenantID, item.PublicID, item.ProcessingGeneration).Order("created_at").Find(&stageRequests).Error; err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content-stage manifest unavailable"})
+			return
+		}
+	}
 	deliveryMode, modeErr := contentstage.DeliveryMode(db, item.TenantID, item.Type)
 	if modeErr != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
@@ -668,7 +690,7 @@ func InternalCreateContentItem(c *gin.Context) {
 		Created:             true,
 		CreatedAt:           item.CreatedAt.UTC().Format(time.RFC3339),
 		DeliveryMode:        deliveryMode,
-		ManifestDisposition: contentstage.SummarizeManifest(stageRequests, item.ProcessingGeneration, "created"),
+		ManifestDisposition: contentstage.SummarizeForItem(db, item, stageRequests, "created"),
 	})
 }
 
@@ -783,7 +805,43 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "CMS content-stage reducer owns lifecycle in durable mode"})
 		return
 	}
-	item.Status = models.ContentStatus(strings.ToUpper(req.Status))
+	requestedStatus := models.ContentStatus(strings.ToUpper(req.Status))
+	// A late legacy worker can report a timeout after the owning service already
+	// persisted the required artifact. Never downgrade published content, and
+	// never turn an artifact-complete failed row into another failed attempt.
+	// The reconciliation worker promotes the latter without invoking Enrichment.
+	if requestedStatus == models.ContentStatusFailed {
+		if item.Status == models.ContentStatusReady || item.Status == models.ContentStatusArchived {
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": string(item.Status), "lifecycle_reconciled": false, "reason": "published_lifecycle_is_monotonic"})
+			return
+		}
+		if contentItemHasRequiredArtifact(&item) {
+			if item.Status == models.ContentStatusFailed {
+				item.Status = models.ContentStatusReady
+				setFeedUnitDurationBucket(&item)
+				if err := db.Transaction(func(tx *gorm.DB) error {
+					if err := tx.Save(&item).Error; err != nil {
+						return err
+					}
+					if err := feedstate.AttachReadyNewsStory(tx, item); err != nil {
+						return err
+					}
+					if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+						return err
+					}
+					return appendItemProcessingEvent(tx, item, "content_status", "completed", "cms", "artifact_complete_reconciled", map[string]interface{}{"status": string(item.Status)})
+				}).Error; err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile artifact-complete status"})
+					return
+				}
+				c.JSON(http.StatusOK, gin.H{"success": true, "status": string(item.Status), "lifecycle_reconciled": true, "reason": "required_artifact_present"})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{"success": true, "status": string(item.Status), "lifecycle_reconciled": false, "reason": "required_artifact_present"})
+			return
+		}
+	}
+	item.Status = requestedStatus
 	if req.FeedVisibility != nil && strings.TrimSpace(*req.FeedVisibility) != "" {
 		item.FeedVisibility = strings.TrimSpace(*req.FeedVisibility)
 	}
@@ -826,6 +884,29 @@ func InternalUpdateContentStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// contentItemHasRequiredArtifact is deliberately conservative. It prevents a
+// stale compatibility failure from hiding a durable downstream effect; it is
+// not a general READY eligibility shortcut.
+func contentItemHasRequiredArtifact(item *models.ContentItem) bool {
+	if item == nil {
+		return false
+	}
+	if item.Type == models.ContentTypeNews {
+		return item.Embedding != nil && item.StoryID != nil
+	}
+	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+		return false
+	}
+	if item.Embedding == nil || item.PlaybackURL == nil || strings.TrimSpace(*item.PlaybackURL) == "" || item.DurationSec == nil || *item.DurationSec < podsMinDurationSec {
+		return false
+	}
+	metadata := map[string]interface{}{}
+	if len(item.Metadata) > 0 {
+		_ = json.Unmarshal(item.Metadata, &metadata)
+	}
+	return mediaArtifactDurationVerified(*item, metadata, *item.DurationSec)
 }
 
 // InternalUpdateContentArtifacts handles PATCH /internal/content-items/:id/artifacts
@@ -1141,6 +1222,87 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// InternalUpdateContentTopicTags handles PATCH
+// /internal/content-items/:id/topic-tags. This is an optional, idempotent
+// metadata write issued by Enrichment after the required embedding writeback
+// has completed. It intentionally has no content-stage correlation: the
+// embedding endpoint owns the required stage receipt, while tags are an
+// eventual best-effort enrichment effect.
+func InternalUpdateContentTopicTags(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	publicID := c.Param("id")
+	id, err := uuid.Parse(publicID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid content ID"})
+		return
+	}
+
+	var req internalUpdateTopicTagsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if len(req.TopicTags) > 5 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At most 5 topic tags are allowed"})
+		return
+	}
+
+	cleaned := make([]string, 0, len(req.TopicTags))
+	seen := make(map[string]struct{}, len(req.TopicTags))
+	for _, raw := range req.TopicTags {
+		tag := strings.ToLower(strings.TrimSpace(raw))
+		if tag == "" {
+			continue
+		}
+		if len(tag) > 96 || strings.ContainsAny(tag, "\r\n") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Topic tags must be at most 96 characters and single-line"})
+			return
+		}
+		if _, exists := seen[tag]; exists {
+			continue
+		}
+		seen[tag] = struct{}{}
+		cleaned = append(cleaned, tag)
+	}
+
+	var item models.ContentItem
+	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load content"})
+		return
+	}
+
+	if len(cleaned) == 0 {
+		// An empty result means the optional classifier found nothing (or was
+		// skipped). Preserve existing tags instead of erasing useful metadata.
+		c.JSON(http.StatusOK, gin.H{"success": true, "updated": false})
+		return
+	}
+
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).
+			First(&item).Error; err != nil {
+			return err
+		}
+		item.TopicTags = cleaned
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		return appendItemProcessingEvent(tx, item, "topic_tags", "completed", "enrichment", "topic_tags_persisted", map[string]interface{}{
+			"tag_count": len(cleaned),
+		})
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update topic tags"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "updated": true})
 }
 
 // InternalUpdateContentImageEmbedding handles PATCH /internal/content-items/:id/image-embedding.
@@ -1507,6 +1669,69 @@ func InternalListMissingEmbedding(c *gin.Context) {
 	c.JSON(http.StatusOK, internalBatchTextResponse{Items: items})
 }
 
+// InternalReconcileArtifactCompleteStatuses repairs compatibility-mode rows
+// that are marked FAILED even though the artifact owner already persisted the
+// required result. It is intentionally CMS-local: no model call, queue replay,
+// or provider access is performed by this endpoint.
+func InternalReconcileArtifactCompleteStatuses(c *gin.Context) {
+	db := c.MustGet("db").(*gorm.DB)
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var candidates []models.ContentItem
+	if err := db.Where("status = ?", models.ContentStatusFailed).
+		Where("(type = ? AND embedding IS NOT NULL) OR (type IN ? AND embedding IS NOT NULL AND playback_url IS NOT NULL AND duration_sec IS NOT NULL)", models.ContentTypeNews, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).
+		Order("updated_at ASC").Limit(limit).Find(&candidates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list artifact-complete failed items"})
+		return
+	}
+	reconciled := 0
+	for index := range candidates {
+		itemID := candidates[index].PublicID
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			var item models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND status=?", itemID, models.ContentStatusFailed).First(&item).Error; err != nil {
+				return nil
+			}
+			if !contentItemHasRequiredArtifact(&item) {
+				return nil
+			}
+			item.Status = models.ContentStatusReady
+			metadata := map[string]interface{}{}
+			if len(item.Metadata) > 0 {
+				_ = json.Unmarshal(item.Metadata, &metadata)
+			}
+			metadata["lifecycle_reconciliation"] = map[string]interface{}{
+				"reason":        "required_artifact_present",
+				"reconciled_at": time.Now().UTC().Format(time.RFC3339),
+			}
+			if raw, err := json.Marshal(metadata); err == nil {
+				item.Metadata = datatypes.JSON(raw)
+			}
+			setFeedUnitDurationBucket(&item)
+			if err := tx.Save(&item).Error; err != nil {
+				return err
+			}
+			if err := feedstate.AttachReadyNewsStory(tx, item); err != nil {
+				return err
+			}
+			if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+				return err
+			}
+			if err := appendItemProcessingEvent(tx, item, "content_status", "completed", "cms", "artifact_complete_reconciled", map[string]interface{}{"status": string(item.Status)}); err != nil {
+				return err
+			}
+			reconciled++
+			return nil
+		}); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile artifact-complete status"})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"reconciled": reconciled, "scanned": len(candidates)})
+}
+
 // runKNNQuery is the shared dense-vector kNN body. The RRF fusion in
 // Enrichment only uses rank, not the raw cosine score.
 func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string) []internalKNNHit {
@@ -1802,6 +2027,7 @@ func InternalGetContentItem(c *gin.Context) {
 		"media_suitability":            item.MediaSuitability,
 		"media_suitability_confidence": item.MediaSuitabilityConfidence,
 		"media_suitability_reasons":    item.MediaSuitabilityReasons,
+		"has_embedding":                item.Embedding != nil,
 		"metadata":                     item.Metadata,
 	})
 }

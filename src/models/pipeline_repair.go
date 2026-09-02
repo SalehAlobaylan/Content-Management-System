@@ -18,11 +18,13 @@ const (
 	PipelineRepairCancelled        = "cancelled"
 	PipelineRepairUncertain        = "uncertain"
 
-	PipelineStageMediaDownload  = "media_download"
-	PipelineStageMediaTranscode = "media_transcode"
-	PipelineStageMediaThumbnail = "media_thumbnail"
+	PipelineStageMediaDownload           = "media_download"
+	PipelineStageMediaTranscode          = "media_transcode"
+	PipelineStageMediaThumbnail          = "media_thumbnail"
 	PipelineStageMediaDeliveryGeneration = "media_delivery_generation"
-	PipelineStageTextEmbedding  = "text_embedding"
+	PipelineStageTextEmbedding           = "text_embedding"
+
+	PipelineRepairClassMediaDeliveryGeneration = "media_delivery_generation"
 )
 
 // PipelineRepairRequest is the CMS-authoritative command for one exact

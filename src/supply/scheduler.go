@@ -31,8 +31,16 @@ func SourceRunSchedulerHealthy(now time.Time) bool {
 	return last > 0 && now.UTC().Sub(time.Unix(0, last).UTC()) <= sourceRunSchedulerHeartbeatGrace
 }
 
-func markSourceRunSchedulerHeartbeat(now time.Time) {
+func markSourceRunSchedulerHeartbeat(db *gorm.DB, now time.Time) {
 	sourceRunSchedulerHeartbeat.Store(now.UTC().UnixNano())
+	// The operator cutover CLI runs in a different process, so an in-memory
+	// heartbeat can never qualify it. Persist only the existing protocol row's
+	// timestamp; compatibility remains untouched when the migration is absent.
+	if db != nil && db.Migrator().HasTable(&models.SourceRunAdmissionProtocol{}) {
+		_ = db.Model(&models.SourceRunAdmissionProtocol{}).
+			Where("protocol_key=?", admissionProtocolKey).
+			UpdateColumn("updated_at", now.UTC()).Error
+	}
 }
 
 // AdmitDueSourceRuns turns already-due source state into immutable CMS
@@ -83,7 +91,7 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 				return nil
 			}
 			var active int64
-			if err := tx.Model(&models.SourceRunRequest{}).Where("tenant_id=? AND content_source_id=? AND state IN ?", source.TenantID, source.PublicID, []string{string(RequestRequested), string(RequestAccepted), string(RequestRunning), string(RequestVerificationRequired)}).Count(&active).Error; err != nil {
+			if err := tx.Model(&models.SourceRunRequest{}).Where("tenant_id=? AND content_source_id=? AND state IN ?", source.TenantID, source.PublicID, models.SourceRunActiveStates).Count(&active).Error; err != nil {
 				return err
 			}
 			if active > 0 {
@@ -93,7 +101,20 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 			if err != nil {
 				return err
 			}
-			admittedRequest, created, err = CreateRequest(tx, CreateRequestInput{Source: source, Identity: identity, RequestedBy: "schedule", EvidenceFingerprint: "source-next-due:" + source.NextDueAt.UTC().Format(time.RFC3339Nano), Metadata: []byte(`{"schema_version":"source-run/v1","max_results":50}`)})
+			metadata := []byte(`{"schema_version":"source-run/v1","max_results":50,"max_provider_calls":20,"max_bytes":67108864}`)
+			if source.Category == models.SourceCategoryMedia {
+				// Media baseline intake filters the 270-second visibility floor at
+				// provider metadata time and persists at most the tenant-approved
+				// number of preview candidates (ten by default).
+				metadata, err = json.Marshal(map[string]any{
+					"schema_version": "source-run/v1", "max_results": PodsSourceRunItemLimit(tx, source.TenantID),
+					"max_provider_calls": 8, "max_bytes": 64 * 1024 * 1024, "min_duration_minutes": 4.5,
+				})
+				if err != nil {
+					return err
+				}
+			}
+			admittedRequest, created, err = CreateRequest(tx, CreateRequestInput{Source: source, Identity: identity, RequestedBy: "schedule", EvidenceFingerprint: "source-next-due:" + source.NextDueAt.UTC().Format(time.RFC3339Nano), Metadata: metadata})
 			return err
 		})
 		if err != nil {
@@ -279,5 +300,5 @@ func runSourceRunSchedulerOnce(db *gorm.DB) {
 		log.Printf("source-run scheduler admission failed: %v", err)
 		return
 	}
-	markSourceRunSchedulerHeartbeat(time.Now().UTC())
+	markSourceRunSchedulerHeartbeat(db, time.Now().UTC())
 }

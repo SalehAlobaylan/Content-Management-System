@@ -41,8 +41,8 @@ func InternalGetQualityProfile(c *gin.Context) {
 
 // InternalResolveQualityProfile handles GET /internal/quality/profiles/resolve?tenant_id=X&source_type=Y&preset_key=storage-saver
 //
-// Returns the most-specific matching profile or 404 if no rung matches and
-// there's no global default. Aggregation's media worker calls this on every
+// Returns the most-specific matching profile or an explicit safe-default
+// resolution when no rung matches. Aggregation's media worker calls this on every
 // fresh job; a 60-second per-process cache lives on the Aggregation side.
 func InternalResolveQualityProfile(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -52,12 +52,13 @@ func InternalResolveQualityProfile(c *gin.Context) {
 
 	profile, matched := resolveProfileWithPreset(db, tenantID, sourceType, presetKey)
 	if profile == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no matching profile (no global default configured)"})
+		c.JSON(http.StatusOK, gin.H{"profile": nil, "matched_on": "none", "used_default": true})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"profile":    profile,
-		"matched_on": matched,
+		"profile":      profile,
+		"matched_on":   matched,
+		"used_default": false,
 	})
 }
 

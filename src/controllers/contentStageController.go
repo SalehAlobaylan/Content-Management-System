@@ -16,27 +16,39 @@ import (
 
 type contentStageTransitionRequest struct {
 	contentstage.Correlation
-	RetryAfterSec int    `json:"retry_after_sec,omitempty"`
-	FailureClass  string `json:"failure_class,omitempty"`
-	Summary       string `json:"summary,omitempty"`
+	RetryAfterSec int            `json:"retry_after_sec,omitempty"`
+	FailureClass  string         `json:"failure_class,omitempty"`
+	Summary       string         `json:"summary,omitempty"`
+	Phase         string         `json:"phase,omitempty"`
+	Proof         map[string]any `json:"proof,omitempty"`
 }
 
 func claimContentStage(c *gin.Context, lane string, media bool) {
 	db := c.MustGet("db").(*gorm.DB)
-	// The current rollout baseline is the default tenant. Derive both scope and
-	// worker role server-side so an internal caller cannot widen a claim by
-	// submitting a different tenant or owner label.
-	tenantID, claimOwner := "default", "aggregation-"+lane+"-dispatcher"
+	// Tenant scope is selected by CMS. The internal caller may select only the
+	// lane; accepting a caller-supplied/default tenant here caused starvation
+	// whenever another tenant had the oldest eligible work.
+	claimOwner := "aggregation-" + lane + "-dispatcher"
 	if media {
 		claimOwner = "media-content-stage-worker"
 	}
 	var claim contentstage.ClaimEnvelope
 	var found bool
 	var err error
+	var allowedStages []string
+	if raw := strings.TrimSpace(c.Query("stages")); raw != "" {
+		for _, stage := range strings.Split(raw, ",") {
+			if stage = strings.TrimSpace(stage); stage != "" {
+				allowedStages = append(allowedStages, stage)
+			}
+		}
+	}
 	if media {
-		claim, found, err = contentstage.ClaimMediaNext(db, tenantID, claimOwner)
+		claim, found, err = contentstage.ClaimMediaNextAnyTenant(db, "media-content-stage-worker")
+	} else if len(allowedStages) > 0 {
+		claim, found, err = contentstage.ClaimNextAnyTenantForStages(db, lane, claimOwner, allowedStages)
 	} else {
-		claim, found, err = contentstage.ClaimNext(db, tenantID, lane, claimOwner)
+		claim, found, err = contentstage.ClaimNextAnyTenant(db, lane, claimOwner)
 	}
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "content-stage claim unavailable", "reason": err.Error()})
@@ -98,6 +110,8 @@ func contentStageTransition(c *gin.Context, action string) {
 		err = contentstage.Begin(db, requestID, req.Correlation)
 	case "heartbeat":
 		err = contentstage.Heartbeat(db, requestID, req.Correlation)
+	case "checkpoint":
+		err = contentstage.Checkpoint(db, requestID, req.Correlation, req.Phase, req.Proof)
 	case "accepted":
 		err = contentstage.MarkAccepted(db, requestID, req.Correlation)
 	case "deferred":
@@ -121,15 +135,23 @@ func contentStageTransition(c *gin.Context, action string) {
 		c.JSON(http.StatusConflict, gin.H{"error": "content-stage transition rejected", "reason": err.Error()})
 		return
 	}
+	if action == "heartbeat" {
+		var request models.ContentStageRequest
+		if db.Select("claim_expires_at").Where("public_id=?", requestID).First(&request).Error == nil {
+			c.JSON(http.StatusOK, gin.H{"success": true, "state": action, "lease_expires_at": request.ClaimExpiresAt})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "state": action})
 }
 
-func InternalBeginContentStage(c *gin.Context)     { contentStageTransition(c, "begin") }
-func InternalHeartbeatContentStage(c *gin.Context) { contentStageTransition(c, "heartbeat") }
-func InternalAcceptContentStage(c *gin.Context)    { contentStageTransition(c, "accepted") }
-func InternalDeferContentStage(c *gin.Context)     { contentStageTransition(c, "deferred") }
-func InternalUncertainContentStage(c *gin.Context) { contentStageTransition(c, "uncertain") }
-func InternalFailContentStage(c *gin.Context)      { contentStageTransition(c, "failed") }
+func InternalBeginContentStage(c *gin.Context)      { contentStageTransition(c, "begin") }
+func InternalHeartbeatContentStage(c *gin.Context)  { contentStageTransition(c, "heartbeat") }
+func InternalCheckpointContentStage(c *gin.Context) { contentStageTransition(c, "checkpoint") }
+func InternalAcceptContentStage(c *gin.Context)     { contentStageTransition(c, "accepted") }
+func InternalDeferContentStage(c *gin.Context)      { contentStageTransition(c, "deferred") }
+func InternalUncertainContentStage(c *gin.Context)  { contentStageTransition(c, "uncertain") }
+func InternalFailContentStage(c *gin.Context)       { contentStageTransition(c, "failed") }
 
 func InternalSettleAtomizationNotRequired(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -181,11 +203,15 @@ func InternalGetContentStageTrace(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "valid content id and tenant_id are required"})
 		return
 	}
-	trace, err := contentstage.Trace(db, c.Query("tenant_id"), contentID)
+	trace, err := contentstage.TraceWithOptions(db, c.Query("tenant_id"), contentID, contentstage.TraceOptions{
+		SessionID:      c.Query("session_id"),
+		PlaybackDigest: c.Query("playback_digest"),
+	})
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "content-stage trace not found"})
 		return
 	}
+	attachRankingTrace(db, c.Query("tenant_id"), contentID, trace)
 	c.JSON(http.StatusOK, trace)
 }
 
@@ -212,12 +238,27 @@ func AdminGetContentStageTrace(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid content id"})
 		return
 	}
-	trace, err := contentstage.Trace(c.MustGet("db").(*gorm.DB), principal.TenantID, contentID)
+	trace, err := contentstage.TraceWithOptions(c.MustGet("db").(*gorm.DB), principal.TenantID, contentID, contentstage.TraceOptions{
+		SessionID:      c.Query("session_id"),
+		PlaybackDigest: c.Query("playback_digest"),
+	})
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "content-stage trace not found"})
 		return
 	}
+	attachRankingTrace(c.MustGet("db").(*gorm.DB), principal.TenantID, contentID, trace)
 	c.JSON(http.StatusOK, trace)
+}
+
+func attachRankingTrace(db *gorm.DB, tenantID string, contentID uuid.UUID, trace map[string]any) {
+	if trace == nil {
+		return
+	}
+	var item models.ContentItem
+	if db.Where("tenant_id=? AND public_id=?", tenantID, contentID).First(&item).Error != nil {
+		return
+	}
+	trace["ranking"] = podsRankingTrace(db, tenantID, item)
 }
 
 func AdminUpdateContentStageControl(c *gin.Context) {

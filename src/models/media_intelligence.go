@@ -52,7 +52,7 @@ func (MediaIntelligenceScore) TableName() string {
 // feed actually served (and failed to serve) for one tenant × duration bucket ×
 // hour. Written in batch at feed-assembly time (slice 2), read by the Demand
 // surface (slice 3). The topic axis (slice 6) uses the same shape with a topic
-// discriminator; bucket-level rows keep topic = ''.
+// discriminator; bucket-level rows keep topic = ”.
 type MediaDemandStat struct {
 	ID       uint   `gorm:"primaryKey" json:"-"`
 	TenantID string `gorm:"type:varchar(64);not null;uniqueIndex:idx_media_demand_window,priority:1" json:"tenant_id"`

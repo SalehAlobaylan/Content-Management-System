@@ -36,7 +36,36 @@ func RecordPodsBoundaryObservation(db *gorm.DB, row models.PodsBoundaryObservati
 	if row.PublicID == uuid.Nil {
 		row.PublicID = uuid.New()
 	}
-	return db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "boundary"}, {Name: "probe_kind"}, {Name: "probe_id"}, {Name: "content_item_id"}}, DoNothing: true}).Create(&row).Error
+	return db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "boundary"}, {Name: "probe_kind"}, {Name: "probe_id"}, {Name: "content_item_id"}}, DoNothing: true}).Create(&row)
+		if result.Error != nil || result.RowsAffected == 0 || row.Verdict != string(VerdictPresent) ||
+			(row.Boundary != "feed_return" && row.Boundary != "page_render") || !tx.Migrator().HasTable(&models.MediaSourceYieldDaily{}) {
+			return result.Error
+		}
+		var item models.ContentItem
+		if err := tx.Select("content_source_id").Where("tenant_id=? AND public_id=?", row.TenantID, row.ContentItemID).First(&item).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return nil
+			}
+			return err
+		}
+		if item.ContentSourceID == nil {
+			return nil
+		}
+		publicIncrement, firstPageIncrement := 0, 0
+		if row.Boundary == "feed_return" {
+			publicIncrement = 1
+		} else {
+			firstPageIncrement = 1
+		}
+		return tx.Exec(`INSERT INTO media_source_yield_daily
+			(tenant_id, content_source_id, yield_date, public_returns, first_page_returns, updated_at)
+			VALUES (?, ?, ?, ?, ?, now())
+			ON CONFLICT (tenant_id, content_source_id, yield_date) DO UPDATE SET
+			public_returns=media_source_yield_daily.public_returns + EXCLUDED.public_returns,
+			first_page_returns=media_source_yield_daily.first_page_returns + EXCLUDED.first_page_returns,
+			updated_at=now()`, row.TenantID, *item.ContentSourceID, row.ObservedAt.UTC().Format("2006-01-02"), publicIncrement, firstPageIncrement).Error
+	})
 }
 
 // PrunePodsBoundaryObservations is intentionally bounded and is called only

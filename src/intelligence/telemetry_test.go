@@ -11,14 +11,14 @@ func TestBucketLabelForDuration(t *testing.T) {
 		durationSec int
 		want        string
 	}{
-		{271, "5m"},    // just over the Pods floor
-		{300, "5m"},    // exactly 5m
-		{450, "5m"},    // 7.5m rounds down on tie-break to the smaller bucket
-		{960, "15m"},   // 16m → 15m
-		{1560, "30m"},  // 26m → 30m
-		{2100, "30m"},  // 35m ties 30/40 → smaller wins
-		{2400, "40m"},  // the ceiling
-		{9000, "40m"},  // clamps at 40m
+		{271, "5m"},   // just over the Pods floor
+		{300, "5m"},   // exactly 5m
+		{450, "5m"},   // 7.5m rounds down on tie-break to the smaller bucket
+		{960, "15m"},  // 16m → 15m
+		{1560, "30m"}, // 26m → 30m
+		{2100, "30m"}, // 35m ties 30/40 → smaller wins
+		{2400, "40m"}, // the ceiling
+		{9000, "40m"}, // clamps at 40m
 	}
 	for _, c := range cases {
 		if got := BucketLabelForDuration(c.durationSec); got != c.want {

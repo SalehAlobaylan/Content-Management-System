@@ -27,6 +27,9 @@ type ContentSource struct {
 	FeedURL   *string        `gorm:"type:text" json:"feed_url,omitempty"`
 	ImageURL  *string        `gorm:"type:text" json:"image_url,omitempty"`
 	APIConfig datatypes.JSON `gorm:"type:jsonb" json:"api_config,omitempty"`
+	// MediaAcquisitionMode overrides the tenant default for this source. NULL
+	// means inherit; discovery still persists metadata in either mode.
+	MediaAcquisitionMode *string `gorm:"type:varchar(16)" json:"media_acquisition_mode,omitempty"`
 
 	// Status
 	IsActive             bool       `gorm:"default:true" json:"is_active"`
@@ -65,19 +68,19 @@ func (ContentSource) TableName() string {
 	return "content_sources"
 }
 
-// EnsureInitialSchedule gives a newly active Media source an explicit first
-// poll. Media circulation no longer has a legacy fallback scheduler, and the
-// durable source-run scheduler deliberately ignores NULL next_due_at values.
-// News remains on its separate circulation path during this cutover.
+// EnsureInitialSchedule gives every newly active feed source an explicit first
+// poll. The durable source-run scheduler deliberately ignores NULL next_due_at
+// values, so activation must never leave News or Media unscheduled.
 func (source *ContentSource) EnsureInitialSchedule(now time.Time) {
-	if source == nil || !source.IsActive || source.Category != SourceCategoryMedia || source.NextDueAt != nil {
+	if source == nil || !source.IsActive || source.NextDueAt != nil ||
+		(source.Category != SourceCategoryMedia && source.Category != SourceCategoryNews) {
 		return
 	}
 	due := now.UTC()
 	source.NextDueAt = &due
 }
 
-// BeforeCreate enforces the Media scheduling invariant at every creation
+// BeforeCreate enforces the feed-source scheduling invariant at every creation
 // boundary, including admin creation and approved discovery suggestions.
 func (source *ContentSource) BeforeCreate(_ *gorm.DB) error {
 	source.EnsureInitialSchedule(time.Now())

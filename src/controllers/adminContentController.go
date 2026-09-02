@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -143,6 +144,8 @@ type adminContentItemResponse struct {
 	TranscriptApprovedBy   *string                    `json:"transcript_approved_by,omitempty"`
 	LatestTranscriptionJob *transcriptionJobResponse  `json:"latest_transcription_job,omitempty"`
 	TranscriptQuality      *transcriptQualityResponse `json:"transcript_quality,omitempty"`
+	MediaAcquisitionState  string                     `json:"media_acquisition_state,omitempty"`
+	MediaAcquisitionPhase  string                     `json:"media_acquisition_phase,omitempty"`
 }
 
 type updateContentStatusRequest struct {
@@ -243,6 +246,7 @@ func ListContentItems(c *gin.Context) {
 	}
 	// Batched (3 queries total) — the per-row variant is 3 queries per item.
 	populateAdminContentTranscriptionBatch(db, items, data)
+	populateAdminContentAcquisition(db, items, data)
 
 	c.JSON(http.StatusOK, adminContentListResponse{
 		Data:       data,
@@ -592,10 +596,47 @@ func GetAdminContentItem(c *gin.Context) {
 
 	resp := mapAdminContentItemResponse(item)
 	populateAdminContentTranscription(db, item.PublicID, &resp)
+	rows := []adminContentItemResponse{resp}
+	populateAdminContentAcquisition(db, []models.ContentItem{item}, rows)
+	resp = rows[0]
 	c.JSON(http.StatusOK, resp)
 }
 
 func applyAdminContentSpecialFilters(c *gin.Context, query *gorm.DB) (*gorm.DB, error) {
+	if state := strings.TrimSpace(c.Query("media_acquisition_state")); state != "" && state != "all" {
+		states := map[string][]string{
+			// Backfilled root-media rows may still be `blocked`. They are
+			// operator-admittable legacy work, so keep their filter result aligned
+			// with the response projection and the approval endpoint.
+			"awaiting_download": {models.ContentStageAwaitingApproval, models.ContentStageBlocked},
+			"queued":            {models.ContentStageQueued, models.ContentStageDeferred, models.ContentStageClaimed},
+			"ready":             {models.ContentStageVerified},
+			"failed":            {models.ContentStageFailed},
+			"reconciling":       {models.ContentStageUncertain, models.ContentStageReconciling},
+		}[state]
+		if state == "downloading" || state == "preparing" {
+			phasePredicate := `COALESCE((SELECT cse.payload->>'phase' FROM content_stage_events cse
+				WHERE cse.tenant_id=csr.tenant_id AND cse.request_id=csr.public_id
+					AND cse.event_type LIKE 'checkpoint:%'
+				ORDER BY cse.sequence DESC LIMIT 1), '')`
+			operator := "IN ('started','download')"
+			if state == "preparing" {
+				operator = "NOT IN ('','started','download')"
+			}
+			query = query.Where(`EXISTS (SELECT 1 FROM content_stage_requests csr
+				WHERE csr.tenant_id=content_items.tenant_id AND csr.content_item_id=content_items.public_id
+				AND csr.processing_generation=content_items.processing_generation
+				AND csr.stage=? AND csr.state IN ? AND `+phasePredicate+` `+operator+`)`,
+				models.ContentStagePodsMediaArtifacts, []string{models.ContentStageRunning, models.ContentStageVerifying})
+		} else if len(states) == 0 {
+			return query, fmt.Errorf("invalid media_acquisition_state")
+		} else {
+			query = query.Where(`EXISTS (SELECT 1 FROM content_stage_requests csr
+				WHERE csr.tenant_id=content_items.tenant_id AND csr.content_item_id=content_items.public_id
+				AND csr.processing_generation=content_items.processing_generation
+				AND csr.stage=? AND csr.state IN ?)`, models.ContentStagePodsMediaArtifacts, states)
+		}
+	}
 	// Topic filter — topic_tags is a text[] column not handled by the generic
 	// query builder, so apply array membership directly (same pattern as the
 	// public RSS feed controller).
@@ -787,6 +828,9 @@ func UpdateContentStatus(c *gin.Context) {
 
 	resp := mapAdminContentItemResponse(item)
 	populateAdminContentTranscription(db, item.PublicID, &resp)
+	rows := []adminContentItemResponse{resp}
+	populateAdminContentAcquisition(db, []models.ContentItem{item}, rows)
+	resp = rows[0]
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -844,7 +888,81 @@ func UpdateContentSuitability(c *gin.Context) {
 	}
 	resp := mapAdminContentItemResponse(item)
 	populateAdminContentTranscription(db, item.PublicID, &resp)
+	rows := []adminContentItemResponse{resp}
+	populateAdminContentAcquisition(db, []models.ContentItem{item}, rows)
+	resp = rows[0]
 	c.JSON(http.StatusOK, resp)
+}
+
+func populateAdminContentAcquisition(db *gorm.DB, items []models.ContentItem, rows []adminContentItemResponse) {
+	if db == nil || len(items) == 0 || len(items) != len(rows) || !contentstage.SchemaAvailable(db) {
+		return
+	}
+	ids := make([]uuid.UUID, 0, len(items))
+	index := make(map[uuid.UUID]int, len(items))
+	for i, item := range items {
+		if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
+			continue
+		}
+		ids = append(ids, item.PublicID)
+		index[item.PublicID] = i
+		if item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" {
+			rows[i].MediaAcquisitionState = "ready"
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	var requests []models.ContentStageRequest
+	if err := db.Table("content_stage_requests AS csr").Select("csr.*").
+		Joins("JOIN content_items ci ON ci.tenant_id=csr.tenant_id AND ci.public_id=csr.content_item_id AND ci.processing_generation=csr.processing_generation").
+		Where("csr.content_item_id IN ? AND csr.stage=?", ids, models.ContentStagePodsMediaArtifacts).Find(&requests).Error; err != nil {
+		return
+	}
+	requestIDs := make([]uuid.UUID, 0, len(requests))
+	for _, request := range requests {
+		requestIDs = append(requestIDs, request.PublicID)
+	}
+	type acquisitionCheckpoint struct {
+		RequestID uuid.UUID `gorm:"column:request_id"`
+		Phase     string    `gorm:"column:phase"`
+	}
+	phases := make(map[uuid.UUID]string, len(requestIDs))
+	if len(requestIDs) > 0 {
+		var checkpoints []acquisitionCheckpoint
+		if err := db.Raw(`SELECT DISTINCT ON (request_id) request_id, COALESCE(payload->>'phase', '') AS phase
+			FROM content_stage_events WHERE request_id IN ? AND event_type LIKE 'checkpoint:%'
+			ORDER BY request_id, sequence DESC`, requestIDs).Scan(&checkpoints).Error; err == nil {
+			for _, checkpoint := range checkpoints {
+				phases[checkpoint.RequestID] = checkpoint.Phase
+			}
+		}
+	}
+	for _, request := range requests {
+		i, ok := index[request.ContentItemID]
+		if !ok {
+			continue
+		}
+		switch request.State {
+		case models.ContentStageAwaitingApproval, models.ContentStageBlocked:
+			rows[i].MediaAcquisitionState = "awaiting_download"
+		case models.ContentStageQueued, models.ContentStageDeferred, models.ContentStageClaimed:
+			rows[i].MediaAcquisitionState = "queued"
+		case models.ContentStageRunning, models.ContentStageVerifying:
+			rows[i].MediaAcquisitionPhase = phases[request.PublicID]
+			if rows[i].MediaAcquisitionPhase == "started" || rows[i].MediaAcquisitionPhase == "download" {
+				rows[i].MediaAcquisitionState = "downloading"
+			} else {
+				rows[i].MediaAcquisitionState = "preparing"
+			}
+		case models.ContentStageVerified:
+			rows[i].MediaAcquisitionState = "ready"
+		case models.ContentStageUncertain, models.ContentStageReconciling:
+			rows[i].MediaAcquisitionState = "reconciling"
+		case models.ContentStageFailed:
+			rows[i].MediaAcquisitionState = "failed"
+		}
+	}
 }
 
 // populateAdminContentTranscriptionBatch fills transcription job / quality /

@@ -78,6 +78,9 @@ func TestSourceRunRequestRecordsRequestAndAcceptanceEvents(t *testing.T) {
 	if request.State != models.SourceRunRequested || request.CorrelationID == "" {
 		t.Fatalf("unexpected requested lineage: %+v", request)
 	}
+	if _, err := createSourceRunRequest(db, source, "manual", "admin-b", nil); err == nil {
+		t.Fatal("an active source-run request must fence a duplicate manual request")
+	}
 	if err := markSourceRunAccepted(db, request.PublicID, "bullmq-job-42"); err != nil {
 		t.Fatal(err)
 	}

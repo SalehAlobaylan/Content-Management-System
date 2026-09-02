@@ -13,13 +13,13 @@ import (
 
 // TopicDemand is one row of the per-topic demand table (slice 6 / D5-C).
 type TopicDemand struct {
-	Topic        string  `json:"topic"`
-	Serves       int64   `json:"serves"`
-	RepeatServes int64   `json:"repeat_serves"`
-	DemandScore  float64 `json:"demand_score"`   // [0,1], serve-share + repeat blend
+	Topic         string  `json:"topic"`
+	Serves        int64   `json:"serves"`
+	RepeatServes  int64   `json:"repeat_serves"`
+	DemandScore   float64 `json:"demand_score"`   // [0,1], serve-share + repeat blend
 	CoverageScore float64 `json:"coverage_score"` // [0,1], value-weighted supply
-	Gap          float64 `json:"gap"`            // demand − coverage
-	VisibleUnits int64   `json:"visible_units"`
+	Gap           float64 `json:"gap"`            // demand − coverage
+	VisibleUnits  int64   `json:"visible_units"`
 }
 
 // Diagnostics is the full intelligence-observability snapshot.

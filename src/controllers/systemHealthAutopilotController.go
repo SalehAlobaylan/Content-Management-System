@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"content-management-system/src/models"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -519,14 +520,17 @@ func checkSystemAggregation(ctx context.Context) systemProbeResult {
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() { defer wg.Done(); health = systemHTTPProbe(ctx, display.EndpointURL+"/health", false) }()
-	go func() { defer wg.Done(); ready = systemHTTPProbe(ctx, display.EndpointURL+"/ready", false) }()
+	go func() {
+		defer wg.Done()
+		ready = systemHTTPProbeWithToken(ctx, display.EndpointURL+"/internal/readiness/topology", false, aggregationInternalServiceToken())
+	}()
 	go func() { defer wg.Done(); queues, queueErr = fetchSystemAggregationQueueStats(ctx) }()
 	wg.Wait()
 	display.LatencyMS = firstLatency(health.LatencyMS, ready.LatencyMS)
 	display.HTTPStatus = firstHTTPStatus(health.HTTPStatus, ready.HTTPStatus)
 	display.RawError = firstNonEmpty(health.Error, ready.Error)
 	readyBody := asSystemRecord(ready.Body)
-	display.Deps = mapSystemDependencies(asSystemRecord(readyBody["dependencies"]))
+	display.Deps = mapAggregationTopologyDependencies(readyBody)
 	healthObserved := health.JSONObserved && systemHealthStatusObserved(asSystemRecord(health.Body), "healthy")
 	display.ReadinessObserved = ready.JSONObserved && readinessAggregationBodyObserved(readyBody)
 	if queueErr == nil {
@@ -650,6 +654,10 @@ type systemHTTPProbeResult struct {
 }
 
 func systemHTTPProbe(parent context.Context, url string, allowText bool) systemHTTPProbeResult {
+	return systemHTTPProbeWithToken(parent, url, allowText, "")
+}
+
+func systemHTTPProbeWithToken(parent context.Context, url string, allowText bool, token string) systemHTTPProbeResult {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(parent, systemProbeTimeout)
 	defer cancel()
@@ -658,6 +666,9 @@ func systemHTTPProbe(parent context.Context, url string, allowText bool) systemH
 	if err != nil {
 		latency := time.Since(start).Milliseconds()
 		return systemHTTPProbeResult{LatencyMS: &latency, Error: err.Error()}
+	}
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
 	}
 	req.Close = true
 	resp, err := client.Do(req)
@@ -742,8 +753,60 @@ func fetchSystemAggregationQueueStats(parent context.Context) ([]autopilotQueueS
 
 func readinessAggregationBodyObserved(body map[string]interface{}) bool {
 	status := systemString(body["status"])
-	_, hasDeps := body["dependencies"]
-	return (status == "ready" || status == "not_ready") && hasDeps
+	capturedAt, capturedErr := time.Parse(time.RFC3339, systemString(body["captured_at"]))
+	_, hasRoles := body["roles"]
+	_, hasCapabilities := body["capabilities"]
+	digest := systemString(body["topology_digest"])
+	return systemString(body["schema_version"]) == "aggregation-topology-readiness/v1" &&
+		(status == "healthy" || status == "degraded") && hasRoles && hasCapabilities &&
+		validSystemTopologyDigest(digest) && capturedErr == nil && time.Since(capturedAt.UTC()) <= 45*time.Second &&
+		capturedAt.UTC().Before(time.Now().UTC().Add(5*time.Second))
+}
+
+func validSystemTopologyDigest(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func mapAggregationTopologyDependencies(body map[string]interface{}) []systemProbeDependency {
+	deps := []systemProbeDependency{}
+	for role, raw := range asSystemRecord(body["roles"]) {
+		state := asSystemRecord(raw)
+		status := "unhealthy"
+		ready, _ := state["ready"].(bool)
+		required, _ := state["required"].(bool)
+		if ready {
+			status = "healthy"
+		} else if !required {
+			status = "unknown"
+		}
+		reasons := []string{}
+		if values, ok := state["reasons"].([]interface{}); ok {
+			for _, value := range values {
+				if reason := systemString(value); reason != "" {
+					reasons = append(reasons, reason)
+				}
+			}
+		}
+		detail := strings.Join(reasons, "; ")
+		if !required && !ready {
+			detail = strings.TrimSpace("optional role is not currently required; " + detail)
+		}
+		deps = append(deps, systemProbeDependency{Name: "role:" + role, Status: status, Detail: detail})
+	}
+	for capability, raw := range asSystemRecord(body["capabilities"]) {
+		state := asSystemRecord(raw)
+		status := "unhealthy"
+		if ready, _ := state["ready"].(bool); ready {
+			status = "healthy"
+		}
+		deps = append(deps, systemProbeDependency{Name: "capability:" + capability, Status: status})
+	}
+	sort.Slice(deps, func(i, j int) bool { return deps[i].Name < deps[j].Name })
+	return deps
 }
 
 func readinessMLBodyObserved(body map[string]interface{}) bool {

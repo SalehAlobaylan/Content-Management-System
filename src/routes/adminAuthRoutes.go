@@ -87,6 +87,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Delivery diagnostics are CMS-owned and read-only here. Console receives
 	// inventory/proof through this API and never touches queues or storage.
 	adminGroup.GET("/media/delivery/inventory", perm("content", "read"), controllers.AdminMediaDeliveryInventory)
+	adminGroup.GET("/media/circulation/source-diversity", perm("content", "read"), controllers.AdminGetSourceDiversity)
 	adminGroup.GET("/media/delivery/policies", perm("content", "read"), controllers.AdminListMediaDeliveryPolicies)
 	adminGroup.POST("/media/delivery/policies", perm("content", "write"), controllers.AdminCreateMediaDeliveryPolicy)
 	adminGroup.PUT("/media/delivery/policies/:id", perm("content", "write"), controllers.AdminUpdateMediaDeliveryPolicy)
@@ -185,6 +186,10 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Media — Transcription/STT config (auto-STT toggle + budget cap)
 	adminGroup.GET("/transcription-config", perm("content", "read"), controllers.GetTranscriptionConfig)
 	adminGroup.PATCH("/transcription-config", perm("content", "write"), controllers.UpdateTranscriptionConfig)
+	adminGroup.GET("/media-acquisition/config", perm("content", "read"), controllers.GetMediaAcquisitionConfig)
+	adminGroup.PATCH("/media-acquisition/config", perm("content", "write"), controllers.UpdateMediaAcquisitionConfig)
+	adminGroup.POST("/media-acquisition/items/:id/request", perm("content", "write"), controllers.RequestMediaAcquisition)
+	adminGroup.POST("/media-acquisition/requests", perm("content", "write"), controllers.BulkRequestMediaAcquisition)
 	adminGroup.GET("/content-stages/health", perm("aggregation", "read"), controllers.AdminGetContentStageHealth)
 	adminGroup.GET("/content-stages/items/:id/trace", perm("aggregation", "read"), controllers.AdminGetContentStageTrace)
 	adminGroup.PATCH("/content-stages/:lane/control", perm("aggregation", "manage"), controllers.AdminUpdateContentStageControl)

@@ -20,7 +20,11 @@ type ScoreBreakdown struct {
 	Diversity  float64 `json:"diversity"`
 	Trending   float64 `json:"trending"`
 	Preference float64 `json:"preference"`
-	Flags      string  `json:"flags"` // "boosted", "suppressed", "pinned", ""
+	// FreshnessReserved is set by the Pods first-page assembler, after score
+	// calculation. It explains a bounded placement without pretending the raw
+	// ranking score changed.
+	FreshnessReserved bool   `json:"freshness_reserved,omitempty"`
+	Flags             string `json:"flags"` // "boosted", "suppressed", "pinned", ""
 }
 
 // ScoredItem holds a content item with its computed ranking score.
@@ -330,137 +334,14 @@ func ScoreItems(items []models.ContentItem, config models.RankingConfig, flagMap
 
 	// Sort by final score descending
 	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].FinalScore > scored[j].FinalScore
+		if scored[i].FinalScore != scored[j].FinalScore {
+			return scored[i].FinalScore > scored[j].FinalScore
+		}
+		left, right := podsPublicationTime(scored[i].Item), podsPublicationTime(scored[j].Item)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return scored[i].Item.PublicID.String() < scored[j].Item.PublicID.String()
 	})
-
-	// Signal 6 — Diversity post-processing pass
-	scored = applyDiversityPenalty(scored)
-
 	return scored
-}
-
-// ----------------------------------------------------------------
-// Signal 6 — Diversity (anti-repetition penalty, applied at assembly level)
-// ----------------------------------------------------------------
-
-// applyDiversityPenalty interleaves scored items to maximise variety:
-//  1. Prefer a different source than the previous item (hard constraint when possible)
-//  2. Among candidates with a different source, prefer low topic overlap with the
-//     last 3 items in the result window (soft preference)
-//
-// Falls back gracefully when only one source or topic cluster remains.
-func applyDiversityPenalty(scored []ScoredItem) []ScoredItem {
-	if len(scored) <= 1 {
-		return scored
-	}
-
-	// Quick exit: single source and no topic tags — nothing to diversify
-	firstSrc := scoredItemSource(&scored[0])
-	allSame := true
-	for i := 1; i < len(scored); i++ {
-		if scoredItemSource(&scored[i]) != firstSrc {
-			allSame = false
-			break
-		}
-	}
-	if allSame {
-		return scored
-	}
-
-	pool := make([]ScoredItem, len(scored))
-	copy(pool, scored)
-
-	result := make([]ScoredItem, 0, len(scored))
-	prevSrc := ""
-
-	for len(pool) > 0 {
-		// Build the recent-topic window (last 3 items placed so far)
-		windowStart := len(result) - 3
-		if windowStart < 0 {
-			windowStart = 0
-		}
-		recentTags := make([][]string, 0, 3)
-		for _, r := range result[windowStart:] {
-			if len(r.Item.TopicTags) > 0 {
-				recentTags = append(recentTags, r.Item.TopicTags)
-			}
-		}
-
-		// Pass 1: different source AND low topic overlap
-		chosen := -1
-		for i := range pool {
-			if scoredItemSource(&pool[i]) == prevSrc {
-				continue
-			}
-			if !hasHighTopicOverlap(pool[i].Item.TopicTags, recentTags) {
-				chosen = i
-				break
-			}
-		}
-
-		// Pass 2: different source, topic overlap tolerated
-		if chosen == -1 {
-			for i := range pool {
-				if scoredItemSource(&pool[i]) != prevSrc {
-					chosen = i
-					break
-				}
-			}
-		}
-
-		// Pass 3: only one source left — take the best remaining
-		if chosen == -1 {
-			chosen = 0
-		}
-
-		picked := pool[chosen]
-		prevSrc = scoredItemSource(&picked)
-		picked.ScoreBreakdown.Diversity = 1.0
-		result = append(result, picked)
-		pool = append(pool[:chosen], pool[chosen+1:]...)
-	}
-
-	return result
-}
-
-// hasHighTopicOverlap returns true when the candidate's tags overlap >50% with
-// any of the recent items in the window.
-func hasHighTopicOverlap(candidateTags []string, recentTagSets [][]string) bool {
-	if len(candidateTags) == 0 || len(recentTagSets) == 0 {
-		return false
-	}
-	for _, tags := range recentTagSets {
-		if topicOverlap(candidateTags, tags) > 0.5 {
-			return true
-		}
-	}
-	return false
-}
-
-func topicOverlap(a, b []string) float64 {
-	if len(a) == 0 || len(b) == 0 {
-		return 0
-	}
-	set := make(map[string]bool, len(b))
-	for _, t := range b {
-		set[t] = true
-	}
-	var overlap int
-	for _, t := range a {
-		if set[t] {
-			overlap++
-		}
-	}
-	total := len(a)
-	if len(b) < total {
-		total = len(b)
-	}
-	return float64(overlap) / float64(total)
-}
-
-func scoredItemSource(s *ScoredItem) string {
-	if s.Item.SourceName != nil && *s.Item.SourceName != "" {
-		return *s.Item.SourceName
-	}
-	return "__unknown__"
 }

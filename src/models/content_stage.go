@@ -33,17 +33,19 @@ const (
 	ContentStageBlockingFeedDelivery = "feed_delivery"
 	ContentStageBlockingOptional     = "optional"
 
-	ContentStageQueued      = "queued"
-	ContentStageClaimed     = "claimed"
-	ContentStageRunning     = "running"
-	ContentStageVerifying   = "verifying"
-	ContentStageVerified    = "verified"
-	ContentStageDeferred    = "deferred"
-	ContentStageUncertain   = "uncertain"
-	ContentStageReconciling = "reconciling"
-	ContentStageFailed      = "failed"
-	ContentStageCancelled   = "cancelled"
-	ContentStageSuperseded  = "superseded"
+	ContentStageAwaitingApproval = "awaiting_approval"
+	ContentStageBlocked          = "blocked"
+	ContentStageQueued           = "queued"
+	ContentStageClaimed          = "claimed"
+	ContentStageRunning          = "running"
+	ContentStageVerifying        = "verifying"
+	ContentStageVerified         = "verified"
+	ContentStageDeferred         = "deferred"
+	ContentStageUncertain        = "uncertain"
+	ContentStageReconciling      = "reconciling"
+	ContentStageFailed           = "failed"
+	ContentStageCancelled        = "cancelled"
+	ContentStageSuperseded       = "superseded"
 
 	ContentStageCutoverLegacy          = "legacy"
 	ContentStageCutoverShadow          = "shadow"
@@ -61,6 +63,7 @@ type ContentStageRequest struct {
 	Owner                   string         `gorm:"type:varchar(32);not null;index" json:"owner"`
 	BlockingScope           string         `gorm:"type:varchar(24);not null" json:"blocking_scope"`
 	State                   string         `gorm:"type:varchar(24);not null;index" json:"state"`
+	Priority                int16          `gorm:"not null;default:0" json:"priority"`
 	InputFingerprint        string         `gorm:"type:varchar(64);not null" json:"input_fingerprint"`
 	PolicyVersion           string         `gorm:"type:varchar(64);not null" json:"policy_version"`
 	ModelRecipe             string         `gorm:"type:varchar(128);not null" json:"model_recipe,omitempty"`
@@ -182,3 +185,20 @@ type ContentStageControl struct {
 }
 
 func (ContentStageControl) TableName() string { return "content_stage_controls" }
+
+const (
+	MediaAcquisitionAutomatic = "automatic"
+	MediaAcquisitionManual    = "manual"
+)
+
+type MediaAcquisitionConfig struct {
+	ID                     uint      `gorm:"primaryKey" json:"-"`
+	TenantID               string    `gorm:"type:varchar(64);not null;uniqueIndex" json:"tenant_id"`
+	DefaultMode            string    `gorm:"type:varchar(16);not null;default:automatic" json:"default_mode"`
+	PodsSourceRunItemLimit int       `gorm:"not null;default:10" json:"pods_source_run_item_limit"`
+	UpdatedBy              string    `gorm:"type:varchar(128);not null;default:system" json:"updated_by"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+func (MediaAcquisitionConfig) TableName() string { return "media_acquisition_configs" }

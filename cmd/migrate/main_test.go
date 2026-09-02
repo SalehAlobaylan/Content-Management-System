@@ -7,6 +7,10 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 func TestListMigrationFilesOnlyIncludesTimestampedSQL(t *testing.T) {
@@ -27,6 +31,55 @@ func TestListMigrationFilesOnlyIncludesTimestampedSQL(t *testing.T) {
 	}
 	if len(files) != 1 || files[0].Version != "20260712000000_example.sql" {
 		t.Fatalf("unexpected migration files: %#v", files)
+	}
+}
+
+func TestActivateEmptyBootstrapContentStagesPromotesBothLanes(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "content_items"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "content_sources"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec(`UPDATE content_stage_cutovers`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "news").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE content_stage_cutovers`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "pods").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := activateEmptyBootstrapContentStages(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestActivateEmptyBootstrapContentStagesRefusesPopulatedDatabase(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "content_items"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectRollback()
+
+	if err := activateEmptyBootstrapContentStages(db); err == nil || !strings.Contains(err.Error(), "content_items contains 1 row") {
+		t.Fatalf("expected populated database refusal, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -55,6 +108,72 @@ func TestCanonicalMigrationsUseRunnerTransactionContract(t *testing.T) {
 		if topLevelTransaction.Match(sql) && !historicalException {
 			t.Fatalf("%s contains top-level transaction control but is not an audited historical exception", file.Version)
 		}
+	}
+}
+
+func TestSourceTenantScopePrecedesSourceRunReliability(t *testing.T) {
+	files, err := listMigrationFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	positions := map[string]int{}
+	for index, file := range files {
+		positions[file.Version] = index
+	}
+	tenantScope := "20260808990000_content_sources_tenant_scope.sql"
+	reliability := "20260809000000_source_run_reliability.sql"
+	if _, ok := positions[tenantScope]; !ok {
+		t.Fatalf("missing prerequisite migration %s", tenantScope)
+	}
+	if _, ok := positions[reliability]; !ok {
+		t.Fatalf("missing dependent migration %s", reliability)
+	}
+	if positions[tenantScope] >= positions[reliability] {
+		t.Fatalf("%s must precede %s", tenantScope, reliability)
+	}
+}
+
+func TestContentIdempotencyPrecedesContentStageExecution(t *testing.T) {
+	files, err := listMigrationFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	positions := map[string]int{}
+	for index, file := range files {
+		positions[file.Version] = index
+	}
+	prerequisite := "20260817190000_content_items_idempotency.sql"
+	dependent := "20260818100000_content_stage_execution.sql"
+	if _, ok := positions[prerequisite]; !ok {
+		t.Fatalf("missing prerequisite migration %s", prerequisite)
+	}
+	if _, ok := positions[dependent]; !ok {
+		t.Fatalf("missing dependent migration %s", dependent)
+	}
+	if positions[prerequisite] >= positions[dependent] {
+		t.Fatalf("%s must precede %s", prerequisite, dependent)
+	}
+}
+
+func TestQualityProfilesPrecedeAudioFirstDelivery(t *testing.T) {
+	files, err := listMigrationFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	positions := map[string]int{}
+	for index, file := range files {
+		positions[file.Version] = index
+	}
+	prerequisite := "20260822180000_quality_profiles_foundation.sql"
+	dependent := "20260823100000_audio_first_delivery_contract.sql"
+	if _, ok := positions[prerequisite]; !ok {
+		t.Fatalf("missing prerequisite migration %s", prerequisite)
+	}
+	if _, ok := positions[dependent]; !ok {
+		t.Fatalf("missing dependent migration %s", dependent)
+	}
+	if positions[prerequisite] >= positions[dependent] {
+		t.Fatalf("%s must precede %s", prerequisite, dependent)
 	}
 }
 
@@ -184,7 +303,7 @@ func TestMigrationExecutionErrorExplainsStatementTimeout(t *testing.T) {
 func TestEmptyBootstrapRequiresExplicitDisposableAcknowledgement(t *testing.T) {
 	t.Setenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE", "")
 	t.Setenv("DATABASE_URL", "postgresql://postgres:test@127.0.0.1:5432/wahb_cms_test_local123")
-	if err := requireEmptyDisposableBootstrap(nil); err == nil || !strings.Contains(err.Error(), "CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") {
+	if err := validateEmptyBootstrapTarget(); err == nil || !strings.Contains(err.Error(), "CMS_MIGRATION_BOOTSTRAP_DISPOSABLE") {
 		t.Fatalf("missing bootstrap acknowledgement was accepted: %v", err)
 	}
 }
@@ -192,7 +311,52 @@ func TestEmptyBootstrapRequiresExplicitDisposableAcknowledgement(t *testing.T) {
 func TestEmptyBootstrapRejectsManagedDatabaseBeforeOpeningIt(t *testing.T) {
 	t.Setenv("CMS_MIGRATION_BOOTSTRAP_DISPOSABLE", disposableBootstrapMarker)
 	t.Setenv("DATABASE_URL", "postgresql://postgres:test@db.supabase.co:5432/wahb_cms_test_local123")
-	if err := requireEmptyDisposableBootstrap(nil); err == nil || !strings.Contains(err.Error(), "localhost") {
+	if err := validateEmptyBootstrapTarget(); err == nil || !strings.Contains(err.Error(), "localhost or explicitly identified Neon") {
 		t.Fatalf("managed bootstrap target was accepted: %v", err)
+	}
+}
+
+func TestEmptyBootstrapAcceptsExactlyIdentifiedNeonTarget(t *testing.T) {
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_NEON", neonBootstrapMarker)
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_HOST", "ep-staging-pooler.us-east-2.aws.neon.tech")
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_DATABASE", "neondb")
+	t.Setenv("DATABASE_URL", "postgresql://user:test@ep-staging-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require")
+	if err := validateEmptyBootstrapTarget(); err != nil {
+		t.Fatalf("exactly identified Neon bootstrap target was rejected: %v", err)
+	}
+}
+
+func TestEmptyBootstrapRejectsUnexpectedNeonTarget(t *testing.T) {
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_NEON", neonBootstrapMarker)
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_HOST", "ep-other-pooler.us-east-2.aws.neon.tech")
+	t.Setenv("CMS_MIGRATION_BOOTSTRAP_EXPECTED_DATABASE", "neondb")
+	t.Setenv("DATABASE_URL", "postgresql://user:test@ep-staging-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require")
+	if err := validateEmptyBootstrapTarget(); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("unexpected Neon bootstrap target was accepted: %v", err)
+	}
+}
+
+func TestAppliedVersionsTreatsMissingLedgerAsEmpty(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT to_regclass('public.cms_schema_migrations') IS NOT NULL")).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	applied, err := appliedVersions(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 0 {
+		t.Fatalf("missing ledger returned applied migrations: %#v", applied)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

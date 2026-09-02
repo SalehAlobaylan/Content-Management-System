@@ -804,6 +804,11 @@ func applyMediaProviderBounds(settings map[string]interface{}, maxResults int) {
 	delete(settings, "minDurationMinutes")
 	settings["max_results"] = maxResults
 	settings["min_duration_minutes"] = configuredMinimum
+	// Compatibility execution must remain bounded even when every provider page
+	// contains Shorts or other filtered candidates. Durable execution receives
+	// the same limits from its CMS-owned reservation.
+	settings["max_provider_calls"] = 8
+	settings["max_bytes"] = 64 * 1024 * 1024
 }
 
 func InternalClaimCirculationSources(c *gin.Context) {
@@ -914,7 +919,13 @@ func InternalClaimCirculationSources(c *gin.Context) {
 		}
 		q := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("tenant_id = ? AND category = ? AND is_active = ?", tenantID, category, true).
-			Where("feed_url IS NOT NULL AND feed_url <> ''")
+			Where("feed_url IS NOT NULL AND feed_url <> ''").
+			Where(`NOT EXISTS (
+				SELECT 1 FROM source_run_requests active_request
+				WHERE active_request.tenant_id = content_sources.tenant_id
+				  AND active_request.content_source_id = content_sources.public_id
+				  AND active_request.state IN ?
+			)`, models.SourceRunActiveStates)
 		if preserveCheckpoints {
 			q = q.Where("public_id IN ?", recoverySourceIDs)
 		}
@@ -1029,6 +1040,17 @@ type sourceRunReportRequest struct {
 	StartedAt          *string                `json:"started_at"`
 	FinishedAt         *string                `json:"finished_at"`
 	DurationMs         int                    `json:"duration_ms"`
+	LegalCandidates    int                    `json:"legal_duration_candidates"`
+	MaterializedItems  int                    `json:"materialized_items"`
+	VerifiedMedia      int                    `json:"verified_media"`
+	ReadyVisibleUnits  int                    `json:"ready_visible_units"`
+	PublicReturns      int                    `json:"public_returns"`
+	FirstPageReturns   int                    `json:"first_page_returns"`
+	Terminal           bool                   `json:"terminal"`
+	HasMore            bool                   `json:"has_more"`
+	Outcome            string                 `json:"outcome"`
+	ProviderCalls      int                    `json:"provider_calls"`
+	ObservedBytes      int64                  `json:"observed_bytes"`
 	Metadata           map[string]interface{} `json:"metadata"`
 }
 
@@ -1048,14 +1070,30 @@ func InternalReportSourceRun(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid request"})
 		return
 	}
-	tenantID := strings.TrimSpace(req.TenantID)
-	if tenantID == "" {
-		tenantID = defaultCirculationTenant
-	}
 	sourceID, err := uuid.Parse(req.SourceID)
 	if err != nil || strings.TrimSpace(req.JobID) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "source_id and job_id are required"})
 		return
+	}
+	// The producer may carry a tenant hint for correlation, but it cannot choose
+	// lifecycle scope. Resolve the source first and use the CMS-owned tenant;
+	// accepting an empty/default tenant here would let a stale worker write
+	// telemetry and source-run state into the wrong tenant.
+	var source models.ContentSource
+	if err := db.Where("public_id = ?", sourceID).First(&source).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "source_id is not a known CMS source"})
+		return
+	}
+	tenantID := source.TenantID
+	if hintedTenant := strings.TrimSpace(req.TenantID); hintedTenant != "" && hintedTenant != tenantID {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "tenant_id does not match CMS source ownership"})
+		return
+	}
+	// The daily projection is additive and optional during compatibility mode.
+	// A missing migration never blocks source circulation; once present, the
+	// source-run report contributes bounded yield evidence for diagnostics.
+	if db.Migrator().HasTable(&models.MediaSourceYieldDaily{}) {
+		writeMediaSourceYieldDaily(db, tenantID, sourceID, req, time.Now().UTC())
 	}
 	var startedAt, finishedAt *time.Time
 	if req.StartedAt != nil {
@@ -1104,45 +1142,73 @@ func InternalReportSourceRun(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to record run"})
 		return
 	}
+	requestWasTerminal := false
 	if requestID := strings.TrimSpace(req.SourceRunRequestID); requestID != "" {
-		request, err := sourceRunRequestByPublicID(db, tenantID, requestID)
-		if err != nil || request.ContentSourceID != sourceID {
-			c.JSON(http.StatusBadRequest, gin.H{"message": "source_run_request_id does not match source"})
-			return
-		}
-		stage, _ := req.Metadata["stage"].(string)
-		stage = strings.TrimSpace(stage)
-		state := models.SourceRunRunning
-		if stage == "normalize" {
-			if req.Accepted == 0 && req.Failed > 0 {
-				state = models.SourceRunFailed
-			} else {
-				state = models.SourceRunCompleted
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			request, err := sourceRunRequestByPublicID(tx.Clauses(clause.Locking{Strength: "UPDATE"}), tenantID, requestID)
+			if err != nil || request.ContentSourceID != sourceID {
+				return gorm.ErrRecordNotFound
 			}
-		}
-		now := time.Now().UTC()
-		updates := map[string]interface{}{"state": state}
-		if request.StartedAt == nil {
-			updates["started_at"] = now
-		}
-		if state == models.SourceRunCompleted || state == models.SourceRunFailed {
-			updates["finished_at"] = now
-		}
-		if state == models.SourceRunFailed {
-			updates["failure_class"] = "source_run_failed"
-			updates["failure_summary"] = "No accepted items were produced by the normalized run"
-		}
-		if err := db.Model(request).Updates(updates).Error; err != nil {
+			// A delayed retry may repeat evidence, but it can never reopen or
+			// replace the outcome of a terminal request.
+			if models.IsSourceRunTerminal(request.State) {
+				requestWasTerminal = true
+				return nil
+			}
+			stage, _ := req.Metadata["stage"].(string)
+			stage = strings.TrimSpace(stage)
+			state := models.SourceRunRunning
+			if stage == "normalize" {
+				if req.Accepted == 0 && req.Failed > 0 {
+					state = models.SourceRunFailed
+				} else {
+					state = models.SourceRunCompleted
+				}
+			} else if stage == "fetch" && req.Terminal {
+				if req.Failed > 0 && req.Accepted == 0 {
+					state = models.SourceRunFailed
+				} else if req.Accepted == 0 {
+					state = models.SourceRunCompleted
+				}
+			}
+			now := time.Now().UTC()
+			updates := map[string]interface{}{"state": state}
+			if request.StartedAt == nil {
+				updates["started_at"] = now
+			}
+			if models.IsSourceRunTerminal(state) {
+				updates["finished_at"] = now
+			}
+			if state == models.SourceRunCompleted {
+				updates["evidence_state"] = "no_change"
+			}
+			if state == models.SourceRunFailed {
+				updates["failure_class"] = "source_run_failed"
+				updates["failure_summary"] = "Provider or normalization completed without a usable item"
+			}
+			if err := tx.Model(request).Where("state IN ?", models.SourceRunActiveStates).Updates(updates).Error; err != nil {
+				return err
+			}
+			return appendContentProcessingEvent(tx, models.ContentProcessingEvent{
+				TenantID: tenantID, ContentSourceID: &sourceID, SourceRunRequestID: &request.ID,
+				Stage: lineageStageSourceRun + "." + stage, State: state, Producer: "aggregation", JobID: req.JobID,
+				CorrelationID: request.CorrelationID, IdempotencyKey: request.IdempotencyKey, EventClass: "source_run_" + state,
+				Payload: lineagePayload(map[string]interface{}{"fetched": req.Fetched, "accepted": req.Accepted, "duplicates": req.Duplicates, "filtered": req.Filtered, "failed": req.Failed, "terminal": req.Terminal, "has_more": req.HasMore, "outcome": req.Outcome, "provider_calls": req.ProviderCalls, "observed_bytes": req.ObservedBytes}), OccurredAt: now,
+			})
+		}); err != nil {
+			if err == gorm.ErrRecordNotFound {
+				c.JSON(http.StatusBadRequest, gin.H{"message": "source_run_request_id does not match source"})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to update source-run request"})
 			return
 		}
-		if err := appendContentProcessingEvent(db, models.ContentProcessingEvent{
-			TenantID: tenantID, ContentSourceID: &sourceID, SourceRunRequestID: &request.ID,
-			Stage: lineageStageSourceRun + "." + stage, State: state, Producer: "aggregation", JobID: req.JobID,
-			CorrelationID: request.CorrelationID, IdempotencyKey: request.IdempotencyKey, EventClass: "source_run_" + state,
-			Payload: lineagePayload(map[string]interface{}{"fetched": req.Fetched, "accepted": req.Accepted, "duplicates": req.Duplicates, "filtered": req.Filtered, "failed": req.Failed}), OccurredAt: now,
-		}); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to append source-run event"})
+	}
+	// A late callback may still be useful telemetry, but it must not move the
+	// source scheduling/checkpoint projection after a newer terminal outcome.
+	if !requestWasTerminal {
+		if err := updateCompatibilitySourceCheckpoint(db, source, req, time.Now().UTC()); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to update source checkpoint"})
 			return
 		}
 	}
@@ -1172,6 +1238,145 @@ func InternalReportSourceRun(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// updateCompatibilitySourceCheckpoint projects the evidence that the legacy
+// report path can prove. It is deliberately schema-gated so old deployments
+// remain able to ingest while the additive source-reliability migration is
+// pending. A provider-success checkpoint means the provider call completed
+// without a provider error; it does not imply that a legal item was found.
+func updateCompatibilitySourceCheckpoint(db *gorm.DB, source models.ContentSource, req sourceRunReportRequest, observedAt time.Time) error {
+	if db == nil || !db.Migrator().HasColumn(&models.ContentSource{}, "last_provider_success_at") {
+		return nil
+	}
+	updates := map[string]any{}
+	if db.Migrator().HasColumn(&models.ContentSource{}, "last_attempted_at") {
+		updates["last_attempted_at"] = observedAt
+	}
+	success := req.Failed == 0 && req.Outcome != "provider_failure" && req.Outcome != "downstream_unavailable"
+	if success {
+		updates["last_provider_success_at"] = observedAt
+		updates["failure_streak"] = 0
+		if db.Migrator().HasColumn(&models.ContentSource{}, "intake_circuit_until") {
+			updates["intake_circuit_until"] = nil
+		}
+		if req.Accepted > 0 && db.Migrator().HasColumn(&models.ContentSource{}, "last_new_item_at") {
+			updates["last_new_item_at"] = observedAt
+		}
+		if req.Outcome == "no_change" && db.Migrator().HasColumn(&models.ContentSource{}, "last_no_change_at") {
+			updates["last_no_change_at"] = observedAt
+		}
+	} else if req.Terminal {
+		streak := source.FailureStreak + 1
+		updates["failure_streak"] = streak
+		if db.Migrator().HasColumn(&models.ContentSource{}, "intake_circuit_until") && streak >= 3 {
+			updates["intake_circuit_until"] = observedAt.Add(sourceFailureBackoff(streak))
+		}
+	}
+	if req.Terminal && db.Migrator().HasColumn(&models.ContentSource{}, "next_due_at") {
+		minimumInterval := loadCirculationPolicy(db, source.TenantID).SourceMinIntervalMinutes
+		if source.Category == models.SourceCategoryMedia {
+			minimumInterval = loadEffectiveMediaCirculationPolicy(db, source.TenantID).SourceMinIntervalMinutes
+		}
+		nextDue := observedAt.Add(sourceCompatibilityInterval(source, success, req.Terminal, minimumInterval))
+		updates["next_due_at"] = nextDue
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	return db.Model(&models.ContentSource{}).
+		Where("tenant_id = ? AND public_id = ?", source.TenantID, source.PublicID).
+		Updates(updates).Error
+}
+
+func sourceCompatibilityInterval(source models.ContentSource, success bool, terminal bool, minimumIntervalMinutes int) time.Duration {
+	if !terminal {
+		return 0
+	}
+	interval := source.FetchIntervalMinutes
+	if minimumIntervalMinutes < 1 {
+		minimumIntervalMinutes = 1
+	}
+	if interval < minimumIntervalMinutes {
+		interval = minimumIntervalMinutes
+	}
+	if success {
+		return time.Duration(interval) * time.Minute
+	}
+	backoff := sourceFailureBackoff(source.FailureStreak + 1)
+	minimum := time.Duration(minimumIntervalMinutes) * time.Minute
+	if backoff < minimum {
+		return minimum
+	}
+	return backoff
+}
+
+func sourceFailureBackoff(streak int) time.Duration {
+	backoff := 5 * time.Minute
+	for index := 1; index < streak && backoff < 6*time.Hour; index++ {
+		backoff *= 2
+	}
+	if backoff > 6*time.Hour {
+		return 6 * time.Hour
+	}
+	return backoff
+}
+
+func writeMediaSourceYieldDaily(db *gorm.DB, tenantID string, sourceID uuid.UUID, req sourceRunReportRequest, now time.Time) {
+	day := now.Format("2006-01-02")
+	// GREATEST makes fetch/normalize retries idempotent. The source-run
+	// telemetry row remains the detailed per-run audit record. Verified and
+	// consumer-boundary counts are supplied only when the reporting stage has
+	// actually observed them; they are never inferred from a claim.
+	legal := req.LegalCandidates
+	if legal < 0 {
+		legal = 0
+	}
+	materialized := req.MaterializedItems
+	if materialized < 0 {
+		materialized = 0
+	}
+	verified := req.VerifiedMedia
+	if verified < 0 {
+		verified = 0
+	}
+	readyVisible := req.ReadyVisibleUnits
+	if readyVisible < 0 {
+		readyVisible = 0
+	}
+	publicReturns := req.PublicReturns
+	if publicReturns < 0 {
+		publicReturns = 0
+	}
+	firstPageReturns := req.FirstPageReturns
+	if firstPageReturns < 0 {
+		firstPageReturns = 0
+	}
+	fetched := req.Fetched
+	if fetched < 0 {
+		fetched = 0
+	}
+	accepted := req.Accepted
+	if accepted < 0 {
+		accepted = 0
+	}
+	filtered := req.Filtered
+	if filtered < 0 {
+		filtered = 0
+	}
+	db.Exec(`INSERT INTO media_source_yield_daily
+		(tenant_id, content_source_id, yield_date, fetched_candidates, legal_duration_candidates, filtered_candidates, materialized_items, verified_media, ready_visible_units, public_returns, first_page_returns, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now())
+		ON CONFLICT (tenant_id, content_source_id, yield_date) DO UPDATE SET
+		fetched_candidates=GREATEST(media_source_yield_daily.fetched_candidates, EXCLUDED.fetched_candidates),
+		legal_duration_candidates=GREATEST(media_source_yield_daily.legal_duration_candidates, EXCLUDED.legal_duration_candidates),
+		filtered_candidates=GREATEST(media_source_yield_daily.filtered_candidates, EXCLUDED.filtered_candidates),
+		materialized_items=GREATEST(media_source_yield_daily.materialized_items, EXCLUDED.materialized_items),
+		verified_media=GREATEST(media_source_yield_daily.verified_media, EXCLUDED.verified_media),
+		ready_visible_units=GREATEST(media_source_yield_daily.ready_visible_units, EXCLUDED.ready_visible_units),
+		public_returns=GREATEST(media_source_yield_daily.public_returns, EXCLUDED.public_returns),
+		first_page_returns=GREATEST(media_source_yield_daily.first_page_returns, EXCLUDED.first_page_returns),
+		updated_at=now()`, tenantID, sourceID, day, fetched, legal, filtered, materialized, verified, readyVisible, publicReturns, firstPageReturns)
 }
 
 // ─── Automation heartbeat ──────────────────────────────────────────────────

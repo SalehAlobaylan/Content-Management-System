@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -621,7 +622,9 @@ func GetEmbeddingStats(c *gin.Context) {
 		pct = float64(withEmbed) / float64(totalReady) * 100
 	}
 
-	var byType []typeEmbedStat
+	// Keep the JSON contract stable on an empty database. A nil slice encodes as
+	// null, while Console consumers correctly expect by_type to be an array.
+	byType := make([]typeEmbedStat, 0)
 	db.Raw(`
 		SELECT type,
 			COUNT(*) AS total,
@@ -908,25 +911,32 @@ func GetSignalHealth(c *gin.Context) {
 // ================================================================
 
 type previewFeedItem struct {
-	ID             string         `json:"id"`
-	Type           string         `json:"type"`
-	Title          string         `json:"title"`
-	Author         *string        `json:"author,omitempty"`
-	SourceName     *string        `json:"source_name,omitempty"`
-	PublishedAt    *string        `json:"published_at,omitempty"`
-	LikeCount      int            `json:"like_count"`
-	ViewCount      int            `json:"view_count"`
-	ShareCount     int            `json:"share_count"`
-	FinalScore     float64        `json:"final_score"`
-	ScoreBreakdown ScoreBreakdown `json:"score_breakdown"`
-	ChronPosition  int            `json:"chron_position"`
-	RankedPosition int            `json:"ranked_position"`
-	PositionChange int            `json:"position_change"`
+	ID                    string         `json:"id"`
+	Type                  string         `json:"type"`
+	Title                 string         `json:"title"`
+	Author                *string        `json:"author,omitempty"`
+	SourceName            *string        `json:"source_name,omitempty"`
+	PublishedAt           *string        `json:"published_at,omitempty"`
+	LikeCount             int            `json:"like_count"`
+	ViewCount             int            `json:"view_count"`
+	ShareCount            int            `json:"share_count"`
+	FinalScore            float64        `json:"final_score"`
+	ScoreBreakdown        ScoreBreakdown `json:"score_breakdown"`
+	ChronPosition         int            `json:"chron_position"`
+	RankedPosition        int            `json:"ranked_position"`
+	PositionChange        int            `json:"position_change"`
+	RawRank               int            `json:"raw_rank,omitempty"`
+	FreshnessReserved     bool           `json:"freshness_reserved,omitempty"`
+	SourceSpacingMovement int            `json:"source_spacing_movement,omitempty"`
 }
 
 type previewFeedResponse struct {
-	Items    []previewFeedItem `json:"items"`
-	IsActive bool              `json:"is_active"`
+	Items                []previewFeedItem `json:"items"`
+	IsActive             bool              `json:"is_active"`
+	AssemblyMode         string            `json:"assembly_mode,omitempty"`
+	FilterDigest         string            `json:"filter_digest,omitempty"`
+	SourceCapApplied     bool              `json:"source_cap_applied,omitempty"`
+	ConstraintRelaxation string            `json:"constraint_relaxation,omitempty"`
 }
 
 // PreviewPodsFeed handles GET /admin/intelligence/preview/pods
@@ -942,16 +952,12 @@ func PreviewPodsFeed(c *gin.Context) {
 	// Allow temporary weight overrides from query params
 	applyWeightOverrides(c, &config)
 
-	// Fetch items (VIDEO + PODCAST, READY)
-	var items []models.ContentItem
-	db.Where("type IN ? AND status = ? AND tenant_id = ?",
-		[]models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast},
-		models.ContentStatusReady, principal.TenantID).
-		Order("published_at DESC").
-		Limit(50).
-		Find(&items)
-
-	c.JSON(http.StatusOK, buildPreviewResponse(db, items, config, principal.TenantID))
+	assembled, err := assemblePods(db, podsAssemblyRequest{TenantID: principal.TenantID, Mode: podsAssemblyRanked, AsOf: time.Now().UTC(), RankingConfig: &config})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assemble Pods preview", Code: "PREVIEW_FAILED"})
+		return
+	}
+	c.JSON(http.StatusOK, buildPreviewAssemblyResponse(assembled, config))
 }
 
 // PreviewNewsFeed handles GET /admin/intelligence/preview/news
@@ -972,7 +978,7 @@ func PreviewNewsFeed(c *gin.Context) {
 		Limit(50).
 		Find(&items)
 
-	c.JSON(http.StatusOK, buildPreviewResponse(db, items, config, principal.TenantID))
+	c.JSON(http.StatusOK, buildPreviewResponse(db, items, config, principal.TenantID, false))
 }
 
 // ================================================================
@@ -1065,7 +1071,7 @@ func applyWeightOverrides(c *gin.Context, config *models.RankingConfig) {
 	}
 }
 
-func buildPreviewResponse(db *gorm.DB, items []models.ContentItem, config models.RankingConfig, tenantID string) previewFeedResponse {
+func buildPreviewResponse(db *gorm.DB, items []models.ContentItem, config models.RankingConfig, tenantID string, pods bool) previewFeedResponse {
 	if len(items) == 0 {
 		return previewFeedResponse{Items: []previewFeedItem{}, IsActive: config.IsActive}
 	}
@@ -1081,6 +1087,9 @@ func buildPreviewResponse(db *gorm.DB, items []models.ContentItem, config models
 	flagMap := LoadContentFlags(db, tenantID, contentIDs)
 	velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
 	scored := ScoreItems(items, config, flagMap, velocityData, time.Now())
+	if pods {
+		scored = reserveFreshPodsFirstPage(scored, time.Now().UTC())
+	}
 
 	result := make([]previewFeedItem, 0, len(scored))
 	for i, s := range scored {
@@ -1116,4 +1125,59 @@ func buildPreviewResponse(db *gorm.DB, items []models.ContentItem, config models
 	}
 
 	return previewFeedResponse{Items: result, IsActive: config.IsActive}
+}
+
+func buildPreviewAssemblyResponse(assembled podsAssemblyResult, config models.RankingConfig) previewFeedResponse {
+	chronological := append([]ScoredItem(nil), assembled.Raw...)
+	sort.SliceStable(chronological, func(i, j int) bool {
+		left, right := podsPublicationTime(chronological[i].Item), podsPublicationTime(chronological[j].Item)
+		if !left.Equal(right) {
+			return left.After(right)
+		}
+		return chronological[i].Item.PublicID.String() < chronological[j].Item.PublicID.String()
+	})
+	chronMap := make(map[uuid.UUID]int, len(chronological))
+	for index, item := range chronological {
+		chronMap[item.Item.PublicID] = index + 1
+	}
+	rawMap := make(map[uuid.UUID]int, len(assembled.Raw))
+	for index, item := range assembled.Raw {
+		rawMap[item.Item.PublicID] = index + 1
+	}
+	result := make([]previewFeedItem, 0, len(assembled.Final))
+	for index, scored := range assembled.Final {
+		title := ""
+		if scored.Item.Title != nil {
+			title = *scored.Item.Title
+		}
+		var published *string
+		if scored.Item.PublishedAt != nil {
+			value := scored.Item.PublishedAt.UTC().Format(time.RFC3339)
+			published = &value
+		}
+		chronPos := chronMap[scored.Item.PublicID]
+		rawRank := rawMap[scored.Item.PublicID]
+		beforeSourceRank := rawRank
+		for candidateIndex, candidate := range assembled.BeforeSourceConstraints {
+			if candidate.Item.PublicID == scored.Item.PublicID {
+				beforeSourceRank = candidateIndex + 1
+				break
+			}
+		}
+		result = append(result, previewFeedItem{
+			ID: scored.Item.PublicID.String(), Type: string(scored.Item.Type), Title: title,
+			Author: scored.Item.Author, SourceName: scored.Item.SourceName, PublishedAt: published,
+			LikeCount: scored.Item.LikeCount, ViewCount: scored.Item.ViewCount, ShareCount: scored.Item.ShareCount,
+			FinalScore: scored.FinalScore, ScoreBreakdown: scored.ScoreBreakdown, ChronPosition: chronPos,
+			RankedPosition: index + 1, PositionChange: chronPos - (index + 1), RawRank: rawRank,
+			FreshnessReserved:     scored.ScoreBreakdown.FreshnessReserved,
+			SourceSpacingMovement: index + 1 - beforeSourceRank,
+		})
+	}
+	response := previewFeedResponse{
+		Items: result, IsActive: config.IsActive, AssemblyMode: string(podsAssemblyRanked),
+		FilterDigest: assembled.FilterDigest, SourceCapApplied: assembled.SourceCapApplied,
+		ConstraintRelaxation: assembled.ConstraintRelaxation,
+	}
+	return response
 }

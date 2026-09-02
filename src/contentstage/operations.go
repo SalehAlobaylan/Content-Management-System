@@ -14,15 +14,18 @@ import (
 )
 
 type LaneHealth struct {
-	Lane             string                      `json:"lane"`
-	Cutover          string                      `json:"cutover"`
-	Control          models.ContentStageControl  `json:"control"`
-	Verdict          string                      `json:"verdict"`
-	Reasons          []string                    `json:"reasons"`
-	StateCounts      map[string]int64            `json:"state_counts"`
-	StageStateCounts map[string]map[string]int64 `json:"stage_state_counts"`
-	OldestQueuedAt   *time.Time                  `json:"oldest_queued_at,omitempty"`
-	OldestActiveAt   *time.Time                  `json:"oldest_active_at,omitempty"`
+	Lane             string                                       `json:"lane"`
+	Cutover          string                                       `json:"cutover"`
+	Control          models.ContentStageControl                   `json:"control"`
+	Verdict          string                                       `json:"verdict"`
+	Reasons          []string                                     `json:"reasons"`
+	StateCounts      map[string]int64                             `json:"state_counts"`
+	StageStateCounts map[string]map[string]int64                  `json:"stage_state_counts"`
+	OldestQueuedAt   *time.Time                                   `json:"oldest_queued_at,omitempty"`
+	OldestActiveAt   *time.Time                                   `json:"oldest_active_at,omitempty"`
+	SchemaState      string                                       `json:"schema_state"`
+	LatestSnapshot   *models.PipelineLaneHealthSnapshot           `json:"latest_snapshot,omitempty"`
+	LatestSnapshots  map[string]models.PipelineLaneHealthSnapshot `json:"latest_snapshots,omitempty"`
 }
 
 // currentStageRequests excludes historical processing generations. Superseded
@@ -37,6 +40,15 @@ func currentStageRequests(db *gorm.DB, tenantID, lane string) *gorm.DB {
 func Health(db *gorm.DB, tenantID string) ([]LaneHealth, error) {
 	out := make([]LaneHealth, 0, 2)
 	for _, lane := range []string{models.ContentStageLaneNews, models.ContentStageLanePods} {
+		if !SchemaAvailable(db) {
+			out = append(out, LaneHealth{
+				Lane: lane, Cutover: models.ContentStageCutoverLegacy, Verdict: "legacy_schema_pending",
+				Reasons:     []string{"content-stage execution migration is pending; compatibility ingest remains active"},
+				StateCounts: map[string]int64{}, StageStateCounts: map[string]map[string]int64{}, SchemaState: "pending",
+				Control: models.ContentStageControl{TenantID: tenantID, Lane: lane, SchedulingEnabled: true, ExecutionEnabled: true, OptionalMetadataEnabled: true, TranscriptExecutionEnabled: true},
+			})
+			continue
+		}
 		mode, err := CutoverMode(db, tenantID, lane)
 		if err != nil {
 			return nil, err
@@ -94,7 +106,51 @@ func Health(db *gorm.DB, tenantID string) ([]LaneHealth, error) {
 		if mode == models.ContentStageCutoverDurableRequired && oldestQueued != nil && time.Since(oldestQueued.UTC()) > ageLimit {
 			verdict, reasons = "degraded", append(reasons, "required-stage oldest age exceeds lane SLO")
 		}
-		out = append(out, LaneHealth{Lane: lane, Cutover: mode, Control: control, Verdict: verdict, Reasons: reasons, StateCounts: counts, StageStateCounts: stageCounts, OldestQueuedAt: oldestQueued, OldestActiveAt: oldestActive})
+		// A green HTTP/process probe is not feed health. If the lane has no
+		// recently produced eligible output, surface the serving risk directly.
+		productionWindow := 7 * 24 * time.Hour
+		productionQuery := db.Model(&models.ContentItem{}).Where("tenant_id=? AND status=? AND created_at>=?", tenantID, models.ContentStatusReady, time.Now().UTC().Add(-productionWindow))
+		if lane == models.ContentStageLaneNews {
+			productionWindow = 24 * time.Hour
+			productionQuery = db.Model(&models.ContentItem{}).Where("tenant_id=? AND type=? AND status=? AND created_at>=?", tenantID, models.ContentTypeNews, models.ContentStatusReady, time.Now().UTC().Add(-productionWindow))
+		} else {
+			productionQuery = productionQuery.Where("type IN ? AND is_feed_unit=TRUE AND feed_visibility=?", []string{string(models.ContentTypeVideo), string(models.ContentTypePodcast)}, "visible")
+		}
+		var recentEligible int64
+		if err := productionQuery.Count(&recentEligible).Error; err != nil {
+			return nil, err
+		}
+		if recentEligible == 0 {
+			verdict, reasons = "degraded", append(reasons, "recent eligible production is stale")
+		}
+		var latestSnapshot *models.PipelineLaneHealthSnapshot
+		latestSnapshots := map[string]models.PipelineLaneHealthSnapshot{}
+		if db.Migrator().HasTable(&models.PipelineLaneHealthSnapshot{}) {
+			for _, owner := range []string{"aggregation", "enrichment"} {
+				var snapshot models.PipelineLaneHealthSnapshot
+				if db.Where("tenant_id=? AND lane=? AND owner_principal=?", tenantID, lane, owner).Order("captured_at DESC").First(&snapshot).Error == nil {
+					latestSnapshots[owner] = snapshot
+				}
+			}
+			if snapshot, ok := latestSnapshots["aggregation"]; ok {
+				copy := snapshot
+				latestSnapshot = &copy
+			} else if snapshot, ok := latestSnapshots["enrichment"]; ok {
+				copy := snapshot
+				latestSnapshot = &copy
+			}
+			if mode == models.ContentStageCutoverDurableRequired {
+				for _, owner := range []string{"aggregation", "enrichment"} {
+					snapshot, ok := latestSnapshots[owner]
+					if !ok || time.Since(snapshot.CapturedAt.UTC()) > 45*time.Second {
+						verdict, reasons = "degraded", append(reasons, owner+" lane snapshot is missing or stale")
+					}
+				}
+			}
+		} else if mode == models.ContentStageCutoverDurableRequired {
+			verdict, reasons = "degraded", append(reasons, "pipeline lane snapshot schema is pending")
+		}
+		out = append(out, LaneHealth{Lane: lane, Cutover: mode, Control: control, Verdict: verdict, Reasons: reasons, StateCounts: counts, StageStateCounts: stageCounts, OldestQueuedAt: oldestQueued, OldestActiveAt: oldestActive, SchemaState: "available", LatestSnapshot: latestSnapshot, LatestSnapshots: latestSnapshots})
 	}
 	return out, nil
 }

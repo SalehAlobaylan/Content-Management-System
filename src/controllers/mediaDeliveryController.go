@@ -322,9 +322,19 @@ func selectPrimaryAndFallback(renditions []map[string]any) (map[string]any, map[
 	return primary, nil
 }
 
+func renditionGenerationTransitionState(c *gin.Context) string {
+	state := strings.TrimSpace(c.GetString("media_rendition_generation_state"))
+	if state == "" {
+		// Retain compatibility with tests or future route registrations that use
+		// a named :state segment.
+		state = strings.TrimSpace(c.Param("state"))
+	}
+	return state
+}
+
 func InternalTransitionMediaRenditionGeneration(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
-	state := c.Param("state")
+	state := renditionGenerationTransitionState(c)
 	if state != "running" && state != "verifying" && state != "failed" && state != "uncertain" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid rendition generation state"})
 		return
@@ -504,6 +514,107 @@ type hlsPackageRequest struct {
 	ValidationDigest      string         `json:"validation_digest"`
 }
 
+// validateHLSPackageReceipt is the CMS-side half of HLS qualification. The
+// worker performs the media probes, while CMS requires a complete,
+// manifest-owned receipt before the package can become serving-generation
+// eligible. This keeps a plausible digest from standing in for object proof.
+func validateHLSPackageReceipt(db *gorm.DB, pkg *models.MediaHLSPackage, req hlsPackageRequest, tenant string) error {
+	if req.ValidationDigest == "" || deliveryDigest(req.ValidationEvidence) != req.ValidationDigest {
+		return gorm.ErrInvalidData
+	}
+	if req.VariantCount < 2 || req.ValidationEvidence["segment_format"] != "cmaf-fmp4" || numericValue(req.ValidationEvidence["variant_count"]) != req.VariantCount {
+		return gorm.ErrInvalidData
+	}
+	for _, required := range []string{"measured_bandwidth", "keyframe_alignment", "seeks"} {
+		if value, ok := req.ValidationEvidence[required]; !ok || value == nil {
+			return gorm.ErrInvalidData
+		}
+	}
+	if strings.TrimSpace(req.ProgressiveManifestID) == "" {
+		return gorm.ErrInvalidData
+	}
+
+	var generation models.MediaRenditionGeneration
+	if err := db.Where("public_id=? AND tenant_id=?", pkg.RenditionGenerationID, tenant).First(&generation).Error; err != nil {
+		return err
+	}
+	if generation.State != "running" && generation.State != "verifying" {
+		return gorm.ErrInvalidData
+	}
+	var master models.MediaArtifactManifest
+	if err := db.Where("public_id=? AND tenant_id=? AND artifact_role='hls_master' AND state IN ?", pkg.MasterManifestID, tenant, []string{"verified", "active"}).First(&master).Error; err != nil {
+		return err
+	}
+	if master.ContentItemID == nil || *master.ContentItemID != generation.ContentItemID || !manifestHasProviderProof(master) {
+		return gorm.ErrInvalidData
+	}
+
+	progressiveID, err := uuid.Parse(strings.TrimSpace(req.ProgressiveManifestID))
+	if err != nil || pkg.ProgressiveManifestID == nil || *pkg.ProgressiveManifestID != progressiveID {
+		return gorm.ErrInvalidData
+	}
+	var progressive models.MediaArtifactManifest
+	if err := db.Where("public_id=? AND tenant_id=? AND artifact_role='delivery_progressive' AND state IN ?", progressiveID, tenant, []string{"verified", "active"}).First(&progressive).Error; err != nil {
+		return err
+	}
+	if progressive.ContentItemID == nil || *progressive.ContentItemID != generation.ContentItemID || !manifestHasProviderProof(progressive) {
+		return gorm.ErrInvalidData
+	}
+
+	rawFiles, ok := req.ValidationEvidence["files"].([]any)
+	if !ok || len(rawFiles) == 0 {
+		return gorm.ErrInvalidData
+	}
+	seen := map[uuid.UUID]bool{}
+	masterSeen, progressiveSeen := false, false
+	for _, raw := range rawFiles {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			return gorm.ErrInvalidData
+		}
+		manifestID, err := uuid.Parse(strings.TrimSpace(renditionStringValue(entry["manifest_id"])))
+		if err != nil || seen[manifestID] || entry["provider_head_verified"] != true {
+			return gorm.ErrInvalidData
+		}
+		seen[manifestID] = true
+		var manifest models.MediaArtifactManifest
+		if err := db.Where("public_id=? AND tenant_id=? AND state IN ?", manifestID, tenant, []string{"verified", "active"}).First(&manifest).Error; err != nil {
+			return err
+		}
+		if manifest.ContentItemID == nil || *manifest.ContentItemID != generation.ContentItemID || !manifestHasProviderProof(manifest) {
+			return gorm.ErrInvalidData
+		}
+		if manifestID == pkg.MasterManifestID {
+			if manifest.ArtifactRole != "hls_master" {
+				return gorm.ErrInvalidData
+			}
+			masterSeen = true
+		} else if manifestID == *pkg.ProgressiveManifestID {
+			if manifest.ArtifactRole != "delivery_progressive" {
+				return gorm.ErrInvalidData
+			}
+			progressiveSeen = true
+		} else if manifest.PackageManifestID == nil || *manifest.PackageManifestID != pkg.MasterManifestID {
+			return gorm.ErrInvalidData
+		}
+		if numericValue(entry["bytes"]) != int(manifest.SizeBytes) || strings.TrimSpace(renditionStringValue(entry["sha256"])) != strings.TrimSpace(manifest.SHA256) || renditionStringValue(entry["url"]) != manifest.PublicURL || renditionStringValue(entry["provider_content_type"]) != manifest.ContentType || strings.TrimSpace(renditionStringValue(entry["provider_cache_control"])) != strings.TrimSpace(renditionStringValue(entry["cache_control"])) || strings.TrimSpace(renditionStringValue(entry["provider_cache_control"])) != strings.TrimSpace(manifest.CacheControl) {
+			return gorm.ErrInvalidData
+		}
+	}
+	if !masterSeen || !progressiveSeen {
+		return gorm.ErrInvalidData
+	}
+	return nil
+}
+
+func manifestHasProviderProof(manifest models.MediaArtifactManifest) bool {
+	var evidence map[string]any
+	if json.Unmarshal(manifest.VerificationEvidence, &evidence) != nil {
+		return false
+	}
+	return evidence["provider_head_verified"] == true
+}
+
 func InternalCreateMediaHLSPackage(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	var req hlsPackageRequest
@@ -564,6 +675,18 @@ func InternalVerifyMediaHLSPackage(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "HLS package not found"})
 		return
 	}
+	if (pkg.State == "verified" || pkg.State == "active") && pkg.ValidationDigest == req.ValidationDigest {
+		c.JSON(http.StatusOK, pkg)
+		return
+	}
+	if pkg.State != "uploading" && pkg.State != "verifying" {
+		c.JSON(http.StatusConflict, gin.H{"error": "HLS package is not verifiable in its current state"})
+		return
+	}
+	if err = validateHLSPackageReceipt(db, &pkg, req, tenant); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "HLS package receipt is incomplete or not manifest-owned"})
+		return
+	}
 	if err = db.Model(&pkg).Updates(map[string]any{"state": "verified", "variant_count": req.VariantCount, "validation_evidence": longFormJSON(req.ValidationEvidence), "validation_digest": req.ValidationDigest, "updated_at": time.Now().UTC()}).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "HLS package verification failed"})
 		return
@@ -613,6 +736,11 @@ func InternalCreateMediaHLSAccessPoint(c *gin.Context) {
 	}
 	if req.ValidationDigest != pkg.ValidationDigest || manifest.PackageManifestID == nil || *manifest.PackageManifestID != pkg.MasterManifestID {
 		c.JSON(http.StatusConflict, gin.H{"error": "HLS access point proof does not match its package"})
+		return
+	}
+	var generation models.MediaRenditionGeneration
+	if db.Where("public_id=? AND tenant_id=?", pkg.RenditionGenerationID, tenant).First(&generation).Error != nil || manifest.ContentItemID == nil || *manifest.ContentItemID != generation.ContentItemID || !manifestHasProviderProof(manifest) {
+		c.JSON(http.StatusConflict, gin.H{"error": "HLS access master ownership proof is incomplete"})
 		return
 	}
 	access := models.MediaHLSAccessPoint{PublicID: uuid.New(), TenantID: tenant, PackageID: packageID, QualityTier: req.QualityTier, ManifestID: manifestID, MaxHeight: req.MaxHeight, MaxBandwidthKbps: req.MaxBandwidthKbps, ValidationDigest: req.ValidationDigest, State: "verified"}
@@ -938,7 +1066,10 @@ func AdminRequestMediaDeliveryRepair(c *gin.Context) {
 	}
 	repair, err := pipeline.CreateMediaDeliveryRepair(c.MustGet("db").(*gorm.DB), principal.TenantID, itemID, strings.TrimSpace(req.PreviewDigest), principal.Email)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "delivery repair request rejected"})
+		// This is an authenticated operator endpoint. Preserve the bounded,
+		// server-derived rejection reason so Console can distinguish stale proof,
+		// a live owner, disabled recovery, and an already-active exact repair.
+		c.JSON(http.StatusConflict, gin.H{"error": "delivery repair request rejected", "reason": err.Error()})
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"repair": repair, "preview_digest": req.PreviewDigest})

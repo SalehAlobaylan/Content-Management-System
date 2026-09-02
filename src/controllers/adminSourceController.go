@@ -2,11 +2,14 @@ package controllers
 
 import (
 	"bytes"
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,19 +32,33 @@ type adminSourceListResponse struct {
 }
 
 type contentSourceResponse struct {
-	ID                   string          `json:"id"`
-	Name                 string          `json:"name"`
-	Type                 string          `json:"type"`
-	Category             string          `json:"category"`
-	FeedURL              *string         `json:"feed_url,omitempty"`
-	ImageURL             *string         `json:"image_url,omitempty"`
-	APIConfig            json.RawMessage `json:"api_config,omitempty"`
-	IsActive             bool            `json:"is_active"`
-	FetchIntervalMinutes int             `json:"fetch_interval_minutes"`
-	LastFetchedAt        *string         `json:"last_fetched_at,omitempty"`
-	Metadata             json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt            string          `json:"created_at"`
-	UpdatedAt            string          `json:"updated_at"`
+	ID                           string                   `json:"id"`
+	Name                         string                   `json:"name"`
+	Type                         string                   `json:"type"`
+	Category                     string                   `json:"category"`
+	FeedURL                      *string                  `json:"feed_url,omitempty"`
+	ImageURL                     *string                  `json:"image_url,omitempty"`
+	APIConfig                    json.RawMessage          `json:"api_config,omitempty"`
+	MediaAcquisitionMode         *string                  `json:"media_acquisition_mode,omitempty"`
+	ResolvedMediaAcquisitionMode string                   `json:"resolved_media_acquisition_mode"`
+	IsActive                     bool                     `json:"is_active"`
+	FetchIntervalMinutes         int                      `json:"fetch_interval_minutes"`
+	LastFetchedAt                *string                  `json:"last_fetched_at,omitempty"`
+	LastClaimedAt                *string                  `json:"last_claimed_at,omitempty"`
+	LastAttemptedAt              *string                  `json:"last_attempted_at,omitempty"`
+	LastProviderSuccessAt        *string                  `json:"last_provider_success_at,omitempty"`
+	ActiveRun                    *sourceActiveRunResponse `json:"active_run,omitempty"`
+	Metadata                     json.RawMessage          `json:"metadata,omitempty"`
+	CreatedAt                    string                   `json:"created_at"`
+	UpdatedAt                    string                   `json:"updated_at"`
+}
+
+type sourceActiveRunResponse struct {
+	ID          string  `json:"id"`
+	State       string  `json:"state"`
+	Purpose     string  `json:"purpose"`
+	RequestedAt string  `json:"requested_at"`
+	AcceptedAt  *string `json:"accepted_at,omitempty"`
 }
 
 type createContentSourceRequest struct {
@@ -51,6 +68,7 @@ type createContentSourceRequest struct {
 	FeedURL              *string                `json:"feed_url,omitempty"`
 	ImageURL             *string                `json:"image_url,omitempty"`
 	APIConfig            map[string]interface{} `json:"api_config,omitempty"`
+	MediaAcquisitionMode *string                `json:"media_acquisition_mode,omitempty"`
 	IsActive             *bool                  `json:"is_active,omitempty"`
 	FetchIntervalMinutes *int                   `json:"fetch_interval_minutes,omitempty"`
 	Metadata             map[string]interface{} `json:"metadata,omitempty"`
@@ -63,6 +81,7 @@ type updateContentSourceRequest struct {
 	FeedURL              *string                `json:"feed_url,omitempty"`
 	ImageURL             *string                `json:"image_url,omitempty"`
 	APIConfig            map[string]interface{} `json:"api_config,omitempty"`
+	MediaAcquisitionMode *string                `json:"media_acquisition_mode,omitempty"`
 	IsActive             *bool                  `json:"is_active,omitempty"`
 	FetchIntervalMinutes *int                   `json:"fetch_interval_minutes,omitempty"`
 	Metadata             map[string]interface{} `json:"metadata,omitempty"`
@@ -88,6 +107,13 @@ type bulkCreateContentSourcesResponse struct {
 type runSourceResponse struct {
 	Message string `json:"message"`
 	JobID   string `json:"job_id,omitempty"`
+}
+
+type durableRunSourceResponse struct {
+	Message            string `json:"message"`
+	SourceRunRequestID string `json:"source_run_request_id"`
+	State              string `json:"state"`
+	Created            bool   `json:"created"`
 }
 
 type discoverFeedsRequest struct {
@@ -268,8 +294,11 @@ func ListContentSources(c *gin.Context) {
 	}
 
 	data := make([]contentSourceResponse, 0, len(sources))
+	activeRuns := loadActiveSourceRuns(db, principal.TenantID, sources)
 	for _, source := range sources {
-		data = append(data, mapContentSourceResponse(source))
+		response := mapContentSourceResponse(db, source)
+		response.ActiveRun = activeRuns[source.PublicID]
+		data = append(data, response)
 	}
 
 	c.JSON(http.StatusOK, adminSourceListResponse{
@@ -608,7 +637,9 @@ func GetContentSource(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, mapContentSourceResponse(source))
+	response := mapContentSourceResponse(db, source)
+	response.ActiveRun = loadActiveSourceRuns(db, principal.TenantID, []models.ContentSource{source})[source.PublicID]
+	c.JSON(http.StatusOK, response)
 }
 
 // CreateContentSource handles POST /admin/sources
@@ -643,6 +674,13 @@ func CreateContentSource(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
 			Message: "Type is required",
 			Code:    "TYPE_REQUIRED",
+		})
+		return
+	}
+	if !validMediaAcquisitionOverride(req.MediaAcquisitionMode) {
+		c.JSON(http.StatusBadRequest, authErrorResponse{
+			Message: "media_acquisition_mode must be inherit, automatic, or manual",
+			Code:    "INVALID_MEDIA_ACQUISITION_MODE",
 		})
 		return
 	}
@@ -695,6 +733,7 @@ func CreateContentSource(c *gin.Context) {
 		FeedURL:              req.FeedURL,
 		ImageURL:             sourceImageURL(req.ImageURL, req.FeedURL),
 		APIConfig:            apiConfig,
+		MediaAcquisitionMode: parseMediaAcquisitionOverride(req.MediaAcquisitionMode),
 		IsActive:             isActive,
 		FetchIntervalMinutes: fetchInterval,
 		Metadata:             metadata,
@@ -708,7 +747,7 @@ func CreateContentSource(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, mapContentSourceResponse(source))
+	c.JSON(http.StatusCreated, mapContentSourceResponse(db, source))
 }
 
 // BulkCreateContentSources handles POST /admin/sources/bulk
@@ -748,6 +787,14 @@ func BulkCreateContentSources(c *gin.Context) {
 				Index:   index,
 				Name:    name,
 				Message: "Type is required",
+			})
+			continue
+		}
+		if !validMediaAcquisitionOverride(sourceReq.MediaAcquisitionMode) {
+			failed = append(failed, bulkCreateFailure{
+				Index:   index,
+				Name:    name,
+				Message: "media_acquisition_mode must be inherit, automatic, or manual",
 			})
 			continue
 		}
@@ -804,6 +851,7 @@ func BulkCreateContentSources(c *gin.Context) {
 			FeedURL:              sourceReq.FeedURL,
 			ImageURL:             sourceImageURL(sourceReq.ImageURL, sourceReq.FeedURL),
 			APIConfig:            apiConfig,
+			MediaAcquisitionMode: parseMediaAcquisitionOverride(sourceReq.MediaAcquisitionMode),
 			IsActive:             isActive,
 			FetchIntervalMinutes: fetchInterval,
 			Metadata:             metadata,
@@ -818,7 +866,7 @@ func BulkCreateContentSources(c *gin.Context) {
 			continue
 		}
 
-		created = append(created, mapContentSourceResponse(source))
+		created = append(created, mapContentSourceResponse(db, source))
 	}
 
 	c.JSON(http.StatusOK, bulkCreateContentSourcesResponse{
@@ -911,6 +959,14 @@ func UpdateContentSource(c *gin.Context) {
 		}
 		source.APIConfig = apiConfig
 	}
+	if req.MediaAcquisitionMode != nil {
+		mode := strings.ToLower(strings.TrimSpace(*req.MediaAcquisitionMode))
+		if mode != "" && mode != "inherit" && mode != models.MediaAcquisitionAutomatic && mode != models.MediaAcquisitionManual {
+			c.JSON(http.StatusBadRequest, authErrorResponse{Message: "media_acquisition_mode must be inherit, automatic, or manual", Code: "INVALID_MEDIA_ACQUISITION_MODE"})
+			return
+		}
+		source.MediaAcquisitionMode = parseMediaAcquisitionOverride(req.MediaAcquisitionMode)
+	}
 
 	if req.Metadata != nil {
 		metadata, err := mapToJSON(req.Metadata)
@@ -943,15 +999,24 @@ func UpdateContentSource(c *gin.Context) {
 	// schedule consumed by the CMS source-run admission loop.
 	source.EnsureInitialSchedule(time.Now())
 
-	if err := db.Save(&source).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&source).Error; err != nil {
+			return err
+		}
+		if req.MediaAcquisitionMode == nil {
+			return nil
+		}
+		resolved := contentstage.ResolveMediaAcquisitionMode(tx, models.ContentItem{TenantID: source.TenantID, ContentSourceID: &source.PublicID})
+		return contentstage.ReconcileSourceAcquisitionPolicy(tx, source, resolved)
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to update source",
+			Message: "Failed to update source and reconcile media acquisition work",
 			Code:    "UPDATE_FAILED",
 		})
 		return
 	}
 
-	c.JSON(http.StatusOK, mapContentSourceResponse(source))
+	c.JSON(http.StatusOK, mapContentSourceResponse(db, source))
 }
 
 // DeleteContentSource handles DELETE /admin/sources/:id
@@ -1019,65 +1084,33 @@ func RunContentSource(c *gin.Context) {
 		return
 	}
 
-	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
-	if aggregationBaseURL == "" {
-		c.JSON(http.StatusServiceUnavailable, authErrorResponse{
-			Message: "Aggregation service URL is not configured",
-			Code:    "AGGREGATION_NOT_CONFIGURED",
-		})
-		return
-	}
-
-	sourceURL, err := extractSourceRunURL(source)
-	if err != nil {
+	if _, err := extractSourceRunURL(source); err != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{
 			Message: err.Error(),
 			Code:    "SOURCE_URL_REQUIRED",
 		})
 		return
 	}
+	if !source.IsActive {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Source is inactive", Code: "SOURCE_INACTIVE"})
+		return
+	}
 
-	settings, _ := parseSourceAPIConfig(source.APIConfig)
-	lineageRequest, err := createSourceRunRequest(db, source, "manual", principal.UserID, nil)
+	request, created, err := createDurableSourceRun(db, source, "manual", principal.UserID, nil, time.Now().UTC())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create source-run request", Code: "SOURCE_RUN_REQUEST_FAILED"})
-		return
-	}
-	triggerReq := aggregationTriggerRequest{
-		SourceType:         string(source.Type),
-		URL:                sourceURL,
-		Name:               source.Name,
-		Settings:           settings,
-		SourceID:           source.PublicID.String(),
-		SourceRunRequestID: lineageRequest.PublicID.String(),
-		TenantID:           source.TenantID,
-	}
-
-	triggerRes, err := triggerAggregationSourceRun(
-		aggregationBaseURL,
-		c.GetHeader("Authorization"),
-		triggerReq,
-	)
-	if err != nil {
-		markSourceRunDispatchFailed(db, lineageRequest.PublicID, err)
-		c.JSON(http.StatusBadGateway, authErrorResponse{
-			Message: "Failed to trigger aggregation run: " + err.Error(),
-			Code:    "AGGREGATION_TRIGGER_FAILED",
-		})
-		return
-	}
-	if err := markSourceRunAccepted(db, lineageRequest.PublicID, triggerRes.JobID); err != nil {
-		c.JSON(http.StatusBadGateway, authErrorResponse{Message: "Aggregation accepted the run but CMS could not record it", Code: "SOURCE_RUN_ACCEPTANCE_FAILED"})
+		if errors.Is(err, ErrSourceRunAlreadyActive) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "A source run is already active for this source", Code: "SOURCE_RUN_ALREADY_ACTIVE"})
+			return
+		}
+		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Failed to admit durable source-run request: " + err.Error(), Code: "SOURCE_RUN_ADMISSION_FAILED"})
 		return
 	}
 
-	now := time.Now().UTC()
-	source.LastFetchedAt = &now
-	_ = db.Save(&source).Error
-
-	c.JSON(http.StatusOK, runSourceResponse{
-		Message: triggerRes.Message,
-		JobID:   triggerRes.JobID,
+	c.JSON(http.StatusAccepted, durableRunSourceResponse{
+		Message:            "Source run admitted and waiting for Aggregation dispatch",
+		SourceRunRequestID: request.PublicID.String(),
+		State:              request.State,
+		Created:            created,
 	})
 }
 
@@ -1321,28 +1354,82 @@ func ResolveYoutube(c *gin.Context) {
 	})
 }
 
-func mapContentSourceResponse(source models.ContentSource) contentSourceResponse {
-	var lastFetched *string
-	if source.LastFetchedAt != nil {
-		formatted := source.LastFetchedAt.UTC().Format(time.RFC3339)
-		lastFetched = &formatted
+func parseMediaAcquisitionOverride(value *string) *string {
+	if value == nil {
+		return nil
 	}
+	mode := strings.ToLower(strings.TrimSpace(*value))
+	if mode == "" || mode == "inherit" {
+		return nil
+	}
+	return &mode
+}
 
-	return contentSourceResponse{
-		ID:                   source.PublicID.String(),
-		Name:                 source.Name,
-		Type:                 string(source.Type),
-		Category:             source.Category,
-		FeedURL:              source.FeedURL,
-		ImageURL:             source.ImageURL,
-		APIConfig:            json.RawMessage(source.APIConfig),
-		IsActive:             source.IsActive,
-		FetchIntervalMinutes: source.FetchIntervalMinutes,
-		LastFetchedAt:        lastFetched,
-		Metadata:             json.RawMessage(source.Metadata),
-		CreatedAt:            source.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:            source.UpdatedAt.UTC().Format(time.RFC3339),
+func validMediaAcquisitionOverride(value *string) bool {
+	if value == nil {
+		return true
 	}
+	mode := strings.ToLower(strings.TrimSpace(*value))
+	return mode == "" || mode == "inherit" || mode == models.MediaAcquisitionAutomatic || mode == models.MediaAcquisitionManual
+}
+
+func mapContentSourceResponse(db *gorm.DB, source models.ContentSource) contentSourceResponse {
+	resolved := contentstage.ResolveMediaAcquisitionMode(db, models.ContentItem{TenantID: source.TenantID, ContentSourceID: &source.PublicID})
+	return contentSourceResponse{
+		ID:                           source.PublicID.String(),
+		Name:                         source.Name,
+		Type:                         string(source.Type),
+		Category:                     source.Category,
+		FeedURL:                      source.FeedURL,
+		ImageURL:                     source.ImageURL,
+		APIConfig:                    json.RawMessage(source.APIConfig),
+		MediaAcquisitionMode:         source.MediaAcquisitionMode,
+		ResolvedMediaAcquisitionMode: resolved,
+		IsActive:                     source.IsActive,
+		FetchIntervalMinutes:         source.FetchIntervalMinutes,
+		LastFetchedAt:                formatSourceTime(source.LastFetchedAt),
+		LastClaimedAt:                formatSourceTime(source.LastClaimedAt),
+		LastAttemptedAt:              formatSourceTime(source.LastAttemptedAt),
+		LastProviderSuccessAt:        formatSourceTime(source.LastProviderSuccessAt),
+		Metadata:                     json.RawMessage(source.Metadata),
+		CreatedAt:                    source.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:                    source.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func loadActiveSourceRuns(db *gorm.DB, tenantID string, sources []models.ContentSource) map[uuid.UUID]*sourceActiveRunResponse {
+	result := make(map[uuid.UUID]*sourceActiveRunResponse)
+	if db == nil || len(sources) == 0 {
+		return result
+	}
+	ids := make([]uuid.UUID, 0, len(sources))
+	for _, source := range sources {
+		ids = append(ids, source.PublicID)
+	}
+	var requests []models.SourceRunRequest
+	if err := db.Where("tenant_id = ? AND content_source_id IN (?) AND state IN (?)", tenantID, ids, models.SourceRunActiveStates).
+		Order("requested_at DESC").Find(&requests).Error; err != nil {
+		log.Printf("[CMS] active source-run projection failed for tenant %q: %v", tenantID, err)
+		return result
+	}
+	for _, request := range requests {
+		if _, exists := result[request.ContentSourceID]; exists {
+			continue
+		}
+		result[request.ContentSourceID] = &sourceActiveRunResponse{
+			ID: request.PublicID.String(), State: request.State, Purpose: request.Purpose,
+			RequestedAt: request.RequestedAt.UTC().Format(time.RFC3339), AcceptedAt: formatSourceTime(request.AcceptedAt),
+		}
+	}
+	return result
+}
+
+func formatSourceTime(value *time.Time) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := value.UTC().Format(time.RFC3339)
+	return &formatted
 }
 
 func mapToJSON(value map[string]interface{}) (datatypes.JSON, error) {

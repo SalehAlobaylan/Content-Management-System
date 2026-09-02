@@ -48,12 +48,14 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/content-stages/media/claim", controllers.InternalClaimMediaContentStage)
 	route(http.MethodPost, "/content-stages/:id/begin", controllers.InternalBeginContentStage)
 	route(http.MethodPost, "/content-stages/:id/heartbeat", controllers.InternalHeartbeatContentStage)
+	route(http.MethodPost, "/content-stages/:id/checkpoint", controllers.InternalCheckpointContentStage)
 	route(http.MethodPost, "/content-stages/:id/accepted", controllers.InternalAcceptContentStage)
 	route(http.MethodPost, "/content-stages/:id/deferred", controllers.InternalDeferContentStage)
 	route(http.MethodPost, "/content-stages/:id/uncertain", controllers.InternalUncertainContentStage)
 	route(http.MethodPost, "/content-stages/:id/failed", controllers.InternalFailContentStage)
 	route(http.MethodPost, "/content-stages/:id/atomization-not-required", controllers.InternalSettleAtomizationNotRequired)
 	route(http.MethodGet, "/content-stages/items/:id/trace", controllers.InternalGetContentStageTrace)
+	route(http.MethodPut, "/pipeline-lanes/:lane/snapshot", controllers.InternalPutPipelineLaneSnapshot)
 	route(http.MethodPost, "/atomization-work/claim", controllers.InternalClaimAtomizationWork)
 	route(http.MethodPost, "/atomization-work/:id/begin", controllers.InternalBeginAtomizationWork)
 	route(http.MethodPost, "/atomization-work/:id/heartbeat", controllers.InternalHeartbeatAtomizationWork)
@@ -101,6 +103,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPatch, "/content-items/:id/status", controllers.InternalUpdateContentStatus)
 	route(http.MethodPatch, "/content-items/:id/artifacts", controllers.InternalUpdateContentArtifacts)
 	route(http.MethodPatch, "/content-items/:id/embedding", controllers.InternalUpdateContentEmbedding)
+	route(http.MethodPatch, "/content-items/:id/topic-tags", controllers.InternalUpdateContentTopicTags)
 	route(http.MethodPatch, "/content-items/:id/image-embedding", controllers.InternalUpdateContentImageEmbedding)
 	route(http.MethodPatch, "/content-items/:id/transcript", controllers.InternalLinkTranscript)
 	route(http.MethodPost, "/content-items/:id/atomization/plan", controllers.InternalSaveAtomizationPlan)
@@ -136,6 +139,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/content-items/knn-sparse", controllers.InternalKNNSparse)
 	route(http.MethodPost, "/content-items/batch-text", controllers.InternalBatchText)
 	route(http.MethodGet, "/content-items/missing-embedding", controllers.InternalListMissingEmbedding)
+	route(http.MethodPost, "/content-items/reconcile-artifact-complete", controllers.InternalReconcileArtifactCompleteStatuses)
 	route(http.MethodPost, "/transcripts", controllers.InternalCreateTranscript)
 	route(http.MethodPost, "/ai-spend/events", controllers.InternalIngestAISpendEvents)
 	route(http.MethodGet, "/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
@@ -159,7 +163,14 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/media-rendition-generations", controllers.InternalCreateMediaRenditionGeneration)
 	route(http.MethodGet, "/media-rendition-generations/:id", controllers.InternalGetMediaRenditionGeneration)
 	for _, state := range []string{"running", "verifying", "failed", "uncertain"} {
-		route(http.MethodPost, "/media-rendition-generations/:id/"+state, controllers.InternalTransitionMediaRenditionGeneration)
+		transitionState := state
+		route(http.MethodPost, "/media-rendition-generations/:id/"+transitionState, func(c *gin.Context) {
+			// These are deliberately separate literal routes so capability policy
+			// remains exact. Pass the literal state explicitly because Gin only
+			// populates c.Param for named route segments.
+			c.Set("media_rendition_generation_state", transitionState)
+			controllers.InternalTransitionMediaRenditionGeneration(c)
+		})
 	}
 	route(http.MethodPost, "/media-rendition-generations/:id/activate", controllers.InternalActivateMediaRenditionGeneration)
 	route(http.MethodPost, "/media-hls-packages", controllers.InternalCreateMediaHLSPackage)

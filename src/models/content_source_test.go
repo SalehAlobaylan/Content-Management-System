@@ -20,13 +20,14 @@ func TestContentSourceEnsureInitialSchedule(t *testing.T) {
 		t.Fatalf("existing schedule was changed: %v", preserved.NextDueAt)
 	}
 
-	for name, source := range map[string]ContentSource{
-		"inactive media": {Category: SourceCategoryMedia, IsActive: false},
-		"news":           {Category: SourceCategoryNews, IsActive: true},
-	} {
-		source.EnsureInitialSchedule(now)
-		if source.NextDueAt != nil {
-			t.Fatalf("%s unexpectedly scheduled at %v", name, source.NextDueAt)
-		}
+	inactive := ContentSource{Category: SourceCategoryMedia, IsActive: false}
+	inactive.EnsureInitialSchedule(now)
+	if inactive.NextDueAt != nil {
+		t.Fatalf("inactive source unexpectedly scheduled at %v", inactive.NextDueAt)
+	}
+	news := ContentSource{Category: SourceCategoryNews, IsActive: true}
+	news.EnsureInitialSchedule(now)
+	if news.NextDueAt == nil || !news.NextDueAt.Equal(now.UTC()) {
+		t.Fatalf("active news source was not scheduled at %v", news.NextDueAt)
 	}
 }

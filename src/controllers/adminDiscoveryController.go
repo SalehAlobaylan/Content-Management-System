@@ -469,8 +469,8 @@ func ApproveSuggestion(c *gin.Context) {
 	writeDiscoveryAudit(db, principal, "discovery.approve", suggestion.PublicID.String(), "success", "")
 	// Kick off the first ingestion so the new source starts producing items
 	// immediately (best-effort — approval already succeeded regardless).
-	triggerSourceFirstFetch(db, c.GetHeader("Authorization"), source, "approval_handoff", principal.UserID, &suggestion.PublicID)
-	c.JSON(http.StatusOK, mapContentSourceResponse(*source))
+	triggerSourceFirstFetch(db, source, "approval_handoff", principal.UserID, &suggestion.PublicID)
+	c.JSON(http.StatusOK, mapContentSourceResponse(db, *source))
 }
 
 // RejectSuggestion handles POST /admin/discovery/suggestions/:id/reject
@@ -651,7 +651,7 @@ func ListNewsSources(c *gin.Context) {
 
 	data := make([]newsSourceResponse, 0, len(sources))
 	for _, s := range sources {
-		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(s)}
+		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(db, s)}
 		if s.DiscoveryProfileID != nil {
 			if pub, exists := profileIDs[*s.DiscoveryProfileID]; exists {
 				row.DiscoveryProfileID = &pub
@@ -1256,7 +1256,7 @@ func mapContentSourcesToDiscoveryResponses(db *gorm.DB, tenantID string, sources
 	profileIDs := loadProfilePublicIDs(db, tenantID)
 	data := make([]newsSourceResponse, 0, len(sources))
 	for _, s := range sources {
-		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(s)}
+		row := newsSourceResponse{contentSourceResponse: mapContentSourceResponse(db, s)}
 		if s.DiscoveryProfileID != nil {
 			if pub, exists := profileIDs[*s.DiscoveryProfileID]; exists {
 				row.DiscoveryProfileID = &pub
@@ -1819,37 +1819,11 @@ func defaultMediaAtomizationPolicy() map[string]interface{} {
 
 // triggerSourceFirstFetch best-effort kicks off the first ingestion for a
 // newly-approved source so it starts producing items without a manual run.
-func triggerSourceFirstFetch(db *gorm.DB, authHeader string, source *models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID) {
+func triggerSourceFirstFetch(db *gorm.DB, source *models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID) {
 	if source == nil {
 		return
 	}
-	aggregationBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
-	if aggregationBaseURL == "" {
-		return
-	}
-	sourceURL, err := extractSourceRunURL(*source)
-	if err != nil {
-		return
-	}
-	settings, _ := parseSourceAPIConfig(source.APIConfig)
-	lineageRequest, err := createSourceRunRequest(db, *source, requestedBy, actorID, suggestionID)
-	if err != nil {
-		return
-	}
-	response, err := triggerAggregationSourceRun(aggregationBaseURL, authHeader, aggregationTriggerRequest{
-		SourceType:         string(source.Type),
-		URL:                sourceURL,
-		Name:               source.Name,
-		Settings:           settings,
-		SourceID:           source.PublicID.String(),
-		SourceRunRequestID: lineageRequest.PublicID.String(),
-		TenantID:           source.TenantID,
-	})
-	if err != nil {
-		markSourceRunDispatchFailed(db, lineageRequest.PublicID, err)
-		return
-	}
-	_ = markSourceRunAccepted(db, lineageRequest.PublicID, response.JobID)
+	_, _, _ = createDurableSourceRun(db, *source, requestedBy, actorID, suggestionID, time.Now().UTC())
 }
 
 func triggerAggregationDiscoveryRun(aggregationBaseURL, authorizationHeader string, payload aggregationDiscoveryRequest) (aggregationTriggerResponse, error) {

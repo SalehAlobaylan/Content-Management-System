@@ -310,7 +310,8 @@ func TestMediaCirculationFabricIncludesBoundedSourceContinuityEvidence(t *testin
 	if err := db.Create(&request).Error; err != nil {
 		t.Fatal(err)
 	}
-	task := models.SourceRunVerificationTask{TenantID: "tenant-a", TaskKey: "delivery", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", EvidenceBoundary: "pods", CausationID: "consumer_pods_delivery:test", VerifierName: "cms", VerifierSchemaVersion: "v1", State: models.SourceRunVerificationTaskTerminal, TerminalVerdict: string(supply.VerdictPresent)}
+	terminalVerdict := string(supply.VerdictPresent)
+	task := models.SourceRunVerificationTask{TenantID: "tenant-a", TaskKey: "delivery", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", EvidenceBoundary: "pods", CausationID: "consumer_pods_delivery:test", VerifierName: "cms", VerifierSchemaVersion: "v1", State: models.SourceRunVerificationTaskTerminal, TerminalVerdict: &terminalVerdict}
 	if err := db.Create(&task).Error; err != nil {
 		t.Fatal(err)
 	}

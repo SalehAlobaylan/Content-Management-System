@@ -93,12 +93,12 @@ const (
 	velocityHalf        = 0.5
 
 	// Refresh discipline (grilling Q9 — three triggers, bounded batches).
-	refreshTTL                = 24 * time.Hour
-	refreshBatchSize          = 200
-	refreshImpressionDelta    = 20 // event-nudge: impressions moved this much since compute
-	refreshEngagementDelta    = 5  // event-nudge: like+share+comment moved this much
-	refreshLoopInterval       = 10 * time.Minute
-	demotionHalfLifeDays      = 14 // rank_down decay half-life (slice 4 consumes this)
+	refreshTTL             = 24 * time.Hour
+	refreshBatchSize       = 200
+	refreshImpressionDelta = 20 // event-nudge: impressions moved this much since compute
+	refreshEngagementDelta = 5  // event-nudge: like+share+comment moved this much
+	refreshLoopInterval    = 10 * time.Minute
+	demotionHalfLifeDays   = 14 // rank_down decay half-life (slice 4 consumes this)
 )
 
 // Storage-eligibility thresholds (grilling Q3): storage may treat an item as

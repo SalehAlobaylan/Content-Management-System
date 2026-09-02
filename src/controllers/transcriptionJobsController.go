@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"crypto/sha256"
@@ -344,6 +345,38 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 		triggerSource = models.TranscriptionTriggerManual
 	}
 	if item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "" {
+		// YouTube/RSS ingest intentionally stores the provider URL first and lets
+		// Aggregation produce a manifest-owned media URL. A manual STT action must
+		// join and prioritize that durable chain instead of writing a terminal
+		// skipped job that can never observe the later artifact.
+		if triggerSource == models.TranscriptionTriggerManual && item.OriginalURL != nil && strings.TrimSpace(*item.OriginalURL) != "" {
+			if contentstage.MediaAcquisitionRequiresApproval(db, item.TenantID, item.PublicID, item.ProcessingGeneration) {
+				job := createSkippedTranscriptionJob(db, item, triggerSource, "media acquisition requires approval before transcription")
+				return job, false, job.SkipReason, sttSkipGuard, nil
+			}
+			if !force {
+				if admit, reason := evaluateSTTAdmission(db, item, triggerSource); !admit {
+					job := createSkippedTranscriptionJob(db, item, triggerSource, reason)
+					return job, false, job.SkipReason, sttSkipGuard, nil
+				}
+			}
+			if err := contentstage.ExpediteManualTranscript(db, item.TenantID, item.PublicID, item.ProcessingGeneration); err != nil {
+				return models.TranscriptionJob{}, false, "", sttSkipNone, err
+			}
+			job, err := createAcceptedTranscriptionJob(db, item, triggerSource)
+			if err != nil {
+				if errors.Is(err, errTranscriptionBudgetCapReached) {
+					job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
+					return job, false, job.SkipReason, sttSkipBudget, nil
+				}
+				if errors.Is(err, errTranscriptionJobInFlight) {
+					job := createSkippedTranscriptionJob(db, item, triggerSource, errTranscriptionJobInFlight.Error())
+					return job, false, job.SkipReason, sttSkipGuard, nil
+				}
+				return job, false, "", sttSkipNone, err
+			}
+			return job, true, "Waiting for durable media artifacts", sttSkipNone, nil
+		}
 		job := createSkippedTranscriptionJob(db, item, triggerSource, "no media_url available")
 		return job, false, job.SkipReason, sttSkipGuard, nil
 	}
@@ -722,7 +755,8 @@ func CreateTranscriptionJob(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create transcription job", Code: "CREATE_FAILED"})
 		return
 	}
-	if triggered {
+	mediaReady := item.MediaURL != nil && strings.TrimSpace(*item.MediaURL) != ""
+	if triggered && mediaReady {
 		itemCopy := item
 		jobID := job.PublicID.String()
 		go func() {
@@ -733,9 +767,13 @@ func CreateTranscriptionJob(c *gin.Context) {
 			}
 		}()
 	}
+	message := "Transcription job accepted"
+	if !triggered {
+		message = "Transcription request skipped"
+	}
 	c.JSON(http.StatusAccepted, utils.ResponseMessage{
 		Code:    http.StatusAccepted,
-		Message: "Transcription job accepted",
+		Message: message,
 		Data: gin.H{
 			"job":       mapTranscriptionJob(job),
 			"triggered": triggered,

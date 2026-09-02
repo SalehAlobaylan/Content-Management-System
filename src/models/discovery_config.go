@@ -12,8 +12,8 @@ type DiscoveryConfig struct {
 	TenantID string `gorm:"type:varchar(64);not null;uniqueIndex:idx_discovery_config_tenant" json:"tenant_id"`
 
 	// Scheduling
-	AutomationEnabled bool `gorm:"default:false" json:"automation_enabled"`
-	SweepIntervalHours int `gorm:"type:integer;default:24" json:"sweep_interval_hours"`
+	AutomationEnabled  bool `gorm:"default:false" json:"automation_enabled"`
+	SweepIntervalHours int  `gorm:"type:integer;default:24" json:"sweep_interval_hours"`
 
 	// Scoring / filtering knobs (replace the hardcoded consts)
 	MinConfidence float64 `gorm:"type:double precision;default:0.15" json:"min_confidence"`
@@ -28,25 +28,25 @@ type DiscoveryConfig struct {
 
 	// Source Intelligence Graph (Slice 4) — self-maintaining candidate graph that
 	// auto-promotes high-scoring on-topic sources into the review queue.
-	IntelligenceEnabled       bool `gorm:"default:false" json:"intelligence_enabled"`
-	TelegramDiscoveryEnabled  bool `gorm:"default:false" json:"telegram_discovery_enabled"`
-	TwitterDiscoveryEnabled   bool `gorm:"default:false" json:"twitter_discovery_enabled"`
+	IntelligenceEnabled      bool `gorm:"default:false" json:"intelligence_enabled"`
+	TelegramDiscoveryEnabled bool `gorm:"default:false" json:"telegram_discovery_enabled"`
+	TwitterDiscoveryEnabled  bool `gorm:"default:false" json:"twitter_discovery_enabled"`
 	// X "who to follow" / قد يعجبك relatedness discovery (guest-accessible REST).
-	TwitterRecommendEnabled   bool `gorm:"default:false" json:"twitter_recommend_enabled"`
+	TwitterRecommendEnabled bool `gorm:"default:false" json:"twitter_recommend_enabled"`
 	// Media (Pods) discovery contributors — YouTube via InnerTube, podcasts via
 	// RSS/iTunes. The *_related flags gate the scraped owner-curated relation
 	// shelves (YT featured / Apple "Listeners Also Subscribed"), enabled only
 	// after a live probe confirms the endpoint shape.
-	YouTubeDiscoveryEnabled   bool `gorm:"default:false" json:"youtube_discovery_enabled"`
-	PodcastDiscoveryEnabled   bool `gorm:"default:false" json:"podcast_discovery_enabled"`
-	YouTubeRelatedEnabled     bool `gorm:"default:false" json:"youtube_related_enabled"`
-	AppleRelatedEnabled       bool `gorm:"default:false" json:"apple_related_enabled"`
+	YouTubeDiscoveryEnabled bool `gorm:"column:youtube_discovery_enabled;default:false" json:"youtube_discovery_enabled"`
+	PodcastDiscoveryEnabled bool `gorm:"default:false" json:"podcast_discovery_enabled"`
+	YouTubeRelatedEnabled   bool `gorm:"column:youtube_related_enabled;default:false" json:"youtube_related_enabled"`
+	AppleRelatedEnabled     bool `gorm:"default:false" json:"apple_related_enabled"`
 	// Storage guard: how many of the most-recent episodes/videos to pull when a
 	// media source is approved. Caps `max_results` on the new source so a podcast
 	// with a deep back-catalog doesn't flood ingestion/S3 on first fetch; ongoing
 	// fetches still pick up new items. 0 = no cap (pull everything — discouraged).
-	MediaInitialMaxEpisodes   int  `gorm:"type:integer;default:5" json:"media_initial_max_episodes"`
-	GraphBuildIntervalHours   int  `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
+	MediaInitialMaxEpisodes int     `gorm:"type:integer;default:5" json:"media_initial_max_episodes"`
+	GraphBuildIntervalHours int     `gorm:"type:integer;default:24" json:"graph_build_interval_hours"`
 	PromotionThreshold      float64 `gorm:"type:double precision;default:0.30" json:"promotion_threshold"`
 	// Composite-score signal weights (sum ≈ 1.0).
 	WeightCitation   float64 `gorm:"type:double precision;default:0.20" json:"weight_citation"`
@@ -68,16 +68,16 @@ func (DiscoveryConfig) TableName() string {
 // DefaultDiscoveryConfig returns the default tuning for a tenant.
 func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 	return DiscoveryConfig{
-		TenantID:                tenantID,
-		AutomationEnabled:       false,
-		SweepIntervalHours:      24,
-		MinConfidence:           0.15,
-		MinRelevance:            0.10,
-		DupThreshold:            0.92,
-		DupPenalty:              0.50,
-		RecencyWindowDays:       30,
-		MaxCandidatesPerProfile: 15,
-		SearchProvider:          "auto",
+		TenantID:                 tenantID,
+		AutomationEnabled:        false,
+		SweepIntervalHours:       24,
+		MinConfidence:            0.15,
+		MinRelevance:             0.10,
+		DupThreshold:             0.92,
+		DupPenalty:               0.50,
+		RecencyWindowDays:        30,
+		MaxCandidatesPerProfile:  15,
+		SearchProvider:           "auto",
 		IntelligenceEnabled:      false,
 		TelegramDiscoveryEnabled: false,
 		TwitterDiscoveryEnabled:  false,
@@ -89,11 +89,11 @@ func DefaultDiscoveryConfig(tenantID string) DiscoveryConfig {
 		MediaInitialMaxEpisodes:  5,
 		GraphBuildIntervalHours:  24,
 		PromotionThreshold:       0.30,
-		WeightCitation:          0.20,
-		WeightCocitation:        0.20,
-		WeightAuthority:         0.20,
-		WeightRelevance:         0.25,
-		WeightHealth:            0.10,
-		WeightNovelty:           0.05,
+		WeightCitation:           0.20,
+		WeightCocitation:         0.20,
+		WeightAuthority:          0.20,
+		WeightRelevance:          0.25,
+		WeightHealth:             0.10,
+		WeightNovelty:            0.05,
 	}
 }

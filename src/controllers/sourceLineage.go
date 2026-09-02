@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -14,11 +15,14 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
-	lineageStageSourceRun = "source_run"
-	lineageStageIngest    = "content_ingest"
+	lineageStageSourceRun   = "source_run"
+	lineageStageIngest      = "content_ingest"
+	legacySourceRunDeadline = 2 * time.Hour
+	legacySourceRunExpiry   = 3 * time.Hour
 )
 
 type SourceRunCorrelation struct {
@@ -26,6 +30,8 @@ type SourceRunCorrelation struct {
 	OperatorStepID *uuid.UUID
 	IdempotencyKey string
 }
+
+var ErrSourceRunAlreadyActive = errors.New("source already has an active source-run request")
 
 func createSourceRunRequest(db *gorm.DB, source models.ContentSource, requestedBy, actorID string, suggestionID *uuid.UUID) (models.SourceRunRequest, error) {
 	return createSourceRunRequestWithCorrelation(db, source, requestedBy, actorID, suggestionID, SourceRunCorrelation{})
@@ -40,6 +46,26 @@ func createSourceRunRequestWithCorrelation(db *gorm.DB, source models.ContentSou
 		return models.SourceRunRequest{}, err
 	}
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// Manual and approval-triggered runs use the same source-level
+		// concurrency fence as scheduled circulation. The migration-backed
+		// partial unique index is the durable backstop, but this lock/query is
+		// required while compatibility mode is still active and also gives the
+		// caller a useful error instead of a late duplicate request.
+		var lockedSource models.ContentSource
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND public_id = ?", source.TenantID, source.PublicID).
+			First(&lockedSource).Error; err != nil {
+			return err
+		}
+		var active int64
+		if err := tx.Model(&models.SourceRunRequest{}).
+			Where("tenant_id = ? AND content_source_id = ? AND state IN ?", source.TenantID, source.PublicID, models.SourceRunActiveStates).
+			Count(&active).Error; err != nil {
+			return err
+		}
+		if active > 0 {
+			return ErrSourceRunAlreadyActive
+		}
 		if err := tx.Create(&request).Error; err != nil {
 			return err
 		}
@@ -58,11 +84,15 @@ func newLegacySourceRunRequest(source models.ContentSource, requestedBy, actorID
 	if idempotencyKey == "" {
 		idempotencyKey = "source-run:" + correlation
 	}
+	now := time.Now().UTC()
+	deadline := now.Add(legacySourceRunDeadline)
+	expires := now.Add(legacySourceRunExpiry)
 	return models.SourceRunRequest{
 		TenantID: source.TenantID, ContentSourceID: source.PublicID, SourceSuggestionID: suggestionID,
 		RequestedBy: requestedBy, RequestedByActorID: strings.TrimSpace(actorID), State: models.SourceRunRequested,
 		OperatorPlanID: correlationInput.OperatorPlanID, OperatorStepID: correlationInput.OperatorStepID,
-		CorrelationID: correlation, IdempotencyKey: idempotencyKey, RequestedAt: time.Now().UTC(), Metadata: datatypes.JSON([]byte(`{}`)),
+		CorrelationID: correlation, IdempotencyKey: idempotencyKey, RequestedAt: now,
+		DeadlineAt: &deadline, ExpiresAt: &expires, Metadata: datatypes.JSON([]byte(`{}`)),
 	}, nil
 }
 

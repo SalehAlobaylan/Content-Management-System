@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
@@ -20,13 +21,21 @@ import (
 )
 
 const (
-	ProtocolVersion    = "content-stage/v1"
-	leaseDuration      = 45 * time.Second
-	verificationWindow = 10 * time.Minute
-	maxEffectAttempts  = 2
-	textElapsedBudget  = 30 * time.Minute
-	mediaElapsedBudget = 60 * time.Minute
+	ProtocolVersion      = "content-stage/v1"
+	defaultLeaseDuration = 45 * time.Second
+	mediaLeaseDuration   = 5 * time.Minute
+	verificationWindow   = 10 * time.Minute
+	maxEffectAttempts    = 2
+	textElapsedBudget    = 30 * time.Minute
+	mediaElapsedBudget   = 60 * time.Minute
 )
+
+func leaseDurationForStage(stage string) time.Duration {
+	if stage == models.ContentStagePodsMediaArtifacts {
+		return mediaLeaseDuration
+	}
+	return defaultLeaseDuration
+}
 
 type Descriptor struct {
 	Lane          string
@@ -133,6 +142,11 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 	if tx == nil || item == nil || item.PublicID == uuid.Nil || strings.TrimSpace(item.TenantID) == "" {
 		return nil, fmt.Errorf("content stage manifest requires a persisted tenant-scoped item")
 	}
+	if !SchemaAvailable(tx) {
+		// Compatibility mode is intentional while the additive ledger migration
+		// is pending. The legacy pipeline remains responsible for this item.
+		return nil, nil
+	}
 	if item.ProcessingGeneration <= 0 {
 		item.ProcessingGeneration = 1
 	}
@@ -150,14 +164,20 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 	for _, d := range descriptors {
 		fingerprint := stageFingerprint(*item, d)
 		idem := digest("content-stage-request/v1", item.TenantID, item.PublicID.String(), fmt.Sprint(item.ProcessingGeneration), d.Stage, fingerprint)
-		deadline := item.CreatedAt.UTC().Add(textElapsedBudget)
+		deadline := time.Now().UTC().Add(textElapsedBudget)
 		if d.Stage == models.ContentStagePodsMediaArtifacts {
-			deadline = item.CreatedAt.UTC().Add(mediaElapsedBudget)
+			deadline = time.Now().UTC().Add(mediaElapsedBudget)
 		}
+		if isTrustedLongForm(*item) {
+			// Long-form work is resumable. Its deadline is an upper safety bound,
+			// not a rejection rule based on the historical item age or duration.
+			deadline = time.Now().UTC().Add(24 * time.Hour)
+		}
+		state := initialStageState(d, ResolveMediaAcquisitionMode(tx, *item))
 		request := models.ContentStageRequest{
 			PublicID: uuid.New(), TenantID: item.TenantID, ContentItemID: item.PublicID,
 			ProcessingGeneration: item.ProcessingGeneration, Lane: d.Lane, Stage: d.Stage,
-			Owner: d.Owner, BlockingScope: d.BlockingScope, State: models.ContentStageQueued,
+			Owner: d.Owner, BlockingScope: d.BlockingScope, State: state,
 			InputFingerprint: fingerprint, PolicyVersion: "v1", ModelRecipe: d.ModelRecipe,
 			IdempotencyKey: idem, DependencyManifest: jsonValue(d.Dependencies),
 			WorkloadEstimate: workloadEstimate(*item, d), DeadlineAt: &deadline,
@@ -173,7 +193,7 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 			if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND stage=?", item.TenantID, item.PublicID, item.ProcessingGeneration, d.Stage).First(&request).Error; err != nil {
 				return nil, err
 			}
-		} else if err := appendEvent(tx, request, nil, "queued", map[string]any{"lane": d.Lane, "stage": d.Stage, "input_fingerprint": fingerprint}); err != nil {
+		} else if err := appendEvent(tx, request, nil, state, map[string]any{"lane": d.Lane, "stage": d.Stage, "input_fingerprint": fingerprint}); err != nil {
 			return nil, err
 		}
 		requests = append(requests, request)
@@ -190,6 +210,9 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 func ReconcileManifest(tx *gorm.DB, item *models.ContentItem, previousDigest string) ([]models.ContentStageRequest, bool, error) {
 	if item == nil {
 		return nil, false, fmt.Errorf("content item is required")
+	}
+	if !SchemaAvailable(tx) {
+		return nil, false, nil
 	}
 	nextDigest := ItemInputDigest(*item)
 	changed := strings.TrimSpace(previousDigest) != "" && previousDigest != nextDigest
@@ -259,6 +282,9 @@ func ReconcileManifest(tx *gorm.DB, item *models.ContentItem, previousDigest str
 			return nil, false, err
 		}
 	}
+	if err := promoteReadyDependents(tx, *item); err != nil {
+		return nil, changed, err
+	}
 	if err := reduceReadiness(tx, item.TenantID, item.PublicID, item.ProcessingGeneration); err != nil {
 		return nil, changed, err
 	}
@@ -266,23 +292,103 @@ func ReconcileManifest(tx *gorm.DB, item *models.ContentItem, previousDigest str
 }
 
 type ManifestDisposition struct {
-	Disposition          string   `json:"disposition"`
-	ProcessingGeneration int64    `json:"processing_generation"`
-	RequiredStages       []string `json:"required_stages"`
-	ActiveStages         []string `json:"active_stages"`
+	Disposition                     string   `json:"disposition"`
+	ProcessingGeneration            int64    `json:"processing_generation"`
+	RequiredStages                  []string `json:"required_stages"`
+	ActiveStages                    []string `json:"active_stages"`
+	NextRequiredStages              []string `json:"next_required_stages,omitempty"`
+	LifecycleReconciliationRequired bool     `json:"lifecycle_reconciliation_required,omitempty"`
 }
 
 func SummarizeManifest(requests []models.ContentStageRequest, generation int64, disposition string) ManifestDisposition {
 	required, active := make([]string, 0), make([]string, 0)
+	nextRequired := make([]string, 0)
 	for _, request := range requests {
 		if request.BlockingScope != models.ContentStageBlockingOptional {
 			required = append(required, request.Stage)
+			if request.State != models.ContentStageVerified && request.State != models.ContentStageCancelled && request.State != models.ContentStageSuperseded {
+				nextRequired = append(nextRequired, request.Stage)
+			}
 		}
 		if request.State != models.ContentStageVerified && request.State != models.ContentStageCancelled && request.State != models.ContentStageSuperseded {
 			active = append(active, request.Stage)
 		}
 	}
-	return ManifestDisposition{Disposition: disposition, ProcessingGeneration: generation, RequiredStages: required, ActiveStages: active}
+	return ManifestDisposition{Disposition: disposition, ProcessingGeneration: generation, RequiredStages: required, ActiveStages: active, NextRequiredStages: nextRequired}
+}
+
+func SummarizeForItem(db *gorm.DB, item models.ContentItem, requests []models.ContentStageRequest, disposition string) ManifestDisposition {
+	if !SchemaAvailable(db) {
+		return CompatibilityDisposition(item, disposition)
+	}
+	result := SummarizeManifest(requests, item.ProcessingGeneration, disposition)
+	result.LifecycleReconciliationRequired = item.Status == models.ContentStatusReady && len(result.NextRequiredStages) > 0
+	if item.Status == models.ContentStatusFailed && len(result.NextRequiredStages) == 0 {
+		required := 0
+		for _, request := range requests {
+			if request.BlockingScope != models.ContentStageBlockingOptional {
+				required++
+			}
+		}
+		// A FAILED row with every required stage already verified is a
+		// lifecycle contradiction, not an invitation to re-run an expensive
+		// owner. The reconciliation worker can repair the status from this
+		// evidence without calling Enrichment or Media again.
+		result.LifecycleReconciliationRequired = required > 0
+	}
+	return result
+}
+
+// CompatibilityDisposition is the stage-aware bridge used before the durable
+// ledger migration exists. It reports the next missing owner work without
+// claiming that the compatibility response is a durable stage receipt.
+func CompatibilityDisposition(item models.ContentItem, disposition string) ManifestDisposition {
+	next := make([]string, 0, 3)
+	missingEmbedding := item.Embedding == nil || item.EmbeddingModel == nil || item.EmbeddingSpaceID == nil || item.EmbeddingProducerID == nil
+	if item.Type == models.ContentTypeNews {
+		if missingEmbedding {
+			next = append(next, models.ContentStageNewsTextEmbedding)
+		}
+		if item.StoryID == nil {
+			next = append(next, models.ContentStageNewsStoryClassification)
+		}
+	} else if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+		mediaReady := item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" && item.DurationSec != nil
+		if !mediaReady {
+			next = append(next, models.ContentStagePodsMediaArtifacts)
+		}
+		if missingEmbedding {
+			next = append(next, models.ContentStagePodsTextEmbedding)
+		}
+		if item.DurationSec != nil && *item.DurationSec > feedcontract.PodsHardMaxDuration && item.TranscriptID == nil {
+			next = append(next, models.ContentStagePodsTranscript)
+		}
+	}
+	artifactComplete := false
+	if item.Status == models.ContentStatusFailed {
+		if item.Type == models.ContentTypeNews {
+			artifactComplete = !missingEmbedding && item.StoryID != nil
+		} else if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+			artifactComplete = !missingEmbedding && item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" && item.DurationSec != nil && *item.DurationSec >= feedcontract.PodsMinDurationSec
+		}
+	}
+	return ManifestDisposition{
+		Disposition: disposition, ProcessingGeneration: maxGeneration(item.ProcessingGeneration),
+		RequiredStages: append([]string(nil), next...), ActiveStages: append([]string(nil), next...),
+		NextRequiredStages:              next,
+		LifecycleReconciliationRequired: (item.Status == models.ContentStatusReady && len(next) > 0) || artifactComplete,
+	}
+}
+
+func maxGeneration(value int64) int64 {
+	if value > 0 {
+		return value
+	}
+	return 1
+}
+
+func isTrustedLongForm(item models.ContentItem) bool {
+	return (item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) && item.DurationSec != nil && *item.DurationSec > feedcontract.PodsHardMaxDuration
 }
 
 func workloadEstimate(item models.ContentItem, d Descriptor) datatypes.JSON {
@@ -312,6 +418,9 @@ func appendEvent(tx *gorm.DB, request models.ContentStageRequest, attempt *model
 }
 
 func CutoverMode(db *gorm.DB, tenantID, lane string) (string, error) {
+	if !SchemaAvailable(db) {
+		return models.ContentStageCutoverLegacy, nil
+	}
 	var cutover models.ContentStageCutover
 	err := db.Where("tenant_id=? AND lane=?", tenantID, lane).First(&cutover).Error
 	if err == gorm.ErrRecordNotFound {
@@ -339,6 +448,9 @@ func DeliveryMode(db *gorm.DB, tenantID string, kind models.ContentType) (string
 }
 
 func executionAllowed(tx *gorm.DB, tenantID, lane, stage string) (bool, error) {
+	if !SchemaAvailable(tx) {
+		return false, nil
+	}
 	mode, err := CutoverMode(tx, tenantID, lane)
 	if err != nil || mode != models.ContentStageCutoverDurableRequired {
 		return false, err
@@ -361,6 +473,9 @@ func executionAllowed(tx *gorm.DB, tenantID, lane, stage string) (bool, error) {
 }
 
 func schedulingAllowed(tx *gorm.DB, tenantID, lane string) (bool, error) {
+	if !SchemaAvailable(tx) {
+		return false, nil
+	}
 	var control models.ContentStageControl
 	err := tx.Where("tenant_id=? AND lane=?", tenantID, lane).First(&control).Error
 	if err == gorm.ErrRecordNotFound {

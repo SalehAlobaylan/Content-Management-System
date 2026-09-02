@@ -3,10 +3,12 @@ package contentstage
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
+	"github.com/pgvector/pgvector-go"
 )
 
 func testItem(kind models.ContentType) models.ContentItem {
@@ -85,6 +87,41 @@ func TestPodsManifestSeparatesRequiredAndOptionalStages(t *testing.T) {
 	}
 }
 
+func TestMetadataFirstAdmissionStates(t *testing.T) {
+	media := descriptors[models.ContentStagePodsMediaArtifacts]
+	transcript := descriptors[models.ContentStagePodsTranscript]
+	if got := initialStageState(media, models.MediaAcquisitionManual); got != models.ContentStageAwaitingApproval {
+		t.Fatalf("manual media state = %s", got)
+	}
+	if got := initialStageState(media, models.MediaAcquisitionAutomatic); got != models.ContentStageQueued {
+		t.Fatalf("automatic media state = %s", got)
+	}
+	if got := initialStageState(transcript, models.MediaAcquisitionAutomatic); got != models.ContentStageBlocked {
+		t.Fatalf("dependent transcript state = %s", got)
+	}
+}
+
+func TestTranscriptAdmissionKeepsProviderCaptionsAutomatic(t *testing.T) {
+	if shouldAwaitGeneratedSTT(true, false, 0) {
+		t.Fatal("provider caption import must not wait for generated-STT approval")
+	}
+	if !shouldAwaitGeneratedSTT(false, false, 0) {
+		t.Fatal("caption-less generated STT must wait when auto STT is disabled")
+	}
+	if shouldAwaitGeneratedSTT(false, false, 100) {
+		t.Fatal("manual transcript priority must release generated STT")
+	}
+}
+
+func TestMediaLeaseIsWorkloadAware(t *testing.T) {
+	if got := leaseDurationForStage(models.ContentStagePodsMediaArtifacts); got != 5*time.Minute {
+		t.Fatalf("media lease = %s", got)
+	}
+	if got := leaseDurationForStage(models.ContentStagePodsTranscript); got != 45*time.Second {
+		t.Fatalf("short-stage lease = %s", got)
+	}
+}
+
 func TestManifestSummaryDoesNotTreatVerifiedAsActive(t *testing.T) {
 	requests := []models.ContentStageRequest{
 		{Stage: models.ContentStageNewsTextEmbedding, BlockingScope: models.ContentStageBlockingContentReady, State: models.ContentStageVerified},
@@ -97,5 +134,39 @@ func TestManifestSummaryDoesNotTreatVerifiedAsActive(t *testing.T) {
 	}
 	if len(summary.ActiveStages) != 2 {
 		t.Fatalf("active stages = %v", summary.ActiveStages)
+	}
+}
+
+func TestCompatibilityDispositionDefersArtifactCompleteFailure(t *testing.T) {
+	item := testItem(models.ContentTypeNews)
+	item.Status = models.ContentStatusFailed
+	model, space, producer := "qwen", "text-space", "enrichment"
+	item.EmbeddingModel, item.EmbeddingSpaceID, item.EmbeddingProducerID = &model, &space, &producer
+	embedding := pgvector.NewVector([]float32{1})
+	item.Embedding = &embedding
+	storyID := uuid.New()
+	item.StoryID = &storyID
+
+	summary := CompatibilityDisposition(item, "no_change")
+	if len(summary.NextRequiredStages) != 0 {
+		t.Fatalf("artifact-complete failure unexpectedly requested work: %v", summary.NextRequiredStages)
+	}
+	if !summary.LifecycleReconciliationRequired {
+		t.Fatal("artifact-complete failure must require lifecycle reconciliation")
+	}
+}
+
+func TestCompatibilityDispositionQueuesOnlyMissingMediaOwnerStages(t *testing.T) {
+	item := testItem(models.ContentTypePodcast)
+	item.Status = models.ContentStatusReady
+	playback, duration := "https://cdn.example.test/audio.m4a", 1800
+	item.PlaybackURL, item.DurationSec = &playback, &duration
+
+	summary := CompatibilityDisposition(item, "no_change")
+	if len(summary.NextRequiredStages) != 1 || summary.NextRequiredStages[0] != models.ContentStagePodsTextEmbedding {
+		t.Fatalf("expected only missing embedding stage, got %v", summary.NextRequiredStages)
+	}
+	if !summary.LifecycleReconciliationRequired {
+		t.Fatal("READY item with missing required work must request lifecycle reconciliation")
 	}
 }

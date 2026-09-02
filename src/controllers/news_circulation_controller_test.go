@@ -197,6 +197,19 @@ func TestSanitizeCirculationPolicyEnforcesCadenceGuardrails(t *testing.T) {
 	}
 }
 
+func TestSourceCompatibilityIntervalHonorsPolicyFloor(t *testing.T) {
+	source := models.ContentSource{FetchIntervalMinutes: 1}
+	if got, want := sourceCompatibilityInterval(source, true, true, 10), 10*time.Minute; got != want {
+		t.Fatalf("successful interval = %s, want %s", got, want)
+	}
+	if got, want := sourceCompatibilityInterval(source, false, true, 10), 10*time.Minute; got != want {
+		t.Fatalf("failed interval = %s, want %s", got, want)
+	}
+	if got := sourceCompatibilityInterval(source, true, false, 10); got != 0 {
+		t.Fatalf("non-terminal interval = %s, want zero", got)
+	}
+}
+
 func TestSanitizeCirculationPolicyEnforcesAutopilotGuardrails(t *testing.T) {
 	policy := models.DefaultNewsCirculationPolicy("default")
 	policy.AutopilotMode = "wild"

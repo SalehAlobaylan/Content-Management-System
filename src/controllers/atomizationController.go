@@ -2531,6 +2531,10 @@ type mediaAtomizationPipelineItem struct {
 	LatestError                  *string    `json:"latest_error"`
 	RunStatus                    *string    `json:"run_status"`
 	RunPhase                     *string    `json:"run_phase"`
+	MediaStageState              *string    `json:"media_stage_state"`
+	MediaStagePhase              *string    `json:"media_stage_phase"`
+	TranscriptStageState         *string    `json:"transcript_stage_state"`
+	FailedOrStuck                bool       `json:"failed_or_stuck"`
 	AtomizationOverride          *string    `json:"atomization_override"`
 	AtomizationOverrideReason    *string    `json:"atomization_override_reason"`
 	ManualAtomizationRequestedAt *time.Time `json:"manual_atomization_requested_at"`
@@ -2608,6 +2612,28 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 			END AS latest_error,
 			(SELECT r.status FROM media_atomization_runs r WHERE r.parent_content_item_id = p.public_id ORDER BY r.updated_at DESC LIMIT 1) AS run_status,
 			(SELECT r.phase FROM media_atomization_runs r WHERE r.parent_content_item_id = p.public_id ORDER BY r.updated_at DESC LIMIT 1) AS run_phase,
+			(SELECT sr.state FROM content_stage_requests sr
+				WHERE sr.tenant_id = p.tenant_id AND sr.content_item_id = p.public_id
+					AND sr.processing_generation = p.processing_generation AND sr.stage = 'pods_media_artifacts'
+				ORDER BY sr.updated_at DESC LIMIT 1) AS media_stage_state,
+			(SELECT ev.payload->>'phase' FROM content_stage_events ev
+				JOIN content_stage_requests sr ON sr.tenant_id=ev.tenant_id AND sr.public_id=ev.request_id
+				WHERE sr.tenant_id=p.tenant_id AND sr.content_item_id=p.public_id
+					AND sr.processing_generation=p.processing_generation AND sr.stage='pods_media_artifacts'
+					AND ev.event_type LIKE 'checkpoint:%'
+				ORDER BY ev.sequence DESC LIMIT 1) AS media_stage_phase,
+			(SELECT sr.state FROM content_stage_requests sr
+				WHERE sr.tenant_id = p.tenant_id AND sr.content_item_id = p.public_id
+					AND sr.processing_generation = p.processing_generation AND sr.stage = 'pods_transcript'
+				ORDER BY sr.updated_at DESC LIMIT 1) AS transcript_stage_state,
+			(
+				p.chaptering_status = 'failed'
+				OR p.status = 'FAILED'
+				OR (
+					p.chaptering_status IN ('planning', 'cutting', 'renditions', 'children', 'embedding', 'embedding_pending', 'waiting_transcript')
+					AND p.updated_at < NOW() - INTERVAL '2 hours'
+				)
+			) AS failed_or_stuck,
 			p.atomization_override,
 			p.atomization_override_reason,
 			p.manual_atomization_requested_at,
@@ -2615,7 +2641,7 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 		FROM content_items p
 		LEFT JOIN content_items c ON c.parent_content_item_id = p.public_id AND c.tenant_id = p.tenant_id AND c.status <> 'ARCHIVED' AND c.feed_visibility <> 'hidden'
 		WHERE `+strings.Join(where, " AND ")+`
-		GROUP BY p.public_id, p.title, p.status, p.chaptering_status, p.source_name, p.duration_sec, p.transcript_id, p.atomization_override, p.atomization_override_reason, p.manual_atomization_requested_at, p.updated_at
+		GROUP BY p.public_id, p.tenant_id, p.processing_generation, p.title, p.status, p.chaptering_status, p.source_name, p.duration_sec, p.transcript_id, p.atomization_override, p.atomization_override_reason, p.manual_atomization_requested_at, p.updated_at
 		ORDER BY p.updated_at DESC
 		LIMIT ?`, args...).Scan(&rows).Error; err != nil {
 		mediaAtomizationQueryError(c, err)
@@ -2636,9 +2662,7 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 		key := pipelineStageForItem(rows[i])
 		col := index[key]
 		columns[col].Count++
-		if len(columns[col].Items) < 8 {
-			columns[col].Items = append(columns[col].Items, rows[i])
-		}
+		columns[col].Items = append(columns[col].Items, rows[i])
 	}
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization pipeline fetched", Data: gin.H{
@@ -2651,18 +2675,46 @@ func AdminGetMediaAtomizationPipeline(c *gin.Context) {
 func defaultPipelineColumns() []mediaAtomizationPipelineColumn {
 	return []mediaAtomizationPipelineColumn{
 		{Key: "ready", Label: "Ready"},
-		{Key: "transcript", Label: "Transcript"},
-		{Key: "planning", Label: "Planning"},
-		{Key: "cutting", Label: "Cutting"},
-		{Key: "embedding", Label: "Embedding"},
+		{Key: "awaiting_download", Label: "Awaiting download"},
+		{Key: "media", Label: "Preparing media"},
+		{Key: "transcript", Label: "Awaiting transcript"},
+		{Key: "planning", Label: "Planning + cutting"},
+		{Key: "embedding", Label: "Embedding pending"},
 		{Key: "review", Label: "Review"},
 		{Key: "published", Label: "Published"},
 		{Key: "disabled", Label: "Disabled"},
-		{Key: "failed", Label: "Failed"},
+		{Key: "failed", Label: "Failed or reconciling"},
 	}
 }
 
 func pipelineStageForItem(item mediaAtomizationPipelineItem) string {
+	mediaStageState := ""
+	if item.MediaStageState != nil {
+		mediaStageState = strings.TrimSpace(*item.MediaStageState)
+	}
+	switch mediaStageState {
+	case models.ContentStageAwaitingApproval, models.ContentStageBlocked:
+		return "awaiting_download"
+	case models.ContentStageQueued, models.ContentStageDeferred, models.ContentStageClaimed, models.ContentStageRunning, models.ContentStageVerifying:
+		return "media"
+	case models.ContentStageUncertain, models.ContentStageReconciling, models.ContentStageFailed:
+		return "failed"
+	}
+	if item.TranscriptID == nil {
+		transcriptStageState := ""
+		if item.TranscriptStageState != nil {
+			transcriptStageState = strings.TrimSpace(*item.TranscriptStageState)
+		}
+		switch transcriptStageState {
+		case models.ContentStageAwaitingApproval, models.ContentStageBlocked, models.ContentStageQueued, models.ContentStageDeferred, models.ContentStageClaimed, models.ContentStageRunning, models.ContentStageVerifying:
+			return "transcript"
+		case models.ContentStageUncertain, models.ContentStageReconciling, models.ContentStageFailed:
+			return "failed"
+		}
+	}
+	if item.FailedOrStuck {
+		return "failed"
+	}
 	if item.AtomizationOverride != nil && *item.AtomizationOverride == atomizationOverrideDisabled {
 		return "disabled"
 	}
@@ -2680,12 +2732,14 @@ func pipelineStageForItem(item mediaAtomizationPipelineItem) string {
 	case "embedding", "embedding_pending":
 		return "embedding"
 	case "cutting", "renditions", "children":
-		return "cutting"
+		return "planning"
 	case "planning":
 		return "planning"
 	case "waiting_transcript", "transcript_ready":
 		return "transcript"
-	case "queued", "waiting_media", "media_ready", "unstarted":
+	case "waiting_media":
+		return "media"
+	case "queued", "media_ready", "unstarted":
 		return "ready"
 	default:
 		if item.TranscriptID == nil {

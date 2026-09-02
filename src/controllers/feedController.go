@@ -73,6 +73,10 @@ func hasCursor(pagination *utils.CursorPagination) bool {
 // GetPodsFeed returns the Pods feed with cursor-based pagination
 // GET /api/v1/feed/pods?cursor=xxx&limit=20
 func GetPodsFeed(c *gin.Context) {
+	getPodsFeedCanonical(c)
+	return
+	/* Legacy implementation retained below during the compatibility window. */
+	/*
 	db := c.MustGet("db").(*gorm.DB)
 	tenantID, tenantErr := trustedPublicFeedTenant(c)
 	if tenantErr != nil {
@@ -161,6 +165,11 @@ func GetPodsFeed(c *gin.Context) {
 				scored = filterScoredPodsByIDs(scored, seenIDs)
 			}
 		}
+		// Lifetime engagement and accumulated quality signals are intentionally
+		// retained for the non-reserved positions. The same deterministic
+		// first-page transformation is rebuilt for cursor requests as well, so a
+		// promoted item cannot reappear later at its old score position.
+		scored = reserveFreshPodsFirstPage(scored, time.Now().UTC())
 		// Apply cursor-based pagination over scored results
 		startIdx := 0
 		if !pagination.Timestamp.IsZero() {
@@ -330,6 +339,7 @@ func GetPodsFeed(c *gin.Context) {
 		recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
 		recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
 	}
+	*/
 }
 
 func uuidMembership(ids []uuid.UUID) map[uuid.UUID]struct{} {

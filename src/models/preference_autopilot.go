@@ -137,9 +137,9 @@ type PreferenceAutopilotPolicy struct {
 	MaxPendingProposals  int `gorm:"type:integer;not null;default:100" json:"max_pending_proposals"`
 
 	// Coverage floors (percent) — advisory flip-gate defaults, not flip authority.
-	CoverageFloorPodsPct int `gorm:"type:integer;not null;default:70" json:"coverage_floor_pods_pct"`
-	CoverageFloorNewsPct   int `gorm:"type:integer;not null;default:60" json:"coverage_floor_news_pct"`
-	CoverageFloorStoryPct  int `gorm:"type:integer;not null;default:50" json:"coverage_floor_story_pct"`
+	CoverageFloorPodsPct  int `gorm:"type:integer;not null;default:70" json:"coverage_floor_pods_pct"`
+	CoverageFloorNewsPct  int `gorm:"type:integer;not null;default:60" json:"coverage_floor_news_pct"`
+	CoverageFloorStoryPct int `gorm:"type:integer;not null;default:50" json:"coverage_floor_story_pct"`
 
 	// Scoring thresholds (§6 V1 defaults).
 	HighConfidence      float64 `gorm:"type:double precision;not null;default:0.80" json:"high_confidence"`
@@ -195,7 +195,7 @@ func DefaultPreferenceAutopilotPolicy(tenantID string) PreferenceAutopilotPolicy
 		MaxMinedProposals:        25,
 		MaxCentroidRefresh:       3,
 		MaxPendingProposals:      100,
-		CoverageFloorPodsPct:   70,
+		CoverageFloorPodsPct:     70,
 		CoverageFloorNewsPct:     60,
 		CoverageFloorStoryPct:    50,
 		HighConfidence:           0.80,

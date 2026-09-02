@@ -109,6 +109,9 @@ func TestSourceRunDBManifestSealAndStaleLeaseFailClosed(t *testing.T) {
 	if _, err := BeginUnitEffect(db, UnitLeaseInput{TenantID: "tenant-a", UnitID: unitLease.Unit.PublicID.String(), Owner: "dispatcher", LeaseToken: uuid.NewString()}); err == nil {
 		t.Fatal("stale lease token started an effect")
 	}
+	if _, err := SealManifest(db, "tenant-a", request.PublicID.String()); err == nil {
+		t.Fatal("manifest sealed before its first fetch page was authorized")
+	}
 	page, created, err := AuthorizeChildUnit(db, ChildUnitInput{TenantID: "tenant-a", RequestID: request.PublicID.String(), AttemptID: lease.Attempt.PublicID.String(), ParentUnitID: lease.RootExecutionUnit.PublicID.String(), UnitType: "fetch_page", UnitKey: "fetch:one", PageID: "one"})
 	if err != nil || !created {
 		t.Fatalf("authorize page: created=%v err=%v", created, err)
@@ -124,6 +127,39 @@ func TestSourceRunDBManifestSealAndStaleLeaseFailClosed(t *testing.T) {
 	}
 	if _, _, err := AuthorizeChildUnit(db, ChildUnitInput{TenantID: "tenant-a", RequestID: request.PublicID.String(), AttemptID: lease.Attempt.PublicID.String(), ParentUnitID: page.PublicID.String(), UnitType: "normalize_batch", UnitKey: "normalize:one:one", PageID: "one", BatchID: "one"}); err == nil {
 		t.Fatal("sealed manifest admitted a late child")
+	}
+}
+
+func TestSourceRunDBInvalidSealedEmptyManifestConvergesTerminally(t *testing.T) {
+	db := openSupplyFixtureDB(t)
+	source := provisionSupplyFixture(t, db, "tenant-a", "media")
+	request, _, err := CreateRequest(db, CreateRequestInput{Source: source, Identity: supplyFixtureIdentity(source), RequestedBy: "schedule", EvidenceFingerprint: "fixture", Metadata: datatypes.JSON([]byte(`{"max_results":1}`))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := CreateAttemptAndRootUnit(db, "tenant-a", request.PublicID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AcquireUnitExecution(db, "tenant-a", lease.RootExecutionUnit.PublicID.String(), "dispatcher", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.SourceRunRequest{}).Where("public_id=?", request.PublicID).Updates(map[string]any{"manifest_state": string(ManifestSealed), "manifest_sealed_at": time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeSealedCoordinator(db, "tenant-a", request.PublicID); err != nil {
+		t.Fatal(err)
+	}
+	var observedRequest models.SourceRunRequest
+	var observedUnit models.SourceRunExecutionUnit
+	if err := db.Where("public_id=?", request.PublicID).First(&observedRequest).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("public_id=?", lease.RootExecutionUnit.PublicID).First(&observedUnit).Error; err != nil {
+		t.Fatal(err)
+	}
+	if observedRequest.State != string(RequestFailed) || observedUnit.State != string(UnitExpired) {
+		t.Fatalf("invalid sealed manifest did not converge: request=%s unit=%s", observedRequest.State, observedUnit.State)
 	}
 }
 

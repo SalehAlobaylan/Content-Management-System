@@ -349,7 +349,7 @@ func DeleteQualityProfile(c *gin.Context) {
 // =============================================================================
 
 type resolveResult struct {
-	Profile     *models.QualityProfile `json:"profile,omitempty"`
+	Profile     *models.QualityProfile `json:"profile"`
 	MatchedOn   string                 `json:"matched_on"` // tenant+source | tenant | source | global | none
 	UsedDefault bool                   `json:"used_default"`
 }

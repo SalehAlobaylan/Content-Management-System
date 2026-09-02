@@ -71,7 +71,7 @@ type SystemAutopilotPolicy struct {
 	IntervalMinutes       int `gorm:"type:integer;not null;default:10" json:"interval_minutes"`
 	ConfirmProbes         int `gorm:"type:integer;not null;default:2" json:"confirm_probes"`
 	ResolveProbes         int `gorm:"type:integer;not null;default:3" json:"resolve_probes"`
-	FlapCycles24h         int `gorm:"type:integer;not null;default:3" json:"flap_cycles_24h"`
+	FlapCycles24h         int `gorm:"column:flap_cycles_24h;type:integer;not null;default:3" json:"flap_cycles_24h"`
 	ContainmentTTLMinutes int `gorm:"type:integer;not null;default:60" json:"containment_ttl_minutes"`
 
 	ContainmentDisabledFor datatypes.JSON `gorm:"type:jsonb" json:"containment_disabled_for,omitempty"`

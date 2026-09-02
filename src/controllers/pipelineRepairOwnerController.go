@@ -43,6 +43,16 @@ func InternalClaimPipelineRepair(c *gin.Context) {
 	}
 	metadata := map[string]any{}
 	_ = json.Unmarshal(item.Metadata, &metadata)
+	if claim.Request.Stage == models.PipelineStageMediaDeliveryGeneration {
+		var source models.MediaArtifactManifest
+		if err := c.MustGet("db").(*gorm.DB).
+			Where("tenant_id=? AND content_item_id=? AND artifact_role='source' AND state IN ?", claim.Request.TenantID, claim.Request.ContentItemID, []string{"verified", "active"}).
+			Order("created_at DESC").First(&source).Error; err != nil {
+			c.JSON(http.StatusConflict, gin.H{"message": "pipeline repair source manifest is no longer verified"})
+			return
+		}
+		metadata["source_artifact_manifest_id"] = source.PublicID.String()
+	}
 	c.JSON(http.StatusOK, gin.H{"id": claim.Request.PublicID, "attempt_id": claim.Attempt.PublicID, "tenant_id": claim.Request.TenantID, "claim_token": claim.ClaimToken, "deterministic_job_id": claim.Request.DeterministicJobID, "stage": claim.Request.Stage, "content_item_id": claim.Request.ContentItemID, "item_version": claim.Request.ExpectedItemUpdatedAt, "source_run_request_id": claim.Request.SourceRunRequestID, "fence_token": claim.Attempt.FenceToken, "lease_expires_at": claim.Lease.LeaseExpiresAt, "lease_epoch": claim.Lease.LeaseEpoch, "effect_input_digest": claim.Request.EffectInputDigest, "content": gin.H{"type": item.Type, "source": item.Source, "original_url": item.OriginalURL, "media_url": item.MediaURL, "title": item.Title, "excerpt": item.Excerpt, "body_text": item.BodyText, "metadata": metadata}})
 }
 
@@ -86,7 +96,12 @@ func InternalHeartbeatPipelineRepair(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"message": "pipeline repair heartbeat rejected"})
 		return
 	}
-	c.Status(http.StatusNoContent)
+	var request models.PipelineRepairRequest
+	if err := c.MustGet("db").(*gorm.DB).Select("claim_expires_at").Where("public_id=? AND claim_token=?", c.Param("id"), token).First(&request).Error; err != nil || request.ClaimExpiresAt == nil {
+		c.JSON(http.StatusConflict, gin.H{"message": "pipeline repair lease readback failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"lease_expires_at": request.ClaimExpiresAt})
 }
 
 // InternalCompletePipelineRepair is the fenced terminal receipt from the

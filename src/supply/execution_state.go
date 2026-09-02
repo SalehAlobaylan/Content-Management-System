@@ -199,6 +199,9 @@ func SealManifest(db *gorm.DB, tenantID, requestID string) (models.SourceRunRequ
 		if err := tx.Where("tenant_id = ? AND source_run_request_id = ? AND unit_type = ?", tenantID, publicID, "fetch_page").Order("public_id ASC").Find(&pages).Error; err != nil {
 			return err
 		}
+		if len(pages) == 0 {
+			return fmt.Errorf("source-run manifest has no authorized fetch page")
+		}
 		for _, page := range pages {
 			if !IsTerminalUnit(ExecutionUnitState(page.State)) {
 				return fmt.Errorf("fetch-page %s has not reached a terminal state", page.PublicID)
@@ -631,7 +634,7 @@ func completePodsDeliveryTask(tx *gorm.DB, task models.SourceRunVerificationTask
 			"claim_expires_at":  nil,
 			"heartbeat_at":      now,
 			"not_before_at":     now.Add(podsDeliveryObservationRetry),
-			"terminal_verdict":  "",
+			"terminal_verdict":  nil,
 			"terminal_event_id": nil,
 		}).Error
 	}
@@ -841,8 +844,27 @@ func finalizeSealedCoordinator(db *gorm.DB, tenantID string, requestID uuid.UUID
 			}
 			children = append(children, units[i])
 		}
-		if coordinator == nil || IsTerminalUnit(ExecutionUnitState(coordinator.State)) || len(children) == 0 {
+		if coordinator == nil || IsTerminalUnit(ExecutionUnitState(coordinator.State)) {
 			return nil
+		}
+		if len(children) == 0 {
+			// Older advancement code could seal an empty manifest before the
+			// dispatcher authorized its first page. No provider effect exists in
+			// that shape, so terminalize the invalid coordinator instead of
+			// leaving a permanently active request that can never admit work.
+			if coordinator.EffectStartedAt != nil {
+				return fmt.Errorf("sealed empty source-run manifest crossed an effect boundary")
+			}
+			now := time.Now().UTC()
+			if err := tx.Model(&models.SourceRunExecutionUnit{}).
+				Where("public_id = ? AND tenant_id = ? AND state NOT IN ?", coordinator.PublicID, tenantID, []string{string(UnitSucceeded), string(UnitFailed), string(UnitCancelled), string(UnitExpired)}).
+				Updates(map[string]any{"state": string(UnitExpired), "terminal_outcome": string(OutcomeUnknown), "finished_at": now, "verification_required": false}).Error; err != nil {
+				return err
+			}
+			if err := rebuildRequestCounters(tx, tenantID, requestID); err != nil {
+				return err
+			}
+			return reconcileAttemptAndRequest(tx, tenantID, coordinator.SourceRunAttemptID, requestID)
 		}
 		for _, unit := range children {
 			if !IsTerminalUnit(ExecutionUnitState(unit.State)) {

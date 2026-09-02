@@ -63,7 +63,7 @@ type NewsCirculationPolicy struct {
 	TrendingWeight      float64 `gorm:"type:double precision;not null;default:0.05" json:"trending_weight"`
 
 	SourceCadenceMode        string `gorm:"type:varchar(20);not null;default:'suggest'" json:"source_cadence_mode"`
-	SourceClaimIntervalMins  int    `gorm:"type:integer;not null;default:15" json:"source_claim_interval_minutes"`
+	SourceClaimIntervalMins  int    `gorm:"column:source_claim_interval_minutes;type:integer;not null;default:15" json:"source_claim_interval_minutes"`
 	SourceClaimBatchSize     int    `gorm:"type:integer;not null;default:20" json:"source_claim_batch_size"`
 	SourceMinIntervalMinutes int    `gorm:"type:integer;not null;default:10" json:"source_min_interval_minutes"`
 	SourceMaxIntervalMinutes int    `gorm:"type:integer;not null;default:360" json:"source_max_interval_minutes"`
