@@ -228,6 +228,7 @@ type internalUpdateStatusRequest struct {
 }
 
 type internalUpdateArtifactsRequest struct {
+	DeferStageCompletion  bool                     `json:"defer_stage_completion,omitempty"`
 	MediaURL              *string                  `json:"media_url"`
 	ThumbnailURL          *string                  `json:"thumbnail_url"`
 	DurationSec           *int                     `json:"duration_sec"`
@@ -985,11 +986,14 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 		if err := feedstate.SyncMediaMembership(tx, item); err != nil {
 			return err
 		}
-		if req.ContentStage != nil {
+		if req.ContentStage != nil && !req.DeferStageCompletion {
 			artifactDigest := contentstage.ItemInputDigest(item)
 			if err := contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerAggregationPods, artifactDigest, map[string]any{"playback_ready": item.PlaybackURL != nil, "duration_sec": item.DurationSec}); err != nil {
 				return err
 			}
+		}
+		if req.ContentStage != nil && req.DeferStageCompletion {
+			return nil // Preparation is not complete until fenced activation finishes.
 		}
 		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
 	}); err != nil {

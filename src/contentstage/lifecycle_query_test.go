@@ -69,8 +69,7 @@ func TestClaimCandidateQueriesKeepAggregateAndLockingStatementsIndependent(t *te
 		"from \"content_stage_requests\"", "lane=", "owner=", "state in", "not_before_at",
 		"cancellation_requested_at is null", "stage in", "blocking_scope<>", "group by",
 		"max(csa.created_at)", "min(content_stage_requests.created_at)", "limit",
-		"earlier_item.content_source_id = claim_item.content_source_id",
-		"earlier_media.state not in", "earlier_required.state not in",
+		"pods_episode_dispositions", "d.disposition<>'active'",
 		"item_media.state =",
 	)
 	requireSQLExcludes(t, tenantSQL, "for update", "skip locked")
@@ -86,8 +85,9 @@ func TestClaimCandidateQueriesKeepAggregateAndLockingStatementsIndependent(t *te
 	requireSQLContains(t, rowSQL,
 		"from \"content_stage_requests\"", "lane=", "owner=", "state in", "not_before_at",
 		"cancellation_requested_at is null", "tenant_id=", "stage in", "blocking_scope<>",
-		"order by priority desc, created_at asc, public_id asc", "limit", "for update skip locked",
-		"earlier_item.content_source_id = claim_item.content_source_id",
+		"priority desc, created_at asc, public_id asc", "limit", "for update skip locked",
+		"pods_episode_execution_slot", "coalesce(leaf.parent_content_item_id,leaf.public_id)",
+		"pods_episode_dispositions",
 		"item_media.state =",
 	)
 	requireSQLExcludes(t, rowSQL, "group by", "max(csa.created_at)", "min(content_stage_requests.created_at)")

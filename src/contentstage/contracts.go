@@ -31,7 +31,7 @@ const (
 )
 
 func leaseDurationForStage(stage string) time.Duration {
-	if stage == models.ContentStagePodsMediaArtifacts {
+	if stage == models.ContentStagePodsMediaArtifacts || stage == models.ContentStagePodsAtomization {
 		return mediaLeaseDuration
 	}
 	return defaultLeaseDuration
@@ -164,15 +164,6 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 	for _, d := range descriptors {
 		fingerprint := stageFingerprint(*item, d)
 		idem := digest("content-stage-request/v1", item.TenantID, item.PublicID.String(), fmt.Sprint(item.ProcessingGeneration), d.Stage, fingerprint)
-		deadline := time.Now().UTC().Add(textElapsedBudget)
-		if d.Stage == models.ContentStagePodsMediaArtifacts {
-			deadline = time.Now().UTC().Add(mediaElapsedBudget)
-		}
-		if isTrustedLongForm(*item) {
-			// Long-form work is resumable. Its deadline is an upper safety bound,
-			// not a rejection rule based on the historical item age or duration.
-			deadline = time.Now().UTC().Add(24 * time.Hour)
-		}
 		state := initialStageState(d, ResolveMediaAcquisitionMode(tx, *item))
 		request := models.ContentStageRequest{
 			PublicID: uuid.New(), TenantID: item.TenantID, ContentItemID: item.PublicID,
@@ -180,8 +171,10 @@ func EnsureManifest(tx *gorm.DB, item *models.ContentItem) ([]models.ContentStag
 			Owner: d.Owner, BlockingScope: d.BlockingScope, State: state,
 			InputFingerprint: fingerprint, PolicyVersion: "v1", ModelRecipe: d.ModelRecipe,
 			IdempotencyKey: idem, DependencyManifest: jsonValue(d.Dependencies),
-			WorkloadEstimate: workloadEstimate(*item, d), DeadlineAt: &deadline,
-			TerminalProof: jsonValue(map[string]any{}),
+			// Dependency, approval and source-sequencing waits are not execution.
+			// Claim starts the bounded execution clock.
+			WorkloadEstimate: workloadEstimate(*item, d),
+			TerminalProof:    jsonValue(map[string]any{}),
 		}
 		result := tx.Clauses(clause.OnConflict{Columns: []clause.Column{
 			{Name: "tenant_id"}, {Name: "content_item_id"}, {Name: "processing_generation"}, {Name: "stage"},
@@ -545,8 +538,15 @@ func boundedInput(item models.ContentItem, stage string) map[string]any {
 				if analysisURL, ok := metadata["analysis_audio_url"].(string); ok {
 					input["analysis_audio_url"] = analysisURL
 				}
-				if captionArtifact, ok := metadata["caption_artifact"].(map[string]any); ok {
-					input["caption_artifact"] = captionArtifact
+				// Do not forward an empty discovery placeholder. Media treats a
+				// bounded, non-empty artifact as the free provider-caption path;
+				// malformed/empty values must fall through to the generated-STT
+				// admission policy instead of failing the stage while claiming that
+				// a caption exists.
+				if HasUsableCaptionArtifact(item) {
+					if captionArtifact, ok := metadata["caption_artifact"].(map[string]any); ok {
+						input["caption_artifact"] = captionArtifact
+					}
 				}
 			}
 		}

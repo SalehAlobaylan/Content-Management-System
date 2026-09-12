@@ -191,6 +191,53 @@ func TestVerifyAppliedChecksumsRejectsDrift(t *testing.T) {
 	}
 }
 
+func TestInspectAppliedChecksumDriftRejectsUnsupportedMigration(t *testing.T) {
+	_, _, _, err := inspectAppliedChecksumDrift(nil, nil, nil, "20260908130000_other.sql")
+	if err == nil || !strings.Contains(err.Error(), atomizationReliabilityMigration) {
+		t.Fatalf("unsupported checksum repair target was accepted: %v", err)
+	}
+}
+
+func TestRepairAppliedChecksumDriftRequiresExplicitAcknowledgement(t *testing.T) {
+	file := migrationFile{Version: atomizationReliabilityMigration}
+	err := repairAppliedChecksumDrift(nil, file, strings.Repeat("a", 64), "original migration unavailable", "")
+	if err == nil || !strings.Contains(err.Error(), "--acknowledge-checksum-repair") {
+		t.Fatalf("checksum repair without acknowledgement was accepted: %v", err)
+	}
+}
+
+func TestRepairAtomizationReliabilitySchemaAppliesOnlySupportedMissingObjects(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectExec(`ALTER TABLE transcription_segment_units`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DO \$\$`).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	issues := []string{
+		"transcription_segment_units.effect_started_at",
+		"constraint nested_manifest_fence_shape",
+	}
+	if err := repairAtomizationReliabilitySchema(db, issues); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepairAtomizationReliabilitySchemaRefusesUnknownPostcondition(t *testing.T) {
+	err := repairAtomizationReliabilitySchema(nil, []string{"unexpected.object"})
+	if err == nil || !strings.Contains(err.Error(), "unsupported missing postcondition") {
+		t.Fatalf("unknown postcondition was accepted: %v", err)
+	}
+}
+
 func TestRequireDestructiveApproval(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "20260719020000_drop_table.sql")

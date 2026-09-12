@@ -1,6 +1,7 @@
 package atomizationwork
 
 import (
+	"content-management-system/src/podsflow"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	lease                = 60 * time.Second
+	lease                = 5 * time.Minute
 	verificationDeadline = 30 * time.Minute
 	maxAttempts          = 2
 )
@@ -98,6 +99,15 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 				continue
 			}
 			parent, transcript, _, fingerprint, err := Candidate(tx, request.TenantID, request.ParentContentItemID)
+			if err == nil {
+				admitted, slotErr := podsflow.Acquire(tx, parent)
+				if slotErr != nil {
+					return slotErr
+				}
+				if !admitted {
+					continue
+				}
+			}
 			if err != nil || fingerprint != request.InputFingerprint || transcript.PublicID != request.TranscriptID || !parent.UpdatedAt.Equal(request.ParentUpdatedAt) {
 				continue
 			}
@@ -177,29 +187,36 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	return claim, true, nil
 }
 
-func Begin(db *gorm.DB, requestID, owner string, token uuid.UUID) error {
+// Begin keeps a variadic fence argument for source compatibility with the
+// pre-fencing readiness probe.  Production callers must provide the durable
+// fence; the readiness check intentionally runs first so a stale owner can be
+// rejected without touching the database.
+func Begin(db *gorm.DB, requestID, owner string, token uuid.UUID, fences ...uuid.UUID) error {
 	if !supply.SupplyActionOwnerReady("aggregation_atomization", time.Now().UTC()) {
 		return fmt.Errorf("atomization owner readiness is unavailable")
+	}
+	if len(fences) == 0 {
+		return fmt.Errorf("atomization fence is required")
 	}
 	if err := recheckAtomizationActionAccess(db, requestID); err != nil {
 		return err
 	}
-	return leaseStep(db, requestID, owner, token, true)
+	return leaseStep(db, requestID, owner, token, fences[0], true)
 }
-func Heartbeat(db *gorm.DB, requestID, owner string, token uuid.UUID) error {
+func Heartbeat(db *gorm.DB, requestID, owner string, token, fence uuid.UUID) error {
 	if !supply.SupplyActionOwnerReady("aggregation_atomization", time.Now().UTC()) {
 		return fmt.Errorf("atomization owner readiness is unavailable")
 	}
 	if err := recheckAtomizationActionAccess(db, requestID); err != nil {
 		return err
 	}
-	return leaseStep(db, requestID, owner, token, false)
+	return leaseStep(db, requestID, owner, token, fence, false)
 }
 
 // Defer returns a claimed/running work unit to the durable queue without
 // burning its attempt budget. It is used only before/after an admission check
 // proves no physical compute capacity is available.
-func Defer(db *gorm.DB, requestID, owner string, token uuid.UUID, retryAfter time.Duration, summary string) error {
+func Defer(db *gorm.DB, requestID, owner string, token, fence uuid.UUID, retryAfter time.Duration, summary string) error {
 	if retryAfter < time.Second {
 		retryAfter = time.Second
 	}
@@ -209,15 +226,23 @@ func Defer(db *gorm.DB, requestID, owner string, token uuid.UUID, retryAfter tim
 	now := time.Now().UTC()
 	return db.Transaction(func(tx *gorm.DB) error {
 		var request models.AtomizationWorkRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_owner=? AND claim_token=? AND state IN ?", requestID, owner, token, []string{"claimed", "running"}).First(&request).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_owner=? AND claim_token=? AND fence_token=? AND state IN ?", requestID, owner, token, fence, []string{"claimed", "running"}).First(&request).Error; err != nil {
 			return err
 		}
 		next := now.Add(retryAfter)
-		if err := tx.Model(&request).Updates(map[string]any{"state": "queued", "not_before_at": next, "claim_owner": "", "claim_token": nil, "fence_token": nil, "claim_expires_at": nil}).Error; err != nil {
-			return err
+		changed := tx.Model(&models.AtomizationWorkRequest{}).Where("tenant_id=? AND public_id=? AND claim_owner=? AND claim_token=? AND fence_token=? AND state IN ?", request.TenantID, request.PublicID, owner, token, fence, []string{"claimed", "running"}).Updates(map[string]any{"state": "queued", "not_before_at": next, "claim_owner": "", "claim_token": nil, "fence_token": nil, "claim_expires_at": nil})
+		if changed.Error != nil {
+			return changed.Error
 		}
-		if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND claim_token=?", request.TenantID, request.PublicID, token).Updates(map[string]any{"state": "deferred", "finished_at": now}).Error; err != nil {
-			return err
+		if changed.RowsAffected != 1 {
+			return fmt.Errorf("atomization deferral authority changed")
+		}
+		attemptChanged := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND claim_token=? AND fence_token=? AND finished_at IS NULL", request.TenantID, request.PublicID, token, fence).Updates(map[string]any{"state": "deferred", "finished_at": now})
+		if attemptChanged.Error != nil {
+			return attemptChanged.Error
+		}
+		if attemptChanged.RowsAffected != 1 {
+			return fmt.Errorf("atomization attempt deferral authority changed")
 		}
 		return event(tx, request, "capacity_deferred", map[string]any{"not_before_at": next, "summary": summary})
 	})
@@ -240,11 +265,11 @@ func recheckAtomizationActionAccess(db *gorm.DB, requestID string) error {
 	}
 	return supply.RecheckSupplyActionExecutionAuthority(db, action)
 }
-func leaseStep(db *gorm.DB, requestID, owner string, token uuid.UUID, begin bool) error {
+func leaseStep(db *gorm.DB, requestID, owner string, token, fence uuid.UUID, begin bool) error {
 	now := time.Now().UTC()
 	return db.Transaction(func(tx *gorm.DB) error {
 		var request models.AtomizationWorkRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_owner=? AND claim_token=?", requestID, owner, token).First(&request).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_owner=? AND claim_token=? AND fence_token=?", requestID, owner, token, fence).First(&request).Error; err != nil {
 			return err
 		}
 		if request.ClaimExpiresAt == nil || !request.ClaimExpiresAt.After(now) || request.CancellationRequestedAt != nil {
@@ -271,11 +296,19 @@ func leaseStep(db *gorm.DB, requestID, owner string, token uuid.UUID, begin bool
 			attemptUpdates["state"] = "running"
 			attemptUpdates["effect_started_at"] = now
 		}
-		if err := tx.Model(&request).Updates(updates).Error; err != nil {
-			return err
+		changed := tx.Model(&models.AtomizationWorkRequest{}).Where("tenant_id=? AND public_id=? AND claim_owner=? AND claim_token=? AND fence_token=? AND state=? AND claim_expires_at>?", request.TenantID, request.PublicID, owner, token, fence, request.State, now).Updates(updates)
+		if changed.Error != nil {
+			return changed.Error
 		}
-		if err := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND claim_token=?", request.TenantID, request.PublicID, token).Updates(attemptUpdates).Error; err != nil {
-			return err
+		if changed.RowsAffected != 1 {
+			return fmt.Errorf("atomization lease authority changed")
+		}
+		attemptChanged := tx.Model(&models.AtomizationWorkAttempt{}).Where("tenant_id=? AND request_id=? AND claim_token=? AND fence_token=? AND lease_expires_at>?", request.TenantID, request.PublicID, token, fence, now).Updates(attemptUpdates)
+		if attemptChanged.Error != nil {
+			return attemptChanged.Error
+		}
+		if attemptChanged.RowsAffected != 1 {
+			return fmt.Errorf("atomization attempt lease authority changed")
 		}
 		if err := stepAction(tx, request, token, expires, begin, now); err != nil {
 			return err
@@ -287,14 +320,14 @@ func leaseStep(db *gorm.DB, requestID, owner string, token uuid.UUID, begin bool
 	})
 }
 
-func Checkpoint(db *gorm.DB, requestID string, token uuid.UUID, phase string, proof map[string]any) error {
+func Checkpoint(db *gorm.DB, requestID string, token, fence uuid.UUID, phase string, proof map[string]any) error {
 	allowed := map[string]bool{"plan_persisted": true, "first_cut": true, "uploads_complete": true, "children_persisted": true, "embedding_handoff": true, "owner_complete": true}
 	if !allowed[phase] {
 		return fmt.Errorf("atomization checkpoint is not registered")
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		var request models.AtomizationWorkRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_token=? AND state=?", requestID, token, "running").First(&request).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND claim_token=? AND fence_token=? AND state=?", requestID, token, fence, "running").First(&request).Error; err != nil {
 			return err
 		}
 		var checkpoints map[string]any
@@ -304,13 +337,18 @@ func Checkpoint(db *gorm.DB, requestID string, token uuid.UUID, phase string, pr
 		}
 		checkpoints[phase] = proof
 		bytes, _ := json.Marshal(checkpoints)
-		updates := map[string]any{"checkpoints": datatypes.JSON(bytes)}
+		now := time.Now().UTC()
+		updates := map[string]any{"checkpoints": datatypes.JSON(bytes), "updated_at": now}
 		if phase == "owner_complete" {
 			updates["state"] = "verifying"
 			updates["claim_expires_at"] = nil
 		}
-		if err := tx.Model(&request).Updates(updates).Error; err != nil {
-			return err
+		changed := tx.Model(&models.AtomizationWorkRequest{}).Where("tenant_id=? AND public_id=? AND claim_token=? AND fence_token=? AND state=? AND claim_expires_at>?", request.TenantID, request.PublicID, token, fence, request.State, now).Updates(updates)
+		if changed.Error != nil {
+			return changed.Error
+		}
+		if changed.RowsAffected != 1 {
+			return fmt.Errorf("atomization checkpoint authority changed")
 		}
 		if phase == "owner_complete" {
 			if err := verifyActionPending(tx, request, proof); err != nil {

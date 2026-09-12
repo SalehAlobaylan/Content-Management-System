@@ -1,6 +1,7 @@
 package contentstage
 
 import (
+	"content-management-system/src/podsflow"
 	"log"
 	"sync/atomic"
 	"time"
@@ -87,6 +88,24 @@ func runWorkerOnce(db *gorm.DB, classify ClassifyFunc) {
 	}
 	if err := RecoverExpired(db); err != nil {
 		log.Printf("content-stage lease recovery failed: %v", err)
+		return
+	}
+	if err := ReconcilePreEffectFailures(db); err != nil {
+		log.Printf("content-stage pre-effect failure reconciliation failed: %v", err)
+		return
+	}
+	// A long-form owner can finish every fenced chapter and still lose the
+	// outer finalization callback (for example when a queue lock expires or a
+	// bounded receipt insert rejects the payload).  That leaves a running
+	// generation with a terminal stage request, which no dispatcher can claim.
+	// Requeue only generations whose complete manifest proof is unambiguous;
+	// ambiguous/partial effects remain on the explicit reconciliation path.
+	if err := podsflow.ReconcileFinalizationGaps(db); err != nil {
+		log.Printf("content-stage atomization finalization recovery failed: %v", err)
+		return
+	}
+	if err := podsflow.ReconcileReadyGenerations(db); err != nil {
+		log.Printf("content-stage generation activation failed: %v", err)
 		return
 	}
 	for index := 0; index < verificationBatchPerTick; index++ {

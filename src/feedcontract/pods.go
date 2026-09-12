@@ -68,6 +68,14 @@ func PodsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema boo
 	if SupportsStorageStateSchema(db) {
 		q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
 	}
+	// Atomization candidates are not serving generations. This also fences
+	// previously marked-visible candidates while completion is reconciled.
+	if db.Migrator().HasTable(&models.AtomizationGeneration{}) {
+		q = q.Where(`(parent_content_item_id IS NULL OR COALESCE(metadata->>'atomization_generation_id','')='' OR EXISTS (
+			SELECT 1 FROM atomization_generations ag WHERE ag.tenant_id=content_items.tenant_id
+			AND ag.parent_content_item_id=content_items.parent_content_item_id
+			AND ag.public_id::text=content_items.metadata->>'atomization_generation_id' AND ag.state='active'))`)
+	}
 	return q
 }
 

@@ -31,6 +31,17 @@ func TestTranscriptBoundedInputCarriesOnlyBoundedCaptionArtifact(t *testing.T) {
 	}
 }
 
+func TestTranscriptBoundedInputDropsEmptyCaptionPlaceholder(t *testing.T) {
+	item := testItem(models.ContentTypePodcast)
+	item.Metadata, _ = json.Marshal(map[string]any{
+		"caption_artifact": map[string]any{},
+	})
+	input := boundedInput(item, models.ContentStagePodsTranscript)
+	if _, ok := input["caption_artifact"]; ok {
+		t.Fatal("empty caption placeholder must not be sent as an importable caption")
+	}
+}
+
 func TestStageFingerprintsOnlyChangeForAuthoritativeInputs(t *testing.T) {
 	item := testItem(models.ContentTypeNews)
 	descriptor := descriptors[models.ContentStageNewsTextEmbedding]

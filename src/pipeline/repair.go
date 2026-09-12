@@ -50,6 +50,82 @@ func isDirectMediaDeliveryRepair(request models.PipelineRepairRequest) bool {
 	return request.Stage == models.PipelineStageMediaDeliveryGeneration && request.RepairClass == mediaDeliveryRepairClass
 }
 
+// Long-form parents are custody inputs for atomization, not public delivery
+// units.  Their media stage already owns the source, analysis-audio, and
+// thumbnail manifests.  A media-delivery-generation repair for one of these
+// parents is therefore a legacy admission bug: running it creates a redundant
+// source-only generation and can hold the repair dispatcher indefinitely.
+func isLongFormParent(item models.ContentItem) bool {
+	return item.ParentContentItemID == nil &&
+		(item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) &&
+		item.DurationSec != nil && *item.DurationSec > 2400
+}
+
+const longFormDeliveryRepairRetired = "source_only_long_parent_not_applicable"
+
+// retireLongFormDeliveryRepair terminalizes a repair that could never be the
+// correct owner for a long-form parent.  It is deliberately conservative about
+// a still-live claim: a rolling deployment must first let the old lease expire
+// before retiring it, so an in-flight effect is not mislabeled while it is
+// still able to write.  Once the lease is stale, all request/attempt/lease rows
+// are fenced together and the object/generation audit remains intact.
+func retireLongFormDeliveryRepair(tx *gorm.DB, request models.PipelineRepairRequest, item models.ContentItem, now time.Time) (bool, error) {
+	if !isDirectMediaDeliveryRepair(request) || !isLongFormParent(item) {
+		return false, nil
+	}
+	if request.State == models.PipelineRepairSucceeded || request.State == models.PipelineRepairFailed || request.State == models.PipelineRepairCancelled {
+		return false, nil
+	}
+	if request.ClaimExpiresAt != nil && request.ClaimExpiresAt.After(now) {
+		return false, nil
+	}
+	proof := jsonValue(map[string]any{
+		"effect":         "not_applicable",
+		"reason":         longFormDeliveryRepairRetired,
+		"content_item":   item.PublicID.String(),
+		"duration_sec":   *item.DurationSec,
+		"reconciliation": "legacy_delivery_repair_retired_before_source_stage_reconciliation",
+	})
+	if err := tx.Model(&models.PipelineRepairRequest{}).Where("public_id=? AND state IN ?", request.PublicID, []string{
+		models.PipelineRepairAwaitingApproval,
+		models.PipelineRepairQueued,
+		models.PipelineRepairClaimed,
+		models.PipelineRepairRunning,
+		models.PipelineRepairVerifying,
+		models.PipelineRepairUncertain,
+	}).Updates(map[string]any{
+		"state":                     models.PipelineRepairFailed,
+		"failure_class":             longFormDeliveryRepairRetired,
+		"terminal_proof":            proof,
+		"finished_at":               now,
+		"claim_owner":               "",
+		"claim_token":               nil,
+		"claim_expires_at":          nil,
+		"cancellation_requested_at": nil,
+		"updated_at":                now,
+	}).Error; err != nil {
+		return false, err
+	}
+	var attempt models.PipelineRepairAttempt
+	if err := tx.Where("tenant_id=? AND repair_request_id=?", request.TenantID, request.PublicID).Order("attempt_number DESC").First(&attempt).Error; err != nil && err != gorm.ErrRecordNotFound {
+		return false, err
+	} else if err == nil && attempt.State != models.PipelineRepairSucceeded && attempt.State != models.PipelineRepairFailed && attempt.State != models.PipelineRepairCancelled {
+		if err := tx.Model(&attempt).Updates(map[string]any{"state": models.PipelineRepairFailed, "finished_at": now}).Error; err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Model(&models.PipelineStageLease{}).Where("tenant_id=? AND repair_request_id=? AND state IN ?", request.TenantID, request.PublicID, []string{"claimed", "running", "verifying"}).Updates(map[string]any{"state": "terminal", "terminal_at": now, "lease_expires_at": now, "updated_at": now}).Error; err != nil {
+		return false, err
+	}
+	if err := appendEvent(tx, request, nil, "retired_long_form_delivery_repair", map[string]any{
+		"failure_class": longFormDeliveryRepairRetired,
+		"duration_sec":  *item.DurationSec,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // MediaDeliveryCandidate is deliberately independent from the failed-stage
 // event heuristic. A generation replacement may repair a READY legacy item;
 // its fence is the immutable source manifest plus the exact item version.
@@ -57,6 +133,9 @@ func MediaDeliveryCandidate(db *gorm.DB, tenantID string, itemID uuid.UUID) (Can
 	var item models.ContentItem
 	if err := db.Where("public_id=? AND tenant_id=?", itemID, tenantID).First(&item).Error; err != nil {
 		return Candidate{}, models.MediaArtifactManifest{}, err
+	}
+	if isLongFormParent(item) {
+		return Candidate{}, models.MediaArtifactManifest{}, fmt.Errorf("source-only long parent does not require media delivery repair")
 	}
 	var source models.MediaArtifactManifest
 	if err := db.Where("tenant_id=? AND content_item_id=? AND artifact_role='source' AND state IN ?", tenantID, itemID, []string{"verified", "active"}).Order("created_at DESC").First(&source).Error; err != nil {
@@ -299,6 +378,21 @@ func CreateMediaDeliveryRepair(db *gorm.DB, tenantID string, itemID uuid.UUID, p
 // verified source manifest and the current content-item version. It returns an
 // existing live exact repair idempotently and never accepts a caller URL.
 func EnsureMediaDeliveryRepair(db *gorm.DB, tenantID string, itemID uuid.UUID) (models.PipelineRepairRequest, bool, error) {
+	var item models.ContentItem
+	if err := db.Where("tenant_id=? AND public_id=?", tenantID, itemID).First(&item).Error; err != nil {
+		return models.PipelineRepairRequest{}, false, err
+	}
+	if isLongFormParent(item) {
+		return models.PipelineRepairRequest{}, false, fmt.Errorf("source-only long parent does not require media delivery repair")
+	}
+	// An uncertain effect may still own objects even if the item's version
+	// changed. Never admit a replacement until that effect is reconciled.
+	var uncertain models.PipelineRepairRequest
+	if err := db.Where("tenant_id=? AND content_item_id=? AND stage=? AND state=?", tenantID, itemID, models.PipelineStageMediaDeliveryGeneration, models.PipelineRepairUncertain).Order("created_at ASC").First(&uncertain).Error; err == nil {
+		return uncertain, false, nil
+	} else if err != gorm.ErrRecordNotFound {
+		return models.PipelineRepairRequest{}, false, err
+	}
 	candidate, _, err := MediaDeliveryCandidate(db, tenantID, itemID)
 	if err != nil {
 		return models.PipelineRepairRequest{}, false, err
@@ -406,6 +500,16 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			return err
 		}
 		for _, r := range requests {
+			if isDirectMediaDeliveryRepair(r) {
+				var item models.ContentItem
+				if err := tx.Where("tenant_id=? AND public_id=?", r.TenantID, r.ContentItemID).First(&item).Error; err == nil {
+					if retired, retireErr := retireLongFormDeliveryRepair(tx, r, item, now); retireErr != nil {
+						return retireErr
+					} else if retired {
+						continue
+					}
+				}
+			}
 			var c Candidate
 			var err error
 			if isDirectMediaDeliveryRepair(r) {
@@ -752,6 +856,11 @@ func VerifyOne(db *gorm.DB) (bool, error) {
 		return false, err
 	}
 	var event models.ContentProcessingEvent
+	// Rotate unresolved candidates so one legacy uncertainty cannot starve
+	// every newer repair. Unknown effects remain uncertain, not falsely failed.
+	if err := db.Model(&r).UpdateColumn("updated_at", time.Now().UTC()).Error; err != nil {
+		return true, err
+	}
 	if r.EffectProducerEventID == nil || strings.TrimSpace(r.EffectInputDigest) == "" {
 		// A pre-correlation, post-effect repair is intrinsically uncertain. It
 		// remains visible for human investigation rather than accepting any
@@ -788,6 +897,50 @@ func VerifyOne(db *gorm.DB) (bool, error) {
 			return err
 		}
 		return appendEvent(tx, r, nil, "verified", map[string]any{"event_id": event.PublicID.String()})
+	})
+}
+
+// RetireLongFormDeliveryRepairs is called by the CMS repair sweeper on every
+// pass.  It is also safe to call during startup: only stale leases are
+// terminalized, while a still-running legacy worker gets one lease window to
+// finish and report its receipt.  This removes the old source-only delivery
+// repair from the active set so the authoritative pods_media_artifacts stage
+// can reconcile and the global episode slot can advance.
+func RetireLongFormDeliveryRepairs(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	return db.Transaction(func(tx *gorm.DB) error {
+		var requests []models.PipelineRepairRequest
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where(
+			"stage=? AND repair_class=? AND state IN ?",
+			models.PipelineStageMediaDeliveryGeneration,
+			models.PipelineRepairClassMediaDeliveryGeneration,
+			[]string{
+				models.PipelineRepairAwaitingApproval,
+				models.PipelineRepairQueued,
+				models.PipelineRepairClaimed,
+				models.PipelineRepairRunning,
+				models.PipelineRepairVerifying,
+				models.PipelineRepairUncertain,
+			},
+		).Order("updated_at ASC").Limit(64).Find(&requests).Error; err != nil {
+			return err
+		}
+		for _, request := range requests {
+			var item models.ContentItem
+			if err := tx.Where("tenant_id=? AND public_id=?", request.TenantID, request.ContentItemID).First(&item).Error; err != nil {
+				if err == gorm.ErrRecordNotFound {
+					continue
+				}
+				return err
+			}
+			if _, err := retireLongFormDeliveryRepair(tx, request, item, now); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

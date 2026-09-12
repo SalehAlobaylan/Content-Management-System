@@ -11,41 +11,46 @@ import (
 // object-store artifact. MediaStorageArtifactEvent remains the append-only
 // history; this row is the state used by reconciliation and cleanup.
 type MediaArtifactManifest struct {
-	ID                         uint           `gorm:"primaryKey" json:"-"`
-	PublicID                   uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID                   string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	ContentItemID              *uuid.UUID     `gorm:"type:uuid;index" json:"content_item_id,omitempty"`
-	ParentContentItemID        *uuid.UUID     `gorm:"type:uuid;index" json:"parent_content_item_id,omitempty"`
-	AtomizationGenerationID    *uuid.UUID     `gorm:"type:uuid;index" json:"atomization_generation_id,omitempty"`
-	AtomizationChapterUnitID   *uuid.UUID     `gorm:"type:uuid;index" json:"atomization_chapter_unit_id,omitempty"`
-	TranscriptionGenerationID  *uuid.UUID     `gorm:"type:uuid;index" json:"transcription_generation_id,omitempty"`
-	TranscriptionSegmentUnitID *uuid.UUID     `gorm:"type:uuid;index" json:"transcription_segment_unit_id,omitempty"`
-	AttemptID                  *uuid.UUID     `gorm:"type:uuid;index" json:"attempt_id,omitempty"`
-	ArtifactRole               string         `gorm:"type:varchar(32);not null;index" json:"artifact_role"`
-	PackageManifestID          *uuid.UUID     `gorm:"type:uuid;index" json:"package_manifest_id,omitempty"`
-	StorageTier                string         `gorm:"type:varchar(16);not null;default:'primary'" json:"storage_tier"`
-	Bucket                     string         `gorm:"type:varchar(255);not null" json:"bucket"`
-	ObjectKey                  string         `gorm:"type:text;not null" json:"object_key"`
-	PublicURL                  string         `gorm:"type:text" json:"public_url,omitempty"`
-	ContentType                string         `gorm:"type:varchar(255)" json:"content_type,omitempty"`
-	CacheControl               string         `gorm:"type:varchar(255)" json:"cache_control,omitempty"`
-	SizeBytes                  int64          `gorm:"type:bigint;not null;default:0" json:"size_bytes"`
-	ETag                       string         `gorm:"column:etag;type:varchar(255)" json:"etag,omitempty"`
-	SHA256                     string         `gorm:"type:char(64)" json:"sha256,omitempty"`
-	DurationMs                 *int64         `gorm:"type:bigint" json:"duration_ms,omitempty"`
-	CreatorRole                string         `gorm:"type:varchar(64);not null" json:"creator_role"`
-	ProducerEventID            uuid.UUID      `gorm:"type:uuid;not null" json:"producer_event_id"`
-	FenceToken                 *uuid.UUID     `gorm:"type:uuid" json:"fence_token,omitempty"`
-	InputDigest                string         `gorm:"type:char(64);not null" json:"input_digest"`
-	State                      string         `gorm:"type:varchar(24);not null;index" json:"state"`
-	RecoveryClass              string         `gorm:"type:varchar(32);not null;default:'recoverable'" json:"recovery_class"`
-	VerificationEvidence       datatypes.JSON `gorm:"type:jsonb" json:"verification_evidence,omitempty"`
-	TerminalProof              datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`
-	CleanupEligibleAt          *time.Time     `json:"cleanup_eligible_at,omitempty"`
-	VerifiedAt                 *time.Time     `json:"verified_at,omitempty"`
-	DeletedAt                  *time.Time     `json:"deleted_at,omitempty"`
-	CreatedAt                  time.Time      `json:"created_at"`
-	UpdatedAt                  time.Time      `json:"updated_at"`
+	ID                         uint       `gorm:"primaryKey" json:"-"`
+	PublicID                   uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID                   string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ContentItemID              *uuid.UUID `gorm:"type:uuid;index" json:"content_item_id,omitempty"`
+	ParentContentItemID        *uuid.UUID `gorm:"type:uuid;index" json:"parent_content_item_id,omitempty"`
+	AtomizationGenerationID    *uuid.UUID `gorm:"type:uuid;index" json:"atomization_generation_id,omitempty"`
+	AtomizationChapterUnitID   *uuid.UUID `gorm:"type:uuid;index" json:"atomization_chapter_unit_id,omitempty"`
+	TranscriptionGenerationID  *uuid.UUID `gorm:"type:uuid;index" json:"transcription_generation_id,omitempty"`
+	TranscriptionSegmentUnitID *uuid.UUID `gorm:"type:uuid;index" json:"transcription_segment_unit_id,omitempty"`
+	AttemptID                  *uuid.UUID `gorm:"type:uuid;index" json:"attempt_id,omitempty"`
+	ArtifactRole               string     `gorm:"type:varchar(32);not null;index" json:"artifact_role"`
+	PackageManifestID          *uuid.UUID `gorm:"type:uuid;index" json:"package_manifest_id,omitempty"`
+	StorageTier                string     `gorm:"type:varchar(16);not null;default:'primary'" json:"storage_tier"`
+	Bucket                     string     `gorm:"type:varchar(255);not null" json:"bucket"`
+	ObjectKey                  string     `gorm:"type:text;not null" json:"object_key"`
+	PublicURL                  string     `gorm:"type:text" json:"public_url,omitempty"`
+	ContentType                string     `gorm:"type:varchar(255)" json:"content_type,omitempty"`
+	CacheControl               string     `gorm:"type:varchar(255)" json:"cache_control,omitempty"`
+	SizeBytes                  int64      `gorm:"type:bigint;not null;default:0" json:"size_bytes"`
+	ETag                       string     `gorm:"column:etag;type:varchar(255)" json:"etag,omitempty"`
+	SHA256                     string     `gorm:"type:char(64)" json:"sha256,omitempty"`
+	DurationMs                 *int64     `gorm:"type:bigint" json:"duration_ms,omitempty"`
+	CreatorRole                string     `gorm:"type:varchar(64);not null" json:"creator_role"`
+	ProducerEventID            uuid.UUID  `gorm:"type:uuid;not null" json:"producer_event_id"`
+	// Capability material is selected explicitly by internal recovery code; it
+	// must never leak through ordinary model serialization, list endpoints, or
+	// Console projections.
+	FenceToken           *uuid.UUID     `gorm:"type:uuid" json:"-"`
+	UnitFenceToken       *uuid.UUID     `gorm:"type:uuid" json:"-"`
+	OuterFenceToken      *uuid.UUID     `gorm:"type:uuid" json:"-"`
+	InputDigest          string         `gorm:"type:char(64);not null" json:"input_digest"`
+	State                string         `gorm:"type:varchar(24);not null;index" json:"state"`
+	RecoveryClass        string         `gorm:"type:varchar(32);not null;default:'recoverable'" json:"recovery_class"`
+	VerificationEvidence datatypes.JSON `gorm:"type:jsonb" json:"verification_evidence,omitempty"`
+	TerminalProof        datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`
+	CleanupEligibleAt    *time.Time     `json:"cleanup_eligible_at,omitempty"`
+	VerifiedAt           *time.Time     `json:"verified_at,omitempty"`
+	DeletedAt            *time.Time     `json:"deleted_at,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
 }
 
 func (MediaArtifactManifest) TableName() string { return "media_artifact_manifests" }
@@ -67,7 +72,7 @@ type TranscriptionGeneration struct {
 	MergedTranscriptID      *uuid.UUID     `gorm:"type:uuid;index" json:"merged_transcript_id,omitempty"`
 	ClaimOwner              string         `json:"claim_owner,omitempty"`
 	ClaimToken              *uuid.UUID     `gorm:"type:uuid" json:"-"`
-	FenceToken              *uuid.UUID     `gorm:"type:uuid" json:"fence_token,omitempty"`
+	FenceToken              *uuid.UUID     `gorm:"type:uuid" json:"-"`
 	ClaimExpiresAt          *time.Time     `json:"claim_expires_at,omitempty"`
 	TerminalProof           datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`
 	FailureClass            string         `json:"failure_class,omitempty"`
@@ -78,6 +83,7 @@ type TranscriptionGeneration struct {
 func (TranscriptionGeneration) TableName() string { return "transcription_generations" }
 
 type TranscriptionSegmentUnit struct {
+	EffectStartedAt    *time.Time     `json:"effect_started_at,omitempty"`
 	ID                 uint           `gorm:"primaryKey" json:"-"`
 	PublicID           uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
 	TenantID           string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
@@ -93,7 +99,7 @@ type TranscriptionSegmentUnit struct {
 	NotBeforeAt        *time.Time     `json:"not_before_at,omitempty"`
 	ClaimOwner         string         `json:"claim_owner,omitempty"`
 	ClaimToken         *uuid.UUID     `gorm:"type:uuid" json:"-"`
-	FenceToken         *uuid.UUID     `gorm:"type:uuid" json:"fence_token,omitempty"`
+	FenceToken         *uuid.UUID     `gorm:"type:uuid" json:"-"`
 	LeaseExpiresAt     *time.Time     `json:"lease_expires_at,omitempty"`
 	AttemptCount       int            `gorm:"not null;default:0" json:"attempt_count"`
 	FailureClass       string         `json:"failure_class,omitempty"`
@@ -108,29 +114,33 @@ type TranscriptionSegmentUnit struct {
 func (TranscriptionSegmentUnit) TableName() string { return "transcription_segment_units" }
 
 type AtomizationGeneration struct {
-	ID                  uint           `gorm:"primaryKey" json:"-"`
-	PublicID            uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID            string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	ParentContentItemID uuid.UUID      `gorm:"type:uuid;not null;index" json:"parent_content_item_id"`
-	WorkRequestID       uuid.UUID      `gorm:"type:uuid;not null;index" json:"work_request_id"`
-	GenerationNumber    int            `gorm:"not null" json:"generation_number"`
-	TranscriptDigest    string         `gorm:"type:char(64);not null" json:"transcript_digest"`
-	PolicyDigest        string         `gorm:"type:char(64);not null" json:"policy_digest"`
-	InputDigest         string         `gorm:"type:char(64);not null" json:"input_digest"`
-	PlanDigest          string         `gorm:"type:char(64);not null" json:"plan_digest"`
-	ExpectedUnits       int            `gorm:"not null;default:0" json:"expected_units"`
-	CompletedUnits      int            `gorm:"not null;default:0" json:"completed_units"`
-	CoverageDigest      string         `gorm:"type:char(64)" json:"coverage_digest,omitempty"`
-	State               string         `gorm:"type:varchar(24);not null;index" json:"state"`
-	ActivationAt        *time.Time     `json:"activation_at,omitempty"`
-	TerminalProof       datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	ContentStageRequestID *uuid.UUID     `gorm:"type:uuid" json:"content_stage_request_id,omitempty"`
+	ProcessingGeneration  int64          `json:"processing_generation"`
+	Plan                  datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'" json:"plan"`
+	ID                    uint           `gorm:"primaryKey" json:"-"`
+	PublicID              uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID              string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	ParentContentItemID   uuid.UUID      `gorm:"type:uuid;not null;index" json:"parent_content_item_id"`
+	WorkRequestID         uuid.UUID      `gorm:"type:uuid;not null;index" json:"work_request_id"`
+	GenerationNumber      int            `gorm:"not null" json:"generation_number"`
+	TranscriptDigest      string         `gorm:"type:char(64);not null" json:"transcript_digest"`
+	PolicyDigest          string         `gorm:"type:char(64);not null" json:"policy_digest"`
+	InputDigest           string         `gorm:"type:char(64);not null" json:"input_digest"`
+	PlanDigest            string         `gorm:"type:char(64);not null" json:"plan_digest"`
+	ExpectedUnits         int            `gorm:"not null;default:0" json:"expected_units"`
+	CompletedUnits        int            `gorm:"not null;default:0" json:"completed_units"`
+	CoverageDigest        string         `gorm:"type:char(64)" json:"coverage_digest,omitempty"`
+	State                 string         `gorm:"type:varchar(24);not null;index" json:"state"`
+	ActivationAt          *time.Time     `json:"activation_at,omitempty"`
+	TerminalProof         datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 
 func (AtomizationGeneration) TableName() string { return "atomization_generations" }
 
 type AtomizationChapterUnit struct {
+	EffectStartedAt        *time.Time     `json:"effect_started_at,omitempty"`
 	ID                     uint           `gorm:"primaryKey" json:"-"`
 	PublicID               uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
 	TenantID               string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
@@ -144,11 +154,11 @@ type AtomizationChapterUnit struct {
 	NotBeforeAt            *time.Time     `json:"not_before_at,omitempty"`
 	ClaimOwner             string         `json:"claim_owner,omitempty"`
 	ClaimToken             *uuid.UUID     `gorm:"type:uuid" json:"-"`
-	FenceToken             *uuid.UUID     `gorm:"type:uuid" json:"fence_token,omitempty"`
+	FenceToken             *uuid.UUID     `gorm:"type:uuid" json:"-"`
 	LeaseExpiresAt         *time.Time     `json:"lease_expires_at,omitempty"`
 	AttemptCount           int            `gorm:"not null;default:0" json:"attempt_count"`
 	FailureClass           string         `json:"failure_class,omitempty"`
-	ArtifactManifestIDs    datatypes.JSON `gorm:"type:jsonb" json:"artifact_manifest_ids,omitempty"`
+	ArtifactManifestIDs    datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'" json:"artifact_manifest_ids,omitempty"`
 	CandidateContentItemID *uuid.UUID     `gorm:"type:uuid;index" json:"candidate_content_item_id,omitempty"`
 	Result                 datatypes.JSON `gorm:"type:jsonb" json:"result,omitempty"`
 	TerminalProof          datatypes.JSON `gorm:"type:jsonb" json:"terminal_proof,omitempty"`

@@ -27,6 +27,10 @@ func WorkerHealthy(now time.Time) bool {
 	return at > 0 && now.UTC().Sub(time.Unix(0, at).UTC()) <= 90*time.Second
 }
 func runWorkerOnce(db *gorm.DB) {
+	if err := RetireLongFormDeliveryRepairs(db); err != nil {
+		log.Printf("pipeline repair legacy long-form cleanup failed: %v", err)
+		return
+	}
 	if err := RecoverExpired(db); err != nil {
 		log.Printf("pipeline repair recovery failed: %v", err)
 		return

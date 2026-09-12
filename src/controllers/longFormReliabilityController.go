@@ -13,6 +13,7 @@ import (
 
 	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
+	"content-management-system/src/podsflow"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -96,6 +97,8 @@ type artifactManifestRequest struct {
 	CreatorRole                string         `json:"creator_role"`
 	ProducerEventID            string         `json:"producer_event_id"`
 	FenceToken                 string         `json:"fence_token"`
+	UnitFenceToken             string         `json:"unit_fence_token"`
+	OuterFenceToken            string         `json:"outer_fence_token"`
 	InputDigest                string         `json:"input_digest"`
 	RecoveryClass              string         `json:"recovery_class"`
 	VerificationEvidence       map[string]any `json:"verification_evidence"`
@@ -170,17 +173,27 @@ func InternalCreateArtifactManifest(c *gin.Context) {
 		return
 	}
 	manifest := models.MediaArtifactManifest{PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID, ParentContentItemID: parentID, AtomizationGenerationID: atomGen, AtomizationChapterUnitID: atomUnit, TranscriptionGenerationID: transGen, TranscriptionSegmentUnitID: transUnit, AttemptID: attempt, ArtifactRole: role, PackageManifestID: packageManifest, StorageTier: strings.TrimSpace(req.StorageTier), Bucket: strings.TrimSpace(req.Bucket), ObjectKey: strings.TrimSpace(req.ObjectKey), PublicURL: strings.TrimSpace(req.PublicURL), ContentType: strings.TrimSpace(req.ContentType), CacheControl: strings.TrimSpace(req.CacheControl), SizeBytes: req.SizeBytes, ETag: strings.TrimSpace(req.ETag), SHA256: strings.TrimSpace(req.SHA256), DurationMs: req.DurationMs, CreatorRole: strings.TrimSpace(req.CreatorRole), ProducerEventID: *producer, FenceToken: fence, InputDigest: strings.TrimSpace(req.InputDigest), State: manifestStateUploading, RecoveryClass: strings.TrimSpace(req.RecoveryClass), VerificationEvidence: longFormJSON(req.VerificationEvidence), TerminalProof: longFormJSON(req.TerminalProof)}
+	manifest.UnitFenceToken, err = longFormUUID(req.UnitFenceToken, false)
+	if err != nil {
+		c.JSON(422, gin.H{"code": "invalid_unit_fence", "error": "invalid unit fence"})
+		return
+	}
+	manifest.OuterFenceToken, err = longFormUUID(req.OuterFenceToken, false)
+	if err != nil {
+		c.JSON(422, gin.H{"code": "invalid_outer_fence", "error": "invalid outer fence"})
+		return
+	}
 	if manifest.StorageTier == "" {
 		manifest.StorageTier = "primary"
 	}
 	if manifest.RecoveryClass == "" {
 		manifest.RecoveryClass = "recoverable"
 	}
-	if err := validateArtifactManifestOwnership(db, &manifest); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "manifest ownership validation failed", "reason": err.Error()})
-		return
-	}
 	candidate := manifest
+	// Resolve immutable object identity before checking a live lease. A lost
+	// response after a successful upload must replay the same persisted receipt;
+	// it must not be forced through a new effect merely because the old lease has
+	// expired. A different owner or digest still fails closed below.
 	result := db.Where("tenant_id=? AND storage_tier=? AND bucket=? AND object_key=?", tenant, candidate.StorageTier, candidate.Bucket, candidate.ObjectKey).First(&manifest)
 	if result.Error == nil {
 		if manifest.State == manifestStateDeleted {
@@ -196,6 +209,10 @@ func InternalCreateArtifactManifest(c *gin.Context) {
 	}
 	if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "manifest lookup failed"})
+		return
+	}
+	if err := validateArtifactManifestOwnership(db, &candidate); err != nil {
+		longFormError(c, http.StatusConflict, "manifest_ownership_rejected", "Manifest ownership validation failed", err)
 		return
 	}
 	if err := db.Create(&candidate).Error; err != nil {
@@ -230,6 +247,8 @@ func artifactManifestMatchesImmutableIntent(existing, candidate *models.MediaArt
 		!sameLongFormUUID(existing.TranscriptionGenerationID, candidate.TranscriptionGenerationID) ||
 		!sameLongFormUUID(existing.TranscriptionSegmentUnitID, candidate.TranscriptionSegmentUnitID) ||
 		!sameLongFormUUID(existing.AttemptID, candidate.AttemptID) ||
+		!sameLongFormUUID(existing.UnitFenceToken, candidate.UnitFenceToken) ||
+		!sameLongFormUUID(existing.OuterFenceToken, candidate.OuterFenceToken) ||
 		!sameLongFormUUID(existing.FenceToken, candidate.FenceToken) {
 		return false
 	}
@@ -240,16 +259,25 @@ func artifactManifestMatchesImmutableIntent(existing, candidate *models.MediaArt
 }
 
 func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifactManifest) error {
+	unitOwned := manifest.AtomizationChapterUnitID != nil || manifest.TranscriptionSegmentUnitID != nil
+	unitFence := manifest.UnitFenceToken
+	if unitOwned && unitFence == nil {
+		return fmt.Errorf("unit-owned artifacts require an explicit unit fence")
+	}
+	if !unitOwned && unitFence == nil {
+		unitFence = manifest.FenceToken
+	}
+	outerFence := manifest.OuterFenceToken
+	if !unitOwned {
+		outerFence = manifest.FenceToken
+	}
 	checkItem := func(id *uuid.UUID) error {
 		if id == nil {
 			return nil
 		}
 		var item models.ContentItem
-		if err := db.Where("public_id=?", *id).First(&item).Error; err != nil {
+		if err := db.Where("tenant_id=? AND public_id=?", manifest.TenantID, *id).First(&item).Error; err != nil {
 			return fmt.Errorf("content owner not found")
-		}
-		if item.TenantID != manifest.TenantID {
-			return fmt.Errorf("content owner tenant mismatch")
 		}
 		return nil
 	}
@@ -267,8 +295,20 @@ func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifa
 		if manifest.ParentContentItemID != nil && generation.ParentContentItemID != *manifest.ParentContentItemID {
 			return fmt.Errorf("atomization generation parent mismatch")
 		}
+		if manifest.ParentContentItemID != nil {
+			var root models.ContentItem
+			if err := db.Where("tenant_id=? AND public_id=?", manifest.TenantID, *manifest.ParentContentItemID).First(&root).Error; err != nil {
+				return fmt.Errorf("atomization generation root not found")
+			}
+			if generation.ProcessingGeneration != root.ProcessingGeneration || generation.State == "superseded" {
+				return fmt.Errorf("atomization generation is not the current root generation")
+			}
+		}
 	}
 	if manifest.AtomizationChapterUnitID != nil {
+		if manifest.AttemptID == nil || manifest.ParentContentItemID == nil {
+			return fmt.Errorf("chapter artifacts require explicit root and outer attempt")
+		}
 		var unit models.AtomizationChapterUnit
 		if err := db.Where("public_id=? AND tenant_id=?", *manifest.AtomizationChapterUnitID, manifest.TenantID).First(&unit).Error; err != nil {
 			return fmt.Errorf("atomization unit owner not found")
@@ -276,8 +316,15 @@ func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifa
 		if manifest.AtomizationGenerationID == nil || unit.GenerationID != *manifest.AtomizationGenerationID {
 			return fmt.Errorf("atomization unit generation mismatch")
 		}
-		if manifest.FenceToken != nil && (unit.FenceToken == nil || *unit.FenceToken != *manifest.FenceToken) {
+		if manifest.FenceToken == nil || unitFence == nil || *manifest.FenceToken != *unitFence || unit.FenceToken == nil || *unit.FenceToken != *unitFence {
 			return fmt.Errorf("atomization unit fence mismatch")
+		}
+		var generation models.AtomizationGeneration
+		if err := db.Where("tenant_id=? AND public_id=? AND parent_content_item_id=?", manifest.TenantID, unit.GenerationID, *manifest.ParentContentItemID).First(&generation).Error; err != nil {
+			return fmt.Errorf("atomization unit root lineage mismatch")
+		}
+		if unit.State != unitStateVerified && (unit.LeaseExpiresAt == nil || !unit.LeaseExpiresAt.After(time.Now().UTC())) {
+			return fmt.Errorf("atomization unit lease expired")
 		}
 	}
 	if manifest.TranscriptionGenerationID != nil {
@@ -297,16 +344,31 @@ func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifa
 		if manifest.TranscriptionGenerationID == nil || unit.GenerationID != *manifest.TranscriptionGenerationID {
 			return fmt.Errorf("transcription segment generation mismatch")
 		}
-		if manifest.FenceToken != nil && (unit.FenceToken == nil || *unit.FenceToken != *manifest.FenceToken) {
+		if manifest.FenceToken == nil || unitFence == nil || *manifest.FenceToken != *unitFence || unit.FenceToken == nil || *unit.FenceToken != *unitFence {
 			return fmt.Errorf("transcription segment fence mismatch")
+		}
+		if unit.State != unitStateVerified && (unit.LeaseExpiresAt == nil || !unit.LeaseExpiresAt.After(time.Now().UTC())) {
+			return fmt.Errorf("transcription segment lease expired")
 		}
 	}
 	if manifest.AttemptID != nil {
+		if outerFence == nil {
+			return fmt.Errorf("outer attempt fence required")
+		}
 		var attempt models.ContentStageAttempt
 		contentStageResult := db.Where("public_id=? AND tenant_id=?", *manifest.AttemptID, manifest.TenantID).First(&attempt)
 		if contentStageResult.Error == nil {
-			if manifest.FenceToken != nil && attempt.FenceToken != *manifest.FenceToken {
+			if !attempt.LeaseExpiresAt.After(time.Now().UTC()) || attempt.State != "running" {
+				return fmt.Errorf("outer stage authority expired or not running")
+			}
+			if attempt.FenceToken != *outerFence {
 				return fmt.Errorf("content-stage attempt fence mismatch")
+			}
+			if manifest.AtomizationGenerationID != nil {
+				var gen models.AtomizationGeneration
+				if db.Where("tenant_id=? AND public_id=? AND content_stage_request_id=?", manifest.TenantID, manifest.AtomizationGenerationID, attempt.RequestID).First(&gen).Error != nil {
+					return fmt.Errorf("outer stage does not own generation")
+				}
 			}
 		} else if !errors.Is(contentStageResult.Error, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("content-stage attempt lookup failed")
@@ -318,8 +380,17 @@ func validateArtifactManifestOwnership(db *gorm.DB, manifest *models.MediaArtifa
 			var atomizationAttempt models.AtomizationWorkAttempt
 			atomizationResult := db.Where("public_id=? AND tenant_id=?", *manifest.AttemptID, manifest.TenantID).First(&atomizationAttempt)
 			if atomizationResult.Error == nil {
-				if manifest.FenceToken != nil && atomizationAttempt.FenceToken != *manifest.FenceToken {
+				if !atomizationAttempt.LeaseExpiresAt.After(time.Now().UTC()) || atomizationAttempt.State != "running" {
+					return fmt.Errorf("outer work authority expired or not running")
+				}
+				if atomizationAttempt.FenceToken != *outerFence {
 					return fmt.Errorf("atomization attempt fence mismatch")
+				}
+				if manifest.AtomizationGenerationID != nil {
+					var gen models.AtomizationGeneration
+					if db.Where("tenant_id=? AND public_id=? AND work_request_id=?", manifest.TenantID, manifest.AtomizationGenerationID, atomizationAttempt.RequestID).First(&gen).Error != nil {
+						return fmt.Errorf("outer work does not own generation")
+					}
 				}
 				return nil
 			}
@@ -399,7 +470,18 @@ func InternalTransitionArtifactManifest(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "manifest not found"})
 		return
 	}
-	if err := validateArtifactManifestOwnership(db, &manifest); err != nil {
+	reconciliation := req.VerificationEvidence["reconciled"] == true || req.TerminalProof["reconciled"] == true
+	var ownershipError error
+	if reconciliation {
+		if manifest.AtomizationChapterUnitID != nil {
+			ownershipError = validateChapterArtifactObservation(db, manifest, req)
+		} else {
+			ownershipError = validateSourceArtifactObservation(db, manifest, req)
+		}
+	} else {
+		ownershipError = validateArtifactManifestOwnership(db, &manifest)
+	}
+	if err := ownershipError; err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "manifest ownership validation failed", "reason": err.Error()})
 		return
 	}
@@ -421,7 +503,7 @@ func InternalTransitionArtifactManifest(c *gin.Context) {
 			return
 		}
 	}
-	if !manifestTransitionAllowed(manifest.State, state) {
+	if !reconciliation && !manifestTransitionAllowed(manifest.State, state) {
 		if manifest.State == state {
 			c.JSON(http.StatusOK, manifest)
 			return
@@ -463,8 +545,23 @@ func InternalTransitionArtifactManifest(c *gin.Context) {
 		now := time.Now().UTC()
 		updates["deleted_at"] = &now
 	}
-	if err := db.Model(&manifest).Updates(updates).Error; err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "manifest transition failed"})
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		changed := tx.Model(&manifest).Where("tenant_id=? AND state=? AND fence_token IS NOT DISTINCT FROM ?", manifest.TenantID, manifest.State, manifest.FenceToken).Updates(updates)
+		if changed.Error != nil {
+			return changed.Error
+		}
+		if changed.RowsAffected != 1 {
+			return errors.New("manifest state changed")
+		}
+		if reconciliation && manifest.AtomizationChapterUnitID != nil {
+			if err := tx.Model(&models.AtomizationChapterUnit{}).Where("tenant_id=? AND public_id=? AND fence_token=? AND lease_expires_at<? AND state<>?", manifest.TenantID, manifest.AtomizationChapterUnitID, manifest.UnitFenceToken, time.Now().UTC(), unitStateVerified).Update("state", unitStateUncertain).Error; err != nil {
+				return err
+			}
+			return reconcileChapterUnits(tx, manifest.AtomizationGenerationID.String(), time.Now().UTC())
+		}
+		return nil
+	}); err != nil {
+		longFormError(c, http.StatusConflict, "manifest_transition_rejected", "Manifest transition rejected", err)
 		return
 	}
 	if err := db.Where("public_id=?", id).First(&manifest).Error; err != nil {
@@ -497,14 +594,31 @@ func InternalGetArtifactManifest(c *gin.Context) {
 		query = query.Where("state IN ?", strings.Split(state, ","))
 	}
 	if strings.EqualFold(strings.TrimSpace(c.Query("stale")), "true") {
-		query = query.Where("state IN ? AND updated_at < ?", []string{manifestStateUploading, manifestStateUploaded, manifestStateUncertain}, time.Now().UTC().Add(-15*time.Minute))
+		now := time.Now().UTC()
+		if strings.EqualFold(strings.TrimSpace(c.Query("atomization")), "true") {
+			// Atomization manifests are fenced by a nested chapter-unit lease.
+			// Once that lease has been expired for a short safety margin, the
+			// external effect no longer has a valid writer. Do not make a long
+			// episode wait for the broad 15-minute source-artifact quarantine
+			// window; the unit lease is the authoritative boundary here.
+			atomizationCutoff := now.Add(-atomizationObservationSafetyWindow)
+			query = query.Where("state IN ? AND updated_at < ?", []string{manifestStateUploading, manifestStateUploaded, manifestStateUncertain}, atomizationCutoff)
+			query = query.Where("atomization_chapter_unit_id IS NOT NULL AND EXISTS (SELECT 1 FROM atomization_chapter_units u WHERE u.public_id=media_artifact_manifests.atomization_chapter_unit_id AND u.tenant_id=media_artifact_manifests.tenant_id AND u.effect_started_at IS NOT NULL AND u.lease_expires_at<?)", atomizationCutoff)
+		} else {
+			query = query.Where("state IN ? AND updated_at < ?", []string{manifestStateUploading, manifestStateUploaded, manifestStateUncertain}, now.Add(-15*time.Minute))
+			query = query.Where("atomization_chapter_unit_id IS NULL OR EXISTS (SELECT 1 FROM atomization_chapter_units u WHERE u.public_id=media_artifact_manifests.atomization_chapter_unit_id AND u.tenant_id=media_artifact_manifests.tenant_id AND u.effect_started_at IS NOT NULL AND u.lease_expires_at<?)", now.Add(-15*time.Minute))
+		}
 	}
 	if id := strings.TrimSpace(c.Param("id")); id != "" {
 		if err := query.First(&manifest).Error; err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "manifest not found"})
 			return
 		}
-		c.JSON(http.StatusOK, manifest)
+		if strings.EqualFold(strings.TrimSpace(c.Query("credentials")), "true") {
+			c.JSON(http.StatusOK, artifactManifestCredentialView(manifest))
+		} else {
+			c.JSON(http.StatusOK, manifest)
+		}
 		return
 	}
 	var manifests []models.MediaArtifactManifest
@@ -512,7 +626,19 @@ func InternalGetArtifactManifest(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "manifest query failed"})
 		return
 	}
+	// Recovery must first identify a manifest through this safe projection and
+	// then explicitly fetch one credential-bearing record by ID. This prevents
+	// a broad stale-manifest list from becoming a capability dump.
 	c.JSON(http.StatusOK, gin.H{"manifests": manifests})
+}
+
+type artifactManifestCredentialProjection struct {
+	models.MediaArtifactManifest
+	FenceToken *uuid.UUID `json:"fence_token,omitempty"`
+}
+
+func artifactManifestCredentialView(manifest models.MediaArtifactManifest) artifactManifestCredentialProjection {
+	return artifactManifestCredentialProjection{MediaArtifactManifest: manifest, FenceToken: manifest.FenceToken}
 }
 
 type transcriptionGenerationRequest struct {
@@ -661,19 +787,48 @@ func claimTranscriptionUnit(db *gorm.DB, owner string) (*models.TranscriptionSeg
 	var unit models.TranscriptionSegmentUnit
 	var generation models.TranscriptionGeneration
 	err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("(state IN ? AND (not_before_at IS NULL OR not_before_at <= ?)) OR (state IN ? AND lease_expires_at < ?)", []string{unitStateQueued, unitStateDeferred, unitStateUncertain}, now, []string{unitStateClaimed, unitStateRunning, unitStateVerifying}, now).Order("created_at ASC, segment_index ASC").First(&unit).Error; err != nil {
+		if err := reconcileExpiredTranscriptionSegments(tx, now); err != nil {
 			return err
 		}
-		if err := tx.Where("public_id=?", unit.GenerationID).First(&generation).Error; err != nil {
+		// Uncertain or effect-started work is reconciliation-only. A worker may
+		// reclaim an expired claim only when it never crossed the effect boundary.
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("(state IN ? AND (not_before_at IS NULL OR not_before_at <= ?)) OR (state=? AND effect_started_at IS NULL AND lease_expires_at < ?)", []string{unitStateQueued, unitStateDeferred}, now, unitStateClaimed, now).Order("created_at ASC, segment_index ASC").First(&unit).Error; err != nil {
 			return err
+		}
+		if err := tx.Where("public_id=? AND tenant_id=?", unit.GenerationID, unit.TenantID).First(&generation).Error; err != nil {
+			return err
+		}
+		if generation.State == "superseded" || generation.MergedTranscriptID != nil {
+			return gorm.ErrRecordNotFound
+		}
+		var item models.ContentItem
+		if err := tx.Where("tenant_id=? AND public_id=?", generation.TenantID, generation.ContentItemID).First(&item).Error; err != nil {
+			return err
+		}
+		root := item
+		if item.ParentContentItemID != nil {
+			if err := tx.Where("tenant_id=? AND public_id=?", item.TenantID, *item.ParentContentItemID).First(&root).Error; err != nil {
+				return err
+			}
+		}
+		admitted, err := podsflow.Acquire(tx, root)
+		if err != nil {
+			return err
+		}
+		if !admitted {
+			return gorm.ErrRecordNotFound
 		}
 		claim := uuid.New()
 		fence := uuid.New()
 		expires := now.Add(2 * time.Minute)
-		if err := tx.Model(&unit).Updates(map[string]any{"state": unitStateClaimed, "claim_owner": owner, "claim_token": claim, "fence_token": fence, "lease_expires_at": expires, "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": now}).Error; err != nil {
-			return err
+		changed := tx.Model(&unit).Where("tenant_id=? AND state IN ? AND ((state IN ? AND (not_before_at IS NULL OR not_before_at <= ?)) OR (state=? AND effect_started_at IS NULL AND lease_expires_at < ?))", unit.TenantID, []string{unitStateQueued, unitStateDeferred, unitStateClaimed}, []string{unitStateQueued, unitStateDeferred}, now, unitStateClaimed, now).Updates(map[string]any{"state": unitStateClaimed, "claim_owner": owner, "claim_token": claim, "fence_token": fence, "lease_expires_at": expires, "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": now})
+		if changed.Error != nil {
+			return changed.Error
 		}
-		if err := tx.Model(&generation).Updates(map[string]any{"state": unitStateRunning, "updated_at": now}).Error; err != nil {
+		if changed.RowsAffected != 1 {
+			return errors.New("transcription segment claim authority changed")
+		}
+		if err := tx.Model(&generation).Where("tenant_id=? AND public_id=?", generation.TenantID, generation.PublicID).Updates(map[string]any{"state": unitStateRunning, "updated_at": now}).Error; err != nil {
 			return err
 		}
 		unit.State, unit.ClaimOwner, unit.ClaimToken, unit.FenceToken, unit.LeaseExpiresAt = unitStateClaimed, owner, &claim, &fence, &expires
@@ -683,6 +838,26 @@ func claimTranscriptionUnit(db *gorm.DB, owner string) (*models.TranscriptionSeg
 		return nil, nil, nil
 	}
 	return &unit, &generation, err
+}
+
+// Started transcription effects cannot be safely reclaimed by the next Media
+// worker. Move only expired running/verifying units into an explicit
+// reconciliation state; an operator or a future provider receipt must settle
+// that state before another claim is admitted.
+func reconcileExpiredTranscriptionSegments(tx *gorm.DB, now time.Time) error {
+	var units []models.TranscriptionSegmentUnit
+	if err := tx.Where("state IN ? AND lease_expires_at<=?", []string{unitStateRunning, unitStateVerifying}, now).Find(&units).Error; err != nil {
+		return err
+	}
+	for _, unit := range units {
+		changed := tx.Model(&unit).Where("tenant_id=? AND public_id=? AND state=? AND lease_expires_at<=?", unit.TenantID, unit.PublicID, unit.State, now).Updates(map[string]any{
+			"state": unitStateUncertain, "failure_class": "lease_expired_after_effect", "updated_at": now,
+		})
+		if changed.Error != nil {
+			return changed.Error
+		}
+	}
+	return nil
 }
 
 func InternalClaimTranscriptionSegment(c *gin.Context) {
@@ -695,7 +870,12 @@ func InternalClaimTranscriptionSegment(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"unit": unit, "generation": generation})
+	unit.AttemptCount++
+	if unit.ClaimToken == nil || unit.FenceToken == nil || unit.LeaseExpiresAt == nil {
+		longFormError(c, http.StatusInternalServerError, "claim_contract_failure", "CMS returned an incomplete transcription claim", errors.New("transcription claim credentials missing"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"unit": newTranscriptionUnitClaim(*unit), "generation": generation})
 }
 
 type longFormUnitStepRequest struct {
@@ -726,12 +906,14 @@ func InternalTransitionTranscriptionSegment(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "segment not found"})
 		return
 	}
-	if body.ClaimToken != "" {
-		token, parseErr := uuid.Parse(body.ClaimToken)
-		if parseErr != nil || unit.ClaimToken == nil || *unit.ClaimToken != token {
-			c.JSON(http.StatusConflict, gin.H{"error": "stale segment claim"})
-			return
-		}
+	if strings.TrimSpace(body.ClaimToken) == "" {
+		c.JSON(http.StatusConflict, gin.H{"code": "claim_token_required", "error": "transcription segment claim token is required"})
+		return
+	}
+	token, parseErr := uuid.Parse(body.ClaimToken)
+	if parseErr != nil || unit.ClaimToken == nil || *unit.ClaimToken != token {
+		c.JSON(http.StatusConflict, gin.H{"code": "stale_segment_authority", "error": "stale segment claim"})
+		return
 	}
 	target := strings.TrimSpace(c.Param("state"))
 	if target == "" {
@@ -740,11 +922,22 @@ func InternalTransitionTranscriptionSegment(c *gin.Context) {
 	if target == "" {
 		target = unitStateRunning
 	}
+	if target == unitStateVerified && unit.State == unitStateVerified {
+		if unit.ResultDigest == longFormDigest(map[string]any{"text": body.TranscriptText, "segments": body.TranscriptSegments}) || (body.TranscriptText == "" && body.TranscriptSegments == nil) {
+			c.JSON(http.StatusOK, gin.H{"unit": newTranscriptionUnitClaim(unit), "state": target})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"code": "receipt_mismatch", "error": "verified segment receipt cannot change"})
+		return
+	}
 	if !longFormUnitTransitionAllowed(unit.State, target) {
 		c.JSON(http.StatusConflict, gin.H{"error": "invalid transcription segment state transition"})
 		return
 	}
 	updates := map[string]any{"state": target, "updated_at": time.Now().UTC()}
+	if target == unitStateRunning && unit.EffectStartedAt == nil {
+		updates["effect_started_at"] = time.Now().UTC()
+	}
 	if target == unitStateDeferred {
 		updates["not_before_at"] = time.Now().UTC().Add(time.Duration(body.RetryAfterSec) * time.Second)
 		updates["failure_class"] = "capacity_deferred"
@@ -766,22 +959,33 @@ func InternalTransitionTranscriptionSegment(c *gin.Context) {
 		updates["terminal_proof"] = longFormJSON(map[string]any{"verified": true, "summary": body.Summary})
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&unit).Where("claim_token=?", unit.ClaimToken).Updates(updates).Error; err != nil {
-			return err
+		changed := tx.Model(&unit).Where("tenant_id=? AND public_id=? AND claim_token=? AND fence_token=? AND state=? AND lease_expires_at>?", unit.TenantID, unit.PublicID, token, unit.FenceToken, unit.State, time.Now().UTC()).Updates(updates)
+		if changed.Error != nil {
+			return changed.Error
+		}
+		if changed.RowsAffected != 1 {
+			return errors.New("transcription segment authority expired or changed")
 		}
 		if target == unitStateVerified {
 			var completed int64
 			if err := tx.Model(&models.TranscriptionSegmentUnit{}).Where("generation_id=? AND state=?", unit.GenerationID, unitStateVerified).Count(&completed).Error; err != nil {
 				return err
 			}
-			return tx.Model(&models.TranscriptionGeneration{}).Where("public_id=?", unit.GenerationID).Updates(map[string]any{"state": unitStateRunning, "completed_segments": completed, "updated_at": time.Now().UTC()}).Error
+			generationUpdate := tx.Model(&models.TranscriptionGeneration{}).Where("tenant_id=? AND public_id=?", unit.TenantID, unit.GenerationID).Updates(map[string]any{"state": unitStateRunning, "completed_segments": completed, "updated_at": time.Now().UTC()})
+			if generationUpdate.Error != nil {
+				return generationUpdate.Error
+			}
+			if generationUpdate.RowsAffected != 1 {
+				return errors.New("transcription generation readback authority changed")
+			}
+			return nil
 		}
 		return nil
 	}); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "segment transition rejected"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"unit": unit, "state": target})
+	c.JSON(http.StatusOK, gin.H{"unit": newTranscriptionUnitClaim(unit), "state": target})
 }
 
 func InternalHeartbeatTranscriptionSegment(c *gin.Context) { transitionTranscriptionHeartbeat(c) }
@@ -794,6 +998,7 @@ func transitionTranscriptionHeartbeat(c *gin.Context) {
 	}
 	var body struct {
 		ClaimToken string `json:"claim_token"`
+		FenceToken string `json:"fence_token"`
 	}
 	if c.ShouldBindJSON(&body) != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid heartbeat"})
@@ -804,8 +1009,13 @@ func transitionTranscriptionHeartbeat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid claim token"})
 		return
 	}
+	fence, err := uuid.Parse(body.FenceToken)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid fence token"})
+		return
+	}
 	expires := time.Now().UTC().Add(2 * time.Minute)
-	result := db.Model(&models.TranscriptionSegmentUnit{}).Where("public_id=? AND claim_token=? AND state IN ?", id, token, []string{unitStateClaimed, unitStateRunning, unitStateVerifying}).Updates(map[string]any{"state": unitStateRunning, "lease_expires_at": expires, "updated_at": time.Now().UTC()})
+	result := db.Model(&models.TranscriptionSegmentUnit{}).Where("public_id=? AND claim_token=? AND fence_token=? AND state IN ? AND lease_expires_at>?", id, token, fence, []string{unitStateClaimed, unitStateRunning, unitStateVerifying}, time.Now().UTC()).Updates(map[string]any{"lease_expires_at": expires, "updated_at": time.Now().UTC()})
 	if result.Error != nil || result.RowsAffected != 1 {
 		c.JSON(http.StatusConflict, gin.H{"error": "heartbeat rejected"})
 		return
@@ -837,7 +1047,7 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		return
 	}
 	var units []models.TranscriptionSegmentUnit
-	if err := db.Where("generation_id=?", id).Order("segment_index ASC").Find(&units).Error; err != nil {
+	if err := db.Where("tenant_id=? AND generation_id=?", generation.TenantID, id).Order("segment_index ASC").Find(&units).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "segment query failed"})
 		return
 	}
@@ -852,7 +1062,7 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		}
 	}
 	var item models.ContentItem
-	if err := db.Where("public_id=?", generation.ContentItemID).First(&item).Error; err != nil {
+	if err := db.Where("tenant_id=? AND public_id=?", generation.TenantID, generation.ContentItemID).First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "content item not found"})
 		return
 	}
@@ -885,6 +1095,7 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		}
 	}
 	var transcript models.Transcript
+	alreadyFinalized := false
 	stageCorrelation := request.ContentStage
 	if stageCorrelation == nil && len(generation.TerminalProof) > 0 {
 		var proof struct {
@@ -895,6 +1106,61 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		}
 	}
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// The preflight above is intentionally cheap, but the generation lock is
+		// the authority for the final write. Two workers may lose the HTTP
+		// response after the first commit; the second must read the same
+		// transcript instead of creating a duplicate.
+		var lockedGeneration models.TranscriptionGeneration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", generation.TenantID, id).First(&lockedGeneration).Error; err != nil {
+			return err
+		}
+		if lockedGeneration.MergedTranscriptID != nil {
+			transcript.PublicID = *lockedGeneration.MergedTranscriptID
+			alreadyFinalized = true
+			return nil
+		}
+		generation = lockedGeneration
+		var currentUnits []models.TranscriptionSegmentUnit
+		if err := tx.Where("tenant_id=? AND generation_id=?", generation.TenantID, generation.PublicID).Order("segment_index ASC").Find(&currentUnits).Error; err != nil {
+			return err
+		}
+		if len(currentUnits) != generation.TotalSegments || len(currentUnits) == 0 {
+			return errors.New("transcription segments are incomplete")
+		}
+		for _, unit := range currentUnits {
+			if unit.State != unitStateVerified {
+				return errors.New("transcription segment is not verified")
+			}
+		}
+		units = currentUnits
+		allSegments = make([]map[string]any, 0)
+		for _, unit := range units {
+			var segments []map[string]any
+			_ = json.Unmarshal(unit.TranscriptSegments, &segments)
+			for _, segment := range segments {
+				if start, ok := segment["start"].(float64); ok {
+					segment["start"] = start + float64(unit.StartMs)/1000
+				}
+				if end, ok := segment["end"].(float64); ok {
+					segment["end"] = end + float64(unit.StartMs)/1000
+				}
+				allSegments = append(allSegments, segment)
+			}
+		}
+		allSegments = dedupeLongFormTranscriptSegments(allSegments)
+		texts = texts[:0]
+		for _, segment := range allSegments {
+			if text, ok := segment["text"].(string); ok && strings.TrimSpace(text) != "" {
+				texts = append(texts, strings.TrimSpace(text))
+			}
+		}
+		if len(texts) == 0 {
+			for _, unit := range units {
+				if strings.TrimSpace(unit.TranscriptText) != "" {
+					texts = append(texts, strings.TrimSpace(unit.TranscriptText))
+				}
+			}
+		}
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
 		if stageCorrelation != nil {
@@ -908,11 +1174,15 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		if err := tx.Create(&transcript).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&models.ContentItem{}).Where("public_id=?", item.PublicID).Updates(map[string]any{"transcript_id": transcript.PublicID, "caption_state": models.CaptionStateSTTDone, "transcript_source": models.TranscriptSourceSTTDeepgram}).Error; err != nil {
+		if err := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).Updates(map[string]any{"transcript_id": transcript.PublicID, "caption_state": models.CaptionStateSTTDone, "transcript_source": models.TranscriptSourceSTTDeepgram}).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&generation).Updates(map[string]any{"state": unitStateVerified, "merged_transcript_id": transcript.PublicID, "completed_segments": len(units), "terminal_proof": longFormJSON(map[string]any{"verified": true, "segment_count": len(units)})}).Error; err != nil {
-			return err
+		generationUpdate := tx.Model(&models.TranscriptionGeneration{}).Where("tenant_id=? AND public_id=? AND merged_transcript_id IS NULL", generation.TenantID, generation.PublicID).Updates(map[string]any{"state": unitStateVerified, "merged_transcript_id": transcript.PublicID, "completed_segments": len(units), "terminal_proof": longFormJSON(map[string]any{"verified": true, "segment_count": len(units)})})
+		if generationUpdate.Error != nil {
+			return generationUpdate.Error
+		}
+		if generationUpdate.RowsAffected != 1 {
+			return errors.New("transcription generation finalization authority changed")
 		}
 		if generation.TranscriptionJobID != nil {
 			var job models.TranscriptionJob
@@ -957,6 +1227,10 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "transcription finalization failed", "code": "TRANSCRIPTION_FINALIZATION_FAILED", "reason": err.Error()})
 		return
 	}
+	if alreadyFinalized {
+		c.JSON(http.StatusOK, gin.H{"transcript_id": transcript.PublicID, "segment_count": len(units)})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"transcript_id": transcript.PublicID, "segment_count": len(units)})
 }
 
@@ -979,15 +1253,17 @@ func dedupeLongFormTranscriptSegments(input []map[string]any) []map[string]any {
 }
 
 type atomizationGenerationRequest struct {
-	TenantID            string           `json:"tenant_id"`
-	ParentContentItemID string           `json:"parent_content_item_id"`
-	WorkRequestID       string           `json:"work_request_id"`
-	TranscriptDigest    string           `json:"transcript_digest"`
-	PolicyDigest        string           `json:"policy_digest"`
-	InputDigest         string           `json:"input_digest"`
-	PlanDigest          string           `json:"plan_digest"`
-	CoverageDigest      string           `json:"coverage_digest"`
-	Chapters            []map[string]any `json:"chapters"`
+	ContentStage        *contentStageCorrelationRequest `json:"content_stage,omitempty"`
+	ResolveOnly         bool                            `json:"resolve_only,omitempty"`
+	TenantID            string                          `json:"tenant_id"`
+	ParentContentItemID string                          `json:"parent_content_item_id"`
+	WorkRequestID       string                          `json:"work_request_id"`
+	TranscriptDigest    string                          `json:"transcript_digest"`
+	PolicyDigest        string                          `json:"policy_digest"`
+	InputDigest         string                          `json:"input_digest"`
+	PlanDigest          string                          `json:"plan_digest"`
+	CoverageDigest      string                          `json:"coverage_digest"`
+	Chapters            []map[string]any                `json:"chapters"`
 }
 
 func InternalCreateAtomizationGeneration(c *gin.Context) {
@@ -1011,7 +1287,7 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid work_request_id"})
 		return
 	}
-	if len(req.Chapters) == 0 {
+	if len(req.Chapters) == 0 && !req.ResolveOnly {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "chapters are required"})
 		return
 	}
@@ -1028,6 +1304,57 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "parent duration is not atomization-eligible"})
 		return
 	}
+	var stageID *uuid.UUID
+	if req.ContentStage != nil {
+		stage, _, err := contentstage.AuthorizeWriteback(db, parentID, req.ContentStage.correlation(), models.ContentStagePodsAtomization)
+		if err != nil {
+			c.JSON(409, gin.H{"code": "stale_stage", "error": err.Error()})
+			return
+		}
+		stageID = &stage.PublicID
+		workID = stage.PublicID
+	} else {
+		var governed models.AtomizationWorkRequest
+		if err := db.Where("public_id=? AND tenant_id=? AND parent_content_item_id=? AND state='running' AND claim_expires_at>? AND cancellation_requested_at IS NULL", workID, tenant, parentID, time.Now().UTC()).First(&governed).Error; err != nil {
+			c.JSON(409, gin.H{"code": "stage_correlation_required", "error": "live durable stage or governed request required"})
+			return
+		}
+	}
+	var transcript models.Transcript
+	if parent.TranscriptID == nil || db.Where("public_id=? AND content_item_id=?", parent.TranscriptID, parent.PublicID).First(&transcript).Error != nil {
+		c.JSON(422, gin.H{"code": "transcript_required", "error": "verified transcript required"})
+		return
+	}
+	req.TranscriptDigest = atomizationTranscriptDigest(transcript)
+	req.PolicyDigest = longFormDigest(atomizationPolicyForItem(db, &parent))
+	req.InputDigest = longFormDigest([]any{parent.PublicID, parent.ProcessingGeneration, req.TranscriptDigest, req.PolicyDigest})
+	// CMS is the digest authority. TypeScript planners may send advisory
+	// digests, but identity is always derived from the canonical JSON that CMS
+	// persists, avoiding language-specific map ordering drift.
+	if !req.ResolveOnly {
+		req.PlanDigest = longFormDigest(req.Chapters)
+		req.CoverageDigest = atomizationCoverageDigest(req.Chapters)
+	}
+	var resumable models.AtomizationGeneration
+	lookup := db.Where("tenant_id=? AND work_request_id=?", tenant, workID)
+	if stageID != nil {
+		lookup = db.Where("tenant_id=? AND content_stage_request_id=?", tenant, stageID)
+	}
+	if err := lookup.Order("generation_number DESC").First(&resumable).Error; err == nil {
+		if resumable.InputDigest != req.InputDigest {
+			c.JSON(409, gin.H{"code": "generation_input_changed", "error": "existing generation requires explicit replacement"})
+			return
+		}
+		c.JSON(200, gin.H{"generation": resumable})
+		return
+	} else if err != gorm.ErrRecordNotFound {
+		c.JSON(503, gin.H{"code": "generation_lookup_failed", "error": "generation lookup unavailable"})
+		return
+	}
+	if req.ResolveOnly {
+		c.JSON(200, gin.H{"generation": nil})
+		return
+	}
 	var workRequest models.AtomizationWorkRequest
 	workResult := db.Where("public_id=?", workID).First(&workRequest)
 	if workResult.Error != nil && !errors.Is(workResult.Error, gorm.ErrRecordNotFound) {
@@ -1038,37 +1365,90 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "atomization work request owner not found"})
 		return
 	}
-	var previous models.AtomizationGeneration
 	generationNumber := 1
 	var samePlan models.AtomizationGeneration
 	if db.Where("tenant_id=? AND work_request_id=? AND plan_digest=?", tenant, workID, req.PlanDigest).First(&samePlan).Error == nil {
 		c.JSON(http.StatusOK, gin.H{"generation": samePlan})
 		return
 	}
-	if db.Where("tenant_id=? AND work_request_id=?", tenant, workID).Order("generation_number DESC").First(&previous).Error == nil {
-		generationNumber = previous.GenerationNumber + 1
-	}
 	initialProof := map[string]any{}
 	if errors.Is(workResult.Error, gorm.ErrRecordNotFound) {
 		initialProof["compatibility_work_request"] = true
 	}
 	generation := models.AtomizationGeneration{PublicID: uuid.New(), TenantID: tenant, ParentContentItemID: parentID, WorkRequestID: workID, GenerationNumber: generationNumber, TranscriptDigest: req.TranscriptDigest, PolicyDigest: req.PolicyDigest, InputDigest: req.InputDigest, PlanDigest: req.PlanDigest, CoverageDigest: req.CoverageDigest, ExpectedUnits: len(req.Chapters), State: "running", TerminalProof: longFormJSON(initialProof)}
-	parentDurationMs := int64(*parent.DurationSec) * 1000
+	generation.ContentStageRequestID, generation.ProcessingGeneration, generation.Plan = stageID, parent.ProcessingGeneration, longFormJSON(req.Chapters)
 	err = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&generation).Error; err != nil {
+		if req.ContentStage != nil {
+			if _, _, err := contentstage.AuthorizeWriteback(tx, parentID, req.ContentStage.correlation(), models.ContentStagePodsAtomization); err != nil {
+				return err
+			}
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", tenant, parentID).First(&parent).Error; err != nil {
 			return err
+		}
+		if parent.DurationSec == nil || *parent.DurationSec <= 2400 {
+			return errors.New("parent duration is not atomization-eligible")
+		}
+		if parent.TranscriptID == nil {
+			return errors.New("generation transcript changed")
+		}
+		var lockedTranscript models.Transcript
+		if err := tx.Where("public_id=? AND content_item_id=?", *parent.TranscriptID, parent.PublicID).First(&lockedTranscript).Error; err != nil {
+			return err
+		}
+		lockedPolicy := atomizationPolicyForItem(tx, &parent)
+		if atomizationTranscriptDigest(lockedTranscript) != generation.TranscriptDigest || longFormDigest(lockedPolicy) != generation.PolicyDigest || generation.ProcessingGeneration != parent.ProcessingGeneration {
+			return errors.New("generation input changed")
+		}
+		parentDurationMs := int64(*parent.DurationSec) * 1000
+		var existing models.AtomizationGeneration
+		identity := tx.Where("tenant_id=? AND work_request_id=?", tenant, workID)
+		if stageID != nil {
+			identity = tx.Where("tenant_id=? AND content_stage_request_id=?", tenant, stageID)
+		}
+		if err := identity.Order("generation_number DESC").First(&existing).Error; err == nil {
+			if existing.InputDigest != generation.InputDigest {
+				return errors.New("generation input changed")
+			}
+			generation = existing
+			return nil
+		} else if err != gorm.ErrRecordNotFound {
+			return err
+		}
+		var lastNumber int
+		if err := tx.Model(&models.AtomizationGeneration{}).Select("COALESCE(MAX(generation_number),0)").Where("tenant_id=? AND parent_content_item_id=?", tenant, parentID).Scan(&lastNumber).Error; err != nil {
+			return err
+		}
+		generation.GenerationNumber = lastNumber + 1
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&generation)
+		if created.Error != nil {
+			return created.Error
+		}
+		if created.RowsAffected == 0 {
+			identity = tx.Where("tenant_id=? AND work_request_id=?", tenant, workID)
+			if stageID != nil {
+				identity = tx.Where("tenant_id=? AND content_stage_request_id=?", tenant, stageID)
+			}
+			if err := identity.Order("generation_number DESC").First(&existing).Error; err != nil {
+				return err
+			}
+			if existing.InputDigest != generation.InputDigest {
+				return errors.New("generation input changed")
+			}
+			generation = existing
+			return nil
 		}
 		var previousEnd int64
 		for i, ch := range req.Chapters {
 			start, ok1 := numberFromMap(ch, "start_ms")
 			end, ok2 := numberFromMap(ch, "end_ms")
-			if !ok1 || !ok2 || start < 0 || end <= start || int64(start) != previousEnd || end-start < 270000 || end-start > 2400000 {
+			if !ok1 || !ok2 || start < 0 || end <= start || start != float64(int64(start)) || end != float64(int64(end)) || int64(start) != previousEnd || end-start < 270000 || end-start > 2400000 {
 				return errors.New("invalid chapter bounds")
 			}
 			if i == len(req.Chapters)-1 && int64(end) != parentDurationMs {
 				return errors.New("chapter plan does not cover the parent")
 			}
-			unit := models.AtomizationChapterUnit{PublicID: uuid.New(), TenantID: tenant, GenerationID: generation.PublicID, UnitIndex: i, StartMs: int64(start), EndMs: int64(end), PlanDigest: req.PlanDigest, TranscriptSliceDigest: longFormDigest(ch), State: unitStateQueued, Result: longFormJSON(ch), TerminalProof: longFormJSON(map[string]any{})}
+			unit := models.AtomizationChapterUnit{PublicID: uuid.New(), TenantID: tenant, GenerationID: generation.PublicID, UnitIndex: i, StartMs: int64(start), EndMs: int64(end), PlanDigest: req.PlanDigest, TranscriptSliceDigest: longFormDigest(ch), State: unitStateQueued, ArtifactManifestIDs: longFormJSON([]string{}), Result: longFormJSON(ch), TerminalProof: longFormJSON(map[string]any{})}
 			if err := tx.Create(&unit).Error; err != nil {
 				return err
 			}
@@ -1077,7 +1457,7 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "atomization generation creation failed"})
+		longFormError(c, http.StatusUnprocessableEntity, "generation_plan_rejected", "Atomization generation plan or ownership rejected", err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"generation": generation})
@@ -1105,7 +1485,11 @@ func claimAtomizationUnit(db *gorm.DB, owner string, generationID string) (*mode
 	var unit models.AtomizationChapterUnit
 	var gen models.AtomizationGeneration
 	err := db.Transaction(func(tx *gorm.DB) error {
-		query := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("((state IN ? AND (not_before_at IS NULL OR not_before_at<=?)) OR (state IN ? AND lease_expires_at<?))", []string{unitStateQueued, unitStateDeferred, unitStateUncertain}, now, []string{unitStateClaimed, unitStateRunning, unitStateVerifying}, now)
+		if err := reconcileChapterUnits(tx, generationID, now); err != nil {
+			return err
+		}
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("((state IN ? AND (not_before_at IS NULL OR not_before_at<=?)) OR (state=? AND effect_started_at IS NULL AND lease_expires_at<?))", []string{unitStateQueued, unitStateDeferred}, now, unitStateClaimed, now)
+		query = query.Where("NOT EXISTS (SELECT 1 FROM atomization_chapter_units previous WHERE previous.tenant_id=atomization_chapter_units.tenant_id AND previous.generation_id=atomization_chapter_units.generation_id AND previous.unit_index<atomization_chapter_units.unit_index AND previous.state<>'verified')")
 		if strings.TrimSpace(generationID) != "" {
 			query = query.Where("generation_id=?", generationID)
 		}
@@ -1114,6 +1498,29 @@ func claimAtomizationUnit(db *gorm.DB, owner string, generationID string) (*mode
 		}
 		if err := tx.Where("public_id=?", unit.GenerationID).First(&gen).Error; err != nil {
 			return err
+		}
+		if gen.State == "superseded" || gen.State == "active" {
+			return gorm.ErrRecordNotFound
+		}
+		var root models.ContentItem
+		if err := tx.Where("tenant_id=? AND public_id=?", gen.TenantID, gen.ParentContentItemID).First(&root).Error; err != nil {
+			return err
+		}
+		admitted, err := podsflow.Acquire(tx, root)
+		if err != nil {
+			return err
+		}
+		if !admitted {
+			return gorm.ErrRecordNotFound
+		}
+		if gen.ContentStageRequestID != nil {
+			var live int64
+			if err := tx.Model(&models.ContentStageRequest{}).Where("tenant_id=? AND public_id=? AND content_item_id=? AND processing_generation=? AND state='running' AND claim_expires_at>? AND cancellation_requested_at IS NULL", gen.TenantID, gen.ContentStageRequestID, root.PublicID, root.ProcessingGeneration, now).Count(&live).Error; err != nil {
+				return err
+			}
+			if live != 1 {
+				return gorm.ErrRecordNotFound
+			}
 		}
 		claim := uuid.New()
 		fence := uuid.New()
@@ -1138,14 +1545,19 @@ func InternalClaimAtomizationChapterUnit(c *gin.Context) {
 	_ = c.ShouldBindJSON(&body)
 	unit, gen, err := claimAtomizationUnit(c.MustGet("db").(*gorm.DB), strings.TrimSpace(c.GetHeader("X-Worker-Role")), strings.TrimSpace(body.GenerationID))
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "chapter unit claim unavailable"})
+		longFormError(c, http.StatusServiceUnavailable, "chapter_claim_unavailable", "Chapter unit claim unavailable", err)
 		return
 	}
 	if unit == nil {
 		c.Status(http.StatusNoContent)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"unit": unit, "generation": gen})
+	unit.AttemptCount++
+	if unit.ClaimToken == nil || unit.FenceToken == nil || unit.LeaseExpiresAt == nil {
+		longFormError(c, http.StatusInternalServerError, "claim_contract_failure", "CMS returned an incomplete chapter claim", errors.New("chapter claim credentials missing"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"unit": newAtomizationUnitClaim(*unit), "generation": gen})
 }
 
 func InternalTransitionAtomizationChapterUnit(c *gin.Context) {
@@ -1177,11 +1589,23 @@ func InternalTransitionAtomizationChapterUnit(c *gin.Context) {
 	if state == "" {
 		state = unitStateRunning
 	}
+	if state == unitStateVerified && unit.State == unitStateVerified {
+		var storedResult, storedIDs any
+		if json.Unmarshal(unit.Result, &storedResult) == nil && json.Unmarshal(unit.ArtifactManifestIDs, &storedIDs) == nil && longFormDigest(storedResult) == longFormDigest(body.Result) && longFormDigest(storedIDs) == longFormDigest(body.ArtifactManifestIDs) {
+			c.JSON(http.StatusOK, gin.H{"unit": unit, "state": state})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"code": "receipt_mismatch", "error": "verified unit receipt cannot change"})
+		return
+	}
 	if !longFormUnitTransitionAllowed(unit.State, state) {
 		c.JSON(http.StatusConflict, gin.H{"error": "invalid chapter unit state transition"})
 		return
 	}
 	updates := map[string]any{"state": state, "updated_at": time.Now().UTC()}
+	if state == unitStateRunning && unit.EffectStartedAt == nil {
+		updates["effect_started_at"] = time.Now().UTC()
+	}
 	if state == unitStateDeferred {
 		updates["not_before_at"] = time.Now().UTC().Add(time.Duration(body.RetryAfterSec) * time.Second)
 		updates["failure_class"] = "capacity_deferred"
@@ -1198,8 +1622,9 @@ func InternalTransitionAtomizationChapterUnit(c *gin.Context) {
 	if state == unitStateVerified {
 		updates["terminal_proof"] = longFormJSON(map[string]any{"verified": true})
 	}
-	if db.Model(&unit).Where("claim_token=?", token).Updates(updates).Error != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "chapter transition rejected"})
+	result := db.Model(&models.AtomizationChapterUnit{}).Where("public_id=? AND tenant_id=? AND claim_token=? AND fence_token=? AND state=? AND lease_expires_at>?", unit.PublicID, unit.TenantID, token, unit.FenceToken, unit.State, time.Now().UTC()).Updates(updates)
+	if result.Error != nil || result.RowsAffected != 1 {
+		longFormError(c, http.StatusConflict, "stale_chapter_authority", "Chapter transition rejected: authority expired or changed", result.Error)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"unit": unit, "state": state})
@@ -1215,7 +1640,8 @@ func longFormUnitTransitionAllowed(from, to string) bool {
 	case unitStateRunning, unitStateVerifying:
 		return to == unitStateRunning || to == unitStateVerifying || to == unitStateVerified || to == unitStateDeferred || to == unitStateUncertain || to == unitStateFailed
 	case unitStateUncertain:
-		return to == unitStateRunning || to == unitStateFailed || to == unitStateDeferred
+		// Only reconciliation can prove absence/adopt receipts and requeue.
+		return to == unitStateFailed
 	case unitStateDeferred:
 		return to == unitStateFailed
 	default:
@@ -1232,6 +1658,7 @@ func InternalHeartbeatAtomizationChapterUnit(c *gin.Context) {
 	}
 	var body struct {
 		ClaimToken string `json:"claim_token"`
+		FenceToken string `json:"fence_token"`
 	}
 	if c.ShouldBindJSON(&body) != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid heartbeat"})
@@ -1242,8 +1669,13 @@ func InternalHeartbeatAtomizationChapterUnit(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid claim token"})
 		return
 	}
+	fence, err := uuid.Parse(body.FenceToken)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid fence token"})
+		return
+	}
 	expires := time.Now().UTC().Add(2 * time.Minute)
-	if db.Model(&models.AtomizationChapterUnit{}).Where("public_id=? AND claim_token=? AND state IN ?", id, token, []string{unitStateClaimed, unitStateRunning, unitStateVerifying}).Updates(map[string]any{"state": unitStateRunning, "lease_expires_at": expires, "updated_at": time.Now().UTC()}).RowsAffected != 1 {
+	if db.Model(&models.AtomizationChapterUnit{}).Where("public_id=? AND claim_token=? AND fence_token=? AND lease_expires_at>? AND state IN ?", id, token, fence, time.Now().UTC(), []string{unitStateClaimed, unitStateRunning, unitStateVerifying}).Updates(map[string]any{"lease_expires_at": expires, "updated_at": time.Now().UTC()}).RowsAffected != 1 {
 		c.JSON(http.StatusConflict, gin.H{"error": "heartbeat rejected"})
 		return
 	}
@@ -1262,7 +1694,20 @@ func InternalListAtomizationChapterUnits(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "chapter unit query failed"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"units": units})
+	views := make([]map[string]any, 0, len(units))
+	for _, unit := range units {
+		// This endpoint is a recovery/list projection. Claim and fence
+		// credentials are capability material and are never exposed here.
+		views = append(views, map[string]any{
+			"id": unit.PublicID, "tenant_id": unit.TenantID, "generation_id": unit.GenerationID,
+			"unit_index": unit.UnitIndex, "start_ms": unit.StartMs, "end_ms": unit.EndMs,
+			"plan_digest": unit.PlanDigest, "transcript_slice_digest": unit.TranscriptSliceDigest,
+			"state": unit.State, "attempt_count": unit.AttemptCount,
+			"lease_expires_at": unit.LeaseExpiresAt, "artifact_manifest_ids": unit.ArtifactManifestIDs,
+			"candidate_content_item_id": unit.CandidateContentItemID, "result": unit.Result,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"units": views})
 }
 
 func InternalFinalizeAtomizationGeneration(c *gin.Context) {
@@ -1284,6 +1729,10 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "generation not found"})
 		return
 	}
+	if gen.ContentStageRequestID != nil && request.ContentStage == nil {
+		c.JSON(http.StatusConflict, gin.H{"code": "stage_correlation_required", "error": "durable generation finalization requires its stage authority"})
+		return
+	}
 	var parent models.ContentItem
 	var transcript models.Transcript
 	if db.Where("public_id=?", gen.ParentContentItemID).First(&parent).Error != nil {
@@ -1302,6 +1751,39 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 	if len(units) != gen.ExpectedUnits {
 		c.JSON(http.StatusConflict, gin.H{"error": "chapter units incomplete"})
 		return
+	}
+	// Lost final responses must be replayed from persisted receipts, without
+	// resetting child readiness or requiring an already-completed lease to live.
+	if request.ContentStage != nil && gen.ContentStageRequestID != nil && gen.CompletedUnits == gen.ExpectedUnits && (gen.State == "verifying" || gen.State == "active") {
+		correlation := request.ContentStage
+		var attempt models.ContentStageAttempt
+		if err := db.Where("tenant_id=? AND public_id=? AND request_id=? AND claim_token=? AND fence_token=? AND input_fingerprint=?", gen.TenantID, correlation.AttemptID, correlation.RequestID, correlation.ClaimToken, correlation.FenceToken, correlation.InputFingerprint).First(&attempt).Error; err != nil {
+			c.JSON(http.StatusConflict, gin.H{"code": "stale_authority", "error": "finalization receipt authority mismatch"})
+			return
+		}
+		var receipts int64
+		if err := db.Model(&models.ContentStageReceipt{}).Where("tenant_id=? AND request_id=? AND attempt_id=? AND outcome='persisted' AND payload->>'generation_id'=?", gen.TenantID, attempt.RequestID, attempt.PublicID, gen.PublicID.String()).Count(&receipts).Error; err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"code": "receipt_lookup_failed", "error": "finalization receipt unavailable"})
+			return
+		}
+		if receipts > 0 {
+			children := make([]map[string]any, 0, len(units))
+			for _, unit := range units {
+				var child models.ContentItem
+				if unit.CandidateContentItemID == nil || db.Where("tenant_id=? AND public_id=? AND parent_content_item_id=?", gen.TenantID, unit.CandidateContentItemID, gen.ParentContentItemID).First(&child).Error != nil {
+					c.JSON(http.StatusConflict, gin.H{"code": "receipt_child_missing", "error": "persisted child needs reconciliation"})
+					return
+				}
+				delivery, err := contentstage.DeliveryMode(db, child.TenantID, child.Type)
+				if err != nil {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "delivery mode unavailable"})
+					return
+				}
+				children = append(children, map[string]any{"id": child.PublicID.String(), "status": child.Status, "feed_visibility": child.FeedVisibility, "delivery_mode": delivery})
+			}
+			c.JSON(http.StatusOK, gin.H{"generation": gen, "children": children})
+			return
+		}
 	}
 	policy := atomizationPolicyForItem(db, &parent)
 	if err := validateAtomizationGenerationUnits(db, &parent, &gen, units); err != nil {
@@ -1325,6 +1807,31 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 				return err
 			}
 		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", gen.TenantID, parent.PublicID).First(&parent).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", gen.TenantID, gen.PublicID).First(&gen).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND generation_id=?", gen.TenantID, gen.PublicID).Order("unit_index ASC").Find(&units).Error; err != nil {
+			return err
+		}
+		if len(units) != gen.ExpectedUnits {
+			return errors.New("chapter units incomplete")
+		}
+		if parent.TranscriptID == nil {
+			return errors.New("generation transcript removed")
+		}
+		if err := tx.Where("public_id=? AND content_item_id=?", parent.TranscriptID, parent.PublicID).First(&transcript).Error; err != nil {
+			return err
+		}
+		policy = atomizationPolicyForItem(tx, &parent)
+		if gen.ProcessingGeneration != parent.ProcessingGeneration || gen.TranscriptDigest != atomizationTranscriptDigest(transcript) || gen.PolicyDigest != longFormDigest(policy) {
+			return errors.New("generation input changed; explicit replacement required")
+		}
+		if err := validateAtomizationGenerationUnits(tx, &parent, &gen, units); err != nil {
+			return err
+		}
 		for _, unit := range units {
 			if unit.State != unitStateVerified {
 				return errors.New("chapter unit is not verified")
@@ -1342,7 +1849,13 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 				return err
 			}
 			children = append(children, map[string]any{"id": child.PublicID.String(), "status": child.Status, "feed_visibility": child.FeedVisibility, "delivery_mode": delivery})
-			_ = tx.Model(&unit).Updates(map[string]any{"candidate_content_item_id": child.PublicID, "updated_at": time.Now().UTC()}).Error
+			linked := tx.Model(&unit).Updates(map[string]any{"candidate_content_item_id": child.PublicID, "updated_at": time.Now().UTC()})
+			if linked.Error != nil {
+				return linked.Error
+			}
+			if linked.RowsAffected != 1 {
+				return errors.New("child unit linkage lost")
+			}
 		}
 		manifestIDs := make([]string, 0)
 		for _, unit := range units {
@@ -1353,49 +1866,17 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 				return err
 			}
 		}
-		now := time.Now().UTC()
-		var previousGenerations []models.AtomizationGeneration
-		if err := tx.Where("tenant_id=? AND parent_content_item_id=? AND state=? AND public_id<>?", gen.TenantID, gen.ParentContentItemID, "active", gen.PublicID).Find(&previousGenerations).Error; err != nil {
+		// Cut verification is not publication. Keep the prior active generation
+		// until all replacement children have cleared their required stages.
+		if err := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", parent.TenantID, parent.PublicID).Updates(map[string]any{"is_feed_unit": false, "feed_visibility": feedVisibilityHidden, "chaptering_status": "processing"}).Error; err != nil {
 			return err
 		}
-		if len(previousGenerations) > 0 {
-			previousIDs := make([]uuid.UUID, 0, len(previousGenerations))
-			for _, previous := range previousGenerations {
-				previousIDs = append(previousIDs, previous.PublicID)
-			}
-			// Eligibility records the replacement proof but deliberately does not
-			// delete cloud objects. The cleanup executor remains rollout-gated.
-			if err := tx.Model(&models.MediaArtifactManifest{}).
-				Where("tenant_id=? AND atomization_generation_id IN ? AND state IN ?", gen.TenantID, previousIDs, []string{manifestStateVerified, manifestStateActive}).
-				Updates(map[string]any{
-					"state":               manifestStateCleanupEligible,
-					"cleanup_eligible_at": now.Add(24 * time.Hour),
-					"terminal_proof":      longFormJSON(map[string]any{"replacement_generation_id": gen.PublicID.String(), "activated_at": now}),
-					"updated_at":          now,
-				}).Error; err != nil {
-				return err
-			}
+		generationProof := map[string]any{"artifacts_verified": true, "unit_count": len(units), "generation_id": gen.PublicID.String()}
+		if request.ContentStage != nil {
+			generationProof["content_stage_request_id"] = stageRequest.PublicID.String()
+			generationProof["content_stage_attempt_id"] = stageAttempt.PublicID.String()
 		}
-		if err := tx.Model(&models.AtomizationGeneration{}).Where("tenant_id=? AND parent_content_item_id=? AND state=?", gen.TenantID, gen.ParentContentItemID, "active").Updates(map[string]any{"state": "superseded", "updated_at": now}).Error; err != nil {
-			return err
-		}
-		childIDs := make([]string, 0, len(children))
-		for _, child := range children {
-			if value, ok := child["id"].(string); ok {
-				childIDs = append(childIDs, value)
-			}
-		}
-		if len(childIDs) > 0 {
-			if err := tx.Model(&models.ContentItem{}).
-				Where("tenant_id=? AND parent_content_item_id=? AND public_id NOT IN ?", parent.TenantID, parent.PublicID, childIDs).
-				Updates(map[string]any{"status": models.ContentStatusArchived, "feed_visibility": feedVisibilityHidden, "is_feed_unit": false, "chaptering_status": "superseded"}).Error; err != nil {
-				return err
-			}
-		}
-		if err := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", parent.TenantID, parent.PublicID).Updates(map[string]any{"is_feed_unit": false, "feed_visibility": feedVisibilityHidden, "chaptering_status": "completed"}).Error; err != nil {
-			return err
-		}
-		if err := tx.Model(&gen).Updates(map[string]any{"state": "active", "completed_units": len(units), "activation_at": now, "terminal_proof": longFormJSON(map[string]any{"verified": true, "unit_count": len(units)})}).Error; err != nil {
+		if err := tx.Model(&gen).Updates(map[string]any{"state": "verifying", "completed_units": len(units), "terminal_proof": longFormJSON(generationProof)}).Error; err != nil {
 			return err
 		}
 		if request.ContentStage != nil {
@@ -1410,7 +1891,7 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "atomization generation finalization failed", "reason": err.Error()})
+		longFormError(c, http.StatusConflict, "generation_finalization_rejected", "Generation finalization rejected; inspect its durable units and ownership", err)
 		return
 	}
 	_ = db.Where("public_id=?", gen.PublicID).First(&gen)
@@ -1423,6 +1904,10 @@ func atomizationUnitManifestIDs(unit models.AtomizationChapterUnit) []string {
 		return nil
 	}
 	return ids
+}
+
+func atomizationTranscriptDigest(transcript models.Transcript) string {
+	return longFormDigest(map[string]any{"id": transcript.PublicID, "content_item_id": transcript.ContentItemID, "full_text": transcript.FullText, "segments": transcript.Segments, "word_timestamps": transcript.WordTimestamps, "language": transcript.Language})
 }
 
 func validateAtomizationGenerationUnits(db *gorm.DB, parent *models.ContentItem, generation *models.AtomizationGeneration, units []models.AtomizationChapterUnit) error {
@@ -1443,6 +1928,43 @@ func validateAtomizationGenerationUnits(db *gorm.DB, parent *models.ContentItem,
 		if err := json.Unmarshal(unit.Result, &result); err != nil || result.PlaybackURL == nil || strings.TrimSpace(*result.PlaybackURL) == "" || result.MediaURL == nil || strings.TrimSpace(*result.MediaURL) == "" {
 			return fmt.Errorf("unit %d has no verified playback result", index)
 		}
+		if int64(result.StartMs) != unit.StartMs || int64(result.EndMs) != unit.EndMs {
+			return fmt.Errorf("unit %d result changed immutable plan bounds", index)
+		}
+		ids := atomizationUnitManifestIDs(unit)
+		if len(ids) == 0 {
+			return fmt.Errorf("unit %d has no artifact proof", index)
+		}
+		if len(uniqueStrings(ids)) != len(ids) {
+			return fmt.Errorf("unit %d artifact manifest receipt contains duplicate IDs", index)
+		}
+		var manifests []models.MediaArtifactManifest
+		if err := db.Where("tenant_id=? AND atomization_generation_id=? AND atomization_chapter_unit_id=? AND unit_fence_token=? AND state IN ? AND deleted_at IS NULL", generation.TenantID, generation.PublicID, unit.PublicID, unit.FenceToken, []string{manifestStateVerified, manifestStateActive}).Find(&manifests).Error; err != nil {
+			return err
+		}
+		if len(manifests) != len(ids) || !sameStringSet(ids, manifestPublicIDs(manifests)) {
+			return fmt.Errorf("unit %d artifact ownership mismatch", index)
+		}
+		playback, media := false, false
+		for _, m := range manifests {
+			playback = playback || m.PublicURL == *result.PlaybackURL
+			media = media || m.PublicURL == *result.MediaURL
+			if m.PublicURL == *result.MediaURL && m.DurationMs == nil {
+				return fmt.Errorf("unit %d media duration proof missing", index)
+			}
+			if m.DurationMs != nil && (m.PublicURL == *result.MediaURL || m.ArtifactRole == "chapter_media" || m.ArtifactRole == "delivery_audio" || m.ArtifactRole == "playback_mp4" || m.ArtifactRole == "delivery_progressive") {
+				drift := *m.DurationMs - duration
+				if drift < 0 {
+					drift = -drift
+				}
+				if drift > 1000 || *m.DurationMs < 270000 || *m.DurationMs > 2400000 {
+					return fmt.Errorf("unit %d playback duration mismatch", index)
+				}
+			}
+		}
+		if !playback || !media {
+			return fmt.Errorf("unit %d URLs lack owned manifests", index)
+		}
 		if err := validateTypedAudioTierSet(result.MediaRenditions); err != nil {
 			return fmt.Errorf("unit %d has an invalid native-audio tier set", index)
 		}
@@ -1453,13 +1975,12 @@ func validateAtomizationGenerationUnits(db *gorm.DB, parent *models.ContentItem,
 	if cursor != parentDurationMs {
 		return fmt.Errorf("coverage ends at %dms, parent is %dms", cursor, parentDurationMs)
 	}
-	type coveragePoint struct {
-		StartMs int64 `json:"start_ms"`
-		EndMs   int64 `json:"end_ms"`
-	}
-	coverage := make([]coveragePoint, 0, len(units))
+	coverage := make([]map[string]any, 0, len(units))
 	for _, unit := range units {
-		coverage = append(coverage, coveragePoint{StartMs: unit.StartMs, EndMs: unit.EndMs})
+		// Keep the digest representation identical to the create/resolve
+		// contract. encoding/json sorts map keys, so this also accepts legacy
+		// generations whose CMS-created digest used the map representation.
+		coverage = append(coverage, map[string]any{"start_ms": unit.StartMs, "end_ms": unit.EndMs})
 	}
 	if generation.CoverageDigest != "" && generation.CoverageDigest != longFormDigest(coverage) {
 		return errors.New("coverage digest does not match chapter units")
@@ -1475,4 +1996,56 @@ func validateAtomizationGenerationUnits(db *gorm.DB, parent *models.ContentItem,
 		return fmt.Errorf("only %d of %d chapter manifests are verified", verified, len(manifestIDs))
 	}
 	return nil
+}
+
+// atomizationCoverageDigest is the single canonical digest representation for
+// a chapter plan. JSON maps are intentional here: the original CMS contract
+// persisted this representation, and validation must not reject an otherwise
+// complete generation merely because a Go struct emits fields in a different
+// order.
+func atomizationCoverageDigest(chapters []map[string]any) string {
+	coverage := make([]map[string]any, 0, len(chapters))
+	for _, chapter := range chapters {
+		coverage = append(coverage, map[string]any{
+			"start_ms": chapter["start_ms"],
+			"end_ms":   chapter["end_ms"],
+		})
+	}
+	return longFormDigest(coverage)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		seen[value] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	return result
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(uniqueStrings(left)) != len(uniqueStrings(right)) {
+		return false
+	}
+	leftSet := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		leftSet[value] = struct{}{}
+	}
+	for _, value := range right {
+		if _, ok := leftSet[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func manifestPublicIDs(manifests []models.MediaArtifactManifest) []string {
+	ids := make([]string, 0, len(manifests))
+	for _, manifest := range manifests {
+		ids = append(ids, manifest.PublicID.String())
+	}
+	return ids
 }

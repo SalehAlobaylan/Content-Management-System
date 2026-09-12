@@ -308,30 +308,29 @@ func evaluateSTTAdmissionReadOnly(db *gorm.DB, item *models.ContentItem, trigger
 }
 
 func evaluateSTTAdmissionWithConfig(db *gorm.DB, item *models.ContentItem, triggerSource string, cfg models.TranscriptionConfig) (bool, string) {
-	state := ""
-	if item.CaptionState != nil {
-		state = *item.CaptionState
-	}
 	if triggerSource == "" {
 		triggerSource = models.TranscriptionTriggerManual
 	}
 	if item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "" {
 		return false, "no media_url available"
 	}
-	if state == models.CaptionStateYouTubeHuman {
-		return false, "human caption present (no STT needed)"
+	if contentstage.HasProviderCaption(db, *item) {
+		if item.TranscriptID != nil {
+			return false, "provider caption present (no STT needed)"
+		}
+		return false, "provider caption awaiting import (no STT needed)"
 	}
-	qualityDriven := triggerSource == models.TranscriptionTriggerAutoQuality || triggerSource == models.TranscriptionTriggerStudioAutopilot
+	state := ""
+	if item.CaptionState != nil {
+		state = *item.CaptionState
+	}
 	if state == models.CaptionStateSTTDone {
 		q := latestTranscriptQuality(db, item.PublicID)
 		if q == nil || q.Status != models.TranscriptQualityAutoRepair || !cfg.AutoRepairEnabled {
 			return false, "already upgraded by STT"
 		}
 	}
-	if state == models.CaptionStateYouTubeAuto && !cfg.AutoSttEnabled && !qualityDriven {
-		return false, "auto-STT disabled (manual trigger required)"
-	}
-	if (state == "" || state == models.CaptionStateNone) && !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual && triggerSource != models.TranscriptionTriggerAutoQuality {
+	if !cfg.AutoSttEnabled && triggerSource != models.TranscriptionTriggerManual && triggerSource != models.TranscriptionTriggerBulkManual {
 		return false, "auto-STT disabled (manual trigger required)"
 	}
 	if estimate := estimateSTTCostUSD(item.DurationSec); cfg.MonthlyBudgetCapUsd > 0 && cfg.MonthlySpendUsd+cfg.MonthlyReservedUsd+estimate > cfg.MonthlyBudgetCapUsd {
@@ -344,25 +343,38 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 	if triggerSource == "" {
 		triggerSource = models.TranscriptionTriggerManual
 	}
+	// Force may override STT retry policy, but not replace a usable provider
+	// caption with a paid generation. A stale caption_state or empty metadata
+	// placeholder is deliberately ignored by HasProviderCaption so caption-less
+	// media can reach Deepgram.
+	if contentstage.HasProviderCaption(db, *item) {
+		reason := "provider caption awaiting import (no STT needed)"
+		if item.TranscriptID != nil {
+			reason = "provider caption present (no STT needed)"
+		}
+		job := createSkippedTranscriptionJob(db, item, triggerSource, reason)
+		return job, false, job.SkipReason, sttSkipGuard, nil
+	}
 	if item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "" {
 		// YouTube/RSS ingest intentionally stores the provider URL first and lets
 		// Aggregation produce a manifest-owned media URL. A manual STT action must
 		// join and prioritize that durable chain instead of writing a terminal
 		// skipped job that can never observe the later artifact.
-		if triggerSource == models.TranscriptionTriggerManual && item.OriginalURL != nil && strings.TrimSpace(*item.OriginalURL) != "" {
+		if (triggerSource == models.TranscriptionTriggerManual || triggerSource == models.TranscriptionTriggerBulkManual) && item.OriginalURL != nil && strings.TrimSpace(*item.OriginalURL) != "" {
 			if contentstage.MediaAcquisitionRequiresApproval(db, item.TenantID, item.PublicID, item.ProcessingGeneration) {
 				job := createSkippedTranscriptionJob(db, item, triggerSource, "media acquisition requires approval before transcription")
 				return job, false, job.SkipReason, sttSkipGuard, nil
 			}
-			if !force {
-				if admit, reason := evaluateSTTAdmission(db, item, triggerSource); !admit {
-					job := createSkippedTranscriptionJob(db, item, triggerSource, reason)
-					return job, false, job.SkipReason, sttSkipGuard, nil
-				}
+			if !durablePodsTranscriptStageEnabled(db, item) {
+				job := createSkippedTranscriptionJob(db, item, triggerSource, "no media_url available")
+				return job, false, job.SkipReason, sttSkipGuard, nil
 			}
-			if err := contentstage.ExpediteManualTranscript(db, item.TenantID, item.PublicID, item.ProcessingGeneration); err != nil {
-				return models.TranscriptionJob{}, false, "", sttSkipNone, err
-			}
+			// The media URL is intentionally absent at this point: the durable
+			// media stage will acquire it from OriginalURL first.  Do not run the
+			// normal URL admission check here because its "no media_url" guard is
+			// exactly the condition this manual prerequisite path is meant to
+			// repair.  Budget and active-job guards remain enforced by
+			// createAcceptedTranscriptionJob below.
 			job, err := createAcceptedTranscriptionJob(db, item, triggerSource)
 			if err != nil {
 				if errors.Is(err, errTranscriptionBudgetCapReached) {
@@ -408,6 +420,19 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 		return job, false, "", sttSkipNone, err
 	}
 	return job, true, "", sttSkipNone, nil
+}
+
+// durablePodsTranscriptStageEnabled is the routing boundary for transcript
+// effects. Once the Pods lane is promoted, CMS owns the transcript claim,
+// lease, and writeback correlation; sending a job directly to Media would
+// leave the durable stage blocked and the eventual writeback without a valid
+// stage fence. Legacy lanes retain the historical direct Media path.
+func durablePodsTranscriptStageEnabled(db *gorm.DB, item *models.ContentItem) bool {
+	if db == nil || item == nil || (item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast) {
+		return false
+	}
+	mode, err := contentstage.CutoverMode(db, item.TenantID, models.ContentStageLanePods)
+	return err == nil && mode == models.ContentStageCutoverDurableRequired
 }
 
 func checksumTranscriptText(text string, segments datatypes.JSON) string {
@@ -578,6 +603,13 @@ func latestTranscriptionJob(db *gorm.DB, contentID uuid.UUID) *models.Transcript
 }
 
 func submitTranscriptionJobToMedia(db *gorm.DB, item *models.ContentItem, jobID string) error {
+	if durablePodsTranscriptStageEnabled(db, item) {
+		// The accepted job is picked up by makeEnvelope when the durable
+		// transcript request is claimed. This call only releases the prerequisite
+		// stage and raises its priority; it does not contact Media or create a
+		// second queue delivery.
+		return contentstage.ExpediteManualTranscript(db, item.TenantID, item.PublicID, item.ProcessingGeneration)
+	}
 	mediaJobID, err := triggerTranscriptionForJob(item, jobID)
 	if err != nil {
 		return err
@@ -755,17 +787,30 @@ func CreateTranscriptionJob(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create transcription job", Code: "CREATE_FAILED"})
 		return
 	}
-	mediaReady := item.MediaURL != nil && strings.TrimSpace(*item.MediaURL) != ""
-	if triggered && mediaReady {
+	if triggered {
 		itemCopy := item
 		jobID := job.PublicID.String()
-		go func() {
+		if durablePodsTranscriptStageEnabled(db, &itemCopy) {
+			// Release the durable request before returning the receipt. The stage
+			// envelope then sees this accepted job ID, so a fast dispatcher cannot
+			// start an uncorrelated transcript effect.
 			if err := submitTranscriptionJobToMedia(db, &itemCopy, jobID); err != nil {
 				msg := err.Error()
 				status := models.TranscriptionJobStatusFailed
 				_ = updateTranscriptionJobTerminal(db, jobID, status, msg)
 			}
-		}()
+		} else if item.MediaURL != nil && strings.TrimSpace(*item.MediaURL) != "" {
+			// Legacy lanes still submit directly to Media. Keep that network call
+			// outside the request handler so long-form jobs do not hold the CMS
+			// response open.
+			go func() {
+				if err := submitTranscriptionJobToMedia(db, &itemCopy, jobID); err != nil {
+					msg := err.Error()
+					status := models.TranscriptionJobStatusFailed
+					_ = updateTranscriptionJobTerminal(db, jobID, status, msg)
+				}
+			}()
+		}
 	}
 	message := "Transcription job accepted"
 	if !triggered {

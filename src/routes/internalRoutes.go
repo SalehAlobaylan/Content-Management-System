@@ -9,6 +9,15 @@ import (
 	"gorm.io/gorm"
 )
 
+// Literal routes retain their capability-policy identity, while shared
+// transition handlers receive the state selected by that route.
+func withTransitionState(state string, handler gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Params = append(c.Params, gin.Param{Key: "state", Value: state})
+		handler(c)
+	}
+}
+
 // SetupInternalRoutes registers service-to-service routes from the capability
 // matrix in utils.InternalRoutePolicies. A route cannot be added here without
 // declaring its owning machine principal and capability first.
@@ -118,14 +127,14 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/transcription-generations", controllers.InternalCreateTranscriptionGeneration)
 	route(http.MethodPost, "/transcription-segments/claim", controllers.InternalClaimTranscriptionSegment)
 	for _, state := range []string{"running", "verifying", "verified", "deferred", "uncertain", "failed"} {
-		route(http.MethodPost, "/transcription-segments/:id/"+state, controllers.InternalTransitionTranscriptionSegment)
+		route(http.MethodPost, "/transcription-segments/:id/"+state, withTransitionState(state, controllers.InternalTransitionTranscriptionSegment))
 	}
 	route(http.MethodPost, "/transcription-segments/:id/heartbeat", controllers.InternalHeartbeatTranscriptionSegment)
 	route(http.MethodPost, "/transcription-generations/:id/finalize", controllers.InternalFinalizeTranscriptionGeneration)
 	route(http.MethodPost, "/atomization-generations", controllers.InternalCreateAtomizationGeneration)
 	route(http.MethodPost, "/atomization-chapter-units/claim", controllers.InternalClaimAtomizationChapterUnit)
 	for _, state := range []string{"running", "verifying", "verified", "deferred", "uncertain", "failed"} {
-		route(http.MethodPost, "/atomization-chapter-units/:id/"+state, controllers.InternalTransitionAtomizationChapterUnit)
+		route(http.MethodPost, "/atomization-chapter-units/:id/"+state, withTransitionState(state, controllers.InternalTransitionAtomizationChapterUnit))
 	}
 	route(http.MethodPost, "/atomization-chapter-units/:id/heartbeat", controllers.InternalHeartbeatAtomizationChapterUnit)
 	route(http.MethodGet, "/atomization-generations/:id/units", controllers.InternalListAtomizationChapterUnits)

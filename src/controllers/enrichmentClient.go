@@ -145,8 +145,21 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, tri
 }
 
 func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID string) (string, error) {
-	if item.MediaURL == nil || *item.MediaURL == "" {
-		return "", fmt.Errorf("no media_url available")
+	mediaURL := ""
+	if item.MediaURL != nil {
+		mediaURL = strings.TrimSpace(*item.MediaURL)
+	}
+	if mediaURL == "" && item.PlaybackURL != nil {
+		mediaURL = strings.TrimSpace(*item.PlaybackURL)
+	}
+	if mediaURL == "" {
+		// Manual requests can be admitted before media acquisition has produced a
+		// CMS-owned URL.  The durable pods_transcript stage was expedited by the
+		// CMS admission path and will submit STT after its media predecessor
+		// verifies.  Treat this as a deferred hand-off, not a terminal job
+		// failure; callers may safely leave the transcription job queued/running
+		// for the stage write-back to complete it.
+		return "", nil
 	}
 
 	baseURL := mediaBaseURL()
@@ -163,7 +176,7 @@ func triggerTranscriptionForJob(item *models.ContentItem, transcriptionJobID str
 	// long videos/podcasts are not tied to a CMS goroutine HTTP timeout.
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
-	writer.WriteField("url", *item.MediaURL)
+	writer.WriteField("url", mediaURL)
 	writer.WriteField("content_id", item.PublicID.String())
 	writer.WriteField("transcription_job_id", transcriptionJobID)
 	if item.FileSizeBytes > 0 {

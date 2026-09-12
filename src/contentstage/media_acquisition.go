@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/podsflow"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -39,6 +40,10 @@ func shouldAwaitGeneratedSTT(captionPresent, autoEnabled bool, priority int16) b
 // ResolveMediaAcquisitionMode applies source override -> tenant default ->
 // automatic code default. It intentionally does not use source APIConfig.
 func ResolveMediaAcquisitionMode(db *gorm.DB, item models.ContentItem) string {
+	// Chapters reuse approved parent media; source admission only gates roots.
+	if item.ParentContentItemID != nil {
+		return models.MediaAcquisitionAutomatic
+	}
 	if db == nil || !db.Migrator().HasTable(&models.MediaAcquisitionConfig{}) {
 		return models.MediaAcquisitionAutomatic
 	}
@@ -55,7 +60,14 @@ func ResolveMediaAcquisitionMode(db *gorm.DB, item models.ContentItem) string {
 	return models.MediaAcquisitionAutomatic
 }
 
-func hasCaptionArtifact(item models.ContentItem) bool {
+// HasUsableCaptionArtifact reports whether discovery persisted an actual
+// provider caption that Media can import.  The presence of the
+// “caption_artifact“ key alone is not evidence: older discovery attempts
+// wrote empty objects (and occasionally null/partial values) before caption
+// retrieval completed.  Treating those placeholders as captions suppresses
+// generated STT forever and leaves the transcript stage looking healthy while
+// no transcript exists.
+func HasUsableCaptionArtifact(item models.ContentItem) bool {
 	if len(item.Metadata) == 0 {
 		return false
 	}
@@ -63,12 +75,62 @@ func hasCaptionArtifact(item models.ContentItem) bool {
 	if json.Unmarshal(item.Metadata, &metadata) != nil {
 		return false
 	}
-	caption, ok := metadata["caption_artifact"].(map[string]any)
+	artifact, ok := metadata["caption_artifact"].(map[string]any)
 	if !ok {
 		return false
 	}
-	text, _ := caption["full_text"].(string)
-	return strings.TrimSpace(text) != ""
+	fullText, _ := artifact["full_text"].(string)
+	if strings.TrimSpace(fullText) == "" {
+		return false
+	}
+	// ``segments`` was added after the first caption importer. Treat it as
+	// optional for legacy full-text artifacts, but reject a present value of
+	// the wrong JSON type so a malformed placeholder cannot suppress STT.
+	if rawSegments, present := artifact["segments"]; present {
+		if _, ok := rawSegments.([]any); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// HasProviderCaption includes a caption persisted as a transcript row.  The
+// denormalized caption_state is useful for filtering, but it can outlive a
+// failed/partial import; verify the linked row before using it as an STT
+// suppression guard.  A valid metadata artifact still counts as "awaiting
+// import" and therefore remains a free provider-caption path.
+func HasProviderCaption(db *gorm.DB, item models.ContentItem) bool {
+	if HasUsableCaptionArtifact(item) {
+		return true
+	}
+	if db == nil || item.TranscriptID == nil {
+		return false
+	}
+	var transcript models.Transcript
+	if err := db.Where("public_id = ? AND content_item_id = ?", *item.TranscriptID, item.PublicID).First(&transcript).Error; err != nil {
+		return false
+	}
+	if strings.TrimSpace(transcript.FullText) == "" {
+		return false
+	}
+	if transcript.Source != nil {
+		switch strings.TrimSpace(*transcript.Source) {
+		case models.TranscriptSourceYouTubeAuto, models.TranscriptSourceYouTubeHuman:
+			return true
+		default:
+			return false
+		}
+	}
+	// Legacy provider transcripts may have no source column; only trust the
+	// linked row when the denormalized state explicitly identifies a provider
+	// caption.  STT rows are marked stt_done and never enter this branch.
+	return item.CaptionState != nil && (*item.CaptionState == models.CaptionStateYouTubeAuto || *item.CaptionState == models.CaptionStateYouTubeHuman)
+}
+
+// hasCaptionArtifact is retained as a package-local shorthand for the stage
+// lifecycle code.  Keep all admission decisions on the same validity check.
+func hasCaptionArtifact(item models.ContentItem) bool {
+	return HasUsableCaptionArtifact(item)
 }
 
 func automaticSTTEnabled(db *gorm.DB, tenantID string) bool {
@@ -95,7 +157,7 @@ func promoteReadyDependents(tx *gorm.DB, item models.ContentItem) error {
 		}
 		next := models.ContentStageQueued
 		event := "dependency_released"
-		if request.Stage == models.ContentStagePodsTranscript && shouldAwaitGeneratedSTT(hasCaptionArtifact(item), automaticSTTEnabled(tx, item.TenantID), request.Priority) {
+		if request.Stage == models.ContentStagePodsTranscript && shouldAwaitGeneratedSTT(HasProviderCaption(tx, item), automaticSTTEnabled(tx, item.TenantID), request.Priority) {
 			next = models.ContentStageAwaitingApproval
 			event = "manual_transcript_required"
 		}
@@ -189,6 +251,9 @@ func RequestMediaAcquisition(db *gorm.DB, tenantID string, contentID uuid.UUID, 
 				return err
 			}
 			result.State, result.Disposition = request.State, "queued"
+			if err := podsflow.Resume(tx, item); err != nil {
+				return err
+			}
 		case models.ContentStageQueued, models.ContentStageClaimed, models.ContentStageRunning, models.ContentStageVerifying:
 			result.State, result.Disposition = request.State, "already_active"
 		case models.ContentStageVerified:
@@ -212,7 +277,7 @@ func ReconcileSourceAcquisitionPolicy(tx *gorm.DB, source models.ContentSource, 
 	var requests []models.ContentStageRequest
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Table("content_stage_requests AS csr").Select("csr.*").
 		Joins("JOIN content_items ci ON ci.tenant_id=csr.tenant_id AND ci.public_id=csr.content_item_id AND ci.processing_generation=csr.processing_generation").
-		Where("csr.tenant_id=? AND ci.content_source_id=? AND csr.stage=? AND csr.state IN ?", source.TenantID, source.PublicID, models.ContentStagePodsMediaArtifacts,
+		Where("csr.tenant_id=? AND ci.content_source_id=? AND ci.parent_content_item_id IS NULL AND csr.stage=? AND csr.state IN ?", source.TenantID, source.PublicID, models.ContentStagePodsMediaArtifacts,
 			[]string{
 				models.ContentStageAwaitingApproval, models.ContentStageQueued, models.ContentStageDeferred,
 				models.ContentStageClaimed, models.ContentStageFailed, models.ContentStageUncertain,

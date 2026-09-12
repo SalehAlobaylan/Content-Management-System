@@ -388,96 +388,103 @@ func main() {
 	routes.SetupAdminAuthRoutes(router, db)
 	logCMSAuthConfig()
 
-	// Self-heal classification drift: classify any embedded-but-unclassified
-	// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
-	// precompute News snapshot when done. Runs in the background.
-	controllers.StartClassificationBackfill(db)
-	// Preferences Autopilot scheduler (stage 7) — REPLACES the bare topics
-	// heartbeat. Disabled tenants get the incumbent catalog maintenance exactly;
-	// enabled tenants get the bounded, ledgered runner with a health verdict.
-	controllers.StartPreferenceAutopilotHeartbeat(db)
-	// Precompute missing topics.related_ids (stories predating the write-time
-	// related feature) so feed reads never fall back to per-slide centroid kNN.
-	controllers.StartRelatedBackfill(db)
-	// News Circulation automation heartbeat — periodically recompute source
-	// cadence recommendations (and auto-apply inside guardrails) for tenants that
-	// opted in, so the news pipeline self-tunes without manual admin triggers.
-	controllers.StartCirculationAutomation(db)
-	// Ranking/Intelligence refresh heartbeat — recomputes stale/nudged media
-	// value scores in bounded batches (stage 4; scheduled + event-nudged
-	// triggers in one pass, on-demand scoring happens inside circulation).
-	intelligence.StartRefreshLoop(db)
-	// Media Circulation Autopilot heartbeat (stage 5) — fires deterministic
-	// runs for tenants whose autopilot interval has elapsed; Observe tenants
-	// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
-	controllers.StartMediaCirculationAutopilotHeartbeat(db)
-	controllers.StartRedundancyHygieneHeartbeat(db)
-	controllers.StartEnrichmentAutopilotHeartbeat(db)
-	controllers.StartPipelineAutopilotHeartbeat(db)
-	// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
-	// after the lead executes atomize_now, plus a slower interval sweep-up.
-	controllers.StartMediaStudioAutopilotHeartbeat(db)
-	// System Health / Incident Autopilot — CMS-owned probes + incident ledger.
-	controllers.StartSystemHealthAutopilotHeartbeat(db)
-	// Feed Integrity base system — deterministic CMS-edge verification, not an Autopilot.
-	controllers.StartFeedIntegrityHeartbeat(db)
-	// Retention Autopilot — persisted database-pressure sampling and shadow
-	// compact-News proposals. V1 cannot mutate canonical content.
-	controllers.StartRetentionHeartbeat(db)
-	// Real User Experience — Observe scheduler: rolls up closed telemetry buckets
-	// and evaluates deterministic surface verdicts for tenants that enabled it.
-	controllers.StartExperienceHeartbeat(db)
-	// Embedding & Model Lifecycle (stage 10) — vector-space audit scheduler.
-	// Observation only; disabled by default until an admin enables it.
-	controllers.StartEmbeddingLifecycleHeartbeat(db)
-	controllers.StartAISpendGovernorHeartbeat(db)
-	// Wahb Operator — resumes only expired, persisted read investigations after
-	// a fresh IAM access snapshot; no browser session or user bearer is replayed.
-	controllers.StartOperatorInvestigationHeartbeat(db)
-	// Read-only Operator schedules are separately leased and re-authorized on
-	// every tick. They never carry an approved action or browser credential.
-	controllers.StartOperatorScheduleHeartbeat(db)
-	// Approved Operator plans enter the CMS-owned durable work ledger. The
-	// worker rechecks IAM and tenant policy before it claims an immutable plan.
-	controllers.StartOperatorPlanWorker(db)
-	// Source-run evidence reduction is CMS-owned and read-only with respect to
-	// providers and queues. It replays immutable receipts after commit; it does
-	// not enable source dispatch or any new provider effect.
-	supply.StartProjectionWorker(db)
-	// Deferred upstream identities have their own immutable disposition and
-	// expiry projection. This worker never materializes provider content.
-	supply.StartUpstreamObservationWorker(db)
-	// Expired claims converge without provider I/O: pre-effect dispatch can be
-	// redelivered while started units enter verification, never blind retry.
-	supply.StartRecoveryWorker(db)
-	// Reconciliation independently repairs interrupted verification-task
-	// creation. It cannot dispatch or repeat a source/provider effect.
-	supply.StartReconcilerWorker(db)
-	// Only CMS-owned, static Supply actions are claimable here. Owner-service
-	// handoffs remain unavailable until their typed capability protocols exist.
-	supply.StartSupplyActionWorker(db)
-	// Static owner readiness is cached outside request paths. It can deny only
-	// new external handoffs; recovery evidence, cancellation, and verification
-	// retain authority when an owner is unavailable.
-	supply.StartSupplyOwnerReadinessObserver()
-	// Pipeline repair is verification/recovery only; Aggregation remains the
-	// sole owner of its declared stage effect.
-	pipeline.StartWorker(db)
-	contentstage.StartWorker(db, controllers.ClassifyContentStage)
-	controllers.StartArtifactCoverageWorker(db)
-	controllers.StartAtomizationWorkVerifier(db)
-	controllers.StartStudioClearanceWorker(db)
-	// Admission records due work in CMS only. Aggregation later claims the
-	// CMS-issued unit; this scheduler never selects a queue or provider itself.
-	supply.StartSourceRunScheduler(db)
-	// Supply Continuity records CMS-derived attention episodes for explicitly
-	// owned Media-source tenants. It has no source admission, dispatch, queue,
-	// provider, retry, or Operator-plan authority; its only possible effect is
-	// one separately promotion-gated native Supply action.
-	controllers.StartMediaSupplyEvaluationHeartbeat(db)
-	// Shadow qualification is a CMS-only read loop. It cannot render a Console
-	// surface, call a model, build a plan, or promote the launch state.
-	controllers.StartOperatorShadowHeartbeat(db)
+	// Start supervisors after the HTTP listener is available. Several recovery
+	// workers perform a synchronous first pass; doing that before router.Run can
+	// delay binding on a remote Neon database long enough for start.sh to kill a
+	// healthy CMS. The work remains durable and self-healing; only boot ordering
+	// changes.
+	go func() {
+		// Self-heal classification drift: classify any embedded-but-unclassified
+		// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
+		// precompute News snapshot when done. Runs in the background.
+		controllers.StartClassificationBackfill(db)
+		// Preferences Autopilot scheduler (stage 7) — REPLACES the bare topics
+		// heartbeat. Disabled tenants get the incumbent catalog maintenance exactly;
+		// enabled tenants get the bounded, ledgered runner with a health verdict.
+		controllers.StartPreferenceAutopilotHeartbeat(db)
+		// Precompute missing topics.related_ids (stories predating the write-time
+		// related feature) so feed reads never fall back to per-slide centroid kNN.
+		controllers.StartRelatedBackfill(db)
+		// News Circulation automation heartbeat — periodically recompute source
+		// cadence recommendations (and auto-apply inside guardrails) for tenants that
+		// opted in, so the news pipeline self-tunes without manual admin triggers.
+		controllers.StartCirculationAutomation(db)
+		// Ranking/Intelligence refresh heartbeat — recomputes stale/nudged media
+		// value scores in bounded batches (stage 4; scheduled + event-nudged
+		// triggers in one pass, on-demand scoring happens inside circulation).
+		intelligence.StartRefreshLoop(db)
+		// Media Circulation Autopilot heartbeat (stage 5) — fires deterministic
+		// runs for tenants whose autopilot interval has elapsed; Observe tenants
+		// get shadow (dry-run) ledgers, Safe Auto tenants get bounded execution.
+		controllers.StartMediaCirculationAutopilotHeartbeat(db)
+		controllers.StartRedundancyHygieneHeartbeat(db)
+		controllers.StartEnrichmentAutopilotHeartbeat(db)
+		controllers.StartPipelineAutopilotHeartbeat(db)
+		// Media Studio Clearance Autopilot (stage 6) — chain-first heartbeat: fires
+		// after the lead executes atomize_now, plus a slower interval sweep-up.
+		controllers.StartMediaStudioAutopilotHeartbeat(db)
+		// System Health / Incident Autopilot — CMS-owned probes + incident ledger.
+		controllers.StartSystemHealthAutopilotHeartbeat(db)
+		// Feed Integrity base system — deterministic CMS-edge verification, not an Autopilot.
+		controllers.StartFeedIntegrityHeartbeat(db)
+		// Retention Autopilot — persisted database-pressure sampling and shadow
+		// compact-News proposals. V1 cannot mutate canonical content.
+		controllers.StartRetentionHeartbeat(db)
+		// Real User Experience — Observe scheduler: rolls up closed telemetry buckets
+		// and evaluates deterministic surface verdicts for tenants that enabled it.
+		controllers.StartExperienceHeartbeat(db)
+		// Embedding & Model Lifecycle (stage 10) — vector-space audit scheduler.
+		// Observation only; disabled by default until an admin enables it.
+		controllers.StartEmbeddingLifecycleHeartbeat(db)
+		controllers.StartAISpendGovernorHeartbeat(db)
+		// Wahb Operator — resumes only expired, persisted read investigations after
+		// a fresh IAM access snapshot; no browser session or user bearer is replayed.
+		controllers.StartOperatorInvestigationHeartbeat(db)
+		// Read-only Operator schedules are separately leased and re-authorized on
+		// every tick. They never carry an approved action or browser credential.
+		controllers.StartOperatorScheduleHeartbeat(db)
+		// Approved Operator plans enter the CMS-owned durable work ledger. The
+		// worker rechecks IAM and tenant policy before it claims an immutable plan.
+		controllers.StartOperatorPlanWorker(db)
+		// Source-run evidence reduction is CMS-owned and read-only with respect to
+		// providers and queues. It replays immutable receipts after commit; it does
+		// not enable source dispatch or any new provider effect.
+		supply.StartProjectionWorker(db)
+		// Deferred upstream identities have their own immutable disposition and
+		// expiry projection. This worker never materializes provider content.
+		supply.StartUpstreamObservationWorker(db)
+		// Expired claims converge without provider I/O: pre-effect dispatch can be
+		// redelivered while started units enter verification, never blind retry.
+		supply.StartRecoveryWorker(db)
+		// Reconciliation independently repairs interrupted verification-task
+		// creation. It cannot dispatch or repeat a source/provider effect.
+		supply.StartReconcilerWorker(db)
+		// Only CMS-owned, static Supply actions are claimable here. Owner-service
+		// handoffs remain unavailable until their typed capability protocols exist.
+		supply.StartSupplyActionWorker(db)
+		// Static owner readiness is cached outside request paths. It can deny only
+		// new external handoffs; recovery evidence, cancellation, and verification
+		// retain authority when an owner is unavailable.
+		supply.StartSupplyOwnerReadinessObserver()
+		// Pipeline repair is verification/recovery only; Aggregation remains the
+		// sole owner of its declared stage effect.
+		pipeline.StartWorker(db)
+		contentstage.StartWorker(db, controllers.ClassifyContentStage)
+		controllers.StartArtifactCoverageWorker(db)
+		controllers.StartAtomizationWorkVerifier(db)
+		controllers.StartStudioClearanceWorker(db)
+		// Admission records due work in CMS only. Aggregation later claims the
+		// CMS-issued unit; this scheduler never selects a queue or provider itself.
+		supply.StartSourceRunScheduler(db)
+		// Supply Continuity records CMS-derived attention episodes for explicitly
+		// owned Media-source tenants. It has no source admission, dispatch, queue,
+		// provider, retry, or Operator-plan authority; its only possible effect is
+		// one separately promotion-gated native Supply action.
+		controllers.StartMediaSupplyEvaluationHeartbeat(db)
+		// Shadow qualification is a CMS-only read loop. It cannot render a Console
+		// surface, call a model, build a plan, or promote the launch state.
+		controllers.StartOperatorShadowHeartbeat(db)
+	}()
 
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)

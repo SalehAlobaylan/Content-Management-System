@@ -133,7 +133,13 @@ func snapshotTenantIDs(db *gorm.DB, hinted, lane string) ([]string, error) {
 		}
 	}
 	if len(tenants) == 0 {
-		return nil, fmt.Errorf("snapshot tenant scope is unavailable; provide an explicit tenant_id")
+		// A newly provisioned tenant can have no source or content rows yet,
+		// while the lane-health publisher is already running.  Rejecting that
+		// telemetry with 400 makes the console report a false "live data
+		// unavailable" state and leaves the first snapshot impossible to write.
+		// The CMS default tenant is the only valid scope in this situation; once
+		// a tenant has data the queries above return its exact id instead.
+		tenants = []string{"default"}
 	}
 	return tenants, nil
 }

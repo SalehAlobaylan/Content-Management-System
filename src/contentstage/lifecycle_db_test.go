@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/podsflow"
 	"content-management-system/src/tests/testdb"
 
 	"github.com/google/uuid"
@@ -30,6 +31,10 @@ func openContentStageFixtureDB(t *testing.T) *gorm.DB {
 		&models.ContentStageRequest{}, &models.ContentStageAttempt{},
 		&models.ContentStageReceipt{}, &models.ContentStageEvent{},
 		&models.ContentStageCutover{}, &models.ContentStageControl{},
+		&models.AtomizationGeneration{}, &models.AtomizationChapterUnit{},
+		&models.TranscriptionGeneration{}, &models.TranscriptionSegmentUnit{},
+		&models.AtomizationWorkRequest{}, &models.MediaArtifactManifest{},
+		&podsflow.Slot{}, &podsflow.Disposition{},
 	); err != nil {
 		t.Fatalf("migrate content-stage fixture schema: %v", err)
 	}
@@ -43,12 +48,17 @@ func openContentStageFixtureDB(t *testing.T) *gorm.DB {
 func resetContentStageFixture(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	for _, table := range []string{
+		"pods_episode_dispositions", "pods_episode_execution_slot", "media_artifact_manifests",
+		"atomization_chapter_units", "atomization_generations", "transcription_segment_units", "transcription_generations", "atomization_work_requests",
 		"content_stage_events", "content_stage_receipts", "content_stage_attempts",
 		"content_stage_requests", "content_stage_controls", "content_stage_cutovers", "content_items",
 	} {
 		if err := db.Exec("DELETE FROM " + table).Error; err != nil {
 			t.Fatalf("clear %s: %v", table, err)
 		}
+	}
+	if err := db.Create(&podsflow.Slot{Singleton: true}).Error; err != nil {
+		t.Fatal(err)
 	}
 }
 

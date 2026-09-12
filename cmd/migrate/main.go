@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -37,6 +38,11 @@ type migrationFile struct {
 
 var timestampedMigrationName = regexp.MustCompile(`^\d{14}_.+\.sql$`)
 
+const (
+	atomizationReliabilityMigration = "20260908120000_atomization_reliability.sql"
+	checksumRepairAcknowledgement   = "I_UNDERSTAND_THIS_REWRITES_AN_IMMUTABLE_MIGRATION_LEDGER_ENTRY"
+)
+
 // These immutable historical files own their own transactions. They execute
 // once outside the runner transaction; a ledger-write failure must be repaired
 // with the explicit audited baseline command, never replayed automatically.
@@ -54,24 +60,36 @@ func main() {
 		status           = flag.Bool("status", false, "print migration ledger status without applying files")
 		check            = flag.Bool("check", false, "validate every pending migration without applying it")
 		verify           = flag.Bool("verify", false, "verify checksums and require no pending migration")
+		inspectDrift     = flag.String("inspect-checksum-drift", "", "inspect one supported applied migration whose canonical file checksum drifted")
+		repairDrift      = flag.String("repair-checksum-drift", "", "repair one supported checksum drift after replaying its additive SQL and verifying schema postconditions")
+		expectedChecksum = flag.String("expected-recorded-checksum", "", "exact checksum currently stored in the ledger for checksum repair")
+		repairReason     = flag.String("repair-reason", "", "operator reason recorded in audit_logs for checksum repair")
+		repairAck        = flag.String("acknowledge-checksum-repair", "", "required acknowledgement token for checksum repair")
 		baseline         = flag.String("baseline-through", "", "record timestamped migrations through this version as already applied without executing them")
 		allowDestructive = flag.Bool("allow-destructive", false, "allow migrations containing destructive SQL such as DROP TABLE, DROP COLUMN, TRUNCATE, or DELETE FROM")
 		bootstrapEmpty   = flag.Bool("bootstrap-empty", false, "allow reviewed historical large-table migrations only on an explicitly acknowledged empty local disposable database")
 		dir              = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
+	if *inspectDrift != "" && *repairDrift != "" {
+		log.Fatal("--inspect-checksum-drift and --repair-checksum-drift cannot be combined")
+	}
+	driftCommand := *inspectDrift != "" || *repairDrift != ""
 
 	if (*status && *check) || (*status && *verify) || (*check && *verify) {
 		log.Fatal("--status, --check, and --verify cannot be combined")
 	}
-	if (*status || *check || *verify) && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
+	if (*status || *check || *verify || driftCommand) && (*applyAll || *baseline != "" || *allowDestructive || flag.NArg() > 0) {
 		log.Fatal("--status, --check, and --verify cannot be combined with --all, --baseline-through, --allow-destructive, or explicit migration files")
+	}
+	if driftCommand && (*status || *check || *verify || *bootstrapEmpty) {
+		log.Fatal("checksum drift inspection/repair cannot be combined with status, check, verify, or bootstrap operations")
 	}
 	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
 		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
 	}
-	if !*status && !*check && !*verify && !*applyAll && *baseline == "" && flag.NArg() == 0 {
-		log.Fatal("no migrations selected. Use --status, --check, --verify, --all, --baseline-through, or pass explicit migration filenames")
+	if !*status && !*check && !*verify && !driftCommand && !*applyAll && *baseline == "" && flag.NArg() == 0 {
+		log.Fatal("no migrations selected. Use --status, --check, --verify, --inspect-checksum-drift, --repair-checksum-drift, --all, --baseline-through, or pass explicit migration filenames")
 	}
 	if *bootstrapEmpty && (!*applyAll || *status || *check || *baseline != "") {
 		log.Fatal("--bootstrap-empty is only valid with --all and an apply operation")
@@ -89,7 +107,7 @@ func main() {
 
 	// Inspection must not turn an unknown database into a partially initialized
 	// one. Only effect-bearing commands may create or upgrade the ledger.
-	if !*status && !*check && !*verify {
+	if (!*status && !*check && !*verify && !driftCommand) || *repairDrift != "" {
 		if err := ensureLedger(db); err != nil {
 			log.Fatalf("ensure migration ledger: %v", err)
 		}
@@ -98,6 +116,32 @@ func main() {
 	applied, err := appliedVersions(db)
 	if err != nil {
 		log.Fatalf("read migration ledger: %v", err)
+	}
+	if driftCommand {
+		target := *inspectDrift
+		if *repairDrift != "" {
+			target = *repairDrift
+		}
+		file, record, issues, err := inspectAppliedChecksumDrift(db, files, applied, target)
+		if err != nil {
+			log.Fatalf("inspect migration checksum drift: %v", err)
+		}
+		log.Printf("Checksum drift confirmed for %s", file.Version)
+		log.Printf("Recorded checksum: %s", record.Checksum)
+		log.Printf("Canonical checksum: %s", file.Checksum)
+		if len(issues) == 0 {
+			log.Printf("Live schema satisfies all supported postconditions.")
+		} else {
+			log.Printf("Live schema is missing %d supported postcondition(s): %s", len(issues), strings.Join(issues, ", "))
+		}
+		if *repairDrift == "" {
+			return
+		}
+		if err := repairAppliedChecksumDrift(db, file, *expectedChecksum, *repairReason, *repairAck); err != nil {
+			log.Fatalf("repair migration checksum drift: %v", err)
+		}
+		log.Printf("Repaired checksum drift for %s; previous checksum is preserved in audit_logs.", file.Version)
+		return
 	}
 	if err := verifyAppliedChecksums(files, applied); err != nil {
 		log.Fatalf("migration ledger checksum verification failed: %v", err)
@@ -386,6 +430,248 @@ func verifyAppliedChecksums(files []migrationFile, applied map[string]migrationR
 		}
 		if record.Checksum != "" && record.Checksum != file.Checksum {
 			return fmt.Errorf("migration %q checksum differs from its immutable ledger record", version)
+		}
+	}
+	return nil
+}
+
+func inspectAppliedChecksumDrift(db *gorm.DB, files []migrationFile, applied map[string]migrationRecord, requested string) (migrationFile, migrationRecord, []string, error) {
+	requested = strings.TrimSpace(requested)
+	if requested != atomizationReliabilityMigration && requested != strings.TrimSuffix(atomizationReliabilityMigration, ".sql") {
+		return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("checksum recovery is supported only for %s", atomizationReliabilityMigration)
+	}
+	var file migrationFile
+	found := false
+	for _, candidate := range files {
+		if candidate.Version == atomizationReliabilityMigration {
+			file = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("canonical migration %s is missing", atomizationReliabilityMigration)
+	}
+	record, ok := applied[file.Version]
+	if !ok {
+		return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("migration %s is not recorded as applied; use the normal apply workflow", file.Version)
+	}
+	if record.Checksum == "" {
+		return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("migration %s has no recorded checksum; checksum drift repair is not applicable", file.Version)
+	}
+	if record.Checksum == file.Checksum {
+		return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("migration %s is not drifted", file.Version)
+	}
+	for version, other := range applied {
+		if version == file.Version {
+			continue
+		}
+		matched := false
+		for _, candidate := range files {
+			if candidate.Version != version {
+				continue
+			}
+			matched = true
+			if other.Checksum != "" && other.Checksum != candidate.Checksum {
+				return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("unrelated migration %s is also drifted", version)
+			}
+			break
+		}
+		if !matched {
+			return migrationFile{}, migrationRecord{}, nil, fmt.Errorf("ledger contains unrelated migration %s missing from migrations/", version)
+		}
+	}
+	issues, err := atomizationReliabilitySchemaIssues(db)
+	return file, record, issues, err
+}
+
+type requiredMigrationColumn struct {
+	tableName string
+	column    string
+	dataType  string
+}
+
+func atomizationReliabilitySchemaIssues(db *gorm.DB) ([]string, error) {
+	requiredColumns := []requiredMigrationColumn{
+		{"media_artifact_manifests", "unit_fence_token", "uuid"},
+		{"media_artifact_manifests", "outer_fence_token", "uuid"},
+		{"atomization_generations", "content_stage_request_id", "uuid"},
+		{"atomization_generations", "processing_generation", "bigint"},
+		{"atomization_generations", "plan", "jsonb"},
+		{"atomization_chapter_units", "effect_started_at", "timestamp with time zone"},
+		{"transcription_segment_units", "effect_started_at", "timestamp with time zone"},
+		{"pods_episode_execution_slot", "singleton", "boolean"},
+		{"pods_episode_execution_slot", "processing_generation", "bigint"},
+		{"pods_episode_dispositions", "root_content_item_id", "uuid"},
+		{"pods_episode_dispositions", "disposition", "character varying"},
+	}
+	issues := make([]string, 0)
+	for _, required := range requiredColumns {
+		var exists bool
+		if err := db.Raw(`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema='public' AND table_name=? AND column_name=? AND data_type=?
+		)`, required.tableName, required.column, required.dataType).Scan(&exists).Error; err != nil {
+			return nil, fmt.Errorf("inspect %s.%s: %w", required.tableName, required.column, err)
+		}
+		if !exists {
+			issues = append(issues, required.tableName+"."+required.column)
+		}
+	}
+	for _, required := range []struct{ tableName, constraint string }{
+		{"media_artifact_manifests", "atomization_manifest_nested_authority"},
+		{"media_artifact_manifests", "nested_manifest_fence_shape"},
+	} {
+		var exists bool
+		if err := db.Raw(`SELECT EXISTS (
+			SELECT 1 FROM pg_constraint
+			WHERE conname=? AND conrelid=to_regclass('public.' || ?)
+		)`, required.constraint, required.tableName).Scan(&exists).Error; err != nil {
+			return nil, fmt.Errorf("inspect constraint %s: %w", required.constraint, err)
+		}
+		if !exists {
+			issues = append(issues, "constraint "+required.constraint)
+		}
+	}
+	for _, index := range []string{"atomization_generation_stage_identity"} {
+		var exists bool
+		if err := db.Raw(`SELECT to_regclass('public.' || ?) IS NOT NULL`, index).Scan(&exists).Error; err != nil {
+			return nil, fmt.Errorf("inspect index %s: %w", index, err)
+		}
+		if !exists {
+			issues = append(issues, "index "+index)
+		}
+	}
+	var auditLogsExists bool
+	if err := db.Raw(`SELECT to_regclass('public.audit_logs') IS NOT NULL`).Scan(&auditLogsExists).Error; err != nil {
+		return nil, fmt.Errorf("inspect audit_logs: %w", err)
+	}
+	if !auditLogsExists {
+		issues = append(issues, "audit_logs prerequisite")
+	}
+	sort.Strings(issues)
+	return issues, nil
+}
+
+func repairAppliedChecksumDrift(db *gorm.DB, file migrationFile, expectedChecksum, reason, acknowledgement string) error {
+	if file.Version != atomizationReliabilityMigration {
+		return fmt.Errorf("checksum recovery is supported only for %s", atomizationReliabilityMigration)
+	}
+	expectedChecksum = strings.ToLower(strings.TrimSpace(expectedChecksum))
+	if len(expectedChecksum) != 64 {
+		return fmt.Errorf("--expected-recorded-checksum must be the exact 64-character checksum printed by inspection")
+	}
+	if _, err := hex.DecodeString(expectedChecksum); err != nil {
+		return fmt.Errorf("--expected-recorded-checksum is not hexadecimal")
+	}
+	reason = strings.TrimSpace(reason)
+	if len(reason) < 12 {
+		return fmt.Errorf("--repair-reason must contain an audit explanation of at least 12 characters")
+	}
+	if acknowledgement != checksumRepairAcknowledgement {
+		return fmt.Errorf("--acknowledge-checksum-repair must equal %s", checksumRepairAcknowledgement)
+	}
+	if destructive, err := migrationIsDestructive(file); err != nil {
+		return err
+	} else if destructive {
+		return fmt.Errorf("refusing checksum repair because %s contains destructive SQL", file.Version)
+	}
+	if err := requireLargeTableMigrationSafety([]migrationFile{file}); err != nil {
+		return err
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", int64(20260908120000)).Error; err != nil {
+			return fmt.Errorf("acquire migration repair lock: %w", err)
+		}
+		var locked struct {
+			Checksum      string
+			ExecutionMode string
+		}
+		result := tx.Raw(`SELECT COALESCE(checksum_sha256, '') AS checksum, execution_mode
+			FROM cms_schema_migrations WHERE version=? FOR UPDATE`, file.Version).Scan(&locked)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("ledger row for %s disappeared during repair", file.Version)
+		}
+		if locked.Checksum != expectedChecksum {
+			return fmt.Errorf("recorded checksum changed: expected %s, found %s", expectedChecksum, locked.Checksum)
+		}
+		if locked.Checksum == file.Checksum {
+			return fmt.Errorf("migration %s no longer has checksum drift", file.Version)
+		}
+		issues, err := atomizationReliabilitySchemaIssues(tx)
+		if err != nil {
+			return err
+		}
+		if err := repairAtomizationReliabilitySchema(tx, issues); err != nil {
+			return err
+		}
+		issues, err = atomizationReliabilitySchemaIssues(tx)
+		if err != nil {
+			return err
+		}
+		if len(issues) != 0 {
+			return fmt.Errorf("schema postcondition verification failed after additive replay: %s", strings.Join(issues, ", "))
+		}
+		payload, err := json.Marshal(map[string]string{
+			"migration":               file.Version,
+			"previous_checksum":       locked.Checksum,
+			"canonical_checksum":      file.Checksum,
+			"previous_execution_mode": locked.ExecutionMode,
+			"reason":                  reason,
+		})
+		if err != nil {
+			return err
+		}
+		if err := tx.Exec(`INSERT INTO audit_logs
+			(tenant_id, user_id, user_email, action, target_service, target_resource, status, payload)
+			VALUES ('default', 'cms-migrate', 'cms-migrate@local', 'migration_checksum_repair', 'cms', ?, 'success', ?::jsonb)`, file.Version, string(payload)).Error; err != nil {
+			return fmt.Errorf("write checksum repair audit: %w", err)
+		}
+		updated := tx.Exec(`UPDATE cms_schema_migrations
+			SET checksum_sha256=?, execution_mode='checksum_repaired'
+			WHERE version=? AND checksum_sha256=?`, file.Checksum, file.Version, expectedChecksum)
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return fmt.Errorf("checksum repair lost its compare-and-swap fence")
+		}
+		return nil
+	})
+}
+
+func repairAtomizationReliabilitySchema(tx *gorm.DB, issues []string) error {
+	for _, issue := range issues {
+		switch issue {
+		case "transcription_segment_units.effect_started_at":
+			if err := tx.Exec(`ALTER TABLE transcription_segment_units
+				ADD COLUMN IF NOT EXISTS effect_started_at TIMESTAMPTZ`).Error; err != nil {
+				return migrationExecutionError(err)
+			}
+		case "constraint nested_manifest_fence_shape":
+			if err := tx.Exec(`DO $$
+			BEGIN
+			  IF NOT EXISTS (
+			    SELECT 1 FROM pg_constraint
+			    WHERE conname='nested_manifest_fence_shape'
+			      AND conrelid='public.media_artifact_manifests'::regclass
+			  ) THEN
+			    ALTER TABLE media_artifact_manifests ADD CONSTRAINT nested_manifest_fence_shape
+			      CHECK (transcription_segment_unit_id IS NULL OR
+			        (transcription_generation_id IS NOT NULL AND content_item_id IS NOT NULL
+			         AND attempt_id IS NOT NULL AND unit_fence_token IS NOT NULL AND outer_fence_token IS NOT NULL)) NOT VALID;
+			  END IF;
+			END $$`).Error; err != nil {
+				return migrationExecutionError(err)
+			}
+		default:
+			return fmt.Errorf("automatic repair refuses unsupported missing postcondition %q", issue)
 		}
 	}
 	return nil

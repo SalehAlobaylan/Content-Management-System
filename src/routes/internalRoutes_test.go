@@ -3,11 +3,35 @@ package routes
 import (
 	"content-management-system/src/utils"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestLiteralUnitTransitionRoutesPassTheirState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, resource := range []string{"atomization-chapter-units", "transcription-segments"} {
+		for _, state := range []string{"running", "verifying", "verified", "deferred", "uncertain", "failed"} {
+			t.Run(resource+"/"+state, func(t *testing.T) {
+				router := gin.New()
+				router.POST("/"+resource+"/:id/"+state, withTransitionState(state, func(c *gin.Context) {
+					if c.Param("state") != state || c.Param("id") != "unit-id" {
+						t.Fatalf("wrong transition parameters: %v", c.Params)
+					}
+					c.Status(http.StatusNoContent)
+				}))
+				response := httptest.NewRecorder()
+				// Caller-controlled query state must not replace route authority.
+				router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/"+resource+"/unit-id/"+state+"?state=other", nil))
+				if response.Code != http.StatusNoContent {
+					t.Fatalf("unexpected status: %d", response.Code)
+				}
+			})
+		}
+	}
+}
 
 func TestInternalRoutesExactlyMatchCapabilityMatrix(t *testing.T) {
 	gin.SetMode(gin.TestMode)

@@ -46,6 +46,12 @@ Inspect or apply canonical CMS SQL migrations explicitly:
 ./scripts/cms-migrate.sh apply --allow-destructive
 ```
 
+The migration ledger is immutable during normal operation. The narrowly scoped
+`inspect-drift` and `repair-drift` commands exist only for the audited
+`20260908120000_atomization_reliability.sql` recovery incident. Repair requires
+the exact recorded checksum, replays only additive SQL under a database lock,
+verifies the live schema, and preserves the previous checksum in `audit_logs`.
+
 For an existing pre-ledger database, establish the historical boundary once with `./scripts/cms-migrate.sh baseline <timestamped-file.sql>`. Run `check` before a release to checksum the ledger and lint every pending migration. Normal `apply` advances the ordered safe prefix and stops before the first destructive migration; it never skips that boundary. Continue with `apply --allow-destructive` only after reviewing the blocked migration and satisfying its own readiness guards. Pending updates to the large live `content_items` or `stories` tables are rejected unless the migration declares a reviewed bounded-backfill or operator-maintenance strategy. New canonical migrations must not include top-level `BEGIN`/`COMMIT`: the runner owns the transaction and ledger write; only audited historical exceptions may retain their original transaction wrappers.
 
 ### Go API docs (terminal)

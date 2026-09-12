@@ -110,7 +110,7 @@ type ContentStageAttempt struct {
 	AcceptedAt         *time.Time `json:"accepted_at,omitempty"`
 	FinishedAt         *time.Time `json:"finished_at,omitempty"`
 	FailureClass       string     `json:"failure_class,omitempty"`
-	FailureSummary     string     `json:"failure_summary,omitempty"`
+	FailureSummary     string     `gorm:"type:text" json:"failure_summary,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }

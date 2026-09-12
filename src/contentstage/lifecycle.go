@@ -1,10 +1,12 @@
 package contentstage
 
 import (
+	"content-management-system/src/podsflow"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"content-management-system/src/feedcontract"
 	"content-management-system/src/feedstate"
@@ -59,12 +61,14 @@ func ClaimMediaNext(db *gorm.DB, tenantID, claimOwner string) (ClaimEnvelope, bo
 }
 
 type claimCandidateFilter struct {
-	tenantID      string
-	lane          string
-	expectedOwner string
-	allowedStages []string
-	optional      bool
-	now           time.Time
+	tenantID            string
+	lane                string
+	expectedOwner       string
+	allowedStages       []string
+	optional            bool
+	now                 time.Time
+	admissionRestricted bool
+	admissionRoots      []models.ContentItem
 }
 
 // eligibleClaimCandidateScope deliberately starts from the transaction handle
@@ -82,83 +86,26 @@ func eligibleClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter) *gorm
 			filter.now,
 		)
 	if filter.lane == models.ContentStageLanePods {
-		// Metadata discovery may create durable intent for many media items at
-		// once, but execution is deliberately serial per source. A request is
-		// claimable only when it belongs to the oldest admitted item from that
-		// source whose required pipeline has not reached a terminal state. Items
-		// still awaiting media approval are not admitted and therefore do not
-		// block an operator-selected item.
-		scope = scope.Where(`
-			NOT EXISTS (
-				SELECT 1
-				FROM content_items claim_item
-				JOIN content_items earlier_item
-				  ON earlier_item.tenant_id = claim_item.tenant_id
-				 AND earlier_item.content_source_id = claim_item.content_source_id
-				 AND earlier_item.parent_content_item_id IS NULL
-				 AND (
-					earlier_item.created_at < claim_item.created_at
-					OR (earlier_item.created_at = claim_item.created_at AND earlier_item.public_id::text < claim_item.public_id::text)
-				 )
-				WHERE claim_item.tenant_id = content_stage_requests.tenant_id
-				  AND claim_item.public_id = content_stage_requests.content_item_id
-				  AND claim_item.processing_generation = content_stage_requests.processing_generation
-				  AND claim_item.content_source_id IS NOT NULL
-				  AND EXISTS (
-					SELECT 1 FROM content_stage_requests earlier_media
-					WHERE earlier_media.tenant_id = earlier_item.tenant_id
-					  AND earlier_media.content_item_id = earlier_item.public_id
-					  AND earlier_media.processing_generation = earlier_item.processing_generation
-					  AND earlier_media.stage = ?
-					  AND earlier_media.state NOT IN ?
-				  )
-				  AND EXISTS (
-					SELECT 1 FROM content_stage_requests earlier_required
-					WHERE earlier_required.tenant_id = earlier_item.tenant_id
-					  AND earlier_required.content_item_id = earlier_item.public_id
-					  AND earlier_required.processing_generation = earlier_item.processing_generation
-					  AND earlier_required.blocking_scope <> ?
-					  AND earlier_required.state NOT IN ?
-				  )
-			)
-		`,
-			models.ContentStagePodsMediaArtifacts,
-			[]string{models.ContentStageAwaitingApproval, models.ContentStageCancelled, models.ContentStageSuperseded},
-			models.ContentStageBlockingOptional,
-			[]string{models.ContentStageVerified, models.ContentStageCancelled, models.ContentStageSuperseded},
-		)
-		// A late approval of an older metadata item must not start beside a
-		// newer item that already crossed the effect boundary. Creation order
-		// chooses the next idle item, while this guard enforces one required
-		// end-to-end pipeline per source at a time.
-		scope = scope.Where(`
-			NOT EXISTS (
-				SELECT 1
-				FROM content_items claim_item
-				JOIN content_items active_item
-				  ON active_item.tenant_id = claim_item.tenant_id
-				 AND active_item.content_source_id = claim_item.content_source_id
-				 AND active_item.public_id <> claim_item.public_id
-				JOIN content_stage_requests active_request
-				  ON active_request.tenant_id = active_item.tenant_id
-				 AND active_request.content_item_id = active_item.public_id
-				 AND active_request.processing_generation = active_item.processing_generation
-				WHERE claim_item.tenant_id = content_stage_requests.tenant_id
-				  AND claim_item.public_id = content_stage_requests.content_item_id
-				  AND claim_item.content_source_id IS NOT NULL
-				  AND active_request.blocking_scope <> ?
-				  AND active_request.state IN ?
-			)
-		`,
-			models.ContentStageBlockingOptional,
-			[]string{
-				models.ContentStageClaimed,
-				models.ContentStageRunning,
-				models.ContentStageVerifying,
-				models.ContentStageUncertain,
-				models.ContentStageReconciling,
-			},
-		)
+		if filter.admissionRestricted {
+			admission := tx.Where("1=0")
+			for _, root := range filter.admissionRoots {
+				admission = admission.Or(`EXISTS (SELECT 1 FROM content_items admitted_leaf WHERE admitted_leaf.tenant_id=content_stage_requests.tenant_id AND admitted_leaf.public_id=content_stage_requests.content_item_id AND admitted_leaf.tenant_id=? AND COALESCE(admitted_leaf.parent_content_item_id,admitted_leaf.public_id)=?)`, root.TenantID, root.PublicID)
+			}
+			scope = scope.Where(admission)
+		}
+		scope = scope.Where(`EXISTS (SELECT 1 FROM content_items leaf
+			WHERE leaf.tenant_id=content_stage_requests.tenant_id AND leaf.public_id=content_stage_requests.content_item_id
+			AND leaf.processing_generation=content_stage_requests.processing_generation AND leaf.status<>'ARCHIVED'
+			AND (leaf.parent_content_item_id IS NULL OR EXISTS (
+				SELECT 1 FROM atomization_generations g JOIN content_items root ON root.public_id=g.parent_content_item_id AND root.tenant_id=g.tenant_id
+				WHERE g.tenant_id=leaf.tenant_id AND g.public_id::text=leaf.metadata->>'atomization_generation_id'
+				AND g.processing_generation=root.processing_generation AND g.state<>'superseded')))`)
+		scope = scope.Where(`NOT EXISTS (
+			SELECT 1 FROM content_items leaf
+			JOIN content_items root ON root.tenant_id=leaf.tenant_id AND root.public_id=COALESCE(leaf.parent_content_item_id,leaf.public_id)
+			JOIN pods_episode_dispositions d ON d.tenant_id=root.tenant_id AND d.root_content_item_id=root.public_id AND d.processing_generation=root.processing_generation
+			WHERE leaf.tenant_id=content_stage_requests.tenant_id AND leaf.public_id=content_stage_requests.content_item_id AND d.disposition<>'active'
+		)`)
 		// No work for a metadata-only item may bypass manual media admission.
 		// Once admitted, media must verify before any other stage for that item
 		// becomes claimable; this keeps each source item end-to-end instead of
@@ -187,18 +134,32 @@ func eligibleClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter) *gorm
 }
 
 func rankedClaimTenantScope(tx *gorm.DB, filter claimCandidateFilter) *gorm.DB {
+	activeTenantOrder := ""
+	if filter.lane == models.ContentStageLanePods {
+		activeTenantOrder = "EXISTS (SELECT 1 FROM pods_episode_execution_slot s WHERE s.singleton=true AND s.tenant_id=content_stage_requests.tenant_id) DESC, "
+	}
 	return eligibleClaimCandidateScope(tx, filter).
 		Select("content_stage_requests.tenant_id").
 		Group("content_stage_requests.tenant_id").
 		Clauses(clause.OrderBy{Expression: clause.Expr{
-			SQL:  "(SELECT MAX(csa.created_at) FROM content_stage_attempts csa WHERE csa.tenant_id=content_stage_requests.tenant_id AND csa.lane=? AND csa.owner=?) ASC NULLS FIRST, MIN(content_stage_requests.created_at) ASC, content_stage_requests.tenant_id ASC",
+			SQL:  activeTenantOrder + "(SELECT MAX(csa.created_at) FROM content_stage_attempts csa WHERE csa.tenant_id=content_stage_requests.tenant_id AND csa.lane=? AND csa.owner=?) ASC NULLS FIRST, MIN(content_stage_requests.created_at) ASC, content_stage_requests.tenant_id ASC",
 			Vars: []any{filter.lane, filter.expectedOwner},
 		}}).
 		Limit(64)
 }
 
 func lockedClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter, limit int) *gorm.DB {
-	return eligibleClaimCandidateScope(tx, filter).
+	scope := eligibleClaimCandidateScope(tx, filter)
+	if filter.lane == models.ContentStageLanePods {
+		// Rank the slot owner's family before limiting candidates. Otherwise an
+		// older waiting root can hide the active family's newly created children.
+		scope = scope.Order(`EXISTS (SELECT 1 FROM pods_episode_execution_slot s
+			JOIN content_items leaf ON leaf.tenant_id=s.tenant_id
+			AND COALESCE(leaf.parent_content_item_id,leaf.public_id)=s.root_content_item_id
+			WHERE s.singleton=true AND leaf.tenant_id=content_stage_requests.tenant_id
+			AND leaf.public_id=content_stage_requests.content_item_id) DESC`)
+	}
+	return scope.
 		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 		Order("priority DESC, created_at ASC, public_id ASC").
 		Limit(limit)
@@ -211,15 +172,23 @@ func lockedClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter, limit i
 func effectAttemptsInCurrentBudget(tx *gorm.DB, request models.ContentStageRequest) (int64, error) {
 	query := tx.Model(&models.ContentStageAttempt{}).
 		Where("tenant_id=? AND request_id=? AND effect_started_at IS NOT NULL", request.TenantID, request.PublicID)
-	if request.Stage == models.ContentStagePodsMediaArtifacts {
+	if request.Stage == models.ContentStagePodsMediaArtifacts || request.Stage == models.ContentStagePodsAtomization {
+		eventTypes := []string{"media_acquisition_approved"}
+		if request.Stage == models.ContentStagePodsAtomization {
+			// A partial chapter effect is a new execution boundary after CMS has
+			// retired its exact manifests. Count only attempts started after the
+			// latest operator approval or reconciliation boundary; otherwise a
+			// historical attempt can exhaust the fresh retry budget forever.
+			eventTypes = []string{"manual_atomization_retry_approved", "chapter_effects_reconciled", "atomization_finalization_requeued"}
+		}
 		var admission models.ContentStageEvent
-		err := tx.Where("tenant_id=? AND request_id=? AND event_type=?", request.TenantID, request.PublicID, "media_acquisition_approved").
+		err := tx.Where("tenant_id=? AND request_id=? AND event_type IN ?", request.TenantID, request.PublicID, eventTypes).
 			Order("occurred_at DESC, sequence DESC").First(&admission).Error
 		if err != nil && err != gorm.ErrRecordNotFound {
 			return 0, err
 		}
 		if err == nil {
-			query = query.Where("created_at>=?", admission.OccurredAt)
+			query = query.Where("effect_started_at>=?", admission.OccurredAt)
 		}
 	}
 	var count int64
@@ -246,7 +215,7 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 			"tenant_id=? AND content_item_id=? AND processing_generation=? AND stage IN ? AND state IN ?",
 			tenantID, contentID, generation,
 			[]string{models.ContentStagePodsMediaArtifacts, models.ContentStagePodsTranscript},
-			[]string{models.ContentStageBlocked, models.ContentStageAwaitingApproval, models.ContentStageQueued, models.ContentStageDeferred},
+			[]string{models.ContentStageBlocked, models.ContentStageAwaitingApproval, models.ContentStageQueued, models.ContentStageDeferred, models.ContentStageVerified},
 		).Find(&requests).Error; err != nil {
 			return err
 		}
@@ -255,9 +224,24 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 		}
 		now := time.Now().UTC()
 		for _, request := range requests {
+			// Media is an immutable prerequisite. A verified media request must
+			// never be reopened by a transcript click; the transcript request may
+			// legitimately be verified for a short raw item (where generated STT is
+			// optional) and needs a fresh queued effect for an explicit operator
+			// request.
+			if request.Stage == models.ContentStagePodsMediaArtifacts && request.State == models.ContentStageVerified {
+				continue
+			}
 			updates := map[string]any{"priority": 100, "not_before_at": nil, "updated_at": now}
-			if request.Stage == models.ContentStagePodsTranscript && request.State == models.ContentStageAwaitingApproval {
+			if request.Stage == models.ContentStagePodsTranscript && (request.State == models.ContentStageAwaitingApproval || request.State == models.ContentStageVerified) {
 				updates["state"] = models.ContentStageQueued
+				updates["verified_at"] = nil
+				updates["finished_at"] = nil
+				updates["failure_class"] = ""
+				updates["terminal_proof"] = jsonValue(map[string]any{})
+				updates["claim_owner"] = ""
+				updates["claim_token"] = nil
+				updates["claim_expires_at"] = nil
 				request.State = models.ContentStageQueued
 			}
 			if err := tx.Model(&request).Updates(updates).Error; err != nil {
@@ -268,7 +252,11 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 				return err
 			}
 		}
-		return nil
+		var item models.ContentItem
+		if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", tenantID, contentID, generation).First(&item).Error; err != nil {
+			return err
+		}
+		return podsflow.Resume(tx, item)
 	})
 }
 
@@ -295,6 +283,33 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 			filter := claimCandidateFilter{
 				tenantID: tenantID, lane: lane, expectedOwner: expectedOwner,
 				allowedStages: allowedStages, optional: optional, now: now,
+			}
+			if lane == models.ContentStageLanePods {
+				filter.admissionRestricted = true
+				winner, err := podsflow.NextCandidate(tx)
+				if err != nil {
+					return nil, err
+				}
+				if winner != nil {
+					filter.admissionRoots = append(filter.admissionRoots, *winner)
+				}
+				var slot podsflow.Slot
+				if err := tx.Where("singleton=true").First(&slot).Error; err != nil {
+					return nil, err
+				}
+				if slot.TenantID != nil && slot.RootContentItemID != nil {
+					var active models.ContentItem
+					if err := tx.Where("tenant_id=? AND public_id=?", *slot.TenantID, *slot.RootContentItemID).First(&active).Error; err != nil {
+						return nil, err
+					}
+					state, _, err := podsflow.Observe(tx, active)
+					if err != nil {
+						return nil, err
+					}
+					if state == "active" || state == "reconciling" {
+						filter.admissionRoots = []models.ContentItem{active}
+					}
+				}
 			}
 			if strings.TrimSpace(tenantID) != "" {
 				var rows []models.ContentStageRequest
@@ -377,24 +392,49 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 				}
 				continue
 			}
+			if request.Lane == models.ContentStageLanePods {
+				admitted, err := podsflow.Acquire(tx, item)
+				if err != nil {
+					return err
+				}
+				if !admitted {
+					continue
+				}
+			}
 			attempt, reclaimed, err := reclaimUnstartedAttempt(tx, request, claimOwner, now)
 			if err != nil {
 				return err
 			}
 			if !reclaimed {
+				var total int64
+				if err := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND request_id=?", request.TenantID, request.PublicID).Count(&total).Error; err != nil {
+					return err
+				}
 				count, err := effectAttemptsInCurrentBudget(tx, request)
 				if err != nil {
 					return err
+				}
+				if total == 0 || count == 0 {
+					// Start only after slot admission, including a fresh explicitly
+					// approved budget. Retries with effects retain their deadline.
+					budget := textElapsedBudget
+					if request.Stage == models.ContentStagePodsMediaArtifacts {
+						budget = mediaElapsedBudget
+					}
+					if isTrustedLongForm(item) {
+						budget = 24 * time.Hour
+					}
+					deadline := now.Add(budget)
+					request.DeadlineAt = &deadline
+					if err := tx.Model(&request).UpdateColumn("deadline_at", deadline).Error; err != nil {
+						return err
+					}
 				}
 				if count >= maxEffectAttempts || (request.DeadlineAt != nil && !request.DeadlineAt.After(now)) {
 					if err := failRequest(tx, request, "execution_budget_exhausted", "verified effect remains absent"); err != nil {
 						return err
 					}
 					continue
-				}
-				var total int64
-				if err := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND request_id=?", request.TenantID, request.PublicID).Count(&total).Error; err != nil {
-					return err
 				}
 				claimToken, fence := uuid.New(), uuid.New()
 				expires := now.Add(leaseDurationForStage(request.Stage))
@@ -589,18 +629,26 @@ func Checkpoint(db *gorm.DB, requestID uuid.UUID, input Correlation, phase strin
 		}
 		now := time.Now().UTC()
 		expires := now.Add(leaseDurationForStage(request.Stage))
-		if err := tx.Model(&request).Updates(map[string]any{
+		requestUpdate := tx.Model(&models.ContentStageRequest{}).Where("tenant_id=? AND public_id=? AND state=? AND claim_token=? AND claim_expires_at>?", request.TenantID, request.PublicID, models.ContentStageRunning, request.ClaimToken, now).Updates(map[string]any{
 			"claim_expires_at": expires,
 			"updated_at":       now,
-		}).Error; err != nil {
-			return err
+		})
+		if requestUpdate.Error != nil {
+			return requestUpdate.Error
 		}
-		if err := tx.Model(&attempt).Updates(map[string]any{
+		if requestUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage checkpoint authority changed")
+		}
+		attemptUpdate := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND public_id=? AND request_id=? AND fence_token=? AND claim_token=? AND state=? AND lease_expires_at>?", attempt.TenantID, attempt.PublicID, attempt.RequestID, attempt.FenceToken, attempt.ClaimToken, models.ContentStageRunning, now).Updates(map[string]any{
 			"lease_expires_at": expires,
 			"heartbeat_at":     now,
 			"updated_at":       now,
-		}).Error; err != nil {
-			return err
+		})
+		if attemptUpdate.Error != nil {
+			return attemptUpdate.Error
+		}
+		if attemptUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage attempt checkpoint authority changed")
 		}
 		request.ClaimExpiresAt = &expires
 		attempt.LeaseExpiresAt, attempt.HeartbeatAt = expires, now
@@ -642,11 +690,19 @@ func transitionClaim(db *gorm.DB, requestID uuid.UUID, input Correlation, begin 
 			attemptUpdates["state"] = attemptState
 			attemptUpdates["effect_started_at"] = now
 		}
-		if err := tx.Model(&request).Updates(updates).Error; err != nil {
-			return err
+		requestUpdate := tx.Model(&models.ContentStageRequest{}).Where("tenant_id=? AND public_id=? AND state=? AND claim_token=? AND claim_expires_at>?", request.TenantID, request.PublicID, request.State, request.ClaimToken, now).Updates(updates)
+		if requestUpdate.Error != nil {
+			return requestUpdate.Error
 		}
-		if err := tx.Model(&attempt).Updates(attemptUpdates).Error; err != nil {
-			return err
+		if requestUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage claim authority changed")
+		}
+		attemptUpdate := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND public_id=? AND request_id=? AND fence_token=? AND claim_token=? AND state=? AND lease_expires_at>?", attempt.TenantID, attempt.PublicID, attempt.RequestID, attempt.FenceToken, attempt.ClaimToken, attempt.State, now).Updates(attemptUpdates)
+		if attemptUpdate.Error != nil {
+			return attemptUpdate.Error
+		}
+		if attemptUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage attempt authority changed")
 		}
 		request.State, request.ClaimExpiresAt = requestState, &expires
 		attempt.State, attempt.LeaseExpiresAt, attempt.HeartbeatAt = attemptState, expires, now
@@ -696,14 +752,22 @@ func MarkNotRequired(db *gorm.DB, requestID uuid.UUID, input Correlation, proof 
 		}
 		now := time.Now().UTC()
 		terminalProof := jsonValue(proof)
-		if err := tx.Model(&request).Updates(map[string]any{
+		requestUpdate := tx.Model(&models.ContentStageRequest{}).Where("tenant_id=? AND public_id=? AND state=? AND claim_token=? AND claim_expires_at>?", request.TenantID, request.PublicID, models.ContentStageRunning, request.ClaimToken, now).Updates(map[string]any{
 			"state": models.ContentStageVerified, "verified_at": now, "finished_at": now,
 			"terminal_proof": terminalProof, "claim_token": nil, "claim_expires_at": nil, "updated_at": now,
-		}).Error; err != nil {
-			return err
+		})
+		if requestUpdate.Error != nil {
+			return requestUpdate.Error
 		}
-		if err := tx.Model(&attempt).Updates(map[string]any{"state": models.ContentStageVerified, "finished_at": now, "updated_at": now}).Error; err != nil {
-			return err
+		if requestUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage not-required authority changed")
+		}
+		attemptUpdate := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND public_id=? AND request_id=? AND fence_token=? AND claim_token=? AND state=? AND lease_expires_at>?", attempt.TenantID, attempt.PublicID, attempt.RequestID, attempt.FenceToken, attempt.ClaimToken, models.ContentStageRunning, now).Updates(map[string]any{"state": models.ContentStageVerified, "finished_at": now, "updated_at": now})
+		if attemptUpdate.Error != nil {
+			return attemptUpdate.Error
+		}
+		if attemptUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage attempt not-required authority changed")
 		}
 		request.State, request.VerifiedAt, request.FinishedAt, request.TerminalProof = models.ContentStageVerified, &now, &now, terminalProof
 		attempt.State, attempt.FinishedAt = models.ContentStageVerified, &now
@@ -726,6 +790,46 @@ func MarkFailed(db *gorm.DB, requestID uuid.UUID, input Correlation, failureClas
 	return terminalTransition(db, requestID, input, models.ContentStageFailed, failureClass, summary, nil)
 }
 
+const maxContentStageFailureSummaryBytes = 512
+
+// boundedFailureSummary keeps database writes inside the current schema
+// contract while retaining useful diagnostics from noisy subprocess output.
+// Strings are truncated by bytes because PostgreSQL's varchar limit is a byte
+// limit; avoid splitting a UTF-8 sequence at the boundary.
+func boundedFailureSummary(summary string) string {
+	summary = strings.TrimSpace(summary)
+	if len(summary) <= maxContentStageFailureSummaryBytes {
+		return summary
+	}
+	const marker = "\n...[truncated]...\n"
+	keep := maxContentStageFailureSummaryBytes - len(marker)
+	if keep <= 0 {
+		return summary[:maxContentStageFailureSummaryBytes]
+	}
+	// Keep more of the tail, where ffmpeg normally prints the exit reason.
+	head := keep / 3
+	tail := keep - head
+	headText := summary[:head]
+	tailText := summary[len(summary)-tail:]
+	for len(headText) > 0 && !utf8.ValidString(headText) {
+		_, size := utf8.DecodeLastRuneInString(headText)
+		if size <= 0 || size > len(headText) {
+			headText = headText[:len(headText)-1]
+		} else {
+			headText = headText[:len(headText)-1]
+		}
+	}
+	for len(tailText) > 0 && !utf8.ValidString(tailText) {
+		_, size := utf8.DecodeRuneInString(tailText)
+		if size <= 0 || size > len(tailText) {
+			tailText = tailText[1:]
+		} else {
+			tailText = tailText[1:]
+		}
+	}
+	return headText + marker + tailText
+}
+
 func terminalTransition(db *gorm.DB, requestID uuid.UUID, input Correlation, state, failureClass, summary string, notBefore *time.Time) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		var base models.ContentStageRequest
@@ -743,7 +847,14 @@ func terminalTransition(db *gorm.DB, requestID uuid.UUID, input Correlation, sta
 		} else {
 			requestUpdates["not_before_at"] = now
 		}
-		attemptUpdates := map[string]any{"state": state, "failure_class": failureClass, "failure_summary": summary, "finished_at": now, "updated_at": now}
+		// Failure summaries are operator diagnostics, not an unbounded log
+		// sink.  FFmpeg and other subprocesses can return many kilobytes of
+		// progress output; persisting that directly into the legacy varchar(512)
+		// column causes the whole terminal transition to roll back, leaving the
+		// durable request stuck in `running` forever.  Keep both the beginning
+		// (command/error context) and the tail (actual exit reason) within the
+		// database contract.
+		attemptUpdates := map[string]any{"state": state, "failure_class": failureClass, "failure_summary": boundedFailureSummary(summary), "finished_at": now, "updated_at": now}
 		// A capacity defer proves that the downstream effect never started. Begin
 		// records the worker-side execution boundary before making the dependency
 		// call, so clear that provisional marker when the dependency explicitly
@@ -752,14 +863,22 @@ func terminalTransition(db *gorm.DB, requestID uuid.UUID, input Correlation, sta
 		if state == models.ContentStageDeferred && failureClass == "capacity_deferred" {
 			attemptUpdates["effect_started_at"] = nil
 		}
-		if err := tx.Model(&request).Updates(requestUpdates).Error; err != nil {
-			return err
+		requestUpdate := tx.Model(&models.ContentStageRequest{}).Where("tenant_id=? AND public_id=? AND state IN ? AND claim_token=? AND claim_expires_at>?", request.TenantID, request.PublicID, []string{models.ContentStageClaimed, models.ContentStageRunning}, request.ClaimToken, now).Updates(requestUpdates)
+		if requestUpdate.Error != nil {
+			return requestUpdate.Error
 		}
-		if err := tx.Model(&attempt).Updates(attemptUpdates).Error; err != nil {
-			return err
+		if requestUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage terminal authority changed")
+		}
+		attemptUpdate := tx.Model(&models.ContentStageAttempt{}).Where("tenant_id=? AND public_id=? AND request_id=? AND fence_token=? AND claim_token=? AND state IN ? AND lease_expires_at>?", attempt.TenantID, attempt.PublicID, attempt.RequestID, attempt.FenceToken, attempt.ClaimToken, []string{models.ContentStageClaimed, models.ContentStageRunning}, now).Updates(attemptUpdates)
+		if attemptUpdate.Error != nil {
+			return attemptUpdate.Error
+		}
+		if attemptUpdate.RowsAffected != 1 {
+			return fmt.Errorf("content-stage attempt terminal authority changed")
 		}
 		request.State, request.FailureClass, request.ClaimToken, request.ClaimExpiresAt = state, failureClass, nil, nil
-		attempt.State, attempt.FailureClass, attempt.FailureSummary, attempt.FinishedAt = state, failureClass, summary, &now
+		attempt.State, attempt.FailureClass, attempt.FailureSummary, attempt.FinishedAt = state, failureClass, boundedFailureSummary(summary), &now
 		if state == models.ContentStageDeferred && failureClass == "capacity_deferred" {
 			attempt.EffectStartedAt = nil
 		}
@@ -790,6 +909,14 @@ func RecordPersistence(tx *gorm.DB, request models.ContentStageRequest, attempt 
 	if err != nil || producerEventID == uuid.Nil {
 		return fmt.Errorf("producer event id is required")
 	}
+	// Receipts deliberately keep their artifact digest compact (the schema is
+	// varchar(64)).  A few producers historically passed a human-readable list
+	// of child UUIDs here instead of a digest.  That value is useful in the
+	// payload, but inserting it into the bounded digest column aborts the whole
+	// finalization transaction after all external effects have completed.  Keep
+	// the stable value when it already fits and hash oversized producer values
+	// into the canonical 64-character representation.
+	artifactDigest = normalizeArtifactDigest(artifactDigest)
 	raw, _ := json.Marshal(payload)
 	receipt := models.ContentStageReceipt{
 		PublicID: uuid.New(), TenantID: request.TenantID, RequestID: request.PublicID,
@@ -804,6 +931,20 @@ func RecordPersistence(tx *gorm.DB, request models.ContentStageRequest, attempt 
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
+		// A lost response is a normal retry path. Re-read the immutable receipt
+		// and prove that the caller is replaying the same effect, rather than
+		// treating any producer-event collision as success.
+		var existing models.ContentStageReceipt
+		if err := tx.Where("tenant_id=? AND owner=? AND producer_event_id=?", request.TenantID, owner, producerEventID).First(&existing).Error; err != nil {
+			return err
+		}
+		if existing.RequestID != request.PublicID || existing.AttemptID != attempt.PublicID ||
+			existing.ContentItemID != request.ContentItemID || existing.ProcessingGeneration != request.ProcessingGeneration ||
+			existing.Lane != request.Lane || existing.Stage != request.Stage || existing.FenceToken != attempt.FenceToken ||
+			existing.InputFingerprint != request.InputFingerprint || existing.Outcome != "persisted" ||
+			existing.PayloadDigest != receipt.PayloadDigest || existing.ArtifactDigest != artifactDigest {
+			return fmt.Errorf("producer event receipt conflicts with current stage authority")
+		}
 		return nil
 	}
 	now := time.Now().UTC()
@@ -816,6 +957,13 @@ func RecordPersistence(tx *gorm.DB, request models.ContentStageRequest, attempt 
 	request.State, request.ClaimToken, request.ClaimExpiresAt = models.ContentStageVerifying, nil, nil
 	attempt.State, attempt.FinishedAt = models.ContentStageVerifying, &now
 	return appendEvent(tx, request, &attempt, "effect_persisted", map[string]any{"producer_event_id": producerEventID, "artifact_digest": artifactDigest})
+}
+
+func normalizeArtifactDigest(value string) string {
+	if len(value) <= 64 {
+		return value
+	}
+	return digest("artifact", value)
 }
 
 func VerifyOne(db *gorm.DB) (bool, error) {
@@ -912,6 +1060,18 @@ func VerifyRequest(db *gorm.DB, requestID uuid.UUID) error {
 			}
 			if receipts == 0 {
 				adopted := false
+				if request.Stage == models.ContentStagePodsMediaArtifacts && isTrustedLongForm(item) {
+					// Adoption requires all three exact manifests above, plus source
+					// provenance from this request's fenced attempt.
+					var count int64
+					if err := tx.Table("media_artifact_manifests m").Joins("JOIN content_stage_attempts a ON a.public_id=m.attempt_id AND a.tenant_id=m.tenant_id").Where("m.tenant_id=? AND m.public_id=? AND a.request_id=?", request.TenantID, proof["media_artifact_manifest_id"], request.PublicID).Count(&count).Error; err != nil {
+						return err
+					}
+					adopted = count == 1
+					if adopted {
+						proof["adopted_from"] = "verified_long_parent_manifests"
+					}
+				}
 				if request.Stage == models.ContentStagePodsMediaArtifacts {
 					var repair models.PipelineRepairRequest
 					err := tx.Where(
@@ -957,13 +1117,21 @@ func VerifyRequest(db *gorm.DB, requestID uuid.UUID) error {
 			}
 			return reduceReadiness(tx, request.TenantID, request.ContentItemID, request.ProcessingGeneration)
 		}
-		if (request.State == models.ContentStageUncertain || request.State == models.ContentStageVerifying) && time.Since(request.UpdatedAt) < verificationWindow {
+		// Atomization units register immutable upload intent before touching
+		// storage. Its reconciliation pass can therefore prove the no-upload
+		// case immediately; applying the generic ten-minute uncertainty window
+		// here left a failed FFmpeg cut looking stuck even though no external
+		// effect existed. Other stages retain the conservative observation
+		// window because their providers do not expose the same intent ledger.
+		if request.Stage != models.ContentStagePodsAtomization &&
+			(request.State == models.ContentStageUncertain || request.State == models.ContentStageVerifying) &&
+			time.Since(request.UpdatedAt) < verificationWindow {
 			// Do not let one recently absent artifact monopolize VerifyOne. The
 			// initial observation happens immediately; the next one is scheduled
 			// at the uncertainty window without advancing UpdatedAt.
 			return tx.Model(&request).UpdateColumn("not_before_at", request.UpdatedAt.Add(verificationWindow)).Error
 		}
-		if request.Stage == models.ContentStagePodsMediaArtifacts && (request.State == models.ContentStageUncertain || request.State == models.ContentStageReconciling) {
+		if request.Stage == models.ContentStagePodsMediaArtifacts && !isTrustedLongForm(item) && (request.State == models.ContentStageUncertain || request.State == models.ContentStageReconciling) {
 			var sourceCount int64
 			if err := tx.Table("media_artifact_manifests AS mam").
 				Joins("JOIN content_stage_attempts csa ON csa.tenant_id=mam.tenant_id AND csa.public_id=mam.attempt_id").
@@ -998,6 +1166,18 @@ func VerifyRequest(db *gorm.DB, requestID uuid.UUID) error {
 				return nil
 			}
 		}
+		if request.Stage == models.ContentStagePodsAtomization {
+			if err := podsflow.ReconcileAbsentUnits(tx, item); err != nil {
+				return err
+			}
+			unresolved, err := podsflow.HasUnresolvedChapterEffects(tx, item)
+			if err != nil {
+				return err
+			}
+			if unresolved {
+				return tx.Model(&request).Updates(map[string]any{"state": models.ContentStageReconciling, "not_before_at": time.Now().UTC().Add(30 * time.Second), "failure_class": "chapter_effects_reconciling"}).Error
+			}
+		}
 		attempts, err := effectAttemptsInCurrentBudget(tx, request)
 		if err != nil {
 			return err
@@ -1026,6 +1206,9 @@ func artifactPresent(tx *gorm.DB, item models.ContentItem, stage string) (bool, 
 	case models.ContentStageNewsStoryClassification:
 		return item.StoryID != nil, map[string]any{"story_id": item.StoryID}, nil
 	case models.ContentStagePodsMediaArtifacts:
+		if isTrustedLongForm(item) {
+			return preparedLongParent(tx, item)
+		}
 		ok := item.PlaybackURL != nil && strings.TrimSpace(*item.PlaybackURL) != "" && item.DurationSec != nil && *item.DurationSec >= feedcontract.PodsMinDurationSec
 		return ok, map[string]any{"playback_url_present": ok, "duration_sec": item.DurationSec, "playback_type": item.PlaybackType}, nil
 	case models.ContentStagePodsTranscript:
@@ -1037,9 +1220,7 @@ func artifactPresent(tx *gorm.DB, item models.ContentItem, stage string) (bool, 
 		if item.DurationSec != nil && *item.DurationSec >= feedcontract.PodsMinDurationSec && *item.DurationSec <= feedcontract.PodsHardMaxDuration {
 			return true, map[string]any{"not_required": true, "duration_sec": *item.DurationSec}, nil
 		}
-		var count int64
-		err := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND parent_content_item_id=? AND is_feed_unit=true AND status=?", item.TenantID, item.PublicID, models.ContentStatusReady).Count(&count).Error
-		return count > 0, map[string]any{"ready_feed_unit_children": count}, err
+		return podsflow.GenerationArtifacts(tx, item)
 	case models.ContentStagePodsImageEmbedding:
 		return item.ImageEmbedding != nil, map[string]any{"image_embedding_model": item.ImageEmbeddingModel}, nil
 	case models.ContentStageNewsLLMMetadata, models.ContentStagePodsLLMMetadata:
@@ -1055,13 +1236,59 @@ func artifactPresent(tx *gorm.DB, item models.ContentItem, stage string) (bool, 
 	}
 }
 
+// Long parents are custody artifacts, not public playback units. Verify the
+// exact persisted source, analysis audio and thumbnail instead of requiring a
+// public URL that the long-parent delivery policy deliberately omits.
+func preparedLongParent(tx *gorm.DB, item models.ContentItem) (bool, map[string]any, error) {
+	proof := map[string]any{"long_parent": true, "duration_sec": item.DurationSec}
+	var metadata map[string]any
+	if json.Unmarshal(item.Metadata, &metadata) != nil {
+		return false, proof, nil
+	}
+	duration, _ := metadata["duration_verification"].(map[string]any)
+	measured, _ := duration["duration_sec"].(float64)
+	if duration["source"] != "ffprobe" || item.DurationSec == nil || measured != float64(*item.DurationSec) {
+		return false, proof, nil
+	}
+	for _, artifact := range []struct{ key, role string }{
+		{"media_artifact_manifest_id", "source"},
+		{"analysis_audio_manifest_id", "analysis_audio"},
+		{"thumbnail_manifest_id", "thumbnail"},
+	} {
+		raw, _ := metadata[artifact.key].(string)
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return false, proof, nil
+		}
+		var manifest models.MediaArtifactManifest
+		err = tx.Where("tenant_id=? AND content_item_id=? AND public_id=? AND artifact_role=? AND state IN ? AND size_bytes>0 AND deleted_at IS NULL", item.TenantID, item.PublicID, id, artifact.role, []string{"verified", "active"}).First(&manifest).Error
+		if err == gorm.ErrRecordNotFound {
+			return false, proof, nil
+		}
+		if err != nil {
+			return false, proof, err
+		}
+		if manifest.PublicURL == "" || (artifact.role == "analysis_audio" && !strings.HasPrefix(manifest.ContentType, "audio/")) {
+			return false, proof, nil
+		}
+		proof[artifact.key] = id.String()
+	}
+	return true, proof, nil
+}
+
 // AdoptPresentStages records artifacts created atomically by another
 // CMS-governed stage (notably atomized child renditions/transcripts) before a
 // child manifest is dispatched. It never invents success: every adopted stage
 // passes the same artifact verifier used after worker writeback.
 func AdoptPresentStages(tx *gorm.DB, item models.ContentItem, provenance string) error {
 	var requests []models.ContentStageRequest
-	if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND state IN ?", item.TenantID, item.PublicID, item.ProcessingGeneration, []string{models.ContentStageBlocked, models.ContentStageQueued, models.ContentStageDeferred}).Order("created_at ASC").Find(&requests).Error; err != nil {
+	// A child created by atomization already owns verified playback artifacts.
+	// Its source may still resolve to the tenant's manual acquisition mode, so
+	// EnsureManifest can legitimately create the media request as
+	// awaiting_approval. Include that state here: adopting a CMS-verified child
+	// rendition is not a new download and must not ask the operator to approve
+	// the same bytes a second time.
+	if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND state IN ?", item.TenantID, item.PublicID, item.ProcessingGeneration, []string{models.ContentStageAwaitingApproval, models.ContentStageBlocked, models.ContentStageQueued, models.ContentStageDeferred}).Order("created_at ASC").Find(&requests).Error; err != nil {
 		return err
 	}
 	for _, request := range requests {
@@ -1106,6 +1333,10 @@ func settleConditionalPodsStages(tx *gorm.DB, item models.ContentItem) error {
 	}
 	now := time.Now().UTC()
 	var requests []models.ContentStageRequest
+	// Only these stages are conditional for a short raw media item. Text
+	// embedding remains required for every Pods feed unit; the old broad
+	// ``stage NOT IN`` query accidentally verified it (and optional image/LLM
+	// work) merely because media playback was present.
 	if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND stage IN ? AND state NOT IN ?", item.TenantID, item.PublicID, item.ProcessingGeneration, []string{models.ContentStagePodsTranscript, models.ContentStagePodsAtomization, models.ContentStagePodsCaptionReembedding}, []string{models.ContentStageVerified, models.ContentStageCancelled, models.ContentStageSuperseded}).Find(&requests).Error; err != nil {
 		return err
 	}
@@ -1113,7 +1344,11 @@ func settleConditionalPodsStages(tx *gorm.DB, item models.ContentItem) error {
 	// used when the dependent stage is promoted, so an empty/stale discovery
 	// hint can never suppress the manual-STT gate or leave a transcript stage
 	// waiting on an artifact the Media worker cannot import.
-	wantsTranscript := hasCaptionArtifact(item) || automaticSTTEnabled(tx, item.TenantID)
+	// A caption_state value or metadata key can be stale after a failed import.
+	// Verify the linked provider transcript/artifact before treating transcript
+	// work as optional; otherwise caption-less media is incorrectly parked as
+	// "no STT needed".
+	wantsTranscript := HasProviderCaption(tx, item) || automaticSTTEnabled(tx, item.TenantID)
 	for _, request := range requests {
 		if request.Stage == models.ContentStagePodsTranscript && request.Priority >= 100 {
 			wantsTranscript = true
@@ -1121,17 +1356,23 @@ func settleConditionalPodsStages(tx *gorm.DB, item models.ContentItem) error {
 		}
 	}
 	for _, request := range requests {
-		if wantsTranscript && request.Stage == models.ContentStagePodsTranscript {
-			if err := tx.Model(&request).Updates(map[string]any{"blocking_scope": models.ContentStageBlockingOptional, "not_before_at": now, "updated_at": now}).Error; err != nil {
-				return err
+		if request.Stage == models.ContentStagePodsTranscript {
+			if wantsTranscript {
+				if err := tx.Model(&request).Updates(map[string]any{"blocking_scope": models.ContentStageBlockingOptional, "not_before_at": now, "updated_at": now}).Error; err != nil {
+					return err
+				}
+				request.BlockingScope = models.ContentStageBlockingOptional
+				if err := appendEvent(tx, request, nil, "made_optional", map[string]any{"reason": "raw_parent_caption_enrichment"}); err != nil {
+					return err
+				}
+				continue
 			}
-			request.BlockingScope = models.ContentStageBlockingOptional
-			if err := appendEvent(tx, request, nil, "made_optional", map[string]any{"reason": "raw_parent_caption_enrichment"}); err != nil {
-				return err
-			}
-			continue
+			// A short raw item does not need generated STT for feed delivery.
+			// Leave the request's policy-derived approval state alone when an
+			// operator explicitly requested a transcript; otherwise settle it as
+			// not required below.
 		}
-		if wantsTranscript && request.Stage == models.ContentStagePodsCaptionReembedding {
+		if request.Stage == models.ContentStagePodsCaptionReembedding && wantsTranscript {
 			continue
 		}
 		proof := jsonValue(map[string]any{"not_required": true, "duration_sec": *item.DurationSec, "policy": "raw_parent_at_or_under_40m"})
@@ -1168,11 +1409,19 @@ func RecoverExpired(db *gorm.DB) error {
 				continue
 			}
 			if attempt.EffectStartedAt == nil {
-				if err := tx.Model(&request).Updates(map[string]any{"state": models.ContentStageQueued, "claim_token": nil, "claim_expires_at": nil, "failure_class": "lease_expired_before_effect", "updated_at": now}).Error; err != nil {
+				// A delivery that never reached the effect boundary is safe to
+				// retry, but it must not be immediately claimed again.  Older
+				// workers left not_before_at unchanged, so a slow/downstream
+				// worker hot-loop reclaimed the same request every few seconds and
+				// monopolised the Pods slot.  Use bounded exponential backoff while
+				// preserving the durable attempt for reconciliation.
+				retryAt := now.Add(preEffectLeaseBackoff(attempt.AttemptNumber))
+				if err := tx.Model(&request).Updates(map[string]any{"state": models.ContentStageQueued, "claim_token": nil, "claim_expires_at": nil, "not_before_at": retryAt, "failure_class": "lease_expired_before_effect", "updated_at": now}).Error; err != nil {
 					return err
 				}
 				request.State = models.ContentStageQueued
-				if err := appendEvent(tx, request, &attempt, "lease_expired_before_effect", map[string]any{"reclaimable": true}); err != nil {
+				request.NotBeforeAt = &retryAt
+				if err := appendEvent(tx, request, &attempt, "lease_expired_before_effect", map[string]any{"reclaimable": true, "retry_at": retryAt, "retry_after_sec": int(preEffectLeaseBackoff(attempt.AttemptNumber).Seconds())}); err != nil {
 					return err
 				}
 				if err := reduceReadiness(tx, request.TenantID, request.ContentItemID, request.ProcessingGeneration); err != nil {
@@ -1196,6 +1445,164 @@ func RecoverExpired(db *gorm.DB) error {
 		}
 		return nil
 	})
+}
+
+// preEffectLeaseBackoff spaces out deliveries that expired before the owner
+// could begin an effect.  It is deliberately bounded: a worker outage should
+// not create a permanent schedule delay, while repeated immediate reclaims
+// must not starve the rest of a tenant or the global Pods execution slot.
+func preEffectLeaseBackoff(attemptNumber int) time.Duration {
+	if attemptNumber < 1 {
+		attemptNumber = 1
+	}
+	delay := 30 * time.Second
+	for i := 1; i < attemptNumber && delay < 5*time.Minute; i++ {
+		delay *= 2
+	}
+	if delay > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return delay
+}
+
+const (
+	// A failed request with no effect is safe to repair only after it has been
+	// quiescent for a short period.  This prevents a transient upstream error
+	// from being immediately requeued in a tight loop while still healing the
+	// historical rows created before the durable admission rules were enabled.
+	preEffectFailureQuiescence = 5 * time.Minute
+	preEffectFailureBatch      = 64
+)
+
+// ReconcilePreEffectFailures repairs legacy terminal failures that never
+// crossed the effect boundary.  Older workers could exhaust their claim
+// budget before starting an effect and leave a blocking request permanently in
+// failed, even though the item is merely waiting for media admission or a
+// predecessor.  Such rows are not evidence of a failed side effect and may be
+// safely returned to the state dictated by the current dependency and
+// acquisition policy.  A per-request event makes this repair one-shot so a
+// genuinely failing new attempt is not hidden by an automatic retry loop.
+func ReconcilePreEffectFailures(db *gorm.DB) error {
+	if !SchemaAvailable(db) {
+		return nil
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-preEffectFailureQuiescence)
+	return db.Transaction(func(tx *gorm.DB) error {
+		var requests []models.ContentStageRequest
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where(`state=? AND blocking_scope<>? AND failure_class IN ? AND finished_at IS NOT NULL AND finished_at<=?
+				AND NOT EXISTS (
+					SELECT 1 FROM content_stage_attempts a
+					WHERE a.tenant_id=content_stage_requests.tenant_id
+					  AND a.request_id=content_stage_requests.public_id
+					  AND a.effect_started_at IS NOT NULL
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM content_stage_events e
+					WHERE e.tenant_id=content_stage_requests.tenant_id
+					  AND e.request_id=content_stage_requests.public_id
+					  AND e.event_type=?
+				)`,
+				models.ContentStageFailed, models.ContentStageBlockingOptional,
+				[]string{"execution_budget_exhausted", "deadline_exceeded", "cms_execution_interrupted"}, cutoff,
+				"pre_effect_failure_reclassified").
+			Order("finished_at ASC, public_id ASC").Limit(preEffectFailureBatch).Find(&requests).Error; err != nil {
+			return err
+		}
+		for _, request := range requests {
+			var item models.ContentItem
+			if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", request.TenantID, request.ContentItemID, request.ProcessingGeneration).First(&item).Error; err != nil {
+				if err == gorm.ErrRecordNotFound {
+					continue
+				}
+				return err
+			}
+			if item.Status == models.ContentStatusArchived {
+				continue
+			}
+			next, err := preEffectRecoveryState(tx, item, request)
+			if err != nil {
+				return err
+			}
+			if next == "" {
+				continue
+			}
+			previousFailure := request.FailureClass
+			proof := jsonValue(map[string]any{
+				"reclassified":           true,
+				"previous_state":         models.ContentStageFailed,
+				"previous_failure_class": previousFailure,
+				"reason":                 "no_effect_started",
+				"target_state":           next,
+				"reclassified_at":        now,
+			})
+			if err := tx.Model(&request).Updates(map[string]any{
+				"state":            next,
+				"failure_class":    "",
+				"finished_at":      nil,
+				"verified_at":      nil,
+				"terminal_proof":   proof,
+				"claim_owner":      "",
+				"claim_token":      nil,
+				"claim_expires_at": nil,
+				"not_before_at":    nil,
+				"deadline_at":      nil,
+				"updated_at":       now,
+			}).Error; err != nil {
+				return err
+			}
+			request.State, request.FailureClass, request.FinishedAt, request.VerifiedAt = next, "", nil, nil
+			request.TerminalProof = proof
+			if err := appendEvent(tx, request, nil, "pre_effect_failure_reclassified", map[string]any{
+				"previous_failure_class": previousFailure,
+				"target_state":           next,
+				"reason":                 "no_effect_started",
+			}); err != nil {
+				return err
+			}
+			if err := reduceReadiness(tx, request.TenantID, request.ContentItemID, request.ProcessingGeneration); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func preEffectRecoveryState(tx *gorm.DB, item models.ContentItem, request models.ContentStageRequest) (string, error) {
+	if request.Stage == models.ContentStagePodsMediaArtifacts {
+		if normalizeAcquisitionMode(ResolveMediaAcquisitionMode(tx, item)) == models.MediaAcquisitionManual {
+			return models.ContentStageAwaitingApproval, nil
+		}
+		return models.ContentStageQueued, nil
+	}
+	if request.Lane == models.ContentStageLanePods {
+		// Metadata and optional work are not independently claimable for a
+		// metadata-only parent.  Keep the durable state honest until its media
+		// predecessor verifies, even for the legacy text-embedding descriptor
+		// whose dependency manifest predates media admission.
+		var media models.ContentStageRequest
+		if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND stage=?", request.TenantID, request.ContentItemID, request.ProcessingGeneration, models.ContentStagePodsMediaArtifacts).First(&media).Error; err != nil {
+			if err == gorm.ErrRecordNotFound {
+				return models.ContentStageBlocked, nil
+			}
+			return "", err
+		}
+		if media.State != models.ContentStageVerified {
+			return models.ContentStageBlocked, nil
+		}
+	}
+	ready, err := dependenciesVerified(tx, request)
+	if err != nil {
+		return "", err
+	}
+	if !ready {
+		return models.ContentStageBlocked, nil
+	}
+	if request.Stage == models.ContentStagePodsTranscript && shouldAwaitGeneratedSTT(HasProviderCaption(tx, item), automaticSTTEnabled(tx, item.TenantID), request.Priority) {
+		return models.ContentStageAwaitingApproval, nil
+	}
+	return models.ContentStageQueued, nil
 }
 
 func Cancel(db *gorm.DB, tenantID string, requestID uuid.UUID, reason string) error {
@@ -1286,11 +1693,17 @@ func reduceReadiness(tx *gorm.DB, tenantID string, contentID uuid.UUID, generati
 	// Lifecycle is monotonic after publication. Optional failures, duplicate
 	// observations, stale fences, and timeout recovery must not unpublish a
 	// currently visible item; generation activation/rollback owns replacement.
-	if item.Status == models.ContentStatusReady || item.Status == models.ContentStatusArchived {
+	if (item.Status == models.ContentStatusReady && !(item.ParentContentItemID != nil && item.FeedVisibility == "embedding_pending")) || item.Status == models.ContentStatusArchived {
 		return nil
 	}
 	var requests []models.ContentStageRequest
-	if err := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=? AND blocking_scope=?", tenantID, contentID, generation, models.ContentStageBlockingContentReady).Find(&requests).Error; err != nil {
+	readinessQuery := tx.Where("tenant_id=? AND content_item_id=? AND processing_generation=?", tenantID, contentID, generation)
+	if item.ParentContentItemID != nil {
+		readinessQuery = readinessQuery.Where("blocking_scope<>?", models.ContentStageBlockingOptional)
+	} else {
+		readinessQuery = readinessQuery.Where("blocking_scope=?", models.ContentStageBlockingContentReady)
+	}
+	if err := readinessQuery.Find(&requests).Error; err != nil {
 		return err
 	}
 	if len(requests) == 0 {
@@ -1316,17 +1729,38 @@ func reduceReadiness(tx *gorm.DB, tenantID string, contentID uuid.UUID, generati
 	} else if hasActive {
 		next = models.ContentStatusProcessing
 	}
-	if item.Status == next {
+	publishChild := next == models.ContentStatusReady && item.ParentContentItemID != nil && item.FeedVisibility == "embedding_pending" && item.IsFeedUnit && item.DurationSec != nil && *item.DurationSec >= 270 && *item.DurationSec <= 2400
+	if publishChild {
+		var owned int64
+		if err := tx.Table("atomization_chapter_units u").Joins("JOIN atomization_generations g ON g.public_id=u.generation_id AND g.tenant_id=u.tenant_id").Where("u.tenant_id=? AND u.candidate_content_item_id=? AND u.state='verified' AND g.parent_content_item_id=? AND g.state=?", tenantID, contentID, item.ParentContentItemID, "active").Count(&owned).Error; err != nil {
+			return err
+		}
+		publishChild = owned == 1
+	}
+	if item.Status == next && !publishChild {
 		return nil
 	}
 	item.Status = next
+	if publishChild {
+		item.FeedVisibility = "visible"
+		published := "published"
+		item.ChapteringStatus = &published
+		if err := tx.Model(&models.Chapter{}).Where("tenant_id=? AND child_content_item_id=?", tenantID, contentID).Update("status", published).Error; err != nil {
+			return err
+		}
+	}
 	if err := tx.Save(&item).Error; err != nil {
 		return err
 	}
 	if err := feedstate.AttachReadyNewsStory(tx, item); err != nil {
 		return err
 	}
-	return feedstate.SyncMediaMembership(tx, item)
+	if err := feedstate.SyncMediaMembership(tx, item); err != nil {
+		return err
+	}
+	// The activation sweeper runs after this transaction commits. Never take
+	// a parent lock while holding a child lock: activation owns parent -> child.
+	return nil
 }
 
 func laneForType(kind models.ContentType) string {
