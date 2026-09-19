@@ -1,9 +1,11 @@
 package controllers
 
 import (
+	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"sort"
@@ -14,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Chapter-windowing constants. The transcript is chunked into time-windows
@@ -347,8 +350,8 @@ func mapStudioContent(item *models.ContentItem) studioContentDTO {
 	return dto
 }
 
-// loadOrSeedChapters returns the transcript's chapter rows, lazily seeding them
-// from the transcript's native Chapters jsonb (source=youtube) the first time.
+// Return stored chapters or an in-memory provider preview. GET requests must
+// not seed editorial rows or change an executing generation's review surface.
 func loadOrSeedChapters(db *gorm.DB, tenantID string, transcript *models.Transcript) []models.Chapter {
 	var chapters []models.Chapter
 	db.Where("transcript_id = ? AND tenant_id = ?", transcript.PublicID, tenantID).
@@ -382,17 +385,18 @@ func loadOrSeedChapters(db *gorm.DB, tenantID string, transcript *models.Transcr
 			Source:       src,
 		})
 	}
-	if len(rows) > 0 {
-		db.Create(&rows)
-	}
 	return rows
 }
 
 func chaptersToDTO(chapters []models.Chapter, durMs int) []studioChapterDTO {
 	out := make([]studioChapterDTO, 0, len(chapters))
 	for _, ch := range chapters {
+		id := ""
+		if ch.PublicID != uuid.Nil {
+			id = ch.PublicID.String()
+		}
 		out = append(out, studioChapterDTO{
-			ID:                   ch.PublicID.String(),
+			ID:                   id,
 			Title:                ch.Title,
 			Summary:              ch.Summary,
 			StartMs:              ch.StartMs,
@@ -636,6 +640,9 @@ func SaveChapters(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := guardStudioEdit(tx, *item, true); err != nil {
+			return err
+		}
 		if err := tx.Where("transcript_id = ? AND tenant_id = ?", transcript.PublicID, principal.TenantID).
 			Delete(&models.Chapter{}).Error; err != nil {
 			return err
@@ -647,8 +654,8 @@ func SaveChapters(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Code: http.StatusInternalServerError, Message: "Failed to save chapters",
+		c.JSON(http.StatusConflict, utils.HTTPError{
+			Code: http.StatusConflict, Message: "Chapter save rejected: " + err.Error(),
 		})
 		return
 	}
@@ -723,9 +730,21 @@ func SaveTranscript(c *gin.Context) {
 	segJSON, _ := json.Marshal(req.Segments)
 	transcript.Segments = datatypes.JSON(segJSON)
 	transcript.FullText = fullText
-	if err := db.Save(transcript).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Code: http.StatusInternalServerError, Message: "Failed to save transcript",
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := guardStudioEdit(tx, *item, false); err != nil {
+			return err
+		}
+		var latest models.Transcript
+		if err := tx.Where("tenant_id=? AND public_id=?", principal.TenantID, transcript.PublicID).First(&latest).Error; err != nil {
+			return err
+		}
+		if checksumTranscriptText(latest.FullText, latest.Segments) != prevChecksum {
+			return fmt.Errorf("Transcript changed; reload before saving")
+		}
+		return tx.Save(transcript).Error
+	}); err != nil {
+		c.JSON(http.StatusConflict, utils.HTTPError{
+			Code: http.StatusConflict, Message: "Transcript save rejected: " + err.Error(),
 		})
 		return
 	}
@@ -786,8 +805,28 @@ func ApproveTranscript(c *gin.Context) {
 	} else {
 		transcript.ApprovalReason = nil
 	}
-	if err := db.Save(transcript).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to approve transcript"})
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := contentstage.CheckJourneyGeneration(tx, principal.TenantID, item.PublicID); err != nil {
+			return err
+		}
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, item.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.TranscriptID == nil || *current.TranscriptID != transcript.PublicID {
+			return fmt.Errorf("Transcript changed; refresh before approving")
+		}
+		var approved models.Transcript
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, transcript.PublicID).First(&approved).Error; err != nil {
+			return err
+		}
+		if approved.ApprovedAt != nil {
+			transcript = &approved
+			return nil
+		}
+		return tx.Model(transcript).Updates(map[string]any{"approved_at": transcript.ApprovedAt, "approved_by": transcript.ApprovedBy, "approval_reason": transcript.ApprovalReason}).Error
+	}); err != nil {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: err.Error()})
 		return
 	}
 	createStudioAudit(db, principal, "media_studio.transcript_approve", item.PublicID.String(), "success", "", map[string]interface{}{

@@ -114,6 +114,7 @@ type TranscriptionSegmentUnit struct {
 func (TranscriptionSegmentUnit) TableName() string { return "transcription_segment_units" }
 
 type AtomizationGeneration struct {
+	PlanOrigin            string         `gorm:"not null;default:unavailable" json:"plan_origin"`
 	ContentStageRequestID *uuid.UUID     `gorm:"type:uuid" json:"content_stage_request_id,omitempty"`
 	ProcessingGeneration  int64          `json:"processing_generation"`
 	Plan                  datatypes.JSON `gorm:"type:jsonb;not null;default:'[]'" json:"plan"`

@@ -77,6 +77,9 @@ type claimCandidateFilter struct {
 // chained GORM scope between those statements leaks the aggregate clauses into
 // the row lock and PostgreSQL rejects the resulting query.
 func eligibleClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter) *gorm.DB {
+	if supported, _ := tx.Get("chapter_plan_v1"); supported != true {
+		tx = tx.Where("COALESCE(content_stage_requests.workload_estimate->>'chapter_plan_id','')='' ")
+	}
 	scope := tx.Model(&models.ContentStageRequest{}).
 		Where(
 			"lane=? AND owner=? AND state IN ? AND (not_before_at IS NULL OR not_before_at<=?) AND cancellation_requested_at IS NULL",
@@ -221,6 +224,9 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 		}
 		if len(requests) == 0 {
 			return fmt.Errorf("durable media/transcript prerequisites are not queued")
+		}
+		if err := CheckJourneyGeneration(tx, tenantID, contentID); err != nil {
+			return err
 		}
 		now := time.Now().UTC()
 		for _, request := range requests {

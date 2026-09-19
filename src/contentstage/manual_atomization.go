@@ -40,6 +40,9 @@ func RequestManualAtomization(db *gorm.DB, tenant string, itemID uuid.UUID, acto
 		if item.ProcessingGeneration != request.ProcessingGeneration || item.Status == models.ContentStatusArchived {
 			return fmt.Errorf("atomization target changed")
 		}
+		if err := CheckJourneyGeneration(tx, tenant, itemID); err != nil {
+			return err
+		}
 		if item.DurationSec == nil || *item.DurationSec <= 2400 {
 			return fmt.Errorf("parent must be longer than 40 minutes")
 		}

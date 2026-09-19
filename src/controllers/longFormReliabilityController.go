@@ -1253,6 +1253,7 @@ func dedupeLongFormTranscriptSegments(input []map[string]any) []map[string]any {
 }
 
 type atomizationGenerationRequest struct {
+	PlanOrigin          string                          `json:"plan_origin"`
 	ContentStage        *contentStageCorrelationRequest `json:"content_stage,omitempty"`
 	ResolveOnly         bool                            `json:"resolve_only,omitempty"`
 	TenantID            string                          `json:"tenant_id"`
@@ -1305,6 +1306,8 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		return
 	}
 	var stageID *uuid.UUID
+	appliedPlanID := ""
+	appliedSourceDigest := ""
 	if req.ContentStage != nil {
 		stage, _, err := contentstage.AuthorizeWriteback(db, parentID, req.ContentStage.correlation(), models.ContentStagePodsAtomization)
 		if err != nil {
@@ -1313,6 +1316,13 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 		}
 		stageID = &stage.PublicID
 		workID = stage.PublicID
+		var workload struct {
+			ChapterPlanID string `json:"chapter_plan_id"`
+			SourceDigest  string `json:"chapter_plan_source_digest"`
+		}
+		_ = json.Unmarshal(stage.WorkloadEstimate, &workload)
+		appliedPlanID = workload.ChapterPlanID
+		appliedSourceDigest = workload.SourceDigest
 	} else {
 		var governed models.AtomizationWorkRequest
 		if err := db.Where("public_id=? AND tenant_id=? AND parent_content_item_id=? AND state='running' AND claim_expires_at>? AND cancellation_requested_at IS NULL", workID, tenant, parentID, time.Now().UTC()).First(&governed).Error; err != nil {
@@ -1328,6 +1338,9 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 	req.TranscriptDigest = atomizationTranscriptDigest(transcript)
 	req.PolicyDigest = longFormDigest(atomizationPolicyForItem(db, &parent))
 	req.InputDigest = longFormDigest([]any{parent.PublicID, parent.ProcessingGeneration, req.TranscriptDigest, req.PolicyDigest})
+	if appliedPlanID != "" {
+		req.InputDigest = longFormDigest([]any{parent.PublicID, parent.ProcessingGeneration, req.TranscriptDigest, req.PolicyDigest, draftSourceDigest(parent)})
+	}
 	// CMS is the digest authority. TypeScript planners may send advisory
 	// digests, but identity is always derived from the canonical JSON that CMS
 	// persists, avoiding language-specific map ordering drift.
@@ -1350,6 +1363,31 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 	} else if err != gorm.ErrRecordNotFound {
 		c.JSON(503, gin.H{"code": "generation_lookup_failed", "error": "generation lookup unavailable"})
 		return
+	}
+	if appliedPlanID != "" {
+		req.PlanOrigin = "manual"
+		if appliedSourceDigest != draftSourceDigest(parent) {
+			c.JSON(409, gin.H{"code": "generation_input_changed", "error": "Applied draft media changed; explicit revalidation required"})
+			return
+		}
+		var draft models.MediaChapterDraft
+		if err := db.Where("tenant_id=? AND public_id=? AND applied_request_id=? AND applied_processing_generation=?", tenant, appliedPlanID, workID, parent.ProcessingGeneration).First(&draft).Error; err != nil || draft.TranscriptDigest != req.TranscriptDigest || draft.PolicyDigest != req.PolicyDigest {
+			c.JSON(409, gin.H{"code": "generation_input_changed", "error": "Applied draft inputs changed; explicit revalidation required"})
+			return
+		}
+		var plan []map[string]any
+		if json.Unmarshal(draft.Plan, &plan) != nil {
+			c.JSON(409, gin.H{"code": "generation_plan_rejected", "error": "Applied draft is invalid"})
+			return
+		}
+		if req.ResolveOnly {
+			c.JSON(200, gin.H{"generation": nil, "applied_plan": plan})
+			return
+		}
+		if longFormDigest(plan) != longFormDigest(req.Chapters) {
+			c.JSON(409, gin.H{"code": "generation_plan_rejected", "error": "Worker must execute the exact applied draft"})
+			return
+		}
 	}
 	if req.ResolveOnly {
 		c.JSON(200, gin.H{"generation": nil})
@@ -1377,6 +1415,10 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 	}
 	generation := models.AtomizationGeneration{PublicID: uuid.New(), TenantID: tenant, ParentContentItemID: parentID, WorkRequestID: workID, GenerationNumber: generationNumber, TranscriptDigest: req.TranscriptDigest, PolicyDigest: req.PolicyDigest, InputDigest: req.InputDigest, PlanDigest: req.PlanDigest, CoverageDigest: req.CoverageDigest, ExpectedUnits: len(req.Chapters), State: "running", TerminalProof: longFormJSON(initialProof)}
 	generation.ContentStageRequestID, generation.ProcessingGeneration, generation.Plan = stageID, parent.ProcessingGeneration, longFormJSON(req.Chapters)
+	generation.PlanOrigin = "unavailable"
+	if req.PlanOrigin == "provider" || req.PlanOrigin == "contextual" || (req.PlanOrigin == "manual" && appliedPlanID != "") {
+		generation.PlanOrigin = req.PlanOrigin
+	}
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if req.ContentStage != nil {
 			if _, _, err := contentstage.AuthorizeWriteback(tx, parentID, req.ContentStage.correlation(), models.ContentStagePodsAtomization); err != nil {
@@ -1397,6 +1439,9 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 			return err
 		}
 		lockedPolicy := atomizationPolicyForItem(tx, &parent)
+		if appliedPlanID != "" && appliedSourceDigest != draftSourceDigest(parent) {
+			return errors.New("applied draft media changed")
+		}
 		if atomizationTranscriptDigest(lockedTranscript) != generation.TranscriptDigest || longFormDigest(lockedPolicy) != generation.PolicyDigest || generation.ProcessingGeneration != parent.ProcessingGeneration {
 			return errors.New("generation input changed")
 		}

@@ -25,6 +25,16 @@ type contentStageTransitionRequest struct {
 
 func claimContentStage(c *gin.Context, lane string, media bool) {
 	db := c.MustGet("db").(*gorm.DB)
+	if !media && lane == models.ContentStageLanePods && c.Query("chapter_plan_version") == "1" {
+		db = db.Set("chapter_plan_v1", true)
+		if db.Migrator().HasTable("media_worker_capabilities") {
+			// Piggyback support advertisement; at most one persisted update/minute.
+			if err := db.Exec(`INSERT INTO media_worker_capabilities(name,version,observed_at) VALUES('chapter_plan',1,NOW()) ON CONFLICT(name) DO UPDATE SET version=1,observed_at=NOW() WHERE media_worker_capabilities.observed_at < NOW()-INTERVAL '1 minute'`).Error; err != nil {
+				c.JSON(503, gin.H{"error": "Worker capability advertisement unavailable"})
+				return
+			}
+		}
+	}
 	// Tenant scope is selected by CMS. The internal caller may select only the
 	// lane; accepting a caller-supplied/default tenant here caused starvation
 	// whenever another tenant had the oldest eligible work.

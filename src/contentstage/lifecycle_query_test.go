@@ -50,6 +50,20 @@ func requireSQLExcludes(t *testing.T, sql string, fragments ...string) {
 	}
 }
 
+func TestClaimCandidateRequiresDraftAwareWorker(t *testing.T) {
+	filter := claimCandidateFilter{lane: models.ContentStageLanePods, expectedOwner: models.ContentStageOwnerAggregationPods, now: time.Now()}
+	for _, supported := range []bool{false, true} {
+		db := claimQueryDryRunDB(t).Set("chapter_plan_v1", supported).Session(&gorm.Session{})
+		var rows []models.ContentStageRequest
+		query := eligibleClaimCandidateScope(db, filter).Find(&rows)
+		if supported {
+			requireSQLExcludes(t, query.Statement.SQL.String(), "chapter_plan_id")
+		} else {
+			requireSQLContains(t, query.Statement.SQL.String(), "chapter_plan_id")
+		}
+	}
+}
+
 func TestClaimCandidateQueriesKeepAggregateAndLockingStatementsIndependent(t *testing.T) {
 	db := claimQueryDryRunDB(t)
 	filter := claimCandidateFilter{

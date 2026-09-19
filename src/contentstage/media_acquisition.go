@@ -2,6 +2,7 @@ package contentstage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -40,11 +41,7 @@ func shouldAwaitGeneratedSTT(captionPresent, autoEnabled bool, priority int16) b
 // ResolveMediaAcquisitionMode applies source override -> tenant default ->
 // automatic code default. It intentionally does not use source APIConfig.
 func ResolveMediaAcquisitionMode(db *gorm.DB, item models.ContentItem) string {
-	// Chapters reuse approved parent media; source admission only gates roots.
-	if item.ParentContentItemID != nil {
-		return models.MediaAcquisitionAutomatic
-	}
-	if db == nil || !db.Migrator().HasTable(&models.MediaAcquisitionConfig{}) {
+	if item.ParentContentItemID != nil || db == nil || !db.Migrator().HasTable(&models.MediaAcquisitionConfig{}) {
 		return models.MediaAcquisitionAutomatic
 	}
 	if item.ContentSourceID != nil {
@@ -58,6 +55,37 @@ func ResolveMediaAcquisitionMode(db *gorm.DB, item models.ContentItem) string {
 		return normalizeAcquisitionMode(config.DefaultMode)
 	}
 	return models.MediaAcquisitionAutomatic
+}
+
+// ReadMediaAcquisitionPolicy reports policy provenance without seeding config.
+// Journey reads propagate failures instead of misreporting a fallback as policy.
+func ReadMediaAcquisitionPolicy(db *gorm.DB, item models.ContentItem) (string, string, error) {
+	// Chapters reuse approved parent media; source admission only gates roots.
+	if item.ParentContentItemID != nil {
+		return models.MediaAcquisitionAutomatic, "parent_media", nil
+	}
+	if db == nil || !db.Migrator().HasTable(&models.MediaAcquisitionConfig{}) {
+		return models.MediaAcquisitionAutomatic, "code_default", nil
+	}
+	if item.ContentSourceID != nil {
+		var source models.ContentSource
+		err := db.Select("media_acquisition_mode").Where("tenant_id=? AND public_id=?", item.TenantID, *item.ContentSourceID).First(&source).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", "", err
+		}
+		if err == nil && source.MediaAcquisitionMode != nil {
+			return normalizeAcquisitionMode(*source.MediaAcquisitionMode), "source", nil
+		}
+	}
+	var config models.MediaAcquisitionConfig
+	err := db.Where("tenant_id=?", item.TenantID).First(&config).Error
+	if err == nil {
+		return normalizeAcquisitionMode(config.DefaultMode), "tenant", nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", "", err
+	}
+	return models.MediaAcquisitionAutomatic, "code_default", nil
 }
 
 // HasUsableCaptionArtifact reports whether discovery persisted an actual
@@ -208,6 +236,9 @@ func RequestMediaAcquisition(db *gorm.DB, tenantID string, contentID uuid.UUID, 
 			return err
 		}
 		result.RequestID = request.PublicID.String()
+		if err := CheckJourneyGeneration(tx, tenantID, contentID); err != nil {
+			return err
+		}
 		switch request.State {
 		case models.ContentStageAwaitingApproval, models.ContentStageBlocked:
 			wasBlocked := request.State == models.ContentStageBlocked
