@@ -59,6 +59,9 @@ const (
 	SystemAutopilotGuardObserveMode            = "observe_mode"
 	SystemAutopilotGuardPaused                 = "paused"
 	SystemAutopilotGuardQueueBacklogNoIncident = "queue_backlog_no_incident"
+	SystemAutopilotGuardManualObservation      = "manual_observation"
+	SystemAutopilotGuardDisabled               = "autopilot_disabled"
+	SystemAutopilotGuardEvidenceStale          = "evidence_stale"
 )
 
 type SystemAutopilotPolicy struct {

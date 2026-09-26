@@ -22,23 +22,27 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
-	systemAutopilotScope       = "platform"
-	systemProbeTimeout         = 3 * time.Second
-	systemProbePhaseTimeout    = 10 * time.Second
-	systemProbeBodyLimit       = 256 * 1024
-	systemQueueProbeBodyLimit  = 1024 * 1024
-	systemQueueWaitingWarn     = 100
-	systemAutopilotHistoryRuns = 12
-	systemAutopilotAdvisoryKey = 7_070_000_001
+	systemAutopilotScope           = "platform"
+	systemProbeTimeout             = 3 * time.Second
+	systemProbePhaseTimeout        = 10 * time.Second
+	systemProbeBodyLimit           = 256 * 1024
+	systemQueueProbeBodyLimit      = 1024 * 1024
+	systemQueueWaitingWarn         = 100
+	systemAutopilotHistoryRuns     = 12
+	systemAutopilotAdvisoryKey     = 7_070_000_001
+	systemAutopilotTargetCap       = 100
+	systemAutopilotMutationTimeout = 30 * time.Second
 )
 
 var (
-	systemAutopilotMu      sync.Mutex
-	systemAutopilotRunning bool
-	errSystemAutopilotBusy = errors.New("system health autopilot already running")
+	systemAutopilotMu       sync.Mutex
+	systemAutopilotRunning  bool
+	errSystemAutopilotBusy  = errors.New("system health autopilot already running")
+	errSystemIncidentClosed = errors.New("system incident episode is already closed")
 )
 
 type systemAutopilotRunOptions struct {
@@ -46,6 +50,10 @@ type systemAutopilotRunOptions struct {
 	CreatedBy     string
 	CorrelationID *uuid.UUID
 	TriggerRef    string
+	// ObservationOnly is used by manual diagnostics and downstream recovery
+	// checks. They may record evidence and episodes, but cannot mutate sibling
+	// policy rows even when the persisted policy is Safe Auto.
+	ObservationOnly bool
 }
 
 // systemAutopilotDeps keeps the runner deterministic in DB tests without
@@ -71,6 +79,7 @@ type systemAnomaly struct {
 }
 
 type systemRunSnapshot struct {
+	TooClose  bool                `json:"-"`
 	Timestamp string              `json:"timestamp"`
 	Overall   string              `json:"overall"`
 	Services  []systemProbeResult `json:"services"`
@@ -83,16 +92,17 @@ type systemSiblingAutopilot struct {
 	Table        string
 	PauseColumn  string
 	Dependencies []string
+	Capabilities []string
 }
 
 var systemSiblingAutopilots = []systemSiblingAutopilot{
-	{Key: "pipeline", Label: "Pipeline Repair", Table: "pipeline_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation"}},
-	{Key: "enrichment", Label: "Enrichment Coverage", Table: "enrichment_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation", "enrichment", "media"}},
-	{Key: "embedding_lifecycle", Label: "Embedding Lifecycle", Table: "embedding_lifecycle_policies", PauseColumn: "campaigns_paused_until", Dependencies: []string{"cms", "enrichment", "media"}},
-	{Key: "news_circulation", Label: "News Circulation", Table: "news_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}},
-	{Key: "media_circulation", Label: "Media Circulation", Table: "media_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}},
-	{Key: "media_studio", Label: "Media Studio", Table: "media_studio_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "media", "enrichment"}},
-	{Key: "redundancy", Label: "Redundancy Hygiene", Table: "redundancy_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "aggregation"}},
+	{Key: "pipeline", Label: "Pipeline Repair", Table: "pipeline_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation"}, Capabilities: []string{"aggregation_pipeline"}},
+	{Key: "enrichment", Label: "Enrichment Coverage", Table: "enrichment_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"aggregation", "enrichment", "media"}, Capabilities: []string{"aggregation_pipeline", "enrichment", "media"}},
+	{Key: "embedding_lifecycle", Label: "Embedding Lifecycle", Table: "embedding_lifecycle_policies", PauseColumn: "campaigns_paused_until", Dependencies: []string{"cms", "enrichment", "media"}, Capabilities: []string{"enrichment", "media"}},
+	{Key: "news_circulation", Label: "News Circulation", Table: "news_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, Capabilities: []string{"aggregation_dispatcher", "news_processing"}},
+	{Key: "media_circulation", Label: "Media Circulation", Table: "media_circulation_policies", PauseColumn: "autopilot_paused_until", Dependencies: []string{"aggregation"}, Capabilities: []string{"aggregation_dispatcher", "media"}},
+	{Key: "media_studio", Label: "Media Studio", Table: "media_studio_autopilot_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "media", "enrichment"}, Capabilities: []string{"media", "enrichment"}},
+	{Key: "redundancy", Label: "Redundancy Hygiene", Table: "redundancy_policies", PauseColumn: "paused_until", Dependencies: []string{"cms", "aggregation"}, Capabilities: []string{"aggregation_receipt"}},
 }
 
 func tryStartSystemAutopilotRun() bool {
@@ -118,6 +128,20 @@ func loadSystemAutopilotPolicy(db *gorm.DB) models.SystemAutopilotPolicy {
 		_ = db.Where("scope = ?", systemAutopilotScope).FirstOrCreate(&policy).Error
 	}
 	return sanitizeSystemAutopilotPolicy(policy)
+}
+
+func loadSystemAutopilotPolicyWithError(db *gorm.DB) (models.SystemAutopilotPolicy, error) {
+	var policy models.SystemAutopilotPolicy
+	if err := db.Where("scope = ?", systemAutopilotScope).First(&policy).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return policy, err
+		}
+		policy = models.DefaultSystemAutopilotPolicy()
+		if err := db.Where("scope = ?", systemAutopilotScope).FirstOrCreate(&policy).Error; err != nil {
+			return policy, err
+		}
+	}
+	return sanitizeSystemAutopilotPolicy(policy), nil
 }
 
 func sanitizeSystemAutopilotPolicy(p models.SystemAutopilotPolicy) models.SystemAutopilotPolicy {
@@ -188,6 +212,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 
 	now := deps.now()
 	policy := loadSystemAutopilotPolicy(db)
+	allowContainment := opts.Trigger == "scheduled" && policy.Enabled && policy.Mode == models.SystemAutopilotModeSafeAuto && !opts.ObservationOnly
 	run := models.SystemAutopilotRun{
 		Trigger:       opts.Trigger,
 		Mode:          policy.Mode,
@@ -228,7 +253,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	}
 
 	snapshot, anomalies := deps.collect(db)
-	prev := recentSystemRunSnapshots(db, systemAutopilotHistoryRuns)
+	prev := recentSystemRunSnapshots(db, systemAutopilotHistoryRuns, now, policy.IntervalMinutes)
 	confirmed := confirmSystemAnomalies(anomalies, prev, policy.ConfirmProbes)
 	confirmed = correlateSystemAnomalies(confirmed)
 	confirmed = applySystemFlapGuard(db, confirmed, policy.FlapCycles24h, now, writeAction)
@@ -258,7 +283,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	}
 	// A confirmed episode in recovery relapses immediately when its own evidence
 	// returns. Opening needs N probes; a known incident never forgets its signal.
-	for _, anomaly := range anomalies {
+	for _, anomaly := range observed {
 		if ep, exists := episodesByKey[systemIncidentKey(anomaly.Service, anomaly.Verdict)]; exists && ep.Status == models.SystemIncidentStatusRecovering {
 			already := false
 			for _, current := range confirmed {
@@ -276,6 +301,9 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	contained := false
 	episodeWriteErrors := 0
 	handledConfirmed := []systemAnomaly{}
+	mutationContext, cancelMutations := context.WithTimeout(context.Background(), systemAutopilotMutationTimeout)
+	defer cancelMutations()
+	mutationDB := db.WithContext(mutationContext)
 	for _, anomaly := range confirmed {
 		if anomaly.Verdict == models.SystemVerdictQueueBacklog {
 			continue
@@ -300,7 +328,10 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 				ep.Evidence = marshalAutopilotJSON(anomaly.Evidence)
 				ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, transition, now, anomaly, snapshot)
 			}
-			if err := db.Save(&ep).Error; err != nil {
+			if err := saveSystemEpisodeObservation(db, &ep); err != nil {
+				if errors.Is(err, errSystemIncidentClosed) {
+					continue
+				}
 				episodeWriteErrors++
 				writeAction(models.SystemAutopilotAction{
 					Target:  anomaly.Service,
@@ -361,9 +392,9 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 			})
 		}
 		if isSystemHardDownVerdict(anomaly.Verdict) {
-			applied, containmentWriteErrors := handleSystemContainment(db, policy, anomaly, &ep, now, storeAction, func(action models.SystemAutopilotAction) {
+			applied, containmentWriteErrors := handleSystemContainment(mutationDB, policy, anomaly, &ep, now, storeAction, func(action models.SystemAutopilotAction) {
 				actions = append(actions, action)
-			})
+			}, allowContainment)
 			episodeWriteErrors += containmentWriteErrors
 			if applied {
 				contained = true
@@ -383,10 +414,18 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 
 	resolvedEpisodes, resolutionWriteErrors := resolveRecoveredSystemEpisodes(db, openEpisodes, snapshot, prev, policy.ResolveProbes, now, writeAction)
 	episodeWriteErrors += resolutionWriteErrors
-	if len(resolvedEpisodes) > 0 {
-		episodeWriteErrors += resumeRecoveredSystemContainment(db, policy, resolvedEpisodes, now, storeAction, func(action models.SystemAutopilotAction) {
+	if allowContainment {
+		allContainmentEpisodes := allSystemIncidentEpisodesWithContainment(mutationDB)
+		episodeWriteErrors += resumeRecoveredSystemContainment(mutationDB, policy, allContainmentEpisodes, now, systemRecoveryEvidence{Snapshot: snapshot, Previous: prev}, storeAction, func(action models.SystemAutopilotAction) {
 			actions = append(actions, action)
-		})
+		}, true)
+	} else if opts.Trigger != "scheduled" {
+		// Manual and recovery callers still expose what would be released; they
+		// never acquire a mutation path through the diagnostic endpoint.
+		allContainmentEpisodes := allSystemIncidentEpisodesWithContainment(mutationDB)
+		episodeWriteErrors += resumeRecoveredSystemContainment(mutationDB, policy, allContainmentEpisodes, now, systemRecoveryEvidence{Snapshot: snapshot, Previous: prev}, storeAction, func(action models.SystemAutopilotAction) {
+			actions = append(actions, action)
+		}, false)
 	}
 
 	runSnapshot := systemRunSnapshot{Timestamp: snapshot.Timestamp, Overall: snapshot.Overall, Services: snapshot.Services, Anomalies: anomalies}
@@ -399,8 +438,8 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 		},
 		"run_snapshot": runSnapshot,
 	})
-	run.Headline = systemHeadline(snapshot, handledConfirmed, contained, len(resolvedEpisodes))
-	run.Summary = systemRunSummary(snapshot, handledConfirmed, len(resolvedEpisodes), contained)
+	run.Headline = systemHeadlineForState(db, snapshot, handledConfirmed, contained, len(resolvedEpisodes))
+	run.Summary = systemRunSummaryForState(db, snapshot, handledConfirmed, len(resolvedEpisodes), contained, opts)
 	run.Status = models.SystemAutopilotRunStatusCompleted
 	if episodeWriteErrors > 0 {
 		run.Status = models.SystemAutopilotRunStatusPartial
@@ -530,9 +569,13 @@ func checkSystemAggregation(ctx context.Context) systemProbeResult {
 	display.HTTPStatus = firstHTTPStatus(health.HTTPStatus, ready.HTTPStatus)
 	display.RawError = firstNonEmpty(health.Error, ready.Error)
 	readyBody := asSystemRecord(ready.Body)
-	display.Deps = mapAggregationTopologyDependencies(readyBody)
 	healthObserved := health.JSONObserved && systemHealthStatusObserved(asSystemRecord(health.Body), "healthy")
 	display.ReadinessObserved = ready.JSONObserved && readinessAggregationBodyObserved(readyBody)
+	// A response that fails the topology contract is observation-unknown. Do
+	// not turn its partial role payload into a durable dependency-down verdict.
+	if display.ReadinessObserved {
+		display.Deps = mapAggregationTopologyDependencies(readyBody)
+	}
 	if queueErr == nil {
 		display.Queues = queues
 	} else if display.RawError == "" {
@@ -1184,8 +1227,6 @@ func systemCorrelationRoot(anomaly systemAnomaly) string {
 		return "redis"
 	case (anomaly.Service == "cms" || anomaly.Service == "iam") && anomaly.Verdict == models.SystemVerdictDependencyDown:
 		return "postgres"
-	case (anomaly.Service == "aggregation" || anomaly.Service == "enrichment" || anomaly.Service == "media") && anomaly.Verdict == models.SystemVerdictServiceDown:
-		return "cms"
 	default:
 		return ""
 	}
@@ -1256,19 +1297,49 @@ func hardDownServiceNames(anomalies []systemAnomaly) []string {
 	return names
 }
 
-func recentSystemRunSnapshots(db *gorm.DB, limit int) []systemRunSnapshot {
+func recentSystemRunSnapshots(db *gorm.DB, limit int, now time.Time, intervalMinutes int) []systemRunSnapshot {
 	var runs []models.SystemAutopilotRun
-	if err := db.Where("status IN ?", []string{models.SystemAutopilotRunStatusCompleted, models.SystemAutopilotRunStatusPartial}).
-		Order("started_at DESC").Limit(limit).Find(&runs).Error; err != nil {
+	if err := db.Where("started_at < ?", now).
+		Order("started_at DESC").Limit(limit * 16).Find(&runs).Error; err != nil {
 		return nil
 	}
+	if intervalMinutes < 2 {
+		intervalMinutes = 10
+	}
+	maxGap := time.Duration(intervalMinutes*2+1) * time.Minute
 	out := []systemRunSnapshot{}
+	lastAcceptedAt, lastObservedAt := now, now
+	acceptedCount := 0
 	for _, run := range runs {
 		var wrapper struct {
 			RunSnapshot systemRunSnapshot `json:"run_snapshot"`
 		}
-		if err := json.Unmarshal(run.ProbeResults, &wrapper); err == nil && wrapper.RunSnapshot.Timestamp != "" {
+		if run.Status != models.SystemAutopilotRunStatusCompleted || json.Unmarshal(run.ProbeResults, &wrapper) != nil || wrapper.RunSnapshot.Timestamp == "" {
+			out = append(out, systemRunSnapshot{}) // Failed or interrupted evidence breaks the streak.
+			break
+		}
+		{
+			observedAt, parseErr := time.Parse(time.RFC3339, wrapper.RunSnapshot.Timestamp)
+			if parseErr != nil {
+				observedAt, parseErr = time.Parse(time.RFC3339Nano, wrapper.RunSnapshot.Timestamp)
+			}
+			if parseErr != nil || observedAt.After(lastObservedAt) || lastObservedAt.Sub(observedAt) > maxGap {
+				out = append(out, systemRunSnapshot{})
+				break
+			}
+			// A burst of manual clicks or duplicate scheduler delivery must not
+			// manufacture a confirmation/recovery streak. Count at most one
+			// observation per configured scheduler interval.
+			lastObservedAt = observedAt
+			wrapper.RunSnapshot.TooClose = lastAcceptedAt.Sub(observedAt) < time.Duration(intervalMinutes)*time.Minute
 			out = append(out, wrapper.RunSnapshot)
+			if !wrapper.RunSnapshot.TooClose {
+				lastAcceptedAt = observedAt
+				acceptedCount++
+				if acceptedCount >= limit {
+					break
+				}
+			}
 		}
 	}
 	return out
@@ -1286,6 +1357,9 @@ func confirmSystemAnomalies(current []systemAnomaly, prev []systemRunSnapshot, c
 		count := 1
 		for _, run := range prev {
 			if runHasSystemAnomaly(run, anomaly.Key) {
+				if run.TooClose {
+					continue
+				}
 				count++
 				if count >= confirmProbes {
 					break
@@ -1308,6 +1382,13 @@ func runHasSystemAnomaly(run systemRunSnapshot, key string) bool {
 			return true
 		}
 	}
+	// Historical runs persist raw symptoms. Rebuild the deterministic
+	// correlation group when a later run asks about its shared root.
+	for _, anomaly := range correlateSystemAnomalies(run.Anomalies) {
+		if anomaly.Key == key {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1316,6 +1397,9 @@ func systemAnomalyStreak(current systemAnomaly, prev []systemRunSnapshot) int {
 	for _, run := range prev {
 		if !runHasSystemAnomaly(run, current.Key) {
 			break
+		}
+		if run.TooClose {
+			continue
 		}
 		count++
 	}
@@ -1367,23 +1451,16 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 		if !systemEpisodeObservablyHealthy(ep, snapshot) {
 			continue
 		}
-		ok := 1
-		for _, run := range prev {
-			if systemEpisodeObservablyHealthyServices(ep, run.Services) {
-				ok++
-				if ok >= resolveProbes {
-					break
-				}
-			} else {
-				break
-			}
-		}
+		ok := systemRecoverySamples(ep, snapshot, prev, resolveProbes)
 		if ok < resolveProbes {
 			if ep.Status != models.SystemIncidentStatusRecovering {
 				recoveringAt := now.UTC()
 				ep.Status = models.SystemIncidentStatusRecovering
 				ep.RecoveringSince = &recoveringAt
-				if err := db.Save(&ep).Error; err != nil {
+				if err := saveSystemEpisodeObservation(db, &ep); err != nil {
+					if errors.Is(err, errSystemIncidentClosed) {
+						continue
+					}
 					writeErrors++
 					writeAction(models.SystemAutopilotAction{
 						EpisodeID: &ep.ID,
@@ -1407,7 +1484,10 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 			Severity: ep.Severity,
 			Summary:  ep.Summary,
 		}, snapshot)
-		if err := db.Save(&ep).Error; err != nil {
+		if err := saveSystemEpisodeObservation(db, &ep); err != nil {
+			if errors.Is(err, errSystemIncidentClosed) {
+				continue
+			}
 			writeErrors++
 			writeAction(models.SystemAutopilotAction{
 				EpisodeID: &ep.ID,
@@ -1432,6 +1512,9 @@ func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemInc
 }
 
 func systemEpisodeObservablyHealthy(ep models.SystemIncidentEpisode, snapshot systemHealthSnapshot) bool {
+	if !systemEpisodeCoverageComplete(ep, snapshot.Services) {
+		return false
+	}
 	return systemEpisodeObservablyHealthyServices(ep, snapshot.Services)
 }
 
@@ -1450,6 +1533,30 @@ func systemEpisodeObservablyHealthyServices(ep models.SystemIncidentEpisode, ser
 	default:
 		return healthy[ep.RootService]
 	}
+}
+
+func systemEpisodeCoverageComplete(ep models.SystemIncidentEpisode, services []systemProbeResult) bool {
+	seen := map[string]bool{}
+	for _, svc := range services {
+		if svc.Name != "" {
+			seen[svc.Name] = true
+		}
+	}
+	required := []string{ep.RootService}
+	switch ep.RootService {
+	case "redis":
+		required = []string{"aggregation", "media"}
+	case "postgres":
+		required = []string{"cms", "iam"}
+	case "cms":
+		required = []string{"aggregation", "enrichment", "media"}
+	}
+	for _, name := range required {
+		if !seen[name] {
+			return false
+		}
+	}
+	return true
 }
 
 func containmentDisabledSet(policy models.SystemAutopilotPolicy) map[string]bool {
@@ -1481,6 +1588,7 @@ type systemContainmentLedgerEntry struct {
 	WrittenUntil string `json:"written_until,omitempty"`
 	Outcome      string `json:"outcome"`
 	Reason       string `json:"reason,omitempty"`
+	HumanOwned   bool   `json:"human_owned,omitempty"`
 }
 
 type systemAutopilotActionStore func(*gorm.DB, models.SystemAutopilotAction) (models.SystemAutopilotAction, error)
@@ -1516,10 +1624,14 @@ func storeSystemContainmentEntry(tx *gorm.DB, ep *models.SystemIncidentEpisode, 
 	return payload, nil
 }
 
-func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, anomaly systemAnomaly, ep *models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) (bool, int) {
+func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, anomaly systemAnomaly, ep *models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction), containmentOverride ...bool) (bool, int) {
 	disabled := containmentDisabledSet(policy)
 	now = now.UTC()
 	containmentPaused := policy.ContainmentPausedUntil != nil && policy.ContainmentPausedUntil.After(now)
+	allowContainment := true
+	if len(containmentOverride) > 0 {
+		allowContainment = containmentOverride[0]
+	}
 	desiredUntil := now.Add(time.Duration(policy.ContainmentTTLMinutes) * time.Minute)
 	applied, writeErrors := false, 0
 	write := func(action models.SystemAutopilotAction) {
@@ -1529,8 +1641,46 @@ func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, a
 			actionSink(stored)
 		}
 	}
+	// Bound mutation fanout before the first sibling write. The cap is a
+	// deterministic safety boundary; an oversized registry is surfaced as an
+	// attention action rather than silently pausing only the first N rows.
+	preloadedRows := map[string][]systemSiblingPolicyRow{}
+	preloadErrors := map[string]error{}
+	preloaded := allowContainment && policy.Enabled && policy.Mode == models.SystemAutopilotModeSafeAuto && !containmentPaused
+	preloadedTargetCount := 0
+	if preloaded {
+		for _, sibling := range systemSiblingAutopilots {
+			if !siblingDependsOnAnomaly(sibling, anomaly) || disabled[sibling.Key] {
+				continue
+			}
+			rows, err := systemSiblingPolicyRows(db, sibling)
+			if err != nil {
+				preloadErrors[sibling.Key] = err
+				continue
+			}
+			preloadedRows[sibling.Key] = rows
+			preloadedTargetCount += len(rows)
+		}
+		if preloadedTargetCount > systemAutopilotTargetCap {
+			for _, sibling := range systemSiblingAutopilots {
+				if _, ok := preloadedRows[sibling.Key]; !ok {
+					continue
+				}
+				write(models.SystemAutopilotAction{
+					EpisodeID: &ep.ID,
+					Target:    sibling.Key,
+					Action:    models.SystemAutopilotActionSkipped,
+					Status:    "attention",
+					Verdict:   anomaly.Verdict,
+					Guardrail: models.SystemAutopilotGuardScopeCap,
+					Reason:    fmt.Sprintf("Containment target fanout (%d) exceeds the per-run cap of %d; no sibling pause was written", preloadedTargetCount, systemAutopilotTargetCap),
+				})
+			}
+			return false, writeErrors
+		}
+	}
 	for _, sibling := range systemSiblingAutopilots {
-		if !siblingDependsOnService(sibling, anomaly.Service) && anomaly.Verdict != models.SystemVerdictMultiServiceIncident {
+		if !siblingDependsOnAnomaly(sibling, anomaly) {
 			continue
 		}
 		base := models.SystemAutopilotAction{EpisodeID: &ep.ID, Target: sibling.Key, Verdict: anomaly.Verdict}
@@ -1546,13 +1696,29 @@ func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, a
 			write(base)
 			continue
 		}
+		if !allowContainment {
+			base.Action, base.Status, base.Guardrail = models.SystemAutopilotActionWouldPause, "would_execute", models.SystemAutopilotGuardManualObservation
+			base.Reason = "This run records evidence only; containment is reserved for an enabled scheduled Safe Auto run"
+			if !policy.Enabled {
+				base.Guardrail = models.SystemAutopilotGuardDisabled
+				base.Reason = "System Health Autopilot is disabled; this observation cannot change sibling policy"
+			}
+			write(base)
+			continue
+		}
 		if policy.Mode != models.SystemAutopilotModeSafeAuto {
 			base.Action, base.Status, base.Guardrail = models.SystemAutopilotActionWouldPause, "would_execute", models.SystemAutopilotGuardObserveMode
 			base.Reason = "Observe mode would pause " + sibling.Label
 			write(base)
 			continue
 		}
-		rows, err := systemSiblingPolicyRows(db, sibling)
+		rows, err := preloadedRows[sibling.Key], preloadErrors[sibling.Key]
+		if preloaded && rows == nil && err == nil {
+			rows, err = systemSiblingPolicyRows(db, sibling)
+		}
+		if !preloaded {
+			rows, err = systemSiblingPolicyRows(db, sibling)
+		}
 		if err != nil {
 			base.Action, base.Status, base.Reason = models.SystemAutopilotActionSkipped, "error", "failed to list sibling policy rows: "+err.Error()
 			writeErrors++
@@ -1568,19 +1734,89 @@ func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, a
 			var updatedContainment datatypes.JSON
 			mutated := false
 			err := db.Transaction(func(tx *gorm.DB) error {
-				entry := systemContainmentLedgerEntry{Outcome: "skipped"}
-				if row.PausedUntil != nil && (!ownsPause || owned.WrittenUntil == "") {
+				entry := owned
+				if !ownsPause {
+					entry.Outcome = "skipped"
+				}
+				// Re-read the platform policy under the same transaction as the
+				// sibling CAS. A mode/disable/pause change made after the probe
+				// cannot be bypassed by a stale run snapshot.
+				currentPolicy := policy
+				var persistedPolicy models.SystemAutopilotPolicy
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("scope = ?", systemAutopilotScope).First(&persistedPolicy).Error; err != nil {
+					if !errors.Is(err, gorm.ErrRecordNotFound) {
+						return err
+					}
+					// The public runner always creates the policy before entering
+					// containment. Keep the helper usable in isolated fixtures by
+					// treating a missing row as the caller's already-sanitized policy.
+					currentPolicy = sanitizeSystemAutopilotPolicy(policy)
+				} else {
+					currentPolicy = sanitizeSystemAutopilotPolicy(persistedPolicy)
+				}
+				var currentEpisode models.SystemIncidentEpisode
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentEpisode, ep.ID).Error; err != nil {
+					return err
+				}
+				if currentEpisode.Status != models.SystemIncidentStatusOpen && currentEpisode.Status != models.SystemIncidentStatusRecovering {
+					return errSystemIncidentClosed
+				}
+				if !currentPolicy.Enabled {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardDisabled
+					action.Reason, entry.Reason = "System Health Autopilot was disabled before the containment write", "autopilot_disabled"
+				} else if currentPolicy.Mode != models.SystemAutopilotModeSafeAuto {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardObserveMode
+					action.Reason, entry.Reason = "System Health policy changed to Observe before the containment write", "observe_mode"
+				} else if containmentDisabledSet(currentPolicy)[sibling.Key] {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardOptedOut
+					action.Reason, entry.Reason = "Sibling containment was opted out before the containment write", "opted_out"
+				} else if currentPolicy.ContainmentPausedUntil != nil && currentPolicy.ContainmentPausedUntil.After(now) {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardPaused
+					action.Reason, entry.Reason = "Containment was paused before the containment write", "paused"
+				} else if ownsPause && owned.HumanOwned {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
+					action.Reason, entry.Reason, entry.HumanOwned = "A human takeover is recorded for this tenant; System Health will not reacquire it", "human_pause", true
+				} else if row.PausedUntil != nil && (!ownsPause || owned.WrittenUntil == "") {
 					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
 					action.Reason, entry.Reason = "A human or another incident already owns this tenant pause", "human_pause"
-				} else if row.PausedUntil != nil && !row.PausedUntil.Before(desiredUntil) {
+				} else if ownsPause && owned.WrittenUntil != "" && row.PausedUntil == nil {
+					owned.HumanOwned = true
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
+					action.Reason, entry = "The System Health pause was cleared or replaced before renewal", owned
+					entry.Outcome, entry.Reason, entry.HumanOwned = "skipped", "human_pause", true
+				} else if ownsPause && owned.WrittenUntil != "" && row.PausedUntil != nil {
+					expected, parseErr := time.Parse(time.RFC3339Nano, owned.WrittenUntil)
+					if parseErr != nil || !row.PausedUntil.UTC().Equal(expected.UTC()) {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
+						action.Reason, entry = "The sibling pause no longer matches the exact value System Health owns", owned
+						entry.Outcome, entry.Reason, entry.HumanOwned = "skipped", "human_pause", true
+					} else if !row.PausedUntil.Before(desiredUntil) {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardContainmentTTL
+						action.Reason, entry = "Existing System Health pause already covers the requested containment TTL", owned
+					} else {
+						where := "= ?"
+						args := []interface{}{desiredUntil, now, row.TenantID, expected}
+						query := systemPauseCompareAndSetSQL(sibling, where)
+						var written time.Time
+						result := tx.Raw(query, args...).Scan(&written)
+						if result.Error != nil {
+							return result.Error
+						}
+						if result.RowsAffected == 0 {
+							action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
+							action.Reason, entry.Reason, entry.HumanOwned = "Sibling pause changed before containment compare-and-set", "human_pause", true
+						} else {
+							mutated = true
+							entry = systemContainmentLedgerEntry{WrittenUntil: written.UTC().Format(time.RFC3339Nano), Outcome: "paused"}
+							action.Action, action.Status, action.Reason = models.SystemAutopilotActionPauseSibling, "success", "Extended "+sibling.Label+" until dependency recovers"
+						}
+					}
+				} else if row.PausedUntil != nil {
 					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardContainmentTTL
-					action.Reason, entry = "Existing System Health pause already covers the requested containment TTL", owned
+					action.Reason, entry.Reason = "A foreign or human pause already exists on this tenant", "human_pause"
 				} else {
 					where := "IS NULL"
 					args := []interface{}{desiredUntil, now, row.TenantID}
-					if row.PausedUntil != nil {
-						where, args = "= ?", append(args, *row.PausedUntil)
-					}
 					query := systemPauseCompareAndSetSQL(sibling, where)
 					var written time.Time
 					result := tx.Raw(query, args...).Scan(&written)
@@ -1589,7 +1825,7 @@ func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, a
 					}
 					if result.RowsAffected == 0 {
 						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
-						action.Reason, entry.Reason = "Sibling pause changed before containment compare-and-set", "human_pause"
+						action.Reason, entry.Reason, entry.HumanOwned = "Sibling pause changed before containment compare-and-set", "human_pause", true
 					} else {
 						mutated = true
 						entry = systemContainmentLedgerEntry{WrittenUntil: written.UTC().Format(time.RFC3339Nano), Outcome: "paused"}
@@ -1623,6 +1859,65 @@ func siblingDependsOnService(sibling systemSiblingAutopilot, service string) boo
 		}
 	}
 	return false
+}
+
+func siblingDependsOnAnomaly(sibling systemSiblingAutopilot, anomaly systemAnomaly) bool {
+	if anomaly.Verdict == models.SystemVerdictMultiServiceIncident {
+		return true
+	}
+	if anomaly.Service != "aggregation" {
+		return siblingDependsOnService(sibling, anomaly.Service)
+	}
+	// Aggregation's topology response contains capability-level evidence. A
+	// sibling is scoped to the capability it consumes when that evidence is
+	// available; a plain service-down response remains a service-wide signal.
+	if unhealthyCapabilities := systemUnhealthyCapabilitiesFromEvidence(anomaly.Evidence["service"]); len(unhealthyCapabilities) > 0 {
+		for _, capability := range sibling.Capabilities {
+			if unhealthyCapabilities[capability] {
+				return true
+			}
+		}
+		return false
+	}
+	return siblingDependsOnService(sibling, anomaly.Service)
+}
+
+// systemUnhealthyCapabilitiesFromEvidence accepts both the in-memory probe
+// value and its JSON-decoded representation. Episodes and run snapshots are
+// persisted as JSON, so a type assertion against systemProbeResult alone would
+// silently widen a capability-scoped signal back to all Aggregation siblings
+// after the first process restart.
+func systemUnhealthyCapabilitiesFromEvidence(value interface{}) map[string]bool {
+	capabilities := map[string]bool{}
+	add := func(name, status string) {
+		if strings.HasPrefix(name, "capability:") && status == "unhealthy" {
+			capabilities[strings.TrimPrefix(name, "capability:")] = true
+		}
+	}
+	switch probe := value.(type) {
+	case systemProbeResult:
+		for _, dependency := range probe.Deps {
+			add(dependency.Name, dependency.Status)
+		}
+	case *systemProbeResult:
+		if probe != nil {
+			for _, dependency := range probe.Deps {
+				add(dependency.Name, dependency.Status)
+			}
+		}
+	case map[string]interface{}:
+		for _, raw := range []interface{}{probe["deps"], probe["dependencies"]} {
+			items, ok := raw.([]interface{})
+			if !ok {
+				continue
+			}
+			for _, item := range items {
+				record := asSystemRecord(item)
+				add(systemString(record["name"]), systemString(record["status"]))
+			}
+		}
+	}
+	return capabilities
 }
 
 func systemSiblingPolicyRows(db *gorm.DB, sibling systemSiblingAutopilot) ([]systemSiblingPolicyRow, error) {
@@ -1667,9 +1962,26 @@ func ensureSystemSiblingPolicyRow(db *gorm.DB, sibling systemSiblingAutopilot) e
 	return fmt.Errorf("unregistered sibling autopilot %q", sibling.Key)
 }
 
-func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, episodes []models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction)) int {
+func allSystemIncidentEpisodesWithContainment(db *gorm.DB) []models.SystemIncidentEpisode {
+	episodes, _ := allSystemIncidentEpisodesWithContainmentErr(db)
+	return episodes
+}
+
+func allSystemIncidentEpisodesWithContainmentErr(db *gorm.DB) ([]models.SystemIncidentEpisode, error) {
+	var episodes []models.SystemIncidentEpisode
+	// Keep the query deliberately broad: resolved and human-closed episodes can
+	// still own a pause that needs a later release or expiry reconciliation.
+	err := db.Where("containment IS NOT NULL").Order("updated_at ASC").Find(&episodes).Error
+	return episodes, err
+}
+
+func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, episodes []models.SystemIncidentEpisode, now time.Time, evidence systemRecoveryEvidence, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction), containmentOverride ...bool) int {
 	if policy.Mode != models.SystemAutopilotModeSafeAuto {
 		return 0
+	}
+	allowContainment := true
+	if len(containmentOverride) > 0 {
+		allowContainment = containmentOverride[0]
 	}
 	writeErrors := 0
 	now = now.UTC()
@@ -1692,7 +2004,7 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 				continue
 			}
 			for tenantID, ownership := range tenants {
-				if ownership.WrittenUntil == "" {
+				if ownership.WrittenUntil == "" || ownership.Outcome == "resumed" || ownership.Outcome == "expired" {
 					continue
 				}
 				until, err := time.Parse(time.RFC3339Nano, ownership.WrittenUntil)
@@ -1701,9 +2013,49 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 					continue
 				}
 				action := models.SystemAutopilotAction{EpisodeID: &episode.ID, Target: sibling.Key, Output: marshalAutopilotJSON(gin.H{"tenant_id": tenantID, "episode_id": episode.PublicID.String(), "paused_until": ownership.WrittenUntil})}
-				if containmentPaused {
-					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardPaused
-					action.Reason = "Containment is paused by a human; would resume " + sibling.Label
+
+				persistOutcome := func(entry systemContainmentLedgerEntry) {
+					var stored models.SystemAutopilotAction
+					var updated datatypes.JSON
+					err := db.Transaction(func(tx *gorm.DB) error {
+						var entryErr error
+						updated, entryErr = storeSystemContainmentEntry(tx, &episode, ledger, sibling.Key, tenantID, entry)
+						if entryErr != nil {
+							return entryErr
+						}
+						stored, entryErr = storeAction(tx, action)
+						return entryErr
+					})
+					if err != nil {
+						writeErrors++
+						return
+					}
+					episode.Containment = updated
+					ledger, _ = readSystemContainmentLedger(updated)
+					actionSink(stored)
+				}
+
+				if ownership.HumanOwned {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
+					action.Reason = "A human takeover owns this sibling pause; System Health will not release it"
+					persistOutcome(ownership)
+					continue
+				}
+				if now.After(until) {
+					ownership.Outcome, ownership.Reason = "expired", "System Health pause expired naturally before a verified release"
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardContainmentTTL
+					action.Reason = ownership.Reason
+					persistOutcome(ownership)
+					continue
+				}
+				// Accounting for a lease is distinct from permission to release it.
+				// Human close and an active/recovering episode never prove recovery.
+				if episode.Status != models.SystemIncidentStatusResolved {
+					continue
+				}
+				if !systemReleaseEvidenceHealthy(episode, evidence, policy, now) {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "attention", models.SystemAutopilotGuardEvidenceStale
+					action.Reason = "Release needs a fresh, complete recovery window; the owned pause is retained"
 					if stored, err := storeAction(db, action); err != nil {
 						writeErrors++
 					} else {
@@ -1711,10 +2063,47 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 					}
 					continue
 				}
-				if systemActiveIncidentOwnsSiblingTenant(db, episode.ID, sibling.Key, tenantID) {
+				if containmentDisabledSet(policy)[sibling.Key] {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardOptedOut
+					action.Reason = "Sibling containment is opted out; release remains pending until an explicit cleanup decision"
+					if stored, storeErr := storeAction(db, action); storeErr != nil {
+						writeErrors++
+					} else {
+						actionSink(stored)
+					}
+					continue
+				}
+				if !allowContainment {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardManualObservation
+					action.Reason = "This run records evidence only; release remains pending"
+					if !policy.Enabled {
+						action.Guardrail = models.SystemAutopilotGuardDisabled
+						action.Reason = "System Health Autopilot is disabled; release remains pending"
+					}
+					persistActionOnly := func() {
+						if stored, storeErr := storeAction(db, action); storeErr != nil {
+							writeErrors++
+						} else {
+							actionSink(stored)
+						}
+					}
+					persistActionOnly()
+					continue
+				}
+				if containmentPaused {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardPaused
+					action.Reason = "Containment is paused by a human; release remains pending"
+					if stored, storeErr := storeAction(db, action); storeErr != nil {
+						writeErrors++
+					} else {
+						actionSink(stored)
+					}
+					continue
+				}
+				if systemActiveIncidentBlocksSibling(db, episode.ID, sibling, tenantID) {
 					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardContainmentTTL
-					action.Reason = "Another active incident still owns this tenant containment pause"
-					if stored, err := storeAction(db, action); err != nil {
+					action.Reason = "Another active incident still blocks this sibling tenant"
+					if stored, storeErr := storeAction(db, action); storeErr != nil {
 						writeErrors++
 					} else {
 						actionSink(stored)
@@ -1722,23 +2111,84 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 					continue
 				}
 				var stored models.SystemAutopilotAction
-				var updatedContainment datatypes.JSON
+				var updated datatypes.JSON
 				err = db.Transaction(func(tx *gorm.DB) error {
-					query := systemResumeCompareAndSetSQL(sibling)
-					result := tx.Exec(query, now, tenantID, until)
+					var current models.SystemAutopilotPolicy
+					if policyErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("scope = ?", systemAutopilotScope).First(&current).Error; policyErr != nil {
+						if !errors.Is(policyErr, gorm.ErrRecordNotFound) {
+							return policyErr
+						}
+						current = sanitizeSystemAutopilotPolicy(policy)
+					} else {
+						current = sanitizeSystemAutopilotPolicy(current)
+					}
+					if !current.Enabled {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardDisabled
+						action.Reason = "System Health Autopilot was disabled before the release"
+						var storeErr error
+						stored, storeErr = storeAction(tx, action)
+						if storeErr != nil {
+							return storeErr
+						}
+						updated = episode.Containment
+						return nil
+					}
+					if current.Mode != models.SystemAutopilotModeSafeAuto {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardObserveMode
+						action.Reason = "System Health policy is in Observe mode; release remains pending"
+						var storeErr error
+						stored, storeErr = storeAction(tx, action)
+						if storeErr != nil {
+							return storeErr
+						}
+						updated = episode.Containment
+						return nil
+					}
+					if containmentDisabledSet(current)[sibling.Key] {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardOptedOut
+						action.Reason = "Sibling containment was opted out before the release; cleanup remains pending"
+						var storeErr error
+						stored, storeErr = storeAction(tx, action)
+						if storeErr != nil {
+							return storeErr
+						}
+						updated = episode.Containment
+						return nil
+					}
+					if current.ContainmentPausedUntil != nil && current.ContainmentPausedUntil.After(now) {
+						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "would_execute", models.SystemAutopilotGuardPaused
+						action.Reason = "Containment is paused by a human; release remains pending"
+						var storeErr error
+						stored, storeErr = storeAction(tx, action)
+						if storeErr != nil {
+							return storeErr
+						}
+						updated = episode.Containment
+						return nil
+					}
+					var currentEpisode models.SystemIncidentEpisode
+					if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&currentEpisode, episode.ID).Error; err != nil {
+						return err
+					}
+					if currentEpisode.Status != models.SystemIncidentStatusResolved || !systemReleaseEvidenceHealthy(currentEpisode, evidence, current, now) {
+						return errSystemIncidentClosed
+					}
+					result := tx.Exec(systemResumeCompareAndSetSQL(sibling), now, tenantID, until)
 					entry := ownership
 					if result.Error != nil {
 						return result.Error
 					}
 					if result.RowsAffected == 0 {
+						entry.HumanOwned = true
+						entry.Outcome, entry.Reason = "skipped", "human_pause"
 						action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "skipped", models.SystemAutopilotGuardHumanPause
-						action.Reason, entry.Outcome, entry.Reason = "Sibling pause no longer exactly matches System Health ownership", "skipped", "human_pause"
+						action.Reason = "Sibling pause no longer exactly matches System Health ownership"
 					} else {
-						action.Action, action.Status, action.Reason = models.SystemAutopilotActionResumeSibling, "success", "Cleared resolved System Health containment pause"
 						entry.Outcome, entry.Reason = "resumed", ""
+						action.Action, action.Status, action.Reason = models.SystemAutopilotActionResumeSibling, "success", "Cleared resolved System Health containment pause"
 					}
 					var entryErr error
-					updatedContainment, entryErr = storeSystemContainmentEntry(tx, &episode, ledger, sibling.Key, tenantID, entry)
+					updated, entryErr = storeSystemContainmentEntry(tx, &episode, ledger, sibling.Key, tenantID, entry)
 					if entryErr != nil {
 						return entryErr
 					}
@@ -1749,7 +2199,8 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 					writeErrors++
 					continue
 				}
-				episode.Containment = updatedContainment
+				episode.Containment = updated
+				ledger, _ = readSystemContainmentLedger(updated)
 				actionSink(stored)
 			}
 		}
@@ -1781,6 +2232,64 @@ func systemActiveIncidentOwnsSiblingTenant(db *gorm.DB, excludedEpisodeID uint, 
 		}
 	}
 	return false
+}
+
+func systemActiveIncidentBlocksSibling(db *gorm.DB, excludedEpisodeID uint, sibling systemSiblingAutopilot, tenantID string) bool {
+	var episodes []models.SystemIncidentEpisode
+	if err := db.Where("id <> ? AND status IN ?", excludedEpisodeID, []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).Find(&episodes).Error; err != nil {
+		return true
+	}
+	for _, episode := range episodes {
+		if !isSystemHardDownVerdict(episode.Verdict) || !systemEpisodeAffectsSibling(episode, sibling) {
+			continue
+		}
+		return true // An active dependency failure blocks release regardless of who owns its pause.
+	}
+	return false
+}
+
+// systemEpisodeAffectsSibling preserves capability-level Aggregation scope
+// while evaluating blockers from persisted episodes. The episode evidence is
+// JSON-decoded, so this deliberately handles both direct probe evidence and
+// correlated member evidence. If an older episode has no usable scope, fail
+// closed to its service-level dependency graph.
+func systemEpisodeAffectsSibling(episode models.SystemIncidentEpisode, sibling systemSiblingAutopilot) bool {
+	if episode.RootService != "aggregation" {
+		return siblingDependsOnService(sibling, episode.RootService)
+	}
+	var evidence map[string]interface{}
+	if err := json.Unmarshal(episode.Evidence, &evidence); err != nil {
+		return siblingDependsOnService(sibling, episode.RootService)
+	}
+	if capabilities := systemUnhealthyCapabilitiesFromEvidence(evidence["service"]); len(capabilities) > 0 {
+		for _, capability := range sibling.Capabilities {
+			if capabilities[capability] {
+				return true
+			}
+		}
+		return false
+	}
+	if members, ok := evidence["members"].([]interface{}); ok {
+		foundCapabilityEvidence := false
+		for _, member := range members {
+			memberRecord := asSystemRecord(member)
+			if systemString(memberRecord["service"]) != "aggregation" {
+				continue
+			}
+			foundCapabilityEvidence = true
+			if capabilities := systemUnhealthyCapabilitiesFromEvidence(memberRecord["evidence"]); len(capabilities) > 0 {
+				for _, capability := range sibling.Capabilities {
+					if capabilities[capability] {
+						return true
+					}
+				}
+			}
+		}
+		if foundCapabilityEvidence {
+			return false
+		}
+	}
+	return siblingDependsOnService(sibling, episode.RootService)
 }
 
 func systemPauseCompareAndSetSQL(sibling systemSiblingAutopilot, existingCondition string) string {
@@ -1823,6 +2332,60 @@ func systemRunSummary(snapshot systemHealthSnapshot, confirmed []systemAnomaly, 
 	return "Watching unconfirmed or degraded platform signals"
 }
 
+func systemHasOutstandingContainment(db *gorm.DB) bool {
+	outstanding, err := systemHasOutstandingContainmentErr(db)
+	return err == nil && outstanding
+}
+
+func systemHasOutstandingContainmentErr(db *gorm.DB) (bool, error) {
+	projection, err := systemContainmentStatusWithError(db)
+	return projection.Active+projection.Pending+projection.HumanOwned > 0, err
+}
+
+func systemHeadlineForState(db *gorm.DB, snapshot systemHealthSnapshot, confirmed []systemAnomaly, contained bool, resolved int) string {
+	var active int64
+	_ = db.Model(&models.SystemIncidentEpisode{}).Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).Count(&active).Error
+	outstanding, containmentErr := systemHasOutstandingContainmentErr(db)
+	if active > 0 {
+		if contained || containmentErr != nil || outstanding {
+			return models.SystemAutopilotHeadlineContained
+		}
+		return models.SystemAutopilotHeadlineIncidentOpen
+	}
+	if containmentErr != nil || outstanding {
+		return models.SystemAutopilotHeadlineRecovering
+	}
+	if resolved > 0 {
+		return models.SystemAutopilotHeadlineRecovering
+	}
+	if snapshot.Overall == "healthy" && len(confirmed) == 0 {
+		return models.SystemAutopilotHeadlineAllClear
+	}
+	return models.SystemAutopilotHeadlineWatching
+}
+
+func systemRunSummaryForState(db *gorm.DB, snapshot systemHealthSnapshot, confirmed []systemAnomaly, resolved int, contained bool, opts systemAutopilotRunOptions) string {
+	if opts.Trigger != "scheduled" || opts.ObservationOnly {
+		if len(confirmed) > 0 {
+			return "Diagnostic observation recorded; no sibling automation was changed"
+		}
+		return "Diagnostic observation recorded; no containment effects were requested"
+	}
+	if contained {
+		return fmt.Sprintf("Confirmed %d incident signal(s), applied bounded containment", len(confirmed))
+	}
+	if len(confirmed) > 0 {
+		return fmt.Sprintf("Confirmed %d incident signal(s), opened or updated episodes", len(confirmed))
+	}
+	if resolved > 0 {
+		return fmt.Sprintf("Resolved %d recovered episode(s); containment reconciliation is recorded", resolved)
+	}
+	if outstanding, err := systemHasOutstandingContainmentErr(db); err == nil && snapshot.Overall == "healthy" && !outstanding {
+		return "All configured platform probes are healthy and containment is reconciled"
+	}
+	return "Watching unconfirmed, degraded, or incomplete platform signals"
+}
+
 func latestSystemRun(db *gorm.DB) *models.SystemAutopilotRun {
 	var run models.SystemAutopilotRun
 	if err := db.Order("started_at DESC").First(&run).Error; err != nil {
@@ -1831,10 +2394,155 @@ func latestSystemRun(db *gorm.DB) *models.SystemAutopilotRun {
 	return &run
 }
 
+func latestSystemRunWithError(db *gorm.DB) (*models.SystemAutopilotRun, error) {
+	var run models.SystemAutopilotRun
+	if err := db.Order("started_at DESC").First(&run).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &run, nil
+}
+
 func runDetailWithActions(db *gorm.DB, run models.SystemAutopilotRun) gin.H {
 	var actions []models.SystemAutopilotAction
 	_ = db.Where("run_id = ?", run.ID).Order("started_at ASC").Find(&actions).Error
 	return gin.H{"run": run, "actions": actions}
+}
+
+type systemMonitorProjection struct {
+	State           string     `json:"state"`
+	Fresh           bool       `json:"fresh"`
+	LastObservedAt  *time.Time `json:"last_observed_at,omitempty"`
+	LastCompletedAt *time.Time `json:"last_completed_at,omitempty"`
+	NextDueAt       *time.Time `json:"next_due_at,omitempty"`
+	EvidenceAgeSecs *int64     `json:"evidence_age_seconds,omitempty"`
+	Reason          string     `json:"reason,omitempty"`
+}
+
+type systemContainmentTargetProjection struct {
+	EpisodeID  string `json:"episode_id"`
+	Sibling    string `json:"sibling"`
+	TenantID   string `json:"tenant_id"`
+	Outcome    string `json:"outcome"`
+	Until      string `json:"until,omitempty"`
+	HumanOwned bool   `json:"human_owned,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type systemContainmentProjection struct {
+	Active     int                                 `json:"active"`
+	Pending    int                                 `json:"pending"`
+	HumanOwned int                                 `json:"human_owned"`
+	Expired    int                                 `json:"expired"`
+	Targets    []systemContainmentTargetProjection `json:"targets"`
+}
+
+type systemAttentionProjection struct {
+	EpisodeID string `json:"episode_id,omitempty"`
+	TenantID  string `json:"tenant_id,omitempty"`
+	Target    string `json:"target"`
+	Guardrail string `json:"guardrail,omitempty"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+	At        string `json:"at"`
+}
+
+func systemRunObservationAt(run *models.SystemAutopilotRun) *time.Time {
+	if run == nil {
+		return nil
+	}
+	var wrapper struct {
+		RunSnapshot systemRunSnapshot `json:"run_snapshot"`
+	}
+	if err := json.Unmarshal(run.ProbeResults, &wrapper); err != nil || wrapper.RunSnapshot.Timestamp == "" {
+		return nil
+	}
+	observedAt, err := time.Parse(time.RFC3339Nano, wrapper.RunSnapshot.Timestamp)
+	if err != nil {
+		return nil
+	}
+	return &observedAt
+}
+
+func systemMonitorStatus(policy models.SystemAutopilotPolicy, latest *models.SystemAutopilotRun, now time.Time) systemMonitorProjection {
+	disabled := !policy.Enabled
+	projection := systemMonitorProjection{State: "never_observed", Reason: "No System Health probe has completed"}
+	if disabled {
+		projection.State = "disabled"
+		projection.Reason = "Scheduled System Health observation is disabled"
+	}
+	if latest == nil {
+		return projection
+	}
+	observedAt := systemRunObservationAt(latest)
+	projection.LastCompletedAt = latest.FinishedAt
+	projection.LastObservedAt = observedAt
+	if latest.FinishedAt != nil && !disabled {
+		next := latest.FinishedAt.Add(time.Duration(policy.IntervalMinutes) * time.Minute)
+		projection.NextDueAt = &next
+	}
+	// Keep the control state distinct from evidence freshness. A previously
+	// successful probe remains useful context after an administrator disables
+	// the schedule, but it must not make the monitor look actively fresh.
+	if disabled {
+		return projection
+	}
+	if observedAt != nil {
+		age := now.Sub(observedAt.UTC()).Seconds()
+		if age < 0 {
+			age = 0
+		}
+		ageValue := int64(age)
+		projection.EvidenceAgeSecs = &ageValue
+	}
+	if latest.Status == models.SystemAutopilotRunStatusRunning {
+		projection.State = "running"
+		projection.Reason = "A System Health probe is still running"
+		if now.Sub(latest.StartedAt) > time.Duration(policy.IntervalMinutes*2+1)*time.Minute {
+			projection.State = "overdue"
+			projection.Reason = "The last System Health run has exceeded its observation window"
+		}
+		return projection
+	}
+	if latest.Status == models.SystemAutopilotRunStatusFailed || latest.Status == models.SystemAutopilotRunStatusPartial {
+		projection.State = "unavailable"
+		projection.Reason = firstNonEmpty(latest.Error, "The last System Health run did not complete cleanly")
+		return projection
+	}
+	if observedAt == nil {
+		projection.State = "unavailable"
+		projection.Reason = "The last run has no valid observation timestamp"
+		return projection
+	}
+	maxAge := time.Duration(policy.IntervalMinutes*2+1) * time.Minute
+	if now.Sub(observedAt.UTC()) > maxAge {
+		projection.State = "overdue"
+		projection.Reason = "The last System Health evidence is older than the allowed observation window"
+		return projection
+	}
+	projection.State = "fresh"
+	projection.Fresh = true
+	projection.Reason = "Fresh System Health evidence is available"
+	return projection
+}
+
+func systemContainmentStatus(db *gorm.DB) systemContainmentProjection {
+	projection, _ := systemContainmentStatusWithError(db)
+	return projection
+}
+
+func systemContainmentStatusWithError(db *gorm.DB) (systemContainmentProjection, error) {
+	episodes, err := allSystemIncidentEpisodesWithContainmentErr(db)
+	if err != nil {
+		return systemContainmentProjection{}, err
+	}
+	return projectSystemContainment(db, episodes, time.Now().UTC())
+}
+
+func systemAttentionStatus(db *gorm.DB) ([]systemAttentionProjection, error) {
+	return projectSystemAttention(db, time.Now().UTC())
 }
 
 func GetSystemAutopilotStatus(c *gin.Context) {
@@ -1842,13 +2550,37 @@ func GetSystemAutopilotStatus(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadSystemAutopilotPolicy(db)
+	policy, policyErr := loadSystemAutopilotPolicyWithError(db)
+	if policyErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health policy is unavailable", "code": "POLICY_READ_FAILED"})
+		return
+	}
 	var episodes []models.SystemIncidentEpisode
-	_ = db.Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).
-		Order("last_seen_at DESC").Limit(10).Find(&episodes).Error
+	if err := db.Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).
+		Order("last_seen_at DESC").Limit(10).Find(&episodes).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health incident state is unavailable", "code": "STATUS_READ_FAILED"})
+		return
+	}
 	var recentEpisodes []models.SystemIncidentEpisode
-	_ = db.Order("last_seen_at DESC").Limit(5).Find(&recentEpisodes).Error
-	latest := latestSystemRun(db)
+	if err := db.Order("last_seen_at DESC").Limit(5).Find(&recentEpisodes).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health incident history is unavailable", "code": "HISTORY_READ_FAILED"})
+		return
+	}
+	latest, latestErr := latestSystemRunWithError(db)
+	if latestErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health run history is unavailable", "code": "RUN_READ_FAILED"})
+		return
+	}
+	containment, containmentErr := systemContainmentStatusWithError(db)
+	if containmentErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health containment state is unavailable", "code": "CONTAINMENT_READ_FAILED"})
+		return
+	}
+	attention, attentionErr := systemAttentionStatus(db)
+	if attentionErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health action history is unavailable", "code": "ACTION_READ_FAILED"})
+		return
+	}
 	registry := make([]gin.H, 0, len(systemSiblingAutopilots))
 	disabled := containmentDisabledSet(policy)
 	for _, sibling := range systemSiblingAutopilots {
@@ -1857,6 +2589,7 @@ func GetSystemAutopilotStatus(c *gin.Context) {
 			"key":                 sibling.Key,
 			"label":               sibling.Label,
 			"dependencies":        sibling.Dependencies,
+			"capabilities":        sibling.Capabilities,
 			"containment_enabled": !disabled[sibling.Key],
 		})
 	}
@@ -1867,6 +2600,10 @@ func GetSystemAutopilotStatus(c *gin.Context) {
 		"open_episodes":         episodes,
 		"recent_episodes":       recentEpisodes,
 		"registered_autopilots": registry,
+		"monitor":               systemMonitorStatus(policy, latest, time.Now().UTC()),
+		"containment":           containment,
+		"attention":             attention,
+		"status_version":        "system-health-autopilot/v2",
 	}})
 }
 
@@ -1958,8 +2695,9 @@ func RunSystemAutopilotNow(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	run, actions, err := runSystemHealthAutopilot(db, systemAutopilotRunOptions{
-		Trigger:   "manual",
-		CreatedBy: principal.Email,
+		Trigger:         "manual",
+		CreatedBy:       principal.Email,
+		ObservationOnly: true,
 	})
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
@@ -2026,12 +2764,29 @@ type systemIncidentEpisodeListItem struct {
 }
 
 func recommendedSystemAction(ep models.SystemIncidentEpisode) systemRecommendedAction {
-	return systemRecommendedAction{
+	action := systemRecommendedAction{
 		Label:  "Inspect System Health incident",
 		Kind:   "system_health.inspect",
 		Target: ep.PublicID.String(),
 		Href:   "/platform/system-health",
 	}
+	switch ep.RootService {
+	case "aggregation":
+		action.Label = "Inspect Pipeline operations"
+		action.Kind = "pipeline.inspect"
+		action.Href = "/platform/pipeline"
+	case "enrichment":
+		action.Label = "Inspect Enrichment operations"
+		action.Kind = "enrichment.inspect"
+		action.Href = "/platform/enrichment"
+	case "media":
+		action.Label = "Inspect Media operations"
+		action.Kind = "media.inspect"
+		action.Href = "/platform/media"
+	case "iam", "postgres", "redis", "cms", "platform":
+		action.Href = "/platform/system-health?tab=configuration"
+	}
+	return action
 }
 
 func systemIncidentEpisodeListProjection(ep models.SystemIncidentEpisode) systemIncidentEpisodeListItem {
@@ -2074,8 +2829,31 @@ func GetSystemIncidentEpisode(c *gin.Context) {
 		return
 	}
 	var actions []models.SystemAutopilotAction
-	_ = db.Where("episode_id = ?", ep.ID).Order("started_at ASC").Find(&actions).Error
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"episode": ep, "actions": actions, "recommended_action": recommendedSystemAction(ep)}})
+	if err := db.Where("episode_id = ?", ep.ID).Order("started_at ASC").Find(&actions).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Incident actions are unavailable"})
+		return
+	}
+	policy, err := loadSystemAutopilotPolicyWithError(db)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Incident policy is unavailable"})
+		return
+	}
+	latest, err := latestSystemRunWithError(db)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Recovery evidence is unavailable"})
+		return
+	}
+	now := time.Now().UTC()
+	previous := []systemRunSnapshot{}
+	if latest != nil {
+		previous = recentSystemRunSnapshots(db, systemAutopilotHistoryRuns, latest.StartedAt, policy.IntervalMinutes)
+	}
+	containment, err := projectSystemContainment(db, []models.SystemIncidentEpisode{ep}, now)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Containment policy is unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"episode": ep, "actions": actions, "recommended_action": recommendedSystemAction(ep), "containment": containment, "recovery": systemEpisodeRecoveryStatus(ep, policy, latest, previous, now)}})
 }
 
 func CloseSystemIncidentEpisode(c *gin.Context) {
@@ -2104,33 +2882,63 @@ func CloseSystemIncidentEpisode(c *gin.Context) {
 		return
 	}
 	now := time.Now().UTC()
-	ep.Status = models.SystemIncidentStatusClosedByHuman
-	ep.ResolvedAt = &now
-	ep.ClosedBy = principal.Email
-	ep.CloseReason = body.Reason
-	ep.Timeline = appendSystemEpisodeTimeline(ep.Timeline, "closed_by_human", now, systemAnomaly{
-		Key:      systemIncidentKey(ep.RootService, ep.Verdict),
-		Service:  ep.RootService,
-		Verdict:  ep.Verdict,
-		Severity: ep.Severity,
-		Summary:  body.Reason,
-	}, systemHealthSnapshot{Overall: "human_override"})
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(&ep).Error; err != nil {
+		var current models.SystemIncidentEpisode
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ?", id).First(&current).Error; err != nil {
 			return err
 		}
-		return tx.Create(&models.SystemAutopilotAction{
-			RunID:      0,
-			EpisodeID:  &ep.ID,
-			Target:     ep.RootService,
+		if current.Status != models.SystemIncidentStatusOpen && current.Status != models.SystemIncidentStatusRecovering {
+			return errSystemIncidentClosed
+		}
+		current.Status = models.SystemIncidentStatusClosedByHuman
+		current.ResolvedAt = &now
+		current.ClosedBy = principal.Email
+		current.CloseReason = body.Reason
+		current.Timeline = appendSystemEpisodeTimeline(current.Timeline, "closed_by_human", now, systemAnomaly{
+			Key:      systemIncidentKey(current.RootService, current.Verdict),
+			Service:  current.RootService,
+			Verdict:  current.Verdict,
+			Severity: current.Severity,
+			Summary:  body.Reason,
+		}, systemHealthSnapshot{Overall: "human_override"})
+		var actionRun models.SystemAutopilotRun
+		if err := tx.Order("started_at DESC").First(&actionRun).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+			finished := now
+			actionRun = models.SystemAutopilotRun{
+				Trigger: "human_override", Mode: models.SystemAutopilotModeObserve,
+				Status: models.SystemAutopilotRunStatusCompleted, Headline: models.SystemAutopilotHeadlineWatching,
+				StartedAt: now, FinishedAt: &finished, Summary: "Human incident action recorded",
+				ErrorClass: models.SystemAutopilotErrorClassNone, CreatedBy: principal.Email,
+			}
+			if err := tx.Create(&actionRun).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		}
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(&models.SystemAutopilotAction{
+			RunID:      actionRun.ID,
+			EpisodeID:  &current.ID,
+			Target:     current.RootService,
 			Action:     models.SystemAutopilotActionCloseEpisode,
-			Verdict:    ep.Verdict,
+			Verdict:    current.Verdict,
 			Status:     "success",
 			Reason:     body.Reason,
 			StartedAt:  now,
 			FinishedAt: &now,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
+		ep = current
+		return nil
 	}); err != nil {
+		if errors.Is(err, errSystemIncidentClosed) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "INCIDENT_ALREADY_CLOSED"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

@@ -67,6 +67,7 @@ func systemHealthFailure(at time.Time) (systemHealthSnapshot, []systemAnomaly) {
 
 func runSystemHealthFixture(t *testing.T, db *gorm.DB, at time.Time, snapshot systemHealthSnapshot, anomalies []systemAnomaly) (models.SystemAutopilotRun, []models.SystemAutopilotAction) {
 	t.Helper()
+	snapshot.Timestamp = at.UTC().Format(time.RFC3339Nano)
 	run, actions, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "test"}, systemAutopilotDeps{
 		now:     func() time.Time { return at },
 		collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies },
@@ -125,13 +126,87 @@ func TestSystemHealthDB_HarnessSmoke(t *testing.T) {
 	}
 }
 
+func TestSystemHealthDB_ScheduledContainmentLastsUntilRecovery(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeSafeAuto, nil)
+	start := time.Now().UTC().Truncate(time.Second)
+	for step := 0; step < 5; step++ {
+		at := start.Add(time.Duration(step) * 10 * time.Minute)
+		snapshot, anomalies := healthySystemSnapshotAt(at)
+		if step < 2 {
+			snapshot.Services[2].Status = "unhealthy"
+			snapshot.Overall = "degraded"
+			_, anomalies = systemHealthFailure(at)
+		}
+		_, _, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "scheduled"}, systemAutopilotDeps{now: func() time.Time { return at }, collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if step == 0 {
+			continue
+		}
+		var policy models.PipelineAutopilotPolicy
+		if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&policy).Error; err != nil {
+			t.Fatal(err)
+		}
+		if (policy.PausedUntil != nil) != (step < 4) {
+			t.Fatalf("step %d: unexpected pause %v", step, policy.PausedUntil)
+		}
+	}
+}
+
+func TestSystemHealthDB_EnrichmentPauseOrdersAdmission(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	policy := models.DefaultEnrichmentAutopilotPolicy(defaultCirculationTenant)
+	policy.Enabled = true
+	policy.Mode = models.EnrichmentAutopilotModeSafeAuto
+	if err := db.Create(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	admitted, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func() { close(admitted); <-release })
+	}()
+	select {
+	case <-admitted:
+	case err := <-done:
+		t.Fatalf("admission failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission timed out")
+	}
+	paused := make(chan error, 1)
+	until := time.Now().Add(time.Hour)
+	go func() {
+		paused <- db.Model(&models.EnrichmentAutopilotPolicy{}).Where("tenant_id = ?", defaultCirculationTenant).Update("paused_until", until).Error
+	}()
+	select {
+	case err := <-paused:
+		close(release)
+		<-done
+		t.Fatalf("pause committed while prior admission held its lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-paused; err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	if err := withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func() { called = true }); err == nil || called {
+		t.Fatalf("dispatch admitted after pause: called=%v err=%v", called, err)
+	}
+}
+
 func TestSystemHealthDB_ConfirmNOpensOneEpisode(t *testing.T) {
 	db := systemHealthAutopilotTestDB(t)
 	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 2 })
 	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	snapshot, anomalies := systemHealthFailure(now)
 	runSystemHealthFixture(t, db, now, snapshot, anomalies)
-	_, actions := runSystemHealthFixture(t, db, now.Add(time.Minute), snapshot, anomalies)
+	_, actions := runSystemHealthFixture(t, db, now.Add(10*time.Minute), snapshot, anomalies)
 	var episodes int64
 	if err := db.Model(&models.SystemIncidentEpisode{}).Count(&episodes).Error; err != nil {
 		t.Fatal(err)
@@ -156,6 +231,33 @@ func TestSystemHealthDB_ObserveNeverWritesSiblingPause(t *testing.T) {
 	var policy models.PipelineAutopilotPolicy
 	if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&policy).Error; err == nil && policy.PausedUntil != nil {
 		t.Fatalf("observe mode wrote pipeline pause %v", policy.PausedUntil)
+	}
+}
+
+func TestSystemHealthDB_ManualSafeAutoRunIsObservationOnly(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeSafeAuto, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 1 })
+	now := time.Date(2026, 7, 13, 12, 30, 0, 0, time.UTC)
+	snapshot, anomalies := systemHealthFailure(now)
+	if _, actions, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "manual", ObservationOnly: true}, systemAutopilotDeps{
+		now:     func() time.Time { return now },
+		collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies },
+	}); err != nil {
+		t.Fatal(err)
+	} else {
+		foundObservation := false
+		for _, action := range actions {
+			if action.Guardrail == models.SystemAutopilotGuardManualObservation && action.Action == models.SystemAutopilotActionWouldPause {
+				foundObservation = true
+			}
+		}
+		if !foundObservation {
+			t.Fatalf("manual Safe Auto probe must record would_pause evidence, got %+v", actions)
+		}
+	}
+	var pipeline models.PipelineAutopilotPolicy
+	if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&pipeline).Error; err == nil && pipeline.PausedUntil != nil {
+		t.Fatalf("manual Safe Auto probe wrote pipeline pause %v", pipeline.PausedUntil)
 	}
 }
 
@@ -190,8 +292,8 @@ func TestSystemHealthDB_ResolveMHealthyClosesEpisode(t *testing.T) {
 	failure, anomalies := systemHealthFailure(now)
 	runSystemHealthFixture(t, db, now, failure, anomalies)
 	for i := 1; i <= 3; i++ {
-		healthy, none := healthySystemSnapshotAt(now.Add(time.Duration(i) * time.Minute))
-		runSystemHealthFixture(t, db, now.Add(time.Duration(i)*time.Minute), healthy, none)
+		healthy, none := healthySystemSnapshotAt(now.Add(time.Duration(i) * 10 * time.Minute))
+		runSystemHealthFixture(t, db, now.Add(time.Duration(i)*10*time.Minute), healthy, none)
 	}
 	var episode models.SystemIncidentEpisode
 	if err := db.First(&episode).Error; err != nil {
@@ -208,19 +310,19 @@ func TestSystemHealthDB_UnknownProbeBreaksRecoveryStreak(t *testing.T) {
 	now := time.Date(2026, 7, 13, 13, 0, 0, 0, time.UTC)
 	failure, anomalies := systemHealthFailure(now)
 	runSystemHealthFixture(t, db, now, failure, anomalies)
-	healthy, none := healthySystemSnapshotAt(now.Add(time.Minute))
-	runSystemHealthFixture(t, db, now.Add(time.Minute), healthy, none)
+	healthy, none := healthySystemSnapshotAt(now.Add(10 * time.Minute))
+	runSystemHealthFixture(t, db, now.Add(10*time.Minute), healthy, none)
 	unknown := healthy
-	unknown.Timestamp = now.Add(2 * time.Minute).UTC().Format(time.RFC3339)
+	unknown.Timestamp = now.Add(20 * time.Minute).UTC().Format(time.RFC3339)
 	for i := range unknown.Services {
 		if unknown.Services[i].Name == "aggregation" {
 			unknown.Services[i].Status = "unknown"
 		}
 	}
 	unknown.Overall = "degraded"
-	runSystemHealthFixture(t, db, now.Add(2*time.Minute), unknown, none)
-	finalHealthy, finalNone := healthySystemSnapshotAt(now.Add(3 * time.Minute))
-	runSystemHealthFixture(t, db, now.Add(3*time.Minute), finalHealthy, finalNone)
+	runSystemHealthFixture(t, db, now.Add(20*time.Minute), unknown, none)
+	finalHealthy, finalNone := healthySystemSnapshotAt(now.Add(30 * time.Minute))
+	runSystemHealthFixture(t, db, now.Add(30*time.Minute), finalHealthy, finalNone)
 	var episode models.SystemIncidentEpisode
 	if err := db.First(&episode).Error; err != nil {
 		t.Fatal(err)
@@ -236,12 +338,12 @@ func TestSystemHealthDB_FirstRelapseImmediatelyReopensEpisode(t *testing.T) {
 	now := time.Date(2026, 7, 13, 14, 0, 0, 0, time.UTC)
 	failure, anomalies := systemHealthFailure(now)
 	runSystemHealthFixture(t, db, now, failure, anomalies)
-	runSystemHealthFixture(t, db, now.Add(time.Minute), failure, anomalies)
-	healthy, none := healthySystemSnapshotAt(now.Add(2 * time.Minute))
-	runSystemHealthFixture(t, db, now.Add(2*time.Minute), healthy, none)
+	runSystemHealthFixture(t, db, now.Add(10*time.Minute), failure, anomalies)
+	healthy, none := healthySystemSnapshotAt(now.Add(20 * time.Minute))
+	runSystemHealthFixture(t, db, now.Add(20*time.Minute), healthy, none)
 	// This relapse has no preceding matching failure, so it is not a fresh
 	// confirmed anomaly. A recovering episode must still reopen immediately.
-	runSystemHealthFixture(t, db, now.Add(3*time.Minute), failure, anomalies)
+	runSystemHealthFixture(t, db, now.Add(30*time.Minute), failure, anomalies)
 	var episode models.SystemIncidentEpisode
 	if err := db.First(&episode).Error; err != nil {
 		t.Fatal(err)
@@ -264,7 +366,7 @@ func TestSystemHealthDB_UnchangedIncidentDoesNotGrowTimeline(t *testing.T) {
 	now := time.Date(2026, 7, 13, 15, 0, 0, 0, time.UTC)
 	failure, anomalies := systemHealthFailure(now)
 	for i := 0; i < 500; i++ {
-		at := now.Add(time.Duration(i) * time.Minute)
+		at := now.Add(time.Duration(i) * 10 * time.Minute)
 		failure.Timestamp = at.UTC().Format(time.RFC3339)
 		runSystemHealthFixture(t, db, at, failure, anomalies)
 	}
@@ -374,7 +476,7 @@ func TestSystemHealthDB_ContainmentUsesPerTenantExactOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := models.DefaultSystemAutopilotPolicy()
-	policy.Mode, policy.ContainmentTTLMinutes = models.SystemAutopilotModeSafeAuto, 60
+	policy.Enabled, policy.Mode, policy.ContainmentTTLMinutes = true, models.SystemAutopilotModeSafeAuto, 60
 	store := func(tx *gorm.DB, action models.SystemAutopilotAction) (models.SystemAutopilotAction, error) {
 		action.RunID, action.StartedAt = 0, now
 		action.FinishedAt = &now
@@ -404,7 +506,13 @@ func TestSystemHealthDB_ContainmentUsesPerTenantExactOwnership(t *testing.T) {
 		t.Fatalf("missing Pipeline tenant ownership: %+v", ledger)
 	}
 	resumeActions := []models.SystemAutopilotAction{}
-	if errors := resumeRecoveredSystemContainment(db, policy, []models.SystemIncidentEpisode{ep}, now.Add(time.Minute), store, func(action models.SystemAutopilotAction) { resumeActions = append(resumeActions, action) }); errors != 0 {
+	ep.Status = models.SystemIncidentStatusResolved
+	if err := db.Save(&ep).Error; err != nil {
+		t.Fatal(err)
+	}
+	healthy, _ := healthySystemSnapshotAt(now.Add(30 * time.Minute))
+	evidence := systemRecoveryEvidence{Snapshot: healthy, Previous: []systemRunSnapshot{{Services: healthy.Services}, {Services: healthy.Services}}}
+	if errors := resumeRecoveredSystemContainment(db, policy, []models.SystemIncidentEpisode{ep}, now.Add(30*time.Minute), evidence, store, func(action models.SystemAutopilotAction) { resumeActions = append(resumeActions, action) }); errors != 0 {
 		t.Fatalf("resume errors = %d", errors)
 	}
 	var resumedPipeline models.PipelineAutopilotPolicy
@@ -425,7 +533,7 @@ func TestSystemHealthDB_QueueBacklogIsAttentionOnly(t *testing.T) {
 		Severity: "warning", Summary: "Aggregation queue is backed up",
 	}
 	for i := 0; i < 3; i++ {
-		at := now.Add(time.Duration(i) * time.Minute)
+		at := now.Add(time.Duration(i) * 10 * time.Minute)
 		snapshot, anomalies := systemHealthSnapshotAt(at, anomaly)
 		runSystemHealthFixture(t, db, at, snapshot, anomalies)
 	}

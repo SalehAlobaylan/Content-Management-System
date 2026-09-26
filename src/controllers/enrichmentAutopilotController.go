@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"content-management-system/src/models"
 )
@@ -63,6 +64,7 @@ var (
 	errEnrichmentAutopilotDisabled       = errors.New("enrichment autopilot is not enabled for this tenant")
 	errEnrichmentAutopilotAlreadyRunning = errors.New("enrichment autopilot is already running for this tenant")
 	errEnrichmentAutopilotBusy           = errors.New("a manual bulk enrichment run is in flight; autopilot deferred")
+	errEnrichmentAutopilotPaused         = errors.New("enrichment autopilot is paused for this tenant")
 )
 
 // ----------------------------------------------------------------
@@ -293,9 +295,10 @@ type enrichmentAutopilotRunner struct {
 	attempts int // real executed attempts (breaker denominator)
 	failures int // real errors (breaker numerator)
 
-	budgetCapped bool
-	breakerFired bool
-	serviceGated bool
+	budgetCapped     bool
+	breakerFired     bool
+	serviceGated     bool
+	admissionStopped bool
 }
 
 func (r *enrichmentAutopilotRunner) writeAction(a models.EnrichmentAutopilotAction) {
@@ -357,6 +360,11 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 	if !policy.Enabled {
 		return models.EnrichmentAutopilotRun{}, nil, errEnrichmentAutopilotDisabled
 	}
+	if policy.PausedUntil != nil && policy.PausedUntil.After(time.Now().UTC()) {
+		// This is the native admission boundary for both scheduled and manual
+		// autonomous dispatch. Existing receipts and verification remain usable.
+		return models.EnrichmentAutopilotRun{}, nil, errEnrichmentAutopilotPaused
+	}
 	// Never double-load the model services against a human bulk run (plan §9).
 	if bulkEnrichRunning() {
 		return models.EnrichmentAutopilotRun{}, nil, errEnrichmentAutopilotBusy
@@ -412,7 +420,7 @@ func runEnrichmentAutopilot(db *gorm.DB, tenantID string, opts enrichmentAutopil
 	trust := computeEnrichmentTrust(db, tenantID, policy)
 
 	for _, artifact := range enrichmentManagedArtifacts {
-		if runner.breakerFired || runner.usedTotal >= policy.MaxItemsPerRun {
+		if runner.breakerFired || runner.admissionStopped || runner.usedTotal >= policy.MaxItemsPerRun {
 			break
 		}
 		runner.runArtifactClass(artifact, trust[artifact], serviceDown, queueDepth, queueKnown, statsBefore)
@@ -529,7 +537,7 @@ func (r *enrichmentAutopilotRunner) runArtifactClass(artifact string, trust enri
 	// Select gap candidates for this class (age floor and circulation scope in SQL).
 	items := r.selectClassCandidates(artifact)
 	for i := range items {
-		if r.breakerFired {
+		if r.breakerFired || r.admissionStopped {
 			return
 		}
 		if r.usedTotal >= r.policy.MaxItemsPerRun {
@@ -631,7 +639,23 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 	}
 
 	// Safe Auto: execute through the shared traced path with autopilot attribution.
-	outcomes := triggerItemArtifactsTraced(r.db, item, []string{artifact}, false, models.TranscriptionTriggerEnrichmentAutopilot)
+	var outcomes []artifactOutcome
+	dispatched := false
+	admissionErr := withEnrichmentAutopilotAdmission(r.db, r.run.TenantID, func() {
+		dispatched = true
+		outcomes = triggerItemArtifactsTraced(r.db, item, []string{artifact}, false, models.TranscriptionTriggerEnrichmentAutopilot)
+	})
+	if admissionErr != nil {
+		r.admissionStopped = true
+		if !dispatched {
+			r.itemSkip(item, artifact, "admission_blocked", admissionErr.Error())
+			return
+		}
+		// Dispatch receipts still stand if releasing the admission transaction
+		// fails. Record that uncertainty and stop; never call it an unissued skip.
+		r.errored++
+		r.writeAction(models.EnrichmentAutopilotAction{ContentID: &id, Artifact: artifact, Status: models.EnrichmentAutopilotActionStatusError, Guardrail: "admission_commit_unknown", Reason: "Dispatch was attempted; inspect its receipt. Admission transaction failed: " + admissionErr.Error()})
+	}
 	finishedAt := time.Now()
 	action := models.EnrichmentAutopilotAction{
 		ContentID: &id, Artifact: artifact,
@@ -689,6 +713,30 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 		action.Reason = o.Reason
 		r.writeAction(action)
 	}
+}
+
+// Hold a policy row lock through one native dispatch. Pause updates acquire
+// that same row lock, so dispatch is ordered before or after the committed
+// pause. The effect uses the normal DB connection: admission rollback cannot
+// erase receipts for work already accepted by another service.
+func withEnrichmentAutopilotAdmission(db *gorm.DB, tenantID string, dispatch func()) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		var policy models.EnrichmentAutopilotPolicy
+		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).Where("tenant_id = ?", tenantID).First(&policy).Error; err != nil {
+			return fmt.Errorf("Enrichment admission policy unavailable: %w", err)
+		}
+		if !policy.Enabled {
+			return errEnrichmentAutopilotDisabled
+		}
+		if policy.Mode != models.EnrichmentAutopilotModeSafeAuto {
+			return errors.New("Enrichment switched to Observe; new dispatch is blocked")
+		}
+		if policy.PausedUntil != nil && policy.PausedUntil.After(time.Now().UTC()) {
+			return errEnrichmentAutopilotPaused
+		}
+		dispatch()
+		return nil
+	})
 }
 
 // maybeTripBreaker stops the whole run early if the executed error rate spikes
@@ -1067,6 +1115,8 @@ func RunEnrichmentAutopilotNow(c *gin.Context) {
 			c.JSON(http.StatusConflict, authErrorResponse{Message: err.Error(), Code: "AUTOPILOT_ALREADY_RUNNING"})
 		case errors.Is(err, errEnrichmentAutopilotBusy):
 			c.JSON(http.StatusConflict, authErrorResponse{Message: err.Error(), Code: "BULK_IN_FLIGHT"})
+		case errors.Is(err, errEnrichmentAutopilotPaused):
+			c.JSON(http.StatusConflict, authErrorResponse{Message: err.Error(), Code: "AUTOPILOT_PAUSED"})
 		default:
 			c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Autopilot run failed: " + err.Error(), Code: "RUN_FAILED"})
 		}

@@ -46,7 +46,7 @@ func TestContainmentDisabledSetHonorsPersistedOptIn(t *testing.T) {
 func TestSystemContainmentLedgerScopesOwnershipToSiblingTenant(t *testing.T) {
 	ledger := systemContainmentLedger{Version: 2, Siblings: map[string]map[string]systemContainmentLedgerEntry{
 		"pipeline": {
-			"tenant-a": {WrittenUntil: "2026-07-13T12:00:00Z", Outcome: "paused"},
+			"tenant-a": {WrittenUntil: "2026-07-13T12:00:00Z", Outcome: "paused", HumanOwned: true},
 			"tenant-b": {Outcome: "skipped", Reason: "human_pause"},
 		},
 	}}
@@ -57,6 +57,9 @@ func TestSystemContainmentLedgerScopesOwnershipToSiblingTenant(t *testing.T) {
 	}
 	if entry, ok := containmentEntry(got, "pipeline", "tenant-a"); !ok || entry.WrittenUntil == "" {
 		t.Fatalf("missing tenant-a ownership: %+v", got)
+	}
+	if entry, _ := containmentEntry(got, "pipeline", "tenant-a"); !entry.HumanOwned {
+		t.Fatal("human takeover marker must survive ledger serialization")
 	}
 	if entry, ok := containmentEntry(got, "pipeline", "tenant-b"); !ok || entry.Reason != "human_pause" || entry.WrittenUntil != "" {
 		t.Fatalf("tenant-b human pause must remain unowned: %+v", got)
@@ -224,6 +227,106 @@ func TestSystemEpisodeObservablyHealthyRequiresEveryCorrelatedMember(t *testing.
 	}
 }
 
+func TestSystemEpisodeCoverageRequiresEveryCorrelatedMember(t *testing.T) {
+	ep := models.SystemIncidentEpisode{RootService: "cms"}
+	services := []systemProbeResult{
+		{Name: "enrichment", Status: "healthy"},
+		{Name: "media", Status: "healthy"},
+	}
+	if systemEpisodeCoverageComplete(ep, services) {
+		t.Fatal("missing Aggregation coverage must not qualify a CMS recovery")
+	}
+	services = append(services, systemProbeResult{Name: "aggregation", Status: "healthy"})
+	if !systemEpisodeCoverageComplete(ep, services) {
+		t.Fatal("all correlated CMS members should satisfy coverage")
+	}
+}
+
+func TestSystemAggregationCapabilityScopeDoesNotWidenContainment(t *testing.T) {
+	anomaly := systemAnomaly{
+		Service: "aggregation",
+		Verdict: models.SystemVerdictDependencyDown,
+		Evidence: map[string]interface{}{
+			"service": systemProbeResult{Deps: []systemProbeDependency{{Name: "capability:aggregation_pipeline", Status: "unhealthy"}}},
+		},
+	}
+	pipeline, _ := systemSiblingByKey("pipeline")
+	news, _ := systemSiblingByKey("news_circulation")
+	if !siblingDependsOnAnomaly(pipeline, anomaly) {
+		t.Fatal("pipeline should match its unhealthy Aggregation capability")
+	}
+	if siblingDependsOnAnomaly(news, anomaly) {
+		t.Fatal("news circulation must not inherit an unrelated pipeline capability failure")
+	}
+
+	jsonProbe, err := json.Marshal(systemProbeResult{Deps: []systemProbeDependency{{Name: "capability:aggregation_dispatcher", Status: "unhealthy"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(jsonProbe, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	anomaly.Evidence["service"] = decoded
+	if !siblingDependsOnAnomaly(news, anomaly) {
+		t.Fatal("JSON-decoded capability evidence should retain dispatcher scope")
+	}
+}
+
+func TestSystemPersistedAggregationEpisodeRetainsCapabilityScope(t *testing.T) {
+	sibling, _ := systemSiblingByKey("news_circulation")
+	ep := models.SystemIncidentEpisode{
+		RootService: "aggregation",
+		Evidence: marshalAutopilotJSON(map[string]interface{}{
+			"service": map[string]interface{}{
+				"deps": []map[string]string{{"name": "capability:aggregation_pipeline", "status": "unhealthy"}},
+			},
+		}),
+	}
+	if systemEpisodeAffectsSibling(ep, sibling) {
+		t.Fatal("persisted pipeline capability evidence must not block news circulation")
+	}
+}
+
+func TestSystemMonitorStatusDistinguishesFreshOverdueDisabledAndUnavailable(t *testing.T) {
+	now := testNow()
+	observed := now.Add(-2 * time.Minute)
+	finished := now.Add(-time.Minute)
+	run := &models.SystemAutopilotRun{
+		Status:     models.SystemAutopilotRunStatusCompleted,
+		StartedAt:  finished.Add(-time.Second),
+		FinishedAt: &finished,
+		ProbeResults: marshalAutopilotJSON(map[string]interface{}{
+			"run_snapshot": systemRunSnapshot{Timestamp: observed.Format(time.RFC3339Nano)},
+		}),
+	}
+	policy := models.DefaultSystemAutopilotPolicy()
+	policy.Enabled = true
+	if got := systemMonitorStatus(policy, run, now); got.State != "fresh" || !got.Fresh {
+		t.Fatalf("fresh monitor projection = %+v", got)
+	}
+
+	old := observed.Add(-30 * time.Minute)
+	run.ProbeResults = marshalAutopilotJSON(map[string]interface{}{
+		"run_snapshot": systemRunSnapshot{Timestamp: old.Format(time.RFC3339Nano)},
+	})
+	if got := systemMonitorStatus(policy, run, now); got.State != "overdue" || got.Fresh {
+		t.Fatalf("overdue monitor projection = %+v", got)
+	}
+
+	policy.Enabled = false
+	if got := systemMonitorStatus(policy, run, now); got.State != "disabled" || got.Fresh {
+		t.Fatalf("disabled monitor projection = %+v", got)
+	}
+
+	policy.Enabled = true
+	run.Status = models.SystemAutopilotRunStatusPartial
+	run.Error = "database unavailable"
+	if got := systemMonitorStatus(policy, run, now); got.State != "unavailable" {
+		t.Fatalf("unavailable monitor projection = %+v", got)
+	}
+}
+
 func TestSystemIncidentListProjectionOmitsLargeDiagnosticJSON(t *testing.T) {
 	ep := models.SystemIncidentEpisode{
 		RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Evidence: []byte(`{"large":"diagnostic"}`), Timeline: []byte(`[{"transition":"opened"}]`),
@@ -235,7 +338,7 @@ func TestSystemIncidentListProjectionOmitsLargeDiagnosticJSON(t *testing.T) {
 	if strings.Contains(string(payload), "evidence") || strings.Contains(string(payload), "timeline") {
 		t.Fatalf("list projection leaked diagnostic JSON: %s", payload)
 	}
-	if !strings.Contains(string(payload), `"kind":"system_health.inspect"`) || !strings.Contains(string(payload), `"href":"/platform/system-health"`) {
+	if !strings.Contains(string(payload), `"kind":"pipeline.inspect"`) || !strings.Contains(string(payload), `"href":"/platform/pipeline"`) {
 		t.Fatalf("missing deterministic human recommendation: %s", payload)
 	}
 }

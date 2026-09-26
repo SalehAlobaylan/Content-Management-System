@@ -1081,7 +1081,7 @@ func runRecoveryVerification(db *gorm.DB, run models.FeedRecoveryRun, pass int) 
 		return false
 	}
 	fi, fiErr := runFeedIntegrity(db, run.TenantID, feedIntegrityRunOptions{Trigger: "feed_recovery", CreatedBy: "feed_recovery", Tier: models.FeedIntegrityTierDeep, CorrelationID: &run.CorrelationID, TriggerRef: run.PublicID.String()})
-	sh, shActions, shErr := runSystemHealthAutopilot(db, systemAutopilotRunOptions{Trigger: "feed_recovery", CreatedBy: "feed_recovery", CorrelationID: &run.CorrelationID, TriggerRef: run.PublicID.String()})
+	sh, shActions, shErr := runSystemHealthAutopilot(db, systemAutopilotRunOptions{Trigger: "feed_recovery", CreatedBy: "feed_recovery", CorrelationID: &run.CorrelationID, TriggerRef: run.PublicID.String(), ObservationOnly: true})
 	proofs := make([]recoveryInventoryProof, 0, len(recoveryLanes(run.Lane)))
 	proofOK := true
 	candidateOK := true
