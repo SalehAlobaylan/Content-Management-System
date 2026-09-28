@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // maxCommentLength caps comment text to keep payloads and rendering sane.
@@ -35,6 +36,7 @@ const (
 )
 
 var errConsumerIdempotencyConflict = errors.New("idempotency key was reused with a different request")
+var errInteractionContentUnavailable = errors.New("content became unavailable before interaction was saved")
 
 // commentMetadata is the expected Metadata shape for comment interactions.
 type commentMetadata struct {
@@ -366,6 +368,22 @@ func CreateInteraction(c *gin.Context) {
 	created := false
 	replayed := false
 	err = db.Transaction(func(tx *gorm.DB) error {
+		// Serialize interaction creation with item retirement. A request that
+		// passed the initial public read cannot add a protection after the reset
+		// installs its retirement fence.
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND status=?", contentItemID, models.ContentStatusReady).First(&current).Error; err != nil {
+			return errInteractionContentUnavailable
+		}
+		var retired int64
+		if tx.Migrator().HasTable(&models.PodsResetRetirement{}) {
+			if err := tx.Model(&models.PodsResetRetirement{}).Where("content_item_id=?", contentItemID).Count(&retired).Error; err != nil {
+				return err
+			}
+		}
+		if retired > 0 {
+			return errInteractionContentUnavailable
+		}
 		if idempotencyKey != "" {
 			identityScope := interactionIdentityScope(interaction)
 			lockKey := "consumer-interaction:" + identityScope + ":" + idempotencyKey
@@ -454,6 +472,10 @@ func CreateInteraction(c *gin.Context) {
 	})
 	if errors.Is(err, errConsumerIdempotencyConflict) {
 		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Idempotency-Key was reused with a different request"})
+		return
+	}
+	if errors.Is(err, errInteractionContentUnavailable) {
+		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Content item not found"})
 		return
 	}
 	if err != nil {

@@ -480,6 +480,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/feed-recovery/runs/:id/execute", perm("feed", "manage"), controllers.ExecuteFeedRecoveryRun)
 	adminGroup.POST("/feed-recovery/runs/:id/cancel", perm("feed", "manage"), controllers.CancelFeedRecoveryRun)
 	adminGroup.POST("/feed-recovery/runs/:id/rollback", utils.RequireAdminRole("admin"), controllers.RollbackFeedRecoveryRun)
+	adminGroup.POST("/pods-reset/plans", perm("feed", "manage"), controllers.CreatePodsResetPlan)
+	adminGroup.GET("/pods-reset/candidates", perm("feed", "read"), controllers.ListPodsResetCandidates)
+	adminGroup.GET("/pods-reset/runs", perm("feed", "read"), controllers.ListPodsResetRuns)
+	adminGroup.GET("/pods-reset/plans/:id", perm("feed", "read"), controllers.GetPodsResetPlan)
+	adminGroup.POST("/pods-reset/plans/:id/approve", perm("feed", "manage"), controllers.ApprovePodsResetPlan)
+	adminGroup.POST("/pods-reset/plans/:id/cancel", perm("feed", "manage"), controllers.CancelPodsResetPlan)
+	adminGroup.POST("/pods-reset/plans/:id/pause", perm("feed", "manage"), controllers.RequestPodsResetPause)
+	adminGroup.POST("/pods-reset/plans/:id/resume", perm("feed", "manage"), controllers.ResumePodsResetRun)
+	adminGroup.POST("/pods-reset/plans/:id/execute", perm("feed", "manage"), controllers.ExecutePodsResetRun)
 
 	// Embedding & Model Lifecycle System (stage 10) — vector-space custodian.
 	// Reads under content:read, policy/manual-audit under content:write, privileged

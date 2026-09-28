@@ -565,6 +565,12 @@ func PurgeStorage(c *gin.Context) {
 		})
 		return
 	}
+	for _, item := range items {
+		if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "Direct storage purge is disabled for Pods media; use the explicit Pods Reset owner workflow", Code: "PODS_RESET_REQUIRED"})
+			return
+		}
+	}
 
 	// Build object keys to delete and ask Aggregation to remove them.
 	contentIDs := make([]string, 0, len(items))

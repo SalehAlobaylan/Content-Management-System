@@ -92,6 +92,11 @@ const (
 	retentionCapabilityOwnerRuns           = "owner_runs"
 	retentionCapabilityRecoveryRotate      = "feed_recovery_rotate"
 	retentionCapabilityRecoveryPurge       = "feed_recovery_purge_reseed"
+	retentionCapabilityPodsReset           = "pods_reset"
+	// This build contains the workflow but has not passed the scoped disposable
+	// qualification gate. Flip only in a separately reviewed release after the
+	// documented test matrix and canary prerequisites are satisfied.
+	podsResetQualificationPassed = false
 )
 
 func retentionCapabilityEnabled(control models.RetentionExecutionControl, capability string) bool {
@@ -105,7 +110,11 @@ func retentionCapabilityEnabled(control models.RetentionExecutionControl, capabi
 	case retentionCapabilityRecoveryRotate:
 		return control.FeedRecoveryRotateEnabled
 	case retentionCapabilityRecoveryPurge:
-		return control.FeedRecoveryPurgeEnabled
+		// Kept readable for old records, but the legacy combined operation has
+		// no executable path. New reset uses the explicit Pods Reset capability.
+		return false
+	case retentionCapabilityPodsReset:
+		return podsResetQualificationPassed && control.PodsResetEnabled
 	default:
 		return false
 	}
@@ -623,10 +632,19 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		OwnerRunsEnabled           *bool  `json:"owner_runs_enabled"`
 		FeedRecoveryRotateEnabled  *bool  `json:"feed_recovery_rotate_enabled"`
 		FeedRecoveryPurgeEnabled   *bool  `json:"feed_recovery_purge_enabled"`
+		PodsResetEnabled           *bool  `json:"pods_reset_enabled"`
 		Reason                     string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&patch); err != nil || len(strings.TrimSpace(patch.Reason)) < 10 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "a reason of at least 10 characters is required"})
+		return
+	}
+	if patch.FeedRecoveryPurgeEnabled != nil && *patch.FeedRecoveryPurgeEnabled {
+		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed cannot be enabled; use the separately qualified Pods Reset control"})
+		return
+	}
+	if patch.PodsResetEnabled != nil && *patch.PodsResetEnabled && !podsResetQualificationPassed {
+		c.JSON(http.StatusConflict, gin.H{"error": "Pods Reset execution cannot be enabled until the scoped disposable qualification passes and a reviewed release marks it qualified"})
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
@@ -653,8 +671,12 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		if patch.FeedRecoveryRotateEnabled != nil {
 			control.FeedRecoveryRotateEnabled = *patch.FeedRecoveryRotateEnabled
 		}
-		if patch.FeedRecoveryPurgeEnabled != nil {
-			control.FeedRecoveryPurgeEnabled = *patch.FeedRecoveryPurgeEnabled
+		control.FeedRecoveryPurgeEnabled = false
+		if patch.PodsResetEnabled != nil && podsResetQualificationPassed {
+			control.PodsResetEnabled = *patch.PodsResetEnabled
+		}
+		if !podsResetQualificationPassed {
+			control.PodsResetEnabled = false
 		}
 		control.UpdatedBy = principal.Email
 		control.UpdatedAt = time.Now().UTC()
@@ -664,6 +686,7 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 			"owner_runs_enabled":           control.OwnerRunsEnabled,
 			"feed_recovery_rotate_enabled": control.FeedRecoveryRotateEnabled,
 			"feed_recovery_purge_enabled":  control.FeedRecoveryPurgeEnabled,
+			"pods_reset_enabled":           control.PodsResetEnabled,
 			"updated_by":                   control.UpdatedBy,
 			"updated_at":                   control.UpdatedAt,
 		}).Error
@@ -1247,7 +1270,45 @@ func CreateRetentionHold(c *gin.Context) {
 		CreatedBy: principal.Email, ExpiresAt: request.ExpiresAt,
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	if err := db.Create(&hold).Error; err != nil {
+	errRetiredHoldTarget := errors.New("retired Pods content cannot receive a new retention hold")
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var targets []models.ContentItem
+		switch request.TargetType {
+		case "content":
+			var target models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, request.TargetID).First(&target).Error; err != nil {
+				return err
+			}
+			targets = append(targets, target)
+		case "story":
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND story_id=?", principal.TenantID, request.TargetID).Order("public_id").Find(&targets).Error; err != nil {
+				return err
+			}
+		}
+		if len(targets) > 0 {
+			ids := make([]uuid.UUID, 0, len(targets))
+			for _, target := range targets {
+				ids = append(ids, target.PublicID)
+			}
+			var retired int64
+			if err := tx.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND content_item_id IN ?", principal.TenantID, ids).Count(&retired).Error; err != nil {
+				return err
+			}
+			if retired > 0 {
+				return errRetiredHoldTarget
+			}
+		}
+		return tx.Create(&hold).Error
+	})
+	if err != nil {
+		if errors.Is(err, errRetiredHoldTarget) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "PODS_RESET_RETIRED"})
+			return
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "hold target not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create retention hold"})
 		return
 	}

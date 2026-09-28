@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // =============================================================================
@@ -77,7 +79,17 @@ type internalUpdateItemQualityRequest struct {
 	OldSizeBytes            *int64  `json:"old_size_bytes"`
 	OldStorageKey           *string `json:"old_storage_key"`
 	NewStorageKey           *string `json:"new_storage_key"`
+	NewManifestID           string  `json:"new_manifest_id"`
+	NewProducerEventID      string  `json:"new_producer_event_id"`
+	NewFenceToken           string  `json:"new_fence_token"`
 	EventReason             *string `json:"event_reason"`
+}
+
+func qualityVersionedObjectKey(contentItemID uuid.UUID, version int) string {
+	if version <= 1 {
+		return fmt.Sprintf("content/%s/processed.mp4", contentItemID)
+	}
+	return fmt.Sprintf("content/%s/processed.v%d.mp4", contentItemID, version)
 }
 
 // InternalUpdateContentItemQuality handles PATCH /internal/content-items/:id/quality
@@ -94,35 +106,98 @@ func InternalUpdateContentItemQuality(c *gin.Context) {
 		return
 	}
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+	var newManifestID, producerEventID, fenceToken uuid.UUID
+	alreadyApplied := false
+	if req.BumpVersion {
+		var idErr, producerErr, fenceErr error
+		newManifestID, idErr = uuid.Parse(strings.TrimSpace(req.NewManifestID))
+		producerEventID, producerErr = uuid.Parse(strings.TrimSpace(req.NewProducerEventID))
+		fenceToken, fenceErr = uuid.Parse(strings.TrimSpace(req.NewFenceToken))
+		if idErr != nil || producerErr != nil || fenceErr != nil || req.NewStorageKey == nil || strings.TrimSpace(*req.NewStorageKey) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quality re-encode requires its exact verified artifact identity"})
+			return
+		}
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ?", id).First(&item).Error; err != nil {
+			return err
+		}
+		if item.RetiredPayloadAt != nil || item.Status == models.ContentStatusArchived {
+			return fmt.Errorf("content identity is permanently retired")
+		}
+		if req.BumpVersion {
+			var manifest models.MediaArtifactManifest
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND content_item_id=? AND object_key=? AND producer_event_id=? AND fence_token=?", item.TenantID, newManifestID, item.PublicID, strings.TrimSpace(*req.NewStorageKey), producerEventID, fenceToken).First(&manifest).Error; err != nil {
+				return fmt.Errorf("verified quality artifact is unavailable")
+			}
+			itemTier := "primary"
+			if item.StorageTier != nil && strings.TrimSpace(*item.StorageTier) != "" {
+				itemTier = strings.TrimSpace(*item.StorageTier)
+			}
+			if manifest.ArtifactRole != "playback_mp4" || manifest.CreatorRole != "aggregation_quality_worker" || manifest.ContentType != "video/mp4" || len(manifest.SHA256) != 64 || manifest.SizeBytes <= 0 || req.FileSizeBytes == nil || manifest.SizeBytes != *req.FileSizeBytes || manifest.StorageTier != itemTier || (manifest.State != "verified" && manifest.State != "active") || req.MediaURL == nil || manifest.PublicURL != *req.MediaURL {
+				return fmt.Errorf("quality artifact does not match the requested media pointer")
+			}
+			nextKey := qualityVersionedObjectKey(item.PublicID, item.MediaVersion+1)
+			currentKey := qualityVersionedObjectKey(item.PublicID, item.MediaVersion)
+			if strings.TrimSpace(*req.NewStorageKey) == nextKey && manifest.State == "verified" {
+				// A fresh output must target exactly the next version. The row lock
+				// makes two workers encoding from the same version serialize; only
+				// the first may advance the pointer.
+			} else if strings.TrimSpace(*req.NewStorageKey) == currentKey && manifest.State == "active" && item.MediaURL != nil && *item.MediaURL == *req.MediaURL {
+				// The first PATCH may have committed while its response was lost.
+				// Replay is safe only when both the versioned key and current pointer
+				// already identify this exact active manifest.
+				alreadyApplied = true
+			} else {
+				return fmt.Errorf("quality artifact version is stale or not the exact next version")
+			}
+		}
+		if req.MediaURL != nil {
+			item.MediaURL = req.MediaURL
+		}
+		if req.FileSizeBytes != nil {
+			item.FileSizeBytes = *req.FileSizeBytes
+		}
+		if req.CurrentBitrateKbps != nil {
+			v := *req.CurrentBitrateKbps
+			item.CurrentBitrateKbps = &v
+		}
+		if req.CurrentQualityProfileID != nil {
+			v := *req.CurrentQualityProfileID
+			item.CurrentQualityProfileID = &v
+		}
+		if req.BumpVersion && !alreadyApplied {
+			item.MediaVersion++
+		}
+		now := time.Now().UTC()
+		stateReason := "reencoded"
+		item.StorageState = models.StorageStateReencoded
+		item.StorageStateReason = &stateReason
+		item.StorageRecoveryStatus = models.StorageRecoveryRecoverable
+		item.StorageLastVerifiedAt = &now
+		if err := tx.Save(&item).Error; err != nil {
+			return err
+		}
+		if req.BumpVersion && !alreadyApplied {
+			changed := tx.Model(&models.MediaArtifactManifest{}).Where("tenant_id=? AND public_id=? AND content_item_id=? AND object_key=? AND producer_event_id=? AND fence_token=? AND state='verified'", item.TenantID, newManifestID, item.PublicID, strings.TrimSpace(*req.NewStorageKey), producerEventID, fenceToken).
+				Updates(map[string]interface{}{"state": "active", "updated_at": now})
+			if changed.Error != nil {
+				return changed.Error
+			}
+			if changed.RowsAffected == 0 {
+				var stillActive int64
+				if err := tx.Model(&models.MediaArtifactManifest{}).Where("tenant_id=? AND public_id=? AND content_item_id=? AND producer_event_id=? AND fence_token=? AND state='active'", item.TenantID, newManifestID, item.PublicID, producerEventID, fenceToken).Count(&stillActive).Error; err != nil || stillActive != 1 {
+					return fmt.Errorf("quality artifact activation did not persist")
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "quality update was rejected by the content or artifact ownership fence"})
 		return
 	}
-	if req.MediaURL != nil {
-		item.MediaURL = req.MediaURL
-	}
-	if req.FileSizeBytes != nil {
-		item.FileSizeBytes = *req.FileSizeBytes
-	}
-	if req.CurrentBitrateKbps != nil {
-		v := *req.CurrentBitrateKbps
-		item.CurrentBitrateKbps = &v
-	}
-	if req.CurrentQualityProfileID != nil {
-		v := *req.CurrentQualityProfileID
-		item.CurrentQualityProfileID = &v
-	}
-	if req.BumpVersion {
-		item.MediaVersion++
-	}
-	now := time.Now().UTC()
-	stateReason := "reencoded"
-	item.StorageState = models.StorageStateReencoded
-	item.StorageStateReason = &stateReason
-	item.StorageRecoveryStatus = models.StorageRecoveryRecoverable
-	item.StorageLastVerifiedAt = &now
-	if err := db.Save(&item).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update"})
+	if alreadyApplied {
+		c.JSON(http.StatusOK, gin.H{"success": true, "media_version": item.MediaVersion})
 		return
 	}
 	oldSize := int64(0)

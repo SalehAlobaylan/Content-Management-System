@@ -5,7 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,6 +20,9 @@ const atomizationObservationSafetyWindow = 30 * time.Second
 // Recovery observes the immutable attempt-owned key after its execution lease
 // has expired; it never grants fresh execution authority to that attempt.
 func validateSourceArtifactObservation(db *gorm.DB, manifest models.MediaArtifactManifest, req artifactManifestTransitionRequest) error {
+	if manifest.CreatorRole == "aggregation_quality_worker" {
+		return validateQualityArtifactObservation(db, manifest, req)
+	}
 	if manifest.AttemptID == nil || manifest.FenceToken == nil || manifest.ContentItemID == nil || manifest.AtomizationGenerationID != nil || manifest.TranscriptionGenerationID != nil || manifest.TranscriptionSegmentUnitID != nil {
 		return fmt.Errorf("source observation requires unambiguous content-stage ownership")
 	}
@@ -45,6 +50,68 @@ func validateSourceArtifactObservation(db *gorm.DB, manifest models.MediaArtifac
 	expected, _ := hex.DecodeString(manifest.SHA256)
 	if len(expected) != 32 || (observed != manifest.SHA256 && observed != base64.StdEncoding.EncodeToString(expected)) {
 		return fmt.Errorf("source observation requires matching SHA256")
+	}
+	return nil
+}
+
+func validateQualityArtifactObservation(db *gorm.DB, manifest models.MediaArtifactManifest, req artifactManifestTransitionRequest) error {
+	if req.State != manifestStateVerified || manifest.ArtifactRole != "playback_mp4" || manifest.ContentItemID == nil || manifest.ParentContentItemID != nil || manifest.AttemptID != nil || manifest.AtomizationGenerationID != nil || manifest.AtomizationChapterUnitID != nil || manifest.TranscriptionGenerationID != nil || manifest.TranscriptionSegmentUnitID != nil || manifest.FenceToken == nil {
+		return fmt.Errorf("quality observation requires an item-owned playback artifact and stable fence")
+	}
+	if manifest.State != manifestStateUploaded && manifest.State != manifestStateUncertain {
+		return fmt.Errorf("quality artifact is not awaiting reconciliation")
+	}
+	producer, err := uuid.Parse(strings.TrimSpace(req.ProducerEventID))
+	if err != nil || producer != manifest.ProducerEventID {
+		return fmt.Errorf("quality producer identity mismatch")
+	}
+	fence, err := uuid.Parse(strings.TrimSpace(req.FenceToken))
+	if err != nil || fence != *manifest.FenceToken {
+		return fmt.Errorf("quality artifact fence mismatch")
+	}
+	if req.SizeBytes == nil || *req.SizeBytes != manifest.SizeBytes || manifest.SizeBytes <= 0 || req.ContentType != manifest.ContentType || manifest.ContentType != "video/mp4" || len(manifest.SHA256) != 64 {
+		return fmt.Errorf("quality observation requires exact immutable size, type, and digest")
+	}
+	observedChecksum, _ := req.VerificationEvidence["provider_checksum_sha256"].(string)
+	if observedChecksum != manifest.SHA256 || req.VerificationEvidence["provider_head_verified"] != true {
+		return fmt.Errorf("quality observation requires provider HEAD and exact streamed SHA256 evidence")
+	}
+	if req.ETag == "" {
+		return fmt.Errorf("quality observation requires provider ETag evidence")
+	}
+	if manifest.ETag != "" && !strings.EqualFold(strings.Trim(manifest.ETag, `"`), strings.Trim(req.ETag, `"`)) {
+		return fmt.Errorf("quality observation ETag differs from the recorded provider receipt")
+	}
+	prefix := "content/" + manifest.ContentItemID.String() + "/processed"
+	version := 0
+	switch {
+	case manifest.ObjectKey == prefix+".mp4":
+		version = 1
+	case strings.HasPrefix(manifest.ObjectKey, prefix+".v") && strings.HasSuffix(manifest.ObjectKey, ".mp4"):
+		raw := strings.TrimSuffix(strings.TrimPrefix(manifest.ObjectKey, prefix+".v"), ".mp4")
+		version, err = strconv.Atoi(raw)
+		if err != nil || version < 2 {
+			return fmt.Errorf("quality object key has an invalid media version")
+		}
+	default:
+		return fmt.Errorf("quality object key is outside its canonical item version namespace")
+	}
+	var item models.ContentItem
+	if err := db.Where("tenant_id=? AND public_id=?", manifest.TenantID, *manifest.ContentItemID).First(&item).Error; err != nil {
+		return fmt.Errorf("quality content owner is unavailable")
+	}
+	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast || item.Status != models.ContentStatusReady || item.RetiredPayloadAt != nil {
+		return fmt.Errorf("quality artifact owner is not an active Pods item")
+	}
+	var retirementCount int64
+	if err := db.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND content_item_id=? AND state IN ?", item.TenantID, item.PublicID, []string{"retiring", "retired"}).Count(&retirementCount).Error; err != nil || retirementCount != 0 {
+		return fmt.Errorf("quality artifact owner is or may be permanently retired")
+	}
+	if version != item.MediaVersion+1 && version != item.MediaVersion {
+		return fmt.Errorf("quality object version is not the current or next item media version")
+	}
+	if version == item.MediaVersion && (item.MediaURL == nil || *item.MediaURL != manifest.PublicURL) {
+		return fmt.Errorf("current item media URL does not identify the observed quality artifact")
 	}
 	return nil
 }

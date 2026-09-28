@@ -122,6 +122,7 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodPost, "/atomization/repair-leaks", "atomization.write", agg, true},
 		{http.MethodGet, "/content-items/:id/atomization", "atomization.read", agg, true},
 		{http.MethodPost, "/content-items", "content.ingest", agg, true},
+		{http.MethodPost, "/pods-reset/authorize-object-deletion", "pods-reset.object-delete.authorize", agg, false},
 		{http.MethodPut, "/content-items/:id", "content.ingest", agg, true},
 		{http.MethodPatch, "/content-items/:id/status", "content.lifecycle", agg, true},
 		{http.MethodPatch, "/content-items/:id/artifacts", "content.artifacts", agg, true},

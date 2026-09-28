@@ -1218,9 +1218,18 @@ func BulkDeleteContent(c *gin.Context) {
 		}
 	}
 
+	var podsCount int64
+	if err := query.Session(&gorm.Session{}).Model(&models.ContentItem{}).Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).Count(&podsCount).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to inspect deletion scope", Code: "DELETE_SCOPE_FAILED"})
+		return
+	}
+	if !req.DryRun && podsCount > 0 {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Direct content deletion is disabled for Pods media; use the explicit Pods Reset owner workflow", Code: "PODS_RESET_REQUIRED"})
+		return
+	}
 	if req.DryRun {
 		var count int64
-		query.Model(&models.ContentItem{}).Count(&count)
+		query.Session(&gorm.Session{}).Model(&models.ContentItem{}).Count(&count)
 		c.JSON(http.StatusOK, bulkDeleteContentResponse{
 			DeletedCount: count,
 			Message:      "Dry run - no items deleted",
@@ -1228,7 +1237,7 @@ func BulkDeleteContent(c *gin.Context) {
 		return
 	}
 
-	result := query.Delete(&models.ContentItem{})
+	result := query.Session(&gorm.Session{}).Delete(&models.ContentItem{})
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to delete content: " + result.Error.Error(),

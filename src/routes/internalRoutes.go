@@ -24,6 +24,7 @@ func withTransitionState(state string, handler gin.HandlerFunc) gin.HandlerFunc 
 func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	internal := router.Group("/internal")
 	internal.Use(utils.InternalAuthMiddleware())
+	internal.Use(controllers.PodsResetWriteFenceMiddleware(db))
 	route := func(method, path string, handler gin.HandlerFunc) {
 		policy := utils.MustInternalRoutePolicy(method, path)
 		internal.Handle(method, path, utils.RequireInternalRoutePolicy(policy), handler)
@@ -107,6 +108,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/atomization/repair-leaks", controllers.InternalRepairMediaAtomizationLeaks)
 	route(http.MethodGet, "/content-items/:id/atomization", controllers.InternalGetAtomizationInput)
 	route(http.MethodPost, "/content-items", controllers.InternalCreateContentItem)
+	route(http.MethodPost, "/pods-reset/authorize-object-deletion", controllers.InternalAuthorizePodsResetObjectDeletion)
 	route(http.MethodPut, "/content-items/:id", controllers.InternalUpdateContentItem)
 	route(http.MethodPatch, "/content-items/:id/enrichment-metadata", controllers.InternalMergeEnrichmentMetadata)
 	route(http.MethodPatch, "/content-items/:id/status", controllers.InternalUpdateContentStatus)

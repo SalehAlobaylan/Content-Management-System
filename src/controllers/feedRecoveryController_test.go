@@ -49,6 +49,13 @@ func TestRecoveryPlanRejectsLowSpaceModeOutsidePurge(t *testing.T) {
 	}
 }
 
+func TestRecoveryPlanRejectsLegacyPurgeAndReseed(t *testing.T) {
+	_, err := buildRecoveryPlan(nil, "default", feedRecoveryPlanRequest{Lane: "media", Level: "purge_reseed", CapacityMode: "low_space_reset", NoFullRollback: true}, "admin@example.test")
+	if err == nil {
+		t.Fatal("legacy combined purge and reseed must be rejected before any plan is created")
+	}
+}
+
 func TestRecoveryRunExpectedEmptyOnlyAppliesToTargetedLowSpaceReset(t *testing.T) {
 	if !recoveryRunExpectedEmpty(models.FeedRecoveryPlan{Level: "purge_reseed", CapacityMode: "low_space_reset", TargetCount: 1}) {
 		t.Fatal("targeted low-space purge must expose expected-empty")

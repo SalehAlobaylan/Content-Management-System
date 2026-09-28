@@ -214,6 +214,9 @@ func buildRecoveryPlan(db *gorm.DB, tenant string, req feedRecoveryPlanRequest, 
 	if lane == "" || level == "" || mode == "" {
 		return models.FeedRecoveryPlan{}, gorm.ErrInvalidData
 	}
+	if level == "purge_reseed" {
+		return models.FeedRecoveryPlan{}, fmt.Errorf("legacy purge and reseed is disabled; use an explicit Pods reset manifest")
+	}
 	if level != "purge_reseed" && req.NoFullRollback {
 		return models.FeedRecoveryPlan{}, gorm.ErrInvalidData
 	}
@@ -448,6 +451,10 @@ func ApproveFeedRecoveryPlan(c *gin.Context) {
 	var plan models.FeedRecoveryPlan
 	if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&plan).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "plan not found"})
+		return
+	}
+	if plan.Level == "purge_reseed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed plans are not approvable; prepare a new exact Pods reset manifest"})
 		return
 	}
 	if !plan.ExpiresAt.After(time.Now().UTC()) || plan.State != "awaiting_approval" {
@@ -1766,6 +1773,10 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "recovery plan not found"})
 		return
 	}
+	if plan.Level == "purge_reseed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed execution is disabled; no destructive recovery action was started"})
+		return
+	}
 	secret, err := utils.GetJWTSecret()
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "execution re-auth unavailable"})
@@ -1923,10 +1934,10 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 		}
 	}
 	pass := 1
-	if run.Phase == "verification_wait" {
+	if run.Phase == "verification_wait" || run.Phase == "verifying_probe_2" {
 		pass = 2
 	}
-	if run.Phase != "verification_wait" {
+	if run.Phase != "verification_wait" && run.Phase != "verifying_probe_2" {
 		if err := updateRecoveryRunWithLease(db, run, map[string]interface{}{"phase": "verifying_probe_1", "heartbeat_at": time.Now().UTC()}); err != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": "verification phase could not be fenced"})
 			return

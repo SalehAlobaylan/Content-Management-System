@@ -260,6 +260,7 @@ type ContentItem struct {
 	StorageStateReason    *string    `gorm:"type:text" json:"storage_state_reason,omitempty"`
 	StorageRecoveryStatus string     `gorm:"type:varchar(32);not null;default:'recoverable';index:idx_content_items_storage_recovery_status" json:"storage_recovery_status"`
 	StorageDeletedAt      *time.Time `gorm:"type:timestamp;index:idx_content_items_storage_deleted_at" json:"storage_deleted_at,omitempty"`
+	RetiredPayloadAt      *time.Time `gorm:"type:timestamp" json:"retired_payload_at,omitempty"`
 	StorageLastVerifiedAt *time.Time `gorm:"type:timestamp" json:"storage_last_verified_at,omitempty"`
 
 	// Quality accounting (set by Aggregation on first ingest, updated on re-encode).

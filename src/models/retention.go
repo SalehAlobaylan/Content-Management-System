@@ -103,6 +103,7 @@ type RetentionExecutionControl struct {
 	OwnerRunsEnabled           bool      `gorm:"not null;default:false" json:"owner_runs_enabled"`
 	FeedRecoveryRotateEnabled  bool      `gorm:"not null;default:false" json:"feed_recovery_rotate_enabled"`
 	FeedRecoveryPurgeEnabled   bool      `gorm:"not null;default:false" json:"feed_recovery_purge_enabled"`
+	PodsResetEnabled           bool      `gorm:"not null;default:false" json:"pods_reset_enabled"`
 	UpdatedBy                  string    `gorm:"type:varchar(255)" json:"updated_by,omitempty"`
 	UpdatedAt                  time.Time `json:"updated_at"`
 }
