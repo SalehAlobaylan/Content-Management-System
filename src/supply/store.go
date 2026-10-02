@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
@@ -17,6 +18,8 @@ import (
 const projectionReducerVersion = "source-run-reducer/v1"
 
 type CreateRequestInput struct {
+	// Only this package's campaign owner admission binds a replay page.
+	replayPageAdmission bool
 	Source              models.ContentSource
 	Identity            RequestIdentity
 	RequestedBy         string
@@ -40,6 +43,9 @@ func CreateRequest(db *gorm.DB, input CreateRequestInput) (models.SourceRunReque
 	}
 	if err := input.Identity.Validate(); err != nil {
 		return models.SourceRunRequest{}, false, err
+	}
+	if input.Identity.Purpose == "content_reset_replay" && !input.replayPageAdmission {
+		return models.SourceRunRequest{}, false, fmt.Errorf("replay requests require campaign owner page admission")
 	}
 	if input.Source.PublicID == uuid.Nil || input.Source.PublicID.String() != strings.TrimSpace(input.Identity.ContentSourceID) || input.Source.TenantID != strings.TrimSpace(input.Identity.TenantID) {
 		return models.SourceRunRequest{}, false, fmt.Errorf("source-run identity does not match the tenant-scoped source")
@@ -92,6 +98,17 @@ func CreateRequest(db *gorm.DB, input CreateRequestInput) (models.SourceRunReque
 		}
 		if !current.IsActive || current.Category != request.Lane || current.SourceConfigVersion != input.Source.SourceConfigVersion {
 			return fmt.Errorf("source-run source version or authority changed")
+		}
+		lifecycleLane := current.Category
+		if lifecycleLane == models.SourceCategoryMedia {
+			lifecycleLane = "pods"
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{
+			TenantID: current.TenantID,
+			Lane:     lifecycleLane,
+			SourceID: current.PublicID.String(),
+		}, lifecycle.PhaseSourceAdmission); err != nil {
+			return err
 		}
 		if current.IntakeCircuitUntil != nil && current.IntakeCircuitUntil.After(now) {
 			return fmt.Errorf("source-run intake circuit is open")
@@ -180,10 +197,17 @@ func CreateAttemptAndRootUnit(db *gorm.DB, tenantID, requestID string) (AttemptL
 		if IsTerminalRequest(RequestState(request.State)) {
 			return fmt.Errorf("terminal source-run request cannot receive an attempt")
 		}
+		if request.ProviderEffectsReleasedAt != nil {
+			return fmt.Errorf("released replay request cannot receive another attempt")
+		}
 		var active models.SourceRunAttempt
-		if err := tx.Where("tenant_id = ? AND content_source_id = ? AND state IN ?", tenantID, request.ContentSourceID, []string{
+		activeQuery := tx.Where("tenant_id = ? AND content_source_id = ? AND state IN ?", tenantID, request.ContentSourceID, []string{
 			string(AttemptAuthorized), string(AttemptClaimed), string(AttemptRunning), string(AttemptVerificationRequired),
-		}).First(&active).Error; err == nil {
+		})
+		if tx.Migrator().HasColumn(&models.SourceRunAttempt{}, "provider_effects_released_at") {
+			activeQuery = activeQuery.Where("provider_effects_released_at IS NULL")
+		}
+		if err := activeQuery.First(&active).Error; err == nil {
 			return fmt.Errorf("source already has provider-effecting attempt %s", active.PublicID)
 		} else if err != nil && err != gorm.ErrRecordNotFound {
 			return err
@@ -323,6 +347,9 @@ func AcquireUnitExecution(db *gorm.DB, tenantID, unitID, owner string, leaseFor 
 		}
 		if IsTerminalUnit(ExecutionUnitState(unit.State)) || unit.State == string(UnitVerificationRequired) || unit.CancellationRequestedAt != nil {
 			return fmt.Errorf("source-run execution unit cannot be leased from %s", unit.State)
+		}
+		if err := validateReplayUnitAdmission(tx, unit); err != nil {
+			return err
 		}
 		if unit.EffectStartedAt != nil && (unit.ExecutionLeaseExpiresAt == nil || !unit.ExecutionLeaseExpiresAt.After(now)) {
 			if err := tx.Model(&unit).Updates(map[string]any{

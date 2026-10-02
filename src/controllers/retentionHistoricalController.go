@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/gin-gonic/gin"
@@ -558,9 +559,23 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id IN ?", principal.TenantID, contentIDs).Find(&items).Error; err != nil || len(items) != len(contentIDs) {
 			return errors.New("historical manifest is stale")
 		}
+		lifecycleResources := make([]lifecycle.Resource, 0, len(items))
 		for _, item := range items {
 			if item.Type != models.ContentTypeNews || (item.Status != models.ContentStatusReady && item.Status != models.ContentStatusFailed && item.Status != models.ContentStatusArchived) {
 				return errors.New("historical manifest acquired an ineligible content state")
+			}
+			sourceID := "-"
+			if item.ContentSourceID != nil {
+				sourceID = item.ContentSourceID.String()
+			}
+			lifecycleResources = append(lifecycleResources, lifecycle.Resource{
+				Type: lifecycle.ResourceItem,
+				Key:  "news/" + sourceID + "/" + item.PublicID.String(),
+			})
+		}
+		if len(lifecycleResources) > 0 {
+			if err := lifecycle.CheckResources(tx, principal.TenantID, lifecycleResources, lifecycle.PhaseContentWrite); err != nil {
+				return err
 			}
 		}
 		protected, err := historicalProtectedContentIDs(tx, principal.TenantID, contentIDs, now)

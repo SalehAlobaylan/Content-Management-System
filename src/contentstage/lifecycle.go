@@ -10,6 +10,7 @@ import (
 
 	"content-management-system/src/feedcontract"
 	"content-management-system/src/feedstate"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/pipeline"
 
@@ -151,7 +152,7 @@ func rankedClaimTenantScope(tx *gorm.DB, filter claimCandidateFilter) *gorm.DB {
 		Limit(64)
 }
 
-func lockedClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter, limit int) *gorm.DB {
+func claimCandidateScope(tx *gorm.DB, filter claimCandidateFilter, limit int) *gorm.DB {
 	scope := eligibleClaimCandidateScope(tx, filter)
 	if filter.lane == models.ContentStageLanePods {
 		// Rank the slot owner's family before limiting candidates. Otherwise an
@@ -163,7 +164,6 @@ func lockedClaimCandidateScope(tx *gorm.DB, filter claimCandidateFilter, limit i
 			AND leaf.public_id=content_stage_requests.content_item_id) DESC`)
 	}
 	return scope.
-		Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 		Order("priority DESC, created_at ASC, public_id ASC").
 		Limit(limit)
 }
@@ -210,6 +210,21 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 		return fmt.Errorf("manual transcript priority requires tenant, content item, and generation")
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		var item models.ContentItem
+		if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", tenantID, contentID, generation).First(&item).Error; err != nil {
+			return err
+		}
+		sourceID := ""
+		if item.ContentSourceID != nil {
+			sourceID = item.ContentSourceID.String()
+		}
+		scope := lifecycle.Scope{TenantID: tenantID, Lane: models.ContentStageLanePods, SourceID: sourceID, ItemID: contentID.String()}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
 		if MediaAcquisitionRequiresApproval(tx, tenantID, contentID, generation) {
 			return fmt.Errorf("media acquisition requires approval before transcription")
 		}
@@ -257,10 +272,6 @@ func ExpediteManualTranscript(db *gorm.DB, tenantID string, contentID uuid.UUID,
 			if err := appendEvent(tx, request, nil, "manual_priority_raised", map[string]any{"priority": 100}); err != nil {
 				return err
 			}
-		}
-		var item models.ContentItem
-		if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", tenantID, contentID, generation).First(&item).Error; err != nil {
-			return err
 		}
 		return podsflow.Resume(tx, item)
 	})
@@ -319,7 +330,7 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 			}
 			if strings.TrimSpace(tenantID) != "" {
 				var rows []models.ContentStageRequest
-				if err := lockedClaimCandidateScope(tx, filter, 64).Find(&rows).Error; err != nil {
+				if err := claimCandidateScope(tx, filter, 64).Find(&rows).Error; err != nil {
 					return nil, err
 				}
 				return rows, nil
@@ -338,7 +349,7 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 				var tenantRows []models.ContentStageRequest
 				rowFilter := filter
 				rowFilter.tenantID = selectedTenant
-				if err := lockedClaimCandidateScope(tx, rowFilter, 1).Find(&tenantRows).Error; err != nil {
+				if err := claimCandidateScope(tx, rowFilter, 1).Find(&tenantRows).Error; err != nil {
 					return nil, err
 				}
 				rows = append(rows, tenantRows...)
@@ -388,14 +399,70 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 			if !ready {
 				continue
 			}
-			var item models.ContentItem
-			if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=? AND status<>?", request.TenantID, request.ContentItemID, request.ProcessingGeneration, models.ContentStatusArchived).First(&item).Error; err != nil {
+			var observedItem models.ContentItem
+			if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=? AND status<>?", request.TenantID, request.ContentItemID, request.ProcessingGeneration, models.ContentStatusArchived).First(&observedItem).Error; err != nil {
 				continue
 			}
+			lifecycleSourceID := ""
+			if observedItem.ContentSourceID != nil {
+				lifecycleSourceID = observedItem.ContentSourceID.String()
+			}
+			scope := lifecycle.Scope{
+				TenantID: observedItem.TenantID,
+				Lane:     request.Lane,
+				SourceID: lifecycleSourceID,
+				ItemID:   observedItem.PublicID.String(),
+			}
+			if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					continue
+				}
+				return err
+			}
+			if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
+				if lifecycle.IsConflict(err) {
+					continue
+				}
+				return err
+			}
+			// Candidate discovery is deliberately unlocked so the owner first takes
+			// the shared lifecycle boundary. Lock the content row and then the stage
+			// request in one stable order, revalidating both observations before the
+			// queue claim. This avoids holding a stage-request row lock while waiting
+			// for a campaign's exclusive resource lock.
+			var item models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND processing_generation=? AND status<>?", request.TenantID, request.ContentItemID, request.ProcessingGeneration, models.ContentStatusArchived).First(&item).Error; err != nil {
+				continue
+			}
+			if !item.UpdatedAt.Equal(observedItem.UpdatedAt) || item.Type != observedItem.Type ||
+				(item.ContentSourceID == nil) != (observedItem.ContentSourceID == nil) ||
+				(item.ContentSourceID != nil && *item.ContentSourceID != *observedItem.ContentSourceID) {
+				continue
+			}
+			var lockedRequest models.ContentStageRequest
+			lockErr := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where(
+				"tenant_id=? AND public_id=? AND lane=? AND stage=? AND processing_generation=? AND input_fingerprint=? AND state IN ? AND (not_before_at IS NULL OR not_before_at<=?) AND cancellation_requested_at IS NULL",
+				request.TenantID, request.PublicID, request.Lane, request.Stage, request.ProcessingGeneration,
+				request.InputFingerprint, []string{models.ContentStageQueued, models.ContentStageDeferred}, now,
+			).First(&lockedRequest).Error
+			if lockErr == gorm.ErrRecordNotFound {
+				continue
+			}
+			if lockErr != nil {
+				return lockErr
+			}
+			request = lockedRequest
 			if stageFingerprint(item, descriptors[request.Stage]) != request.InputFingerprint {
 				if err := supersede(tx, request, "input_fingerprint_changed"); err != nil {
 					return err
 				}
+				continue
+			}
+			ready, err = dependenciesVerified(tx, request)
+			if err != nil {
+				return err
+			}
+			if !ready {
 				continue
 			}
 			if request.Lane == models.ContentStageLanePods {
@@ -896,11 +963,53 @@ func terminalTransition(db *gorm.DB, requestID uuid.UUID, input Correlation, sta
 }
 
 func AuthorizeWriteback(tx *gorm.DB, contentID uuid.UUID, input Correlation, expectedStage string) (models.ContentStageRequest, models.ContentStageAttempt, error) {
+	if tx == nil {
+		return models.ContentStageRequest{}, models.ContentStageAttempt{}, fmt.Errorf("content-stage writeback requires a database handle")
+	}
+	var request models.ContentStageRequest
+	var attempt models.ContentStageAttempt
+	err := tx.Transaction(func(scope *gorm.DB) error {
+		var err error
+		request, attempt, err = authorizeWritebackInTransaction(scope, contentID, input, expectedStage)
+		return err
+	})
+	return request, attempt, err
+}
+
+func authorizeWritebackInTransaction(tx *gorm.DB, contentID uuid.UUID, input Correlation, expectedStage string) (models.ContentStageRequest, models.ContentStageAttempt, error) {
+	requestID, _, _, _, _, err := parseCorrelation(input)
+	if err != nil || strings.TrimSpace(input.InputFingerprint) == "" {
+		return models.ContentStageRequest{}, models.ContentStageAttempt{}, fmt.Errorf("invalid content-stage correlation")
+	}
+	// Resolve the resource and acquire its shared lifecycle boundary before
+	// locking the stage request/attempt rows. The final persistence helper checks
+	// the same boundary again inside the write transaction, closing the gap
+	// between worker authorization and the actual content mutation.
+	var observedRequest models.ContentStageRequest
+	if err := tx.Where("public_id=? AND content_item_id=? AND input_fingerprint=?", requestID, contentID, input.InputFingerprint).First(&observedRequest).Error; err != nil {
+		return models.ContentStageRequest{}, models.ContentStageAttempt{}, fmt.Errorf("content-stage request is stale: %w", err)
+	}
+	var observedItem models.ContentItem
+	if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", observedRequest.TenantID, contentID, observedRequest.ProcessingGeneration).First(&observedItem).Error; err != nil {
+		return observedRequest, models.ContentStageAttempt{}, fmt.Errorf("content-stage target generation changed: %w", err)
+	}
+	sourceID := ""
+	if observedItem.ContentSourceID != nil {
+		sourceID = observedItem.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, lifecycle.Scope{
+		TenantID: observedItem.TenantID,
+		Lane:     laneForType(observedItem.Type),
+		SourceID: sourceID,
+		ItemID:   observedItem.PublicID.String(),
+	}, lifecycle.PhaseContentWrite); err != nil {
+		return observedRequest, models.ContentStageAttempt{}, err
+	}
 	request, attempt, err := loadCorrelated(tx, contentID, input, []string{models.ContentStageRunning}, true)
 	if err != nil {
 		return request, attempt, err
 	}
-	if request.Stage != expectedStage || request.ProcessingGeneration <= 0 {
+	if request.Stage != expectedStage || request.ProcessingGeneration <= 0 || request.TenantID != observedRequest.TenantID || request.ProcessingGeneration != observedRequest.ProcessingGeneration {
 		return request, attempt, fmt.Errorf("content-stage writeback stage mismatch")
 	}
 	var item models.ContentItem
@@ -911,9 +1020,38 @@ func AuthorizeWriteback(tx *gorm.DB, contentID uuid.UUID, input Correlation, exp
 }
 
 func RecordPersistence(tx *gorm.DB, request models.ContentStageRequest, attempt models.ContentStageAttempt, input Correlation, owner, artifactDigest string, payload map[string]any) error {
+	if tx == nil {
+		return fmt.Errorf("content-stage persistence requires a database handle")
+	}
+	return tx.Transaction(func(scope *gorm.DB) error {
+		return recordPersistenceInTransaction(scope, request, attempt, input, owner, artifactDigest, payload)
+	})
+}
+
+func recordPersistenceInTransaction(tx *gorm.DB, request models.ContentStageRequest, attempt models.ContentStageAttempt, input Correlation, owner, artifactDigest string, payload map[string]any) error {
 	_, _, _, _, producerEventID, err := parseCorrelation(input)
 	if err != nil || producerEventID == uuid.Nil {
 		return fmt.Errorf("producer event id is required")
+	}
+	// This check is intentionally repeated in the transaction that commits both
+	// the content mutation and its immutable receipt. A reset claim acquired
+	// after AuthorizeWriteback must roll back the content mutation rather than
+	// allowing a late worker to publish into the selected identity.
+	var item models.ContentItem
+	if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", request.TenantID, request.ContentItemID, request.ProcessingGeneration).First(&item).Error; err != nil {
+		return fmt.Errorf("content-stage persistence target changed: %w", err)
+	}
+	sourceID := ""
+	if item.ContentSourceID != nil {
+		sourceID = item.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, lifecycle.Scope{
+		TenantID: item.TenantID,
+		Lane:     laneForType(item.Type),
+		SourceID: sourceID,
+		ItemID:   item.PublicID.String(),
+	}, lifecycle.PhaseContentWrite); err != nil {
+		return err
 	}
 	// Receipts deliberately keep their artifact digest compact (the schema is
 	// varchar(64)).  A few producers historically passed a human-readable list
@@ -1688,9 +1826,25 @@ func reduceReadiness(tx *gorm.DB, tenantID string, contentID uuid.UUID, generati
 	if !SchemaAvailable(tx) {
 		return nil
 	}
+	var observed models.ContentItem
+	if err := tx.Where("tenant_id=? AND public_id=? AND processing_generation=?", tenantID, contentID, generation).First(&observed).Error; err != nil {
+		return err
+	}
+	sourceID := ""
+	if observed.ContentSourceID != nil {
+		sourceID = observed.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, lifecycle.Scope{
+		TenantID: tenantID, Lane: laneForType(observed.Type), SourceID: sourceID, ItemID: contentID.String(),
+	}, lifecycle.PhaseContentWrite); err != nil {
+		return err
+	}
 	var item models.ContentItem
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND processing_generation=?", tenantID, contentID, generation).First(&item).Error; err != nil {
 		return err
+	}
+	if !item.UpdatedAt.Equal(observed.UpdatedAt) || item.Type != observed.Type || (item.ContentSourceID == nil) != (observed.ContentSourceID == nil) || (item.ContentSourceID != nil && *item.ContentSourceID != *observed.ContentSourceID) {
+		return fmt.Errorf("content changed while stage readiness was being reduced")
 	}
 	mode, err := CutoverMode(tx, tenantID, laneForType(item.Type))
 	if err != nil || mode != models.ContentStageCutoverDurableRequired {

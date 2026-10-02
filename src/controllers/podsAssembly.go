@@ -6,11 +6,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 	"content-management-system/src/utils"
@@ -30,16 +32,17 @@ const (
 )
 
 type podsAssemblyRequest struct {
-	TenantID          string
-	Mode              podsAssemblyMode
-	AsOf              time.Time
-	DeliveryLanguage  deliveryLanguage
-	DurationMinutes   int
-	UserID            string
-	SuppressedIDs     []uuid.UUID
-	HardHiddenIDs     []uuid.UUID
-	RecycleSuppressed bool
-	RankingConfig     *models.RankingConfig
+	TenantID            string
+	ServingGenerationID uuid.UUID
+	Mode                podsAssemblyMode
+	AsOf                time.Time
+	DeliveryLanguage    deliveryLanguage
+	DurationMinutes     int
+	UserID              string
+	SuppressedIDs       []uuid.UUID
+	HardHiddenIDs       []uuid.UUID
+	RecycleSuppressed   bool
+	RankingConfig       *models.RankingConfig
 }
 
 type podsAssemblyResult struct {
@@ -60,6 +63,11 @@ func getPodsFeedCanonical(c *gin.Context) {
 		c.JSON(503, utils.HTTPError{Code: 503, Message: "Public feed tenant is unavailable"})
 		return
 	}
+	servingGenerationID, generationSupported, generationActive := feedcontract.ActiveGeneration(db, tenantID, "media")
+	if generationSupported && !generationActive {
+		c.JSON(503, gin.H{"error": "Pods serving generation is unavailable", "code": "FEED_VIEW_UNAVAILABLE"})
+		return
+	}
 	availability := currentFeedAvailability(db, tenantID, "media")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
@@ -77,7 +85,7 @@ func getPodsFeedCanonical(c *gin.Context) {
 	if config.IsActive {
 		mode = podsAssemblyRanked
 	}
-	seed := podsAssemblyRequest{TenantID: tenantID, Mode: mode, DeliveryLanguage: language, DurationMinutes: duration, UserID: userID}
+	seed := podsAssemblyRequest{TenantID: tenantID, ServingGenerationID: servingGenerationID, Mode: mode, DeliveryLanguage: language, DurationMinutes: duration, UserID: userID}
 	if sessionID != "" || userID != "" {
 		seed.SuppressedIDs = fetchPodsSuppressedIDs(db, sessionID, userID, loadTenantConfig(db, tenantID), time.Now().UTC())
 	}
@@ -86,6 +94,17 @@ func getPodsFeedCanonical(c *gin.Context) {
 		seed.HardHiddenIDs = fetchPodsHardHiddenIDs(db, sessionID, userID)
 	}
 	filterDigest := podsAssemblyFilterDigest(seed)
+	if cursorRaw := c.Query("cursor"); cursorRaw != "" {
+		cursorGenerationID, versioned, cursorErr := podsCursorServingGeneration(cursorRaw)
+		if cursorErr == nil && generationSupported && (!versioned || cursorGenerationID != servingGenerationID) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Pods cursor belongs to an older feed view; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
+		if cursorErr == nil && !generationSupported && cursorGenerationID != uuid.Nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Pods cursor view is no longer available; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
+	}
 	limit, asOf, lastID, legacyTimestamp, hasCursor, err := parsePodsCursor(c.Query("cursor"), c.Query("limit"), mode, filterDigest, time.Now().UTC())
 	if err != nil {
 		c.JSON(400, utils.HTTPError{Code: 400, Message: "Invalid cursor: " + err.Error()})
@@ -97,10 +116,17 @@ func getPodsFeedCanonical(c *gin.Context) {
 		c.JSON(500, utils.HTTPError{Code: 500, Message: "Failed to assemble feed: " + err.Error()})
 		return
 	}
+	if generationSupported {
+		currentGenerationID, supported, active := feedcontract.ActiveGeneration(db, tenantID, "media")
+		if !supported || !active || currentGenerationID != servingGenerationID {
+			c.JSON(http.StatusConflict, gin.H{"error": "Pods feed changed while this page was loading; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
+	}
 	page, hasMore := paginatePodsAssemblyWithBoundary(assembled.Final, lastID, legacyTimestamp, limit)
 	var nextCursor *string
 	if hasMore && len(page) > 0 {
-		cursor := encodePodsCursorV2(podsCursorV2{AssemblyTime: seed.AsOf, LastID: page[len(page)-1].Item.PublicID, Mode: mode, FilterDigest: assembled.FilterDigest})
+		cursor := encodePodsCursorV2(podsCursorV2{AssemblyTime: seed.AsOf, LastID: page[len(page)-1].Item.PublicID, Mode: mode, FilterDigest: assembled.FilterDigest, ServingGenerationID: servingGenerationID})
 		nextCursor = &cursor
 	}
 	items := make([]models.ContentItem, len(page))
@@ -125,11 +151,30 @@ func getPodsFeedCanonical(c *gin.Context) {
 func hasCursorParam(hasCursor bool) bool { return hasCursor }
 
 type podsCursorV2 struct {
-	Version      int              `json:"v"`
-	AssemblyTime time.Time        `json:"as_of"`
-	LastID       uuid.UUID        `json:"last_id"`
-	Mode         podsAssemblyMode `json:"mode"`
-	FilterDigest string           `json:"filter_digest"`
+	Version             int              `json:"v"`
+	AssemblyTime        time.Time        `json:"as_of"`
+	LastID              uuid.UUID        `json:"last_id"`
+	Mode                podsAssemblyMode `json:"mode"`
+	FilterDigest        string           `json:"filter_digest"`
+	ServingGenerationID uuid.UUID        `json:"serving_generation_id,omitempty"`
+}
+
+func podsCursorServingGeneration(raw string) (uuid.UUID, bool, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(raw)
+	}
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	if len(decoded) == 0 || decoded[0] != '{' {
+		return uuid.Nil, false, nil
+	}
+	var cursor podsCursorV2
+	if err := json.Unmarshal(decoded, &cursor); err != nil || cursor.Version != 2 {
+		return uuid.Nil, true, fmt.Errorf("invalid Pods cursor v2")
+	}
+	return cursor.ServingGenerationID, true, nil
 }
 
 func podsAssemblyFilterDigest(req podsAssemblyRequest) string {
@@ -141,11 +186,15 @@ func podsAssemblyFilterDigest(req podsAssemblyRequest) string {
 		ids = append(ids, "h:"+id.String())
 	}
 	sort.Strings(ids)
-	raw, _ := json.Marshal(map[string]any{
+	filter := map[string]any{
 		"schema": "pods-assembly-filter/v2", "tenant": req.TenantID, "mode": req.Mode,
 		"language": req.DeliveryLanguage, "duration": req.DurationMinutes,
 		"identity_filter": ids, "recycle": req.RecycleSuppressed,
-	})
+	}
+	if req.ServingGenerationID != uuid.Nil {
+		filter["serving_generation_id"] = req.ServingGenerationID
+	}
+	raw, _ := json.Marshal(filter)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

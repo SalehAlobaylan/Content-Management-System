@@ -191,18 +191,20 @@ type FeedAvailabilityState struct {
 func (FeedAvailabilityState) TableName() string { return "feed_availability_states" }
 
 type FeedGeneration struct {
-	PublicID             uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	TenantID             string         `json:"tenant_id"`
-	Lane                 string         `json:"lane"`
-	State                string         `json:"state"`
-	PreviousGenerationID *uuid.UUID     `json:"previous_generation_id,omitempty"`
-	BuildWatermark       time.Time      `json:"build_watermark"`
-	CaughtUpAt           *time.Time     `json:"caught_up_at,omitempty"`
-	CutoverAt            *time.Time     `json:"cutover_at,omitempty"`
-	RollbackDeadline     *time.Time     `json:"rollback_deadline,omitempty"`
-	Verification         datatypes.JSON `json:"verification"`
-	CreatedAt            time.Time      `json:"created_at"`
-	UpdatedAt            time.Time      `json:"updated_at"`
+	PublicID               uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
+	TenantID               string         `json:"tenant_id"`
+	Lane                   string         `json:"lane"`
+	State                  string         `json:"state"`
+	Purpose                string         `gorm:"type:varchar(24);not null;default:'feed_recovery'" json:"purpose"`
+	ContentResetCampaignID *uint          `json:"content_reset_campaign_id,omitempty"`
+	PreviousGenerationID   *uuid.UUID     `json:"previous_generation_id,omitempty"`
+	BuildWatermark         time.Time      `json:"build_watermark"`
+	CaughtUpAt             *time.Time     `json:"caught_up_at,omitempty"`
+	CutoverAt              *time.Time     `json:"cutover_at,omitempty"`
+	RollbackDeadline       *time.Time     `json:"rollback_deadline,omitempty"`
+	Verification           datatypes.JSON `json:"verification"`
+	CreatedAt              time.Time      `json:"created_at"`
+	UpdatedAt              time.Time      `json:"updated_at"`
 }
 
 func (FeedGeneration) TableName() string { return "feed_generations" }

@@ -85,6 +85,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/freeze", controllers.InternalFreezeSourceRunPage)
 	route(http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations", controllers.InternalRecordSourceRunUpstreamObservations)
 	route(http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations/:observation/disposition", controllers.InternalRecordSourceRunUpstreamObservationDisposition)
+	route(http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/content-reset-grants", controllers.InternalIssueContentResetReconstructionGrant)
 	route(http.MethodPost, "/source-runs/:request/seal", controllers.InternalSealSourceRunManifest)
 	route(http.MethodPost, "/source-run-verification-tasks/claim", controllers.InternalClaimSourceRunVerification)
 	route(http.MethodPost, "/source-run-verification-tasks/claim-next", controllers.InternalClaimNextSourceRunVerification)

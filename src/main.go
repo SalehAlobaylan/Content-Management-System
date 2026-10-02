@@ -473,6 +473,8 @@ func main() {
 		controllers.StartArtifactCoverageWorker(db)
 		controllers.StartAtomizationWorkVerifier(db)
 		controllers.StartStudioClearanceWorker(db)
+		controllers.StartContentResetWorker(db)
+		controllers.StartContentResetPodsRetirementWorker(db)
 		// Admission records due work in CMS only. Aggregation later claims the
 		// CMS-issued unit; this scheduler never selects a queue or provider itself.
 		supply.StartSourceRunScheduler(db)

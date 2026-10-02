@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/lifecycle"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -149,27 +151,46 @@ func SubmitUserContent(c *gin.Context) {
 			// creates the one missing receipt. Do not strand a failed upload behind
 			// an idempotency replay forever.
 			if audioHeader != nil && existing.Status == models.ContentStatusFailed {
-				result := db.Model(&models.ContentItem{}).
-					Where("public_id = ? AND status = ?", existing.PublicID, models.ContentStatusFailed).
-					Update("status", models.ContentStatusPending)
-				if result.Error != nil {
+				if err := db.Transaction(func(tx *gorm.DB) error {
+					if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: existing.TenantID, Lane: "pods", ItemID: existing.PublicID.String()}, lifecycle.PhaseSourceDispatch); err != nil {
+						return err
+					}
+					if err := checkContentLifecycleMutation(tx, existing); err != nil {
+						return err
+					}
+					var current models.ContentItem
+					if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", existing.TenantID, existing.PublicID).First(&current).Error; err != nil {
+						return err
+					}
+					if current.Status != models.ContentStatusFailed {
+						existing = current
+						return nil
+					}
+					current.Status = models.ContentStatusPending
+					if err := tx.Save(&current).Error; err != nil {
+						return err
+					}
+					existing = current
+					return nil
+				}); err != nil {
+					if writeLifecycleConflict(c, err) {
+						return
+					}
 					c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to resume submission"})
 					return
 				}
-				if result.RowsAffected == 0 {
-					var current models.ContentItem
-					if lookupErr := db.Where("public_id = ?", existing.PublicID).First(&current).Error; lookupErr != nil {
-						c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to resume submission"})
-						return
-					}
-					c.JSON(http.StatusOK, gin.H{"id": current.PublicID.String(), "status": string(current.Status), "replayed": true})
+				if existing.Status != models.ContentStatusPending {
+					c.JSON(http.StatusOK, gin.H{"id": existing.PublicID.String(), "status": string(existing.Status), "replayed": true})
 					return
 				}
 				if dispatchErr := dispatchAudioToAggregation(c, existing.PublicID, tenantID, audioHeader); dispatchErr != nil {
 					log.Printf("[CMS] submission retry dispatch failed for %s: %v", existing.PublicID, dispatchErr)
-					_ = db.Model(&models.ContentItem{}).
-						Where("public_id = ? AND status = ?", existing.PublicID, models.ContentStatusPending).
-						Update("status", models.ContentStatusFailed).Error
+					_ = db.Transaction(func(tx *gorm.DB) error {
+						if err := checkContentLifecycleMutation(tx, existing); err != nil {
+							return err
+						}
+						return tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id = ? AND status = ?", tenantID, existing.PublicID, models.ContentStatusPending).Update("status", models.ContentStatusFailed).Error
+					})
 					c.JSON(http.StatusBadGateway, utils.HTTPError{Code: http.StatusBadGateway, Message: "Failed to hand off audio to processing pipeline"})
 					return
 				}
@@ -228,8 +249,22 @@ func SubmitUserContent(c *gin.Context) {
 	// does not retain uploads after the request, so a server-side outbox could
 	// not safely replay the binary payload.
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		lane := "news"
+		if contentType == models.ContentTypeVideo || contentType == models.ContentTypePodcast {
+			lane = "pods"
+		}
+		resources := []lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: lane}}
+		if err := lifecycle.CheckExclusiveResources(tx, tenantID, resources, lifecycle.PhaseContentCreate); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: tenantID, Lane: lane}, lifecycle.PhaseContentCreate); err != nil {
+			return err
+		}
 		return tx.Create(&item).Error
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		if idempotencyKey != "" {
 			var existing models.ContentItem
 			if lookupErr := db.Where("tenant_id = ? AND idempotency_key = ?", tenantID, idempotencyKey).First(&existing).Error; lookupErr == nil {

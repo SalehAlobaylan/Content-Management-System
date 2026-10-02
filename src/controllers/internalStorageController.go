@@ -1,9 +1,13 @@
 package controllers
 
 import (
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +18,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+var errStorageItemChanged = errors.New("storage candidate changed after owner selection")
 
 // -----------------------------------------------------------------------------
 // Aggregation reads candidates and policy through these endpoints.
@@ -83,6 +89,7 @@ type internalCandidate struct {
 	FileSizeBytes       int64   `json:"file_size_bytes"`
 	ViewCount           int     `json:"view_count"`
 	CreatedAt           string  `json:"created_at"`
+	UpdatedAt           string  `json:"updated_at"`
 	ParentContentItemID *string `json:"parent_content_item_id,omitempty"`
 	IsFeedUnit          bool    `json:"is_feed_unit"`
 	FeedVisibility      string  `json:"feed_visibility"`
@@ -172,6 +179,7 @@ func InternalListStorageCandidates(c *gin.Context) {
 			FileSizeBytes:       it.FileSizeBytes,
 			ViewCount:           it.ViewCount,
 			CreatedAt:           it.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt:           it.UpdatedAt.UTC().Format(time.RFC3339Nano),
 			ParentContentItemID: parentID,
 			IsFeedUnit:          it.IsFeedUnit,
 			FeedVisibility:      it.FeedVisibility,
@@ -288,6 +296,26 @@ func createPreparedStorageSaga(db *gorm.DB, tenant string, item models.ContentIt
 	return &saga, nil
 }
 
+func prepareStorageSagaUnderLifecycle(db *gorm.DB, tenant string, selected models.ContentItem, operation, idempotencyKey, manifestHash, correlationID, ownerRequestID string, evidence map[string]interface{}) (*models.StorageOperationSaga, error) {
+	var saga *models.StorageOperationSaga
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", tenant, selected.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(selected.UpdatedAt) || current.FileSizeBytes != selected.FileSizeBytes || stringValue(current.MediaURL) != stringValue(selected.MediaURL) || stringValue(current.ThumbnailURL) != stringValue(selected.ThumbnailURL) {
+			return errStorageItemChanged
+		}
+		if err := checkContentLifecycleMutation(tx, current); err != nil {
+			return err
+		}
+		var err error
+		saga, err = createPreparedStorageSaga(tx, tenant, current, operation, idempotencyKey, manifestHash, correlationID, ownerRequestID, evidence)
+		return err
+	})
+	return saga, err
+}
+
 func requireObjectAppliedSaga(db *gorm.DB, tenant string, item models.ContentItem, operation, idempotencyKey string) (*models.StorageOperationSaga, error) {
 	var saga models.StorageOperationSaga
 	key := storageSagaKey(idempotencyKey, operation, item.PublicID)
@@ -300,9 +328,46 @@ func requireObjectAppliedSaga(db *gorm.DB, tenant string, item models.ContentIte
 	return &saga, nil
 }
 
-func completeStorageSaga(db *gorm.DB, saga *models.StorageOperationSaga, evidence map[string]interface{}) {
+func completeStorageSaga(db *gorm.DB, saga *models.StorageOperationSaga, evidence map[string]interface{}) error {
+	if saga == nil {
+		return errors.New("storage operation saga is required")
+	}
 	now := time.Now().UTC()
-	_ = db.Model(&models.StorageOperationSaga{}).Where("id=?", saga.ID).Updates(map[string]interface{}{"state": "cms_committed", "cms_evidence": storageJSON(evidence), "completed_at": now, "error": ""}).Error
+	result := db.Model(&models.StorageOperationSaga{}).Where("id=? AND state=?", saga.ID, "object_applied").Updates(map[string]interface{}{"state": "cms_committed", "cms_evidence": storageJSON(evidence), "completed_at": now, "error": ""})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("storage saga lost its object-applied state")
+	}
+	return nil
+}
+
+type storageSagaItemSnapshot struct {
+	UpdatedAt       time.Time         `json:"updated_at"`
+	OldSizeBytes    int64             `json:"old_size_bytes"`
+	OldMediaURL     *string           `json:"old_media_url"`
+	OldThumbnailURL *string           `json:"old_thumbnail_url"`
+	RequestedAbsent *bool             `json:"requested_artifacts_absent"`
+	ObjectsAbsent   *bool             `json:"objects_absent"`
+	Errors          []string          `json:"errors"`
+	Artifacts       []string          `json:"artifacts"`
+	MovedCount      int               `json:"moved_count"`
+	NewPrimaryURLs  map[string]string `json:"new_primary_urls"`
+}
+
+func storageSagaSnapshot(saga *models.StorageOperationSaga, item models.ContentItem) (storageSagaItemSnapshot, error) {
+	var snapshot storageSagaItemSnapshot
+	if saga == nil || len(saga.ObjectEvidence) == 0 || json.Unmarshal(saga.ObjectEvidence, &snapshot) != nil {
+		return snapshot, errors.New("storage saga evidence is missing or invalid")
+	}
+	if snapshot.UpdatedAt.IsZero() || !snapshot.UpdatedAt.Equal(item.UpdatedAt) ||
+		snapshot.OldSizeBytes != item.FileSizeBytes ||
+		stringValue(snapshot.OldMediaURL) != stringValue(item.MediaURL) ||
+		stringValue(snapshot.OldThumbnailURL) != stringValue(item.ThumbnailURL) {
+		return snapshot, errStorageItemChanged
+	}
+	return snapshot, nil
 }
 
 type internalStartStorageSagaRequest struct {
@@ -339,8 +404,34 @@ func InternalStartStorageOperationSaga(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "content item is not a canonical storage candidate"})
 		return
 	}
-	saga, err := createPreparedStorageSaga(db, req.TenantID, items[0], req.Operation, req.IdempotencyKey, req.ManifestHash, req.CorrelationID, req.OwnerRequestID, req.Evidence)
+	if req.Evidence == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "storage operation requires a versioned candidate snapshot", "code": "STORAGE_CANDIDATE_STALE"})
+		return
+	}
+	evidenceBytes, err := json.Marshal(req.Evidence)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid storage evidence"})
+		return
+	}
+	if _, err := storageSagaSnapshot(&models.StorageOperationSaga{ObjectEvidence: datatypes.JSON(evidenceBytes)}, items[0]); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "storage candidate changed or lacks a complete version snapshot", "code": "STORAGE_CANDIDATE_STALE"})
+		return
+	}
+	var candidateEvidence storageSagaItemSnapshot
+	if err := json.Unmarshal(evidenceBytes, &candidateEvidence); err != nil || len(candidateEvidence.Artifacts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "storage operation requires an exact non-empty artifact set"})
+		return
+	}
+	saga, err := prepareStorageSagaUnderLifecycle(db, req.TenantID, items[0], req.Operation, req.IdempotencyKey, req.ManifestHash, req.CorrelationID, req.OwnerRequestID, req.Evidence)
+	if err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "content item is held by an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
+			return
+		}
+		if errors.Is(err, errStorageItemChanged) {
+			c.JSON(http.StatusConflict, gin.H{"error": "storage candidate changed; refresh the owner preview", "code": "STORAGE_CANDIDATE_STALE"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start storage operation saga"})
 		return
 	}
@@ -367,23 +458,83 @@ func InternalMarkStorageSagaObjectApplied(c *gin.Context) {
 		return
 	}
 	var saga models.StorageOperationSaga
-	if err := db.Where("public_id=?", id).First(&saga).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "storage operation saga not found"})
-		return
-	}
-	if saga.State == "cms_committed" {
-		c.JSON(http.StatusConflict, gin.H{"error": "storage operation already committed"})
-		return
-	}
-	if saga.State != "prepared" && saga.State != "object_applied" {
-		c.JSON(http.StatusConflict, gin.H{"error": "storage operation cannot be marked"})
-		return
-	}
-	if err := db.Model(&saga).Updates(map[string]interface{}{"state": "object_applied", "object_evidence": storageJSON(req.Evidence)}).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mark object mutation"})
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=?", id).First(&saga).Error; err != nil {
+			return err
+		}
+		if saga.State != "prepared" && saga.State != "object_applied" {
+			return errors.New("storage operation cannot be marked")
+		}
+		merged, err := mergeStorageObjectReceipt(saga.Operation, saga.ObjectEvidence, req.Evidence)
+		if err != nil {
+			return err
+		}
+		if saga.State == "object_applied" {
+			var oldObject, newObject map[string]interface{}
+			if json.Unmarshal(saga.ObjectEvidence, &oldObject) != nil || json.Unmarshal(merged, &newObject) != nil || !reflect.DeepEqual(oldObject, newObject) {
+				return errors.New("storage object receipt changed after it was recorded")
+			}
+			return nil
+		}
+		result := tx.Model(&saga).Where("state=?", "prepared").Updates(map[string]interface{}{"state": "object_applied", "object_evidence": datatypes.JSON(merged)})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("storage saga lost its prepared state")
+		}
+		saga.State = "object_applied"
+		saga.ObjectEvidence = datatypes.JSON(merged)
+		return nil
+	})
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "storage object receipt is invalid or conflicts with the prepared operation", "code": "STORAGE_RECEIPT_UNCERTAIN"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"id": saga.PublicID, "state": "object_applied"}})
+}
+
+func mergeStorageObjectReceipt(operation string, preparedJSON datatypes.JSON, receipt map[string]interface{}) ([]byte, error) {
+	if len(preparedJSON) == 0 || len(receipt) == 0 {
+		return nil, errors.New("prepared evidence and provider receipt are required")
+	}
+	var prepared map[string]interface{}
+	if err := json.Unmarshal(preparedJSON, &prepared); err != nil || prepared == nil {
+		return nil, errors.New("prepared storage evidence is invalid")
+	}
+	for key, value := range receipt {
+		if existing, exists := prepared[key]; exists {
+			if !reflect.DeepEqual(existing, value) {
+				return nil, fmt.Errorf("provider receipt attempted to change immutable evidence field %q", key)
+			}
+			continue
+		}
+		prepared[key] = value
+	}
+	encoded, err := json.Marshal(prepared)
+	if err != nil {
+		return nil, errors.New("failed to encode merged storage receipt")
+	}
+	var merged storageSagaItemSnapshot
+	if err := json.Unmarshal(encoded, &merged); err != nil {
+		return nil, errors.New("merged storage receipt is invalid")
+	}
+	if merged.UpdatedAt.IsZero() || len(merged.Artifacts) == 0 || len(merged.Errors) != 0 {
+		return nil, errors.New("provider receipt lacks the exact version, artifact set, or clean result")
+	}
+	switch operation {
+	case "recoverable_delete":
+		if merged.RequestedAbsent == nil || !*merged.RequestedAbsent {
+			return nil, errors.New("delete receipt does not prove requested artifacts absent")
+		}
+	case "move_to_cold":
+		if merged.MovedCount <= 0 || len(merged.NewPrimaryURLs) == 0 || (merged.NewPrimaryURLs["processed"] == "" && merged.NewPrimaryURLs["original"] == "") {
+			return nil, errors.New("move receipt does not prove a verified destination")
+		}
+	default:
+		return nil, errors.New("unsupported storage saga operation")
+	}
+	return encoded, nil
 }
 
 type internalArchiveItemsRequest struct {
@@ -413,24 +564,21 @@ func InternalArchiveItems(c *gin.Context) {
 	}
 
 	ids := make([]uuid.UUID, 0, len(req.IDs))
+	seen := make(map[uuid.UUID]bool, len(req.IDs))
 	for _, raw := range req.IDs {
-		if id, err := uuid.Parse(raw); err == nil {
-			ids = append(ids, id)
+		id, err := uuid.Parse(raw)
+		if err != nil || seen[id] {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "ids must contain unique valid UUIDs"})
+			return
 		}
-	}
-	if len(ids) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no valid ids"})
-		return
+		seen[id] = true
+		ids = append(ids, id)
 	}
 
 	items, err := storageOwnedItems(db, req.TenantID, ids, "delete")
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
-	}
-	var freed int64
-	for _, item := range items {
-		freed += item.FileSizeBytes
 	}
 
 	now := time.Now().UTC()
@@ -445,53 +593,86 @@ func InternalArchiveItems(c *gin.Context) {
 	if !req.PreserveThumbnails {
 		updates["thumbnail_url"] = nil
 	}
-	sagas := make(map[uuid.UUID]*models.StorageOperationSaga, len(items))
-	for _, item := range items {
-		saga, err := requireObjectAppliedSaga(db, req.TenantID, item, "recoverable_delete", req.IdempotencyKey)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to record storage saga"})
+	var rowsAffected int64
+	var freed int64
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		for _, item := range items {
+			var current models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", req.TenantID, item.PublicID).First(&current).Error; err != nil {
+				return err
+			}
+			if !current.UpdatedAt.Equal(item.UpdatedAt) || current.FileSizeBytes != item.FileSizeBytes || stringValue(current.MediaURL) != stringValue(item.MediaURL) || stringValue(current.ThumbnailURL) != stringValue(item.ThumbnailURL) {
+				return errStorageItemChanged
+			}
+			saga, err := requireObjectAppliedSaga(tx, req.TenantID, current, "recoverable_delete", req.IdempotencyKey)
+			if err != nil {
+				return err
+			}
+			snapshot, err := storageSagaSnapshot(saga, current)
+			if err != nil {
+				return err
+			}
+			if snapshot.RequestedAbsent == nil || !*snapshot.RequestedAbsent || len(snapshot.Errors) != 0 || len(snapshot.Artifacts) == 0 {
+				return errors.New("storage delete saga has no exact artifact-absence proof")
+			}
+			if err := checkContentLifecycleMutation(tx, current); err != nil {
+				return err
+			}
+			res := tx.Model(&models.ContentItem{}).Where("id=? AND tenant_id=? AND public_id=? AND updated_at=?", current.ID, req.TenantID, current.PublicID, current.UpdatedAt).Updates(updates)
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected != 1 {
+				return errStorageItemChanged
+			}
+			rowsAffected++
+			freed += current.FileSizeBytes
+			if _, err := createStorageArtifactEvent(tx, storageArtifactEventInput{
+				TenantID: current.TenantID, ContentItemID: current.PublicID,
+				ParentContentItemID: current.ParentContentItemID,
+				EventType:           models.StorageArtifactEventRecoverableDeleted,
+				Status:              models.StorageArtifactEventStatusSuccess,
+				Reason:              "Archived by storage sweep", Trigger: "auto", Source: "aggregation",
+				OldMediaURL: stringValue(current.MediaURL), OldSizeBytes: current.FileSizeBytes,
+				DeletedBytes: current.FileSizeBytes, FreedBytes: current.FileSizeBytes,
+				ArtifactKeys:          map[string]interface{}{"requested_artifacts": snapshot.Artifacts},
+				RecoveryPayload:       storageRecoveryPayloadForItem(current),
+				StorageState:          models.StorageStateRecoverableDeleted,
+				StorageStateReason:    "storage_archive",
+				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
+			}); err != nil {
+				return err
+			}
+			if err := completeStorageSaga(tx, saga, map[string]interface{}{"storage_state": models.StorageStateRecoverableDeleted, "freed_bytes": current.FileSizeBytes, "requested_artifacts_absent": true}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "content item is held by an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
 			return
 		}
-		sagas[item.PublicID] = saga
-	}
-	res := db.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id IN ?", req.TenantID, ids).Updates(updates)
-	if res.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to archive"})
+		if errors.Is(err, errStorageItemChanged) {
+			c.JSON(http.StatusConflict, gin.H{"error": "storage candidate changed after object mutation; reconciliation is required", "code": "STORAGE_CANDIDATE_STALE"})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "storage archive did not commit atomically; reconciliation is required", "code": "STORAGE_RECONCILIATION_REQUIRED"})
 		return
-	}
-	for _, item := range items {
-		_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-			TenantID:              item.TenantID,
-			ContentItemID:         item.PublicID,
-			ParentContentItemID:   item.ParentContentItemID,
-			EventType:             models.StorageArtifactEventRecoverableDeleted,
-			Status:                models.StorageArtifactEventStatusSuccess,
-			Reason:                "Archived by storage sweep",
-			Trigger:               "auto",
-			Source:                "aggregation",
-			OldMediaURL:           stringValue(item.MediaURL),
-			OldSizeBytes:          item.FileSizeBytes,
-			DeletedBytes:          item.FileSizeBytes,
-			FreedBytes:            item.FileSizeBytes,
-			RecoveryPayload:       storageRecoveryPayloadForItem(item),
-			StorageState:          models.StorageStateRecoverableDeleted,
-			StorageStateReason:    "storage_archive",
-			StorageRecoveryStatus: models.StorageRecoveryRecoverable,
-		})
-		completeStorageSaga(db, sagas[item.PublicID], map[string]interface{}{"storage_state": models.StorageStateRecoverableDeleted, "freed_bytes": item.FileSizeBytes})
 	}
 
 	c.JSON(http.StatusOK, internalArchiveItemsResponse{
-		UpdatedCount: int(res.RowsAffected),
+		UpdatedCount: int(rowsAffected),
 		FreedBytes:   freed,
 	})
 }
 
 type internalMoveToColdItem struct {
-	ID           string  `json:"id"`
-	MediaURL     *string `json:"media_url"`
-	ThumbnailURL *string `json:"thumbnail_url"`
-	NewSizeBytes *int64  `json:"new_size_bytes"`
+	ID                string  `json:"id"`
+	ExpectedUpdatedAt string  `json:"expected_updated_at"`
+	MediaURL          *string `json:"media_url"`
+	ThumbnailURL      *string `json:"thumbnail_url"`
+	NewSizeBytes      *int64  `json:"new_size_bytes"`
 }
 
 type internalMoveToColdRequest struct {
@@ -518,87 +699,135 @@ func InternalMoveItemsToCold(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "items required"})
 		return
 	}
-
 	cold := "cold"
 	now := time.Now().UTC()
+	seen := make(map[uuid.UUID]bool, len(req.Items))
+	resolved := make([]struct {
+		Input internalMoveToColdItem
+		Item  models.ContentItem
+	}, 0, len(req.Items))
+	for _, input := range req.Items {
+		id, err := uuid.Parse(input.ID)
+		if err != nil || seen[id] || input.NewSizeBytes != nil && *input.NewSizeBytes < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "items must contain unique valid ids and non-negative sizes"})
+			return
+		}
+		seen[id] = true
+		expectedUpdatedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(input.ExpectedUpdatedAt))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expected_updated_at must be an RFC3339 timestamp"})
+			return
+		}
+		owned, err := storageOwnedItems(db, req.TenantID, []uuid.UUID{id}, "move_to_cold")
+		if err != nil || len(owned) != 1 || !owned[0].UpdatedAt.Equal(expectedUpdatedAt) {
+			c.JSON(http.StatusConflict, gin.H{"error": "storage candidate changed or is no longer eligible", "code": "STORAGE_CANDIDATE_STALE"})
+			return
+		}
+		resolved = append(resolved, struct {
+			Input internalMoveToColdItem
+			Item  models.ContentItem
+		}{Input: input, Item: owned[0]})
+	}
 	updated := 0
 	var freed int64
-
-	for _, it := range req.Items {
-		id, err := uuid.Parse(it.ID)
-		if err != nil {
-			continue
-		}
-
-		var item models.ContentItem
-		owned, ownerErr := storageOwnedItems(db, req.TenantID, []uuid.UUID{id}, "move_to_cold")
-		if ownerErr != nil || len(owned) != 1 {
-			continue
-		}
-		item = owned[0]
-
-		oldSize := item.FileSizeBytes
-		saga, sagaErr := requireObjectAppliedSaga(db, req.TenantID, item, "move_to_cold", req.IdempotencyKey)
-		if sagaErr != nil {
-			continue
-		}
-		updates := map[string]interface{}{
-			"storage_tier":             &cold,
-			"last_storage_check":       &now,
-			"storage_state":            models.StorageStateCold,
-			"storage_state_reason":     "moved_to_cold",
-			"storage_recovery_status":  models.StorageRecoveryRecoverable,
-			"storage_last_verified_at": &now,
-		}
-		if it.MediaURL != nil {
-			updates["media_url"] = it.MediaURL
-		}
-		if it.ThumbnailURL != nil {
-			updates["thumbnail_url"] = it.ThumbnailURL
-		}
-		if it.NewSizeBytes != nil {
-			updates["file_size_bytes"] = *it.NewSizeBytes
-			freed += oldSize - *it.NewSizeBytes
-		} else {
-			// No size change reported; the cold copy is the same bytes.
-			// We "freed" nothing on the bucket totals but the primary tier
-			// shed `oldSize` bytes — which is what circulation cares about.
-			freed += oldSize
-		}
-
-		if err := db.Model(&models.ContentItem{}).Where("id = ? AND tenant_id=?", item.ID, req.TenantID).Updates(updates).Error; err == nil {
-			updated++
-			newSize := int64Value(it.NewSizeBytes, oldSize)
+	err := db.Transaction(func(tx *gorm.DB) error {
+		for _, selection := range resolved {
+			input, selected := selection.Input, selection.Item
+			var item models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", req.TenantID, selected.PublicID).First(&item).Error; err != nil {
+				return err
+			}
+			expectedUpdatedAt, _ := time.Parse(time.RFC3339Nano, input.ExpectedUpdatedAt)
+			if !item.UpdatedAt.Equal(expectedUpdatedAt) || !item.UpdatedAt.Equal(selected.UpdatedAt) {
+				return errStorageItemChanged
+			}
+			saga, err := requireObjectAppliedSaga(tx, req.TenantID, item, "move_to_cold", req.IdempotencyKey)
+			if err != nil {
+				return err
+			}
+			snapshot, err := storageSagaSnapshot(saga, item)
+			if err != nil {
+				return err
+			}
+			if snapshot.MovedCount <= 0 || len(snapshot.NewPrimaryURLs) == 0 || len(snapshot.Errors) != 0 {
+				return errors.New("storage move saga has no verified destination evidence")
+			}
+			expectedMediaURL := snapshot.NewPrimaryURLs["processed"]
+			if expectedMediaURL == "" {
+				expectedMediaURL = snapshot.NewPrimaryURLs["original"]
+			}
+			if expectedMediaURL == "" || input.MediaURL == nil || *input.MediaURL != expectedMediaURL {
+				return errors.New("storage move URL does not match its object receipt")
+			}
+			if input.ThumbnailURL != nil && snapshot.NewPrimaryURLs["thumbnail"] != *input.ThumbnailURL {
+				return errors.New("storage thumbnail URL does not match its object receipt")
+			}
+			if err := checkContentLifecycleMutation(tx, item); err != nil {
+				return err
+			}
+			oldSize := item.FileSizeBytes
+			newSize := int64Value(input.NewSizeBytes, oldSize)
 			eventFreed := oldSize - newSize
-			if it.NewSizeBytes == nil {
+			if input.NewSizeBytes == nil {
 				eventFreed = oldSize
 			}
 			if eventFreed < 0 {
 				eventFreed = 0
 			}
-			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-				TenantID:              item.TenantID,
-				ContentItemID:         item.PublicID,
-				ParentContentItemID:   item.ParentContentItemID,
-				EventType:             models.StorageArtifactEventMovedCold,
-				Status:                models.StorageArtifactEventStatusSuccess,
-				Reason:                "Moved to cold storage by storage sweep",
-				Trigger:               "auto",
-				Source:                "aggregation",
-				StorageTier:           "cold",
-				OldStorageTier:        tierFromItem(item),
-				OldMediaURL:           stringValue(item.MediaURL),
-				NewMediaURL:           stringValue(it.MediaURL),
-				OldSizeBytes:          oldSize,
-				NewSizeBytes:          newSize,
-				FreedBytes:            eventFreed,
-				RecoveryPayload:       storageRecoveryPayloadForItem(item),
-				StorageState:          models.StorageStateCold,
-				StorageStateReason:    "moved_to_cold",
+			updates := map[string]interface{}{
+				"storage_tier": &cold, "last_storage_check": &now,
+				"storage_state": models.StorageStateCold, "storage_state_reason": "moved_to_cold",
+				"storage_recovery_status": models.StorageRecoveryRecoverable, "storage_last_verified_at": &now,
+				"media_url": input.MediaURL,
+			}
+			if input.ThumbnailURL != nil {
+				updates["thumbnail_url"] = input.ThumbnailURL
+			}
+			if input.NewSizeBytes != nil {
+				updates["file_size_bytes"] = *input.NewSizeBytes
+			}
+			result := tx.Model(&models.ContentItem{}).Where("id=? AND tenant_id=? AND public_id=? AND updated_at=?", item.ID, req.TenantID, item.PublicID, item.UpdatedAt).Updates(updates)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errStorageItemChanged
+			}
+			if _, err := createStorageArtifactEvent(tx, storageArtifactEventInput{
+				TenantID: item.TenantID, ContentItemID: item.PublicID, ParentContentItemID: item.ParentContentItemID,
+				EventType: models.StorageArtifactEventMovedCold, Status: models.StorageArtifactEventStatusSuccess,
+				Reason: "Moved to cold storage by storage sweep", Trigger: "auto", Source: "aggregation",
+				StorageTier: "cold", OldStorageTier: tierFromItem(item), OldMediaURL: stringValue(item.MediaURL),
+				NewMediaURL: stringValue(input.MediaURL), OldSizeBytes: oldSize, NewSizeBytes: newSize,
+				FreedBytes: eventFreed, RecoveryPayload: storageRecoveryPayloadForItem(item),
+				StorageState: models.StorageStateCold, StorageStateReason: "moved_to_cold",
 				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
-			})
-			completeStorageSaga(db, saga, map[string]interface{}{"storage_state": models.StorageStateCold, "new_size_bytes": newSize})
+			}); err != nil {
+				return err
+			}
+			if err := completeStorageSaga(tx, saga, map[string]interface{}{"storage_state": models.StorageStateCold, "new_size_bytes": newSize}); err != nil {
+				return err
+			}
+			updated++
+			if input.NewSizeBytes == nil {
+				freed += oldSize
+			} else {
+				freed += oldSize - *input.NewSizeBytes
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "content item is held by an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
+			return
+		}
+		if errors.Is(err, errStorageItemChanged) {
+			c.JSON(http.StatusConflict, gin.H{"error": "storage candidate changed after object mutation; reconciliation is required", "code": "STORAGE_CANDIDATE_STALE"})
+			return
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": "storage move did not commit atomically; reconciliation is required", "code": "STORAGE_RECONCILIATION_REQUIRED"})
+		return
 	}
 
 	c.JSON(http.StatusOK, internalMoveToColdResponse{

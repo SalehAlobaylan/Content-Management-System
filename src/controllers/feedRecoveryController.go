@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"content-management-system/src/feedcontract"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"crypto/sha256"
@@ -311,7 +312,10 @@ func ensureFeedGenerationFoundation(db *gorm.DB, tenant, requestedLane string) e
 				return err
 			}
 			if lane == "news" {
-				return tx.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'story', story_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL GROUP BY story_id ON CONFLICT DO NOTHING", generation.PublicID, tenant).Error
+				if err := tx.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'story', story_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL GROUP BY story_id ON CONFLICT DO NOTHING", generation.PublicID, tenant).Error; err != nil {
+					return err
+				}
+				return tx.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'news_item', public_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL AND (COALESCE(news_retention_state, 'full')='full' OR news_feed_role IN ('lead','representative')) ON CONFLICT DO NOTHING", generation.PublicID, tenant).Error
 			}
 			return tx.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'feed_unit', public_id FROM content_items WHERE tenant_id=? AND type IN ('VIDEO','PODCAST') AND status='READY' AND is_feed_unit=TRUE AND feed_visibility='visible' ON CONFLICT DO NOTHING", generation.PublicID, tenant).Error
 		}); err != nil {
@@ -620,6 +624,13 @@ func acquireRecoveryLaneLeases(tx *gorm.DB, run models.FeedRecoveryRun, now time
 	token := uuid.New()
 	expires := now.Add(recoveryLaneLeaseTTL)
 	for _, lane := range lanes {
+		lifecycleLane := lane
+		if lifecycleLane == "media" {
+			lifecycleLane = "pods"
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, run.TenantID, []lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: lifecycleLane}}, lifecycle.PhaseFeedRecovery); err != nil {
+			return "", err
+		}
 		var lease models.FeedRecoveryLaneLease
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND lane=?", run.TenantID, lane).First(&lease).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -736,7 +747,10 @@ func reconcileRecoveryGenerationMemberships(db *gorm.DB, tenant, lane string) er
 		return fmt.Errorf("active generation is missing")
 	}
 	if lane == "news" {
-		return db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'story', story_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL GROUP BY story_id ON CONFLICT DO NOTHING", *head.ActiveGenerationID, tenant).Error
+		if err := db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'story', story_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL GROUP BY story_id ON CONFLICT DO NOTHING", *head.ActiveGenerationID, tenant).Error; err != nil {
+			return err
+		}
+		return db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'news_item', public_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL AND (COALESCE(news_retention_state, 'full')='full' OR news_feed_role IN ('lead','representative')) ON CONFLICT DO NOTHING", *head.ActiveGenerationID, tenant).Error
 	}
 	return db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'feed_unit', public_id FROM content_items WHERE tenant_id=? AND type IN ('VIDEO','PODCAST') AND status='READY' AND is_feed_unit=TRUE AND feed_visibility='visible' ON CONFLICT DO NOTHING", *head.ActiveGenerationID, tenant).Error
 }
@@ -922,6 +936,9 @@ func markRecoveryCandidateCaughtUp(db *gorm.DB, run models.FeedRecoveryRun) erro
 		if err := db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'story', story_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL AND updated_at >= ? GROUP BY story_id ON CONFLICT DO NOTHING", *run.CandidateGenerationID, run.TenantID, generation.BuildWatermark).Error; err != nil {
 			return err
 		}
+		if err := db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'news_item', public_id FROM content_items WHERE tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL AND updated_at >= ? AND (COALESCE(news_retention_state, 'full')='full' OR news_feed_role IN ('lead','representative')) ON CONFLICT DO NOTHING", *run.CandidateGenerationID, run.TenantID, generation.BuildWatermark).Error; err != nil {
+			return err
+		}
 	} else {
 		if err := db.Exec("INSERT INTO feed_generation_memberships (generation_id, member_type, member_id) SELECT ?, 'feed_unit', public_id FROM content_items WHERE tenant_id=? AND type IN ('VIDEO','PODCAST') AND status='READY' AND is_feed_unit=TRUE AND feed_visibility='visible' AND updated_at >= ? ON CONFLICT DO NOTHING", *run.CandidateGenerationID, run.TenantID, generation.BuildWatermark).Error; err != nil {
 			return err
@@ -1067,6 +1084,41 @@ func recoveryCandidateMembershipProof(db *gorm.DB, run models.FeedRecoveryRun, l
 		if err := db.Raw(`SELECT COUNT(*) FROM feed_generation_memberships m
 			LEFT JOIN stories s ON s.public_id=m.member_id AND s.tenant_id=?
 			WHERE m.generation_id=? AND m.member_type='story' AND (s.public_id IS NULL OR s.last_member_at IS NULL)`, run.TenantID, *run.CandidateGenerationID).Scan(&invalid).Error; err != nil {
+			return false, err
+		}
+		if invalid != 0 {
+			return false, fmt.Errorf("candidate has %d invalid News story memberships", invalid)
+		}
+		var itemCount int64
+		if err := db.Model(&models.FeedGenerationMembership{}).Where("generation_id=? AND member_type='news_item'", *run.CandidateGenerationID).Count(&itemCount).Error; err != nil {
+			return false, err
+		}
+		if itemCount == 0 {
+			return false, errors.New("candidate has no exact News item memberships")
+		}
+		var emptyStories int64
+		if err := db.Raw(`SELECT COUNT(*)
+			FROM feed_generation_memberships stories
+			WHERE stories.generation_id=? AND stories.member_type='story'
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM feed_generation_memberships items
+				JOIN content_items content ON content.tenant_id=? AND content.public_id=items.member_id
+				WHERE items.generation_id=stories.generation_id AND items.member_type='news_item'
+				  AND content.type='NEWS' AND content.status='READY'
+				  AND content.story_id=stories.member_id
+				  AND (COALESCE(content.news_retention_state, 'full')='full' OR content.news_feed_role IN ('lead','representative'))
+			  )`, *run.CandidateGenerationID, run.TenantID).Scan(&emptyStories).Error; err != nil {
+			return false, err
+		}
+		if emptyStories != 0 {
+			return false, fmt.Errorf("candidate has %d stories without an exact serving item", emptyStories)
+		}
+		if err := db.Raw(`SELECT COUNT(*) FROM feed_generation_memberships m
+			LEFT JOIN content_items c ON c.public_id=m.member_id AND c.tenant_id=?
+			WHERE m.generation_id=? AND m.member_type='news_item'
+			  AND (c.public_id IS NULL OR c.type <> 'NEWS' OR c.status <> 'READY' OR c.story_id IS NULL
+			       OR NOT (COALESCE(c.news_retention_state, 'full')='full' OR c.news_feed_role IN ('lead','representative')))`, run.TenantID, *run.CandidateGenerationID).Scan(&invalid).Error; err != nil {
 			return false, err
 		}
 		return invalid == 0, nil

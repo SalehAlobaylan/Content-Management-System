@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 	"github.com/google/uuid"
@@ -226,6 +227,12 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			if e = tx.Where("public_id=? AND tenant_id=? AND updated_at=?", r.ContentItemID, r.TenantID, r.ItemUpdatedAt).First(&item).Error; e != nil {
 				continue
 			}
+			if e = checkArtifactLifecycle(tx, item); e != nil {
+				if lifecycle.IsConflict(e) || lifecycle.IsIntakePaused(e) {
+					continue
+				}
+				return e
+			}
 			missing, e := Missing(item, r.Artifact)
 			if e != nil || !missing {
 				continue
@@ -300,6 +307,21 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 		return Claim{}, false, accessErr
 	}
 	return claim, true, nil
+}
+
+func checkArtifactLifecycle(tx *gorm.DB, item models.ContentItem) error {
+	lane := "news"
+	if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+		lane = "pods"
+	}
+	scope := lifecycle.Scope{TenantID: item.TenantID, Lane: lane, ItemID: item.PublicID.String()}
+	if item.ContentSourceID != nil {
+		scope.SourceID = item.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+		return err
+	}
+	return lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite)
 }
 
 func Begin(db *gorm.DB, id, owner string, token uuid.UUID) (models.ArtifactCoverageAttempt, error) {

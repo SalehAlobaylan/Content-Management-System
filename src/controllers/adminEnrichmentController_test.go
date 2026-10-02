@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"content-management-system/src/utils"
 )
 
 func newMockGorm(t *testing.T) (*gorm.DB, sqlmock.Sqlmock) {
@@ -33,6 +35,7 @@ func serveWithDB(db *gorm.DB, handler gin.HandlerFunc, target string) *httptest.
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 	c.Set("db", db)
+	c.Set(utils.AdminPrincipalContextKey, utils.AdminPrincipal{TenantID: "test-tenant", UserID: "test-admin", Permissions: []string{"content:read"}})
 	c.Request = httptest.NewRequest(http.MethodGet, target, nil)
 	handler(c)
 	return w

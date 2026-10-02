@@ -86,6 +86,14 @@ func AuthorizeChildUnit(db *gorm.DB, input ChildUnitInput) (models.SourceRunExec
 		if !CanAuthorizeManifestChild(ManifestState(request.ManifestState)) || IsTerminalRequest(RequestState(request.State)) {
 			return fmt.Errorf("source-run manifest is not open for child authorization")
 		}
+		if request.Purpose == "content_reset_replay" {
+			if _, err := ValidateContentResetReplayRequest(tx, request); err != nil {
+				return err
+			}
+			if input.UnitType == "fetch_page" && (input.PageID != "initial" || input.UnitKey != "fetch:initial") {
+				return fmt.Errorf("replay request permits only its single initial provider page")
+			}
+		}
 		var attempt models.SourceRunAttempt
 		if err := tx.Where("public_id = ? AND tenant_id = ? AND source_run_request_id = ?", attemptID, input.TenantID, requestID).First(&attempt).Error; err != nil {
 			return err
@@ -291,6 +299,9 @@ func BeginUnitEffect(db *gorm.DB, input UnitLeaseInput) (models.SourceRunExecuti
 		}
 		if unit.State != string(UnitAccepted) {
 			return fmt.Errorf("source-run execution unit cannot begin an effect from %s", unit.State)
+		}
+		if err := validateReplayUnitAdmission(tx, unit); err != nil {
+			return err
 		}
 		if err := tx.Model(&unit).Updates(map[string]any{"state": string(UnitRunning), "effect_started_at": now, "started_at": now, "heartbeat_at": now}).Error; err != nil {
 			return err
@@ -651,6 +662,13 @@ func completePodsDeliveryTask(tx *gorm.DB, task models.SourceRunVerificationTask
 		return err
 	}
 	if verdict == VerdictPresent {
+		var request models.SourceRunRequest
+		if err := tx.Select("purpose").Where("tenant_id=? AND public_id=?", task.TenantID, task.SourceRunRequestID).First(&request).Error; err != nil {
+			return err
+		}
+		if request.Purpose == "content_reset_replay" {
+			return nil
+		}
 		return tx.Model(&models.ContentSource{}).Where("public_id = ? AND tenant_id = ?", task.ContentSourceID, task.TenantID).Update("last_delivery_verified_at", now).Error
 	}
 	return nil
@@ -658,10 +676,10 @@ func completePodsDeliveryTask(tx *gorm.DB, task models.SourceRunVerificationTask
 
 func ensurePodsDeliveryVerificationTask(tx *gorm.DB, unit models.SourceRunExecutionUnit, ingestEvent models.SourceRunReconciliationEvent) error {
 	var request models.SourceRunRequest
-	if err := tx.Select("lane").Where("public_id = ? AND tenant_id = ?", unit.SourceRunRequestID, unit.TenantID).First(&request).Error; err != nil {
+	if err := tx.Select("lane, purpose").Where("public_id = ? AND tenant_id = ?", unit.SourceRunRequestID, unit.TenantID).First(&request).Error; err != nil {
 		return err
 	}
-	if request.Lane != models.SourceCategoryMedia {
+	if request.Lane != models.SourceCategoryMedia || request.Purpose == "content_reset_replay" {
 		return nil
 	}
 	key := "source-run-pods-delivery:" + unit.PublicID.String() + ":" + ingestEvent.PublicID.String()

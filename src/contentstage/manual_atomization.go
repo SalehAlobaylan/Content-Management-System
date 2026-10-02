@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/podsflow"
 	"github.com/google/uuid"
@@ -20,6 +21,16 @@ func RequestManualAtomization(db *gorm.DB, tenant string, itemID uuid.UUID, acto
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var item models.ContentItem
 		if err := tx.Where("tenant_id=? AND public_id=?", tenant, itemID).First(&item).Error; err != nil {
+			return err
+		}
+		scope := lifecycle.Scope{TenantID: item.TenantID, Lane: "pods", ItemID: item.PublicID.String()}
+		if item.ContentSourceID != nil {
+			scope.SourceID = item.ContentSourceID.String()
+		}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
 			return err
 		}
 		var lockedStages []models.ContentStageRequest

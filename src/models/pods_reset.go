@@ -27,8 +27,15 @@ type PodsResetRun struct {
 	ExecutionEpoch      int64          `gorm:"not null;default:0" json:"execution_epoch"`
 	PauseRequested      bool           `gorm:"not null;default:false" json:"pause_requested"`
 	Error               string         `gorm:"type:text" json:"error,omitempty"`
-	CreatedAt           time.Time      `json:"created_at"`
-	UpdatedAt           time.Time      `json:"updated_at"`
+	// Campaign delegation binding. A non-null parent means this run executes a
+	// bounded Content Reset retirement batch and may not be approved or executed
+	// through the standalone Pods Reset surface.
+	ContentResetCampaignID *uint     `gorm:"type:bigint" json:"content_reset_campaign_id,omitempty"`
+	ContentResetRevisionID *uint     `gorm:"type:bigint" json:"-"`
+	ContentResetLane       *string   `gorm:"type:varchar(8)" json:"content_reset_lane,omitempty"`
+	ContentResetBatch      *int      `gorm:"type:integer" json:"content_reset_batch,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 func (PodsResetRun) TableName() string { return "pods_reset_runs" }

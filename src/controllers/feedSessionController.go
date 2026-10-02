@@ -88,6 +88,15 @@ func activeFeedGeneration(db *gorm.DB, tenantID, lane string) int64 {
 	return head.Generation
 }
 
+func podsSessionGenerationCurrent(db *gorm.DB, tenantID string, generation int64) bool {
+	_, supported, active := feedcontract.ActiveGeneration(db, tenantID, "media")
+	if supported && !active {
+		return false
+	}
+	current := activeFeedGeneration(db, tenantID, "media")
+	return current == generation
+}
+
 // snapshotCurrentPodsFeed deliberately routes through the same controller
 // contract as the public feed. This keeps session creation aligned with active
 // ranking, preference, repetition, and playback eligibility policy while the
@@ -142,9 +151,12 @@ func visibleFrozenPodsPage(db *gorm.DB, tenantID string, items []PodsItem, offse
 		ids = append(ids, item.ID)
 	}
 	var visibleIDs []uuid.UUID
-	// Preserve the frozen membership across later generation rotations while
-	// still removing items that become unsafe or canonically ineligible.
+	// A frozen ordering is valid only within its captured generation. The
+	// session handler rejects a stale generation; this query also applies the
+	// active membership predicate so a head swap racing the handler cannot
+	// return an item that has just left the serving view.
 	query := feedcontract.PodsEligibleMediaQuery(db, tenantID, supportsAtomizedPodsSchema(db))
+	query = feedcontract.ApplyActiveGenerationMembership(db, query, tenantID, "media", "feed_unit", "content_items.public_id")
 	_ = query.
 		Where("content_items.public_id IN ?", ids).
 		Pluck("content_items.public_id", &visibleIDs).Error
@@ -182,9 +194,14 @@ func CreatePodsFeedSession(c *gin.Context) {
 		return
 	}
 
+	generation := activeFeedGeneration(db, tenantID, "media")
 	items, err := snapshotCurrentPodsFeed(c, db)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to create a stable Pods session"})
+		return
+	}
+	if !podsSessionGenerationCurrent(db, tenantID, generation) {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Pods generation changed during session creation; retry with a fresh feed"})
 		return
 	}
 	snapshot, err := json.Marshal(items)
@@ -199,11 +216,16 @@ func CreatePodsFeedSession(c *gin.Context) {
 		IdentityScope: identityScope,
 		FeedType:      "pods",
 		Snapshot:      datatypes.JSON(snapshot),
-		Generation:    activeFeedGeneration(db, tenantID, "media"),
+		Generation:    generation,
 		ExpiresAt:     now.Add(consumerFeedSessionLifetime),
 	}
 	if err := db.Create(&session).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to create a stable Pods session"})
+		return
+	}
+	if !podsSessionGenerationCurrent(db, tenantID, generation) {
+		_ = db.Delete(&session).Error
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Pods generation changed during session creation; retry with a fresh feed"})
 		return
 	}
 
@@ -236,6 +258,10 @@ func GetPodsFeedSessionPage(c *gin.Context) {
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
 		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
+		return
+	}
+	if !podsSessionGenerationCurrent(db, tenantID, session.Generation) {
+		c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: "Pods session is stale; create a fresh feed session"})
 		return
 	}
 	offset, err := parseFrozenSessionCursor(c.Query("cursor"))
@@ -280,6 +306,10 @@ func GetPodsFeedSessionFreshness(c *gin.Context) {
 	}
 	if !session.ExpiresAt.After(time.Now().UTC()) {
 		c.JSON(http.StatusGone, utils.HTTPError{Code: http.StatusGone, Message: "Pods session has expired"})
+		return
+	}
+	if !podsSessionGenerationCurrent(db, tenantID, session.Generation) {
+		c.JSON(http.StatusOK, frozenPodsSessionFreshnessResponse{HasNewContent: true})
 		return
 	}
 	var snapshot []PodsItem

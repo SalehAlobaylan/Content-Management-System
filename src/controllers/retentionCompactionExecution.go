@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/gin-gonic/gin"
@@ -293,6 +294,22 @@ func revalidateCompactionPlan(tx *gorm.DB, tenant string, payload retentionManif
 		Where("tenant_id = ? AND story_id IN ? AND type = ? AND status = ?", tenant, storyIDs, models.ContentTypeNews, models.ContentStatusReady).
 		Find(&members).Error; err != nil {
 		return nil, nil, err
+	}
+	lifecycleResources := make([]lifecycle.Resource, 0, len(members))
+	for _, member := range members {
+		sourceID := "-"
+		if member.ContentSourceID != nil {
+			sourceID = member.ContentSourceID.String()
+		}
+		lifecycleResources = append(lifecycleResources, lifecycle.Resource{
+			Type: lifecycle.ResourceItem,
+			Key:  "news/" + sourceID + "/" + member.PublicID.String(),
+		})
+	}
+	if len(lifecycleResources) > 0 {
+		if err := lifecycle.CheckResources(tx, tenant, lifecycleResources, lifecycle.PhaseContentWrite); err != nil {
+			return nil, nil, err
+		}
 	}
 	_, anchors, _, expectedRetire := compactManifestIDs(payload)
 	expected := uniqueUUIDs(append(anchors, expectedRetire...))

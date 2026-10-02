@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"crypto/sha256"
 	"encoding/hex"
@@ -134,11 +135,36 @@ func createManualArticle(db *gorm.DB, tenantID string, req createAdminContentReq
 		Metadata:       datatypes.JSON(metadataJSON),
 		PublishedAt:    publishedAt,
 	}
-	if err := db.Create(&item).Error; err != nil {
+	created := false
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		lane := "news"
+		if contentType == models.ContentTypeVideo || contentType == models.ContentTypePodcast {
+			lane = "pods"
+		}
+		resources := []lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: lane}}
+		if err := lifecycle.CheckExclusiveResources(tx, tenantID, resources, lifecycle.PhaseContentCreate); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: tenantID, Lane: lane}, lifecycle.PhaseContentCreate); err != nil {
+			return err
+		}
+		var existing models.ContentItem
+		if err := tx.Where("idempotency_key = ? AND tenant_id = ?", idempotencyKey, tenantID).First(&existing).Error; err == nil {
+			item = existing
+			return nil
+		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := tx.Create(&item).Error; err != nil {
+			return err
+		}
+		created = true
+		return nil
+	}); err != nil {
 		return models.ContentItem{}, false, err
 	}
 
-	if status == models.ContentStatusReady {
+	if created && status == models.ContentStatusReady {
 		if text := buildEmbeddingText(&item); strings.TrimSpace(text) != "" {
 			id := item.PublicID.String()
 			go func() {
@@ -169,6 +195,9 @@ func CreateAdminContent(c *gin.Context) {
 
 	item, created, err := createManualArticle(db, principal.TenantID, req)
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create content item: " + err.Error(), Code: "CREATE_FAILED"})
 		return
 	}
@@ -246,7 +275,13 @@ func ImportFeed(c *gin.Context) {
 			Type:         string(models.ContentTypeArticle),
 			Status:       status,
 		}
-		if _, wasCreated, cerr := createManualArticle(db, principal.TenantID, cr); cerr != nil || !wasCreated {
+		if _, wasCreated, cerr := createManualArticle(db, principal.TenantID, cr); cerr != nil {
+			if lifecycle.IsConflict(cerr) || lifecycle.IsIntakePaused(cerr) {
+				c.JSON(http.StatusConflict, gin.H{"error": "manual feed import stopped at the active content lifecycle boundary", "code": "OPERATION_CONFLICT", "imported": imported, "skipped": skipped, "total": len(feed.Items)})
+				return
+			}
+			skipped++
+		} else if !wasCreated {
 			skipped++
 		} else {
 			imported++

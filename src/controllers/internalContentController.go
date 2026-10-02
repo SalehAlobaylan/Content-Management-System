@@ -3,10 +3,14 @@ package controllers
 import (
 	"content-management-system/src/artifacts"
 	"content-management-system/src/contentstage"
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/feedstate"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/pipeline"
+	"content-management-system/src/sourceidentity"
 	"content-management-system/src/spaceid"
+	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,41 +32,137 @@ import (
 )
 
 type internalCreateContentItemRequest struct {
-	IdempotencyKey       string                 `json:"idempotency_key"`
-	Type                 string                 `json:"type"`
-	Format               *string                `json:"format"`
-	Source               string                 `json:"source"`
-	Status               string                 `json:"status"`
-	Title                string                 `json:"title"`
-	BodyText             *string                `json:"body_text"`
-	Excerpt              *string                `json:"excerpt"`
-	ContentLanguage      *string                `json:"content_language"`
-	Author               *string                `json:"author"`
-	SourceName           string                 `json:"source_name"`
-	SourceFeedURL        *string                `json:"source_feed_url"`
-	TenantID             string                 `json:"tenant_id"`
-	ContentSourceID      string                 `json:"content_source_id"`
-	SourceRunRequestID   string                 `json:"source_run_request_id"`
-	OriginalURL          string                 `json:"original_url"`
-	MediaURL             *string                `json:"media_url"`
-	ThumbnailURL         *string                `json:"thumbnail_url"`
-	DurationSec          *int                   `json:"duration_sec"`
-	TopicTags            []string               `json:"topic_tags"`
-	Metadata             map[string]interface{} `json:"metadata"`
-	PublishedAt          *string                `json:"published_at"`
-	RecoveryRunID        *string                `json:"recovery_run_id"`
-	RecoveryManifestHash string                 `json:"recovery_manifest_hash"`
+	IdempotencyKey            string                        `json:"idempotency_key"`
+	Type                      string                        `json:"type"`
+	Format                    *string                       `json:"format"`
+	Source                    string                        `json:"source"`
+	Status                    string                        `json:"status"`
+	Title                     string                        `json:"title"`
+	BodyText                  *string                       `json:"body_text"`
+	Excerpt                   *string                       `json:"excerpt"`
+	ContentLanguage           *string                       `json:"content_language"`
+	Author                    *string                       `json:"author"`
+	SourceName                string                        `json:"source_name"`
+	SourceFeedURL             *string                       `json:"source_feed_url"`
+	TenantID                  string                        `json:"tenant_id"`
+	ContentSourceID           string                        `json:"content_source_id"`
+	SourceRunRequestID        string                        `json:"source_run_request_id"`
+	SourceUpstreamItemID      string                        `json:"source_upstream_item_id,omitempty"`
+	SourceUpstreamFingerprint string                        `json:"source_upstream_fingerprint,omitempty"`
+	SourceObservationID       string                        `json:"source_observation_id,omitempty"`
+	ReconstructionGrant       string                        `json:"content_reset_reconstruction_grant,omitempty"`
+	SourceRunAttribution      *internalSourceRunAttribution `json:"source_run_attribution,omitempty"`
+	OriginalURL               string                        `json:"original_url"`
+	MediaURL                  *string                       `json:"media_url"`
+	ThumbnailURL              *string                       `json:"thumbnail_url"`
+	DurationSec               *int                          `json:"duration_sec"`
+	TopicTags                 []string                      `json:"topic_tags"`
+	Metadata                  map[string]interface{}        `json:"metadata"`
+	PublishedAt               *string                       `json:"published_at"`
+	RecoveryRunID             *string                       `json:"recovery_run_id"`
+	RecoveryManifestHash      string                        `json:"recovery_manifest_hash"`
+}
+
+type internalSourceRunAttribution struct {
+	RequestID           string `json:"request_id"`
+	AttemptID           string `json:"attempt_id"`
+	ExecutionUnitID     string `json:"execution_unit_id"`
+	UnitJobID           string `json:"unit_job_id"`
+	AttemptFenceToken   string `json:"attempt_fence_token"`
+	ExecutionLeaseToken string `json:"execution_lease_token"`
+	PageID              string `json:"page_id"`
+	BatchID             string `json:"batch_id"`
 }
 
 type internalCreateContentItemResponse struct {
-	ID           string `json:"id"`
-	TenantID     string `json:"tenant_id"`
-	Status       string `json:"status"`
-	Created      bool   `json:"created"`
-	Retired      bool   `json:"retired,omitempty"`
-	CreatedAt    string `json:"created_at"`
-	DeliveryMode string `json:"delivery_mode"`
+	ID                  string `json:"id"`
+	TenantID            string `json:"tenant_id"`
+	Status              string `json:"status"`
+	Created             bool   `json:"created"`
+	Retired             bool   `json:"retired,omitempty"`
+	SourceRunAttributed bool   `json:"source_run_attributed,omitempty"`
+	CreatedAt           string `json:"created_at"`
+	DeliveryMode        string `json:"delivery_mode"`
 	contentstage.ManifestDisposition
+}
+
+var sourceRunAttributionMetadataKeys = []string{
+	"source_run_execution_unit_id",
+	"source_run_attempt_id",
+	"source_run_page_id",
+	"source_run_batch_id",
+}
+
+var errInvalidSourceRunAttribution = errors.New("invalid source-run content attribution")
+
+func mergeSourceRunAttribution(existing datatypes.JSON, attribution map[string]string) (datatypes.JSON, bool) {
+	if len(attribution) != len(sourceRunAttributionMetadataKeys) {
+		return existing, false
+	}
+	metadata := map[string]interface{}{}
+	if len(existing) > 0 {
+		if err := json.Unmarshal(existing, &metadata); err != nil || metadata == nil {
+			return existing, false
+		}
+	}
+	for key, value := range attribution {
+		metadata[key] = value
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return existing, false
+	}
+	return datatypes.JSON(encoded), true
+}
+
+func validateSourceRunAttribution(tx *gorm.DB, tenantID string, contentSourceID *uuid.UUID, sourceRunRequestID string, input *internalSourceRunAttribution) (map[string]string, error) {
+	if input == nil {
+		return nil, nil
+	}
+	if tx == nil || contentSourceID == nil || *contentSourceID == uuid.Nil || strings.TrimSpace(sourceRunRequestID) == "" ||
+		strings.TrimSpace(input.RequestID) != strings.TrimSpace(sourceRunRequestID) ||
+		!validSourceRunAttributionToken(input.PageID) || !validSourceRunAttributionToken(input.BatchID) {
+		return nil, fmt.Errorf("%w: envelope is incomplete", errInvalidSourceRunAttribution)
+	}
+	leaseToken, err := uuid.Parse(strings.TrimSpace(input.ExecutionLeaseToken))
+	if err != nil {
+		return nil, fmt.Errorf("%w: execution lease token is invalid", errInvalidSourceRunAttribution)
+	}
+	unit, err := supply.VerifyExecutionEnvelope(tx, tenantID, input.RequestID, input.AttemptID, input.ExecutionUnitID, input.UnitJobID, input.AttemptFenceToken)
+	if err != nil {
+		return nil, fmt.Errorf("%w: execution envelope is invalid: %v", errInvalidSourceRunAttribution, err)
+	}
+	now := time.Now().UTC()
+	if unit.ContentSourceID != *contentSourceID || unit.UnitType != "normalize_batch" || unit.PageID != input.PageID || unit.BatchID != input.BatchID ||
+		unit.State != string(supply.UnitRunning) || unit.ExecutionLeaseToken == nil || *unit.ExecutionLeaseToken != leaseToken ||
+		unit.ExecutionLeaseExpiresAt == nil || !unit.ExecutionLeaseExpiresAt.After(now) {
+		return nil, fmt.Errorf("%w: normalization unit is not current for this content write", errInvalidSourceRunAttribution)
+	}
+	return map[string]string{
+		"source_run_execution_unit_id": unit.PublicID.String(),
+		"source_run_attempt_id":        unit.SourceRunAttemptID.String(),
+		"source_run_page_id":           unit.PageID,
+		"source_run_batch_id":          unit.BatchID,
+	}, nil
+}
+
+func stripSourceRunAttributionMetadata(metadata map[string]interface{}) map[string]interface{} {
+	clean := make(map[string]interface{}, len(metadata))
+	reserved := make(map[string]bool, len(sourceRunAttributionMetadataKeys))
+	for _, key := range sourceRunAttributionMetadataKeys {
+		reserved[key] = true
+	}
+	for key, value := range metadata {
+		if !reserved[key] {
+			clean[key] = value
+		}
+	}
+	return clean
+}
+
+func validSourceRunAttributionToken(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && len(value) <= 128
 }
 
 type internalUpdateContentItemRequest struct {
@@ -167,10 +267,21 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 	}
 	var rows int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		var item models.ContentItem
+		claimsAvailable := lifecycle.SchemaAvailable(tx)
+		if claimsAvailable || req.ContentStage != nil || req.ArtifactRecovery != nil {
+			if err := tx.Where("public_id = ?", id).First(&item).Error; err != nil {
+				return err
+			}
+			if claimsAvailable {
+				if err := checkContentLifecycleMutation(tx, item); err != nil {
+					return err
+				}
+			}
+		}
 		// The legacy enrichment endpoint remains a compatibility path when no
-		// durable stage correlation is supplied. Do not introduce a read of the
-		// content row here: older callers intentionally rely on the atomic
-		// UPDATE's affected-row result as their not-found check.
+		// durable stage correlation is supplied. The row read above supplies the
+		// resource identity needed to honor lifecycle campaign claims.
 		if req.ContentStage == nil && req.ArtifactRecovery == nil {
 			result := tx.Model(&models.ContentItem{}).Where("public_id = ?", id).UpdateColumn("metadata", gorm.Expr("COALESCE(metadata, '{}'::jsonb) || ?::jsonb", string(raw)))
 			rows = result.RowsAffected
@@ -178,10 +289,6 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 		}
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
-		var item models.ContentItem
-		if err := tx.Where("public_id=?", id).First(&item).Error; err != nil {
-			return err
-		}
 		stage := models.ContentStagePodsLLMMetadata
 		if item.Type == models.ContentTypeNews {
 			stage = models.ContentStageNewsLLMMetadata
@@ -210,6 +317,10 @@ func InternalMergeEnrichmentMetadata(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, gin.H{"error": "content mutation conflicts with an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to merge enrichment metadata"})
 		return
 	}
@@ -364,6 +475,67 @@ func requireNormalStageCorrelation(db *gorm.DB, item models.ContentItem, stage s
 
 const maxIdempotencyKeyLength = 512
 
+func lifecycleSourceID(id *uuid.UUID) string {
+	if id == nil {
+		return ""
+	}
+	return id.String()
+}
+
+func checkContentLifecycleMutation(tx *gorm.DB, item models.ContentItem) error {
+	lane := "news"
+	if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+		lane = "pods"
+	}
+	return lifecycle.Check(tx, lifecycle.Scope{
+		TenantID: item.TenantID,
+		Lane:     lane,
+		SourceID: lifecycleSourceID(item.ContentSourceID),
+		ItemID:   item.PublicID.String(),
+	}, lifecycle.PhaseContentWrite)
+}
+
+// lockContentForLifecycleMutation takes the shared lifecycle boundary before
+// locking the content row, then verifies that the resource identity did not
+// change between observation and lock acquisition. Owner commits use this in
+// their existing short transaction so a campaign claim and a late write are
+// ordered by the same advisory lock.
+func lockContentForLifecycleMutation(tx *gorm.DB, tenantID string, contentID uuid.UUID) (models.ContentItem, error) {
+	if tx == nil || strings.TrimSpace(tenantID) == "" || contentID == uuid.Nil {
+		return models.ContentItem{}, errors.New("content lifecycle mutation requires tenant and content identity")
+	}
+	var observed models.ContentItem
+	if err := tx.Where("tenant_id = ? AND public_id = ?", tenantID, contentID).First(&observed).Error; err != nil {
+		return models.ContentItem{}, err
+	}
+	if err := checkContentLifecycleMutation(tx, observed); err != nil {
+		return models.ContentItem{}, err
+	}
+	var current models.ContentItem
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", tenantID, contentID).First(&current).Error; err != nil {
+		return models.ContentItem{}, err
+	}
+	if !current.UpdatedAt.Equal(observed.UpdatedAt) || current.Type != observed.Type ||
+		current.ProcessingGeneration != observed.ProcessingGeneration ||
+		(current.ContentSourceID == nil) != (observed.ContentSourceID == nil) ||
+		(current.ContentSourceID != nil && *current.ContentSourceID != *observed.ContentSourceID) {
+		return models.ContentItem{}, errors.New("content lifecycle identity changed during owner admission")
+	}
+	return current, nil
+}
+
+func writeLifecycleConflict(c *gin.Context, err error) bool {
+	if lifecycle.IsConflict(err) {
+		c.JSON(http.StatusConflict, gin.H{"error": "content mutation conflicts with an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
+		return true
+	}
+	if lifecycle.IsIntakePaused(err) {
+		c.JSON(http.StatusConflict, gin.H{"error": "source intake is paused by an active Content Reset operation", "code": "SOURCE_ADMISSION_PAUSED"})
+		return true
+	}
+	return false
+}
+
 func normalizeMediaSuitability(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case models.MediaSuitabilityAudioFirstTalkingHead:
@@ -478,74 +650,6 @@ func InternalCreateContentItem(c *gin.Context) {
 		lineageTenantID = defaultCirculationTenant
 	}
 
-	// Identity resolution is tenant-scoped. A matching provider key in another
-	// tenant must never expose or mutate that tenant's item or stage evidence.
-	var existing models.ContentItem
-	if err := db.Where("tenant_id = ? AND idempotency_key = ?", lineageTenantID, idempotencyKey).First(&existing).Error; err == nil {
-		var requests []models.ContentStageRequest
-		disposition := "no_change"
-		if manifestErr := db.Transaction(func(tx *gorm.DB) error {
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=?", existing.PublicID).First(&existing).Error; err != nil {
-				return err
-			}
-			previousDigest := ""
-			if existing.ProcessingInputDigest != nil {
-				previousDigest = *existing.ProcessingInputDigest
-			}
-			// The idempotency identity is stable, but source observations may carry
-			// corrected text or a replaced media reference. Compare those inputs in
-			// CMS; Redis and Aggregation must not guess whether work is current.
-			existing.Title = &req.Title
-			existing.BodyText = req.BodyText
-			existing.Excerpt = req.Excerpt
-			existing.ContentLanguage = normalizeContentLanguage(req.ContentLanguage)
-			existing.SourceFeedURL = req.SourceFeedURL
-			existing.OriginalURL = &req.OriginalURL
-			// media_url, thumbnail_url, and duration_sec are produced artifacts
-			// after materialization; duplicate intake must never overwrite them
-			// with the original provider reference.
-			if err := tx.Save(&existing).Error; err != nil {
-				return err
-			}
-			var changed bool
-			var reconcileErr error
-			requests, changed, reconcileErr = contentstage.ReconcileManifest(tx, &existing, previousDigest)
-			if changed {
-				disposition = "changed"
-			}
-			return reconcileErr
-		}); manifestErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile content stage manifest"})
-			return
-		}
-		deliveryMode, modeErr := contentstage.DeliveryMode(db, existing.TenantID, existing.Type)
-		if modeErr != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
-			return
-		}
-		c.JSON(http.StatusOK, internalCreateContentItemResponse{
-			ID:                  existing.PublicID.String(),
-			TenantID:            existing.TenantID,
-			Status:              string(existing.Status),
-			Created:             false,
-			CreatedAt:           existing.CreatedAt.UTC().Format(time.RFC3339),
-			DeliveryMode:        deliveryMode,
-			ManifestDisposition: contentstage.SummarizeForItem(db, existing, requests, disposition),
-		})
-		return
-	} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check idempotency"})
-		return
-	}
-
-	var publishedAt *time.Time
-	if req.PublishedAt != nil && *req.PublishedAt != "" {
-		if parsed, err := time.Parse(time.RFC3339, *req.PublishedAt); err == nil {
-			publishedAt = &parsed
-		}
-	}
-
-	metadataJSON, _ := json.Marshal(req.Metadata)
 	var contentSourceID *uuid.UUID
 	var sourceRunRequestID *uint
 	if strings.TrimSpace(req.ContentSourceID) != "" || strings.TrimSpace(req.SourceRunRequestID) != "" {
@@ -567,8 +671,264 @@ func InternalCreateContentItem(c *gin.Context) {
 				return
 			}
 			sourceRunRequestID = &runRequest.ID
+			// Durable replay purpose requires a scoped reconstruction grant even
+			// when a stale worker omits its optional observation/replay context.
+			if err := validateContentResetReplayIngest(runRequest.Purpose, req); err != nil {
+				c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+				return
+			}
 		}
 	}
+	var sourceIDString string
+	if contentSourceID != nil {
+		sourceIDString = contentSourceID.String()
+	}
+	identityInput, identityErr := sourceidentity.ParseInput(
+		lineageTenantID, sourceIDString, req.SourceRunRequestID,
+		req.SourceObservationID, req.SourceUpstreamItemID,
+	)
+	if identityErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid source item observation", "code": "SOURCE_OBSERVATION_INVALID"})
+		return
+	}
+	if identityInput != nil {
+		if req.SourceRunAttribution == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Source item identity requires a current normalization unit", "code": "SOURCE_OBSERVATION_INVALID"})
+			return
+		}
+		identityInput.SourceRunAttemptID, identityErr = uuid.Parse(strings.TrimSpace(req.SourceRunAttribution.AttemptID))
+		if identityErr == nil {
+			identityInput.ExecutionUnitID, identityErr = uuid.Parse(strings.TrimSpace(req.SourceRunAttribution.ExecutionUnitID))
+		}
+		if identityErr == nil {
+			identityInput.ExecutionFenceToken, identityErr = uuid.Parse(strings.TrimSpace(req.SourceRunAttribution.AttemptFenceToken))
+		}
+		if identityErr == nil {
+			identityInput.ExecutionLeaseToken, identityErr = uuid.Parse(strings.TrimSpace(req.SourceRunAttribution.ExecutionLeaseToken))
+		}
+		if identityErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Source item execution identity is invalid", "code": "SOURCE_OBSERVATION_INVALID"})
+			return
+		}
+		identityInput.UnitJobID = strings.TrimSpace(req.SourceRunAttribution.UnitJobID)
+		identityInput.PageID = strings.TrimSpace(req.SourceRunAttribution.PageID)
+		identityInput.BatchID = strings.TrimSpace(req.SourceRunAttribution.BatchID)
+		identityInput.ExpectedFingerprint = strings.ToLower(strings.TrimSpace(req.SourceUpstreamFingerprint))
+		if _, attributionErr := validateSourceRunAttribution(db, lineageTenantID, contentSourceID, req.SourceRunRequestID, req.SourceRunAttribution); attributionErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Source item identity is outside the current fenced normalization unit", "code": "SOURCE_OBSERVATION_INVALID"})
+			return
+		}
+	}
+	if strings.TrimSpace(req.ReconstructionGrant) != "" {
+		if identityInput == nil || req.SourceRunAttribution == nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant requires source identity and a current normalization unit", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+			return
+		}
+		if len(identityInput.ExpectedFingerprint) != 64 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset replay fingerprint is invalid", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+			return
+		}
+		if _, fingerprintErr := hex.DecodeString(identityInput.ExpectedFingerprint); fingerprintErr != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset replay fingerprint is invalid", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+			return
+		}
+	}
+	var identityBinding *sourceidentity.Binding
+	if strings.TrimSpace(req.ReconstructionGrant) != "" {
+		identityBinding, identityErr = sourceidentity.ResolveReconstructionGrant(db, identityInput, req.ReconstructionGrant)
+	} else {
+		identityBinding, identityErr = sourceidentity.Resolve(db, identityInput)
+	}
+	if identityErr != nil {
+		code := "SOURCE_OBSERVATION_INVALID"
+		message := "Source item observation is not authorized for this materialization"
+		if strings.TrimSpace(req.ReconstructionGrant) != "" {
+			code = "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"
+			message = "Content Reset reconstruction grant is invalid or outside its approved scope"
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": message, "code": code})
+		return
+	}
+	if identityBinding != nil && identityBinding.ReconstructionGrant != nil {
+		grant := identityBinding.ReconstructionGrant
+		idempotencyKey = fmt.Sprintf("content-reset-instance:%s:%d", identityBinding.IdentityPublicID, grant.ReplacementInstanceGeneration)
+	}
+
+	// Identity resolution is tenant-scoped. A matching provider key in another
+	// tenant must never expose or mutate that tenant's item or stage evidence.
+	var existing models.ContentItem
+	var lookupErr error
+	if identityBinding != nil && identityBinding.HasIdentity {
+		if identityBinding.CurrentContentItemID == nil {
+			grantAllowsNewIdentity := identityBinding.ReconstructionGrant != nil &&
+				identityBinding.ReconstructionGrant.State == "issued" &&
+				identityBinding.ReconstructionGrant.GrantKind == "new_identity" &&
+				identityBinding.CurrentInstance == 0
+			if !grantAllowsNewIdentity {
+				c.JSON(http.StatusConflict, gin.H{"error": "Source item identity registry is inconsistent", "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
+				return
+			}
+			lookupErr = gorm.ErrRecordNotFound
+		} else if identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "issued" {
+			// Fresh Start must create a separate content instance. Reusing the old
+			// row would keep its retired identity and idempotency key in place.
+			lookupErr = gorm.ErrRecordNotFound
+		} else {
+			lookupErr = db.Where("tenant_id = ? AND public_id = ?", lineageTenantID, *identityBinding.CurrentContentItemID).First(&existing).Error
+		}
+		if errors.Is(lookupErr, gorm.ErrRecordNotFound) && identityBinding.ReconstructionGrant == nil {
+			c.JSON(http.StatusOK, internalCreateContentItemResponse{
+				ID: identityBinding.CurrentContentItemID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true,
+			})
+			return
+		}
+		if lookupErr == nil && (existing.ContentSourceID == nil || *existing.ContentSourceID != identityBinding.Input.ContentSourceID) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Source item identity points to content owned by another source", "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
+			return
+		}
+	} else {
+		lookupErr = db.Where("tenant_id = ? AND idempotency_key = ?", lineageTenantID, idempotencyKey).First(&existing).Error
+	}
+	if errors.Is(lookupErr, gorm.ErrRecordNotFound) && identityBinding != nil && identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "consumed" {
+		c.JSON(http.StatusConflict, gin.H{"error": "Consumed Content Reset replacement is missing from the content store", "code": "CONTENT_RESET_REPLACEMENT_MISSING"})
+		return
+	}
+	if lookupErr == nil {
+		if identityBinding != nil && identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "consumed" {
+			grant := identityBinding.ReconstructionGrant
+			if grant.ReplacementContentItemID == nil || existing.PublicID != *grant.ReplacementContentItemID {
+				c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant no longer points to its replacement", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+				return
+			}
+			deliveryMode, modeErr := contentstage.DeliveryMode(db, existing.TenantID, existing.Type)
+			if modeErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
+				return
+			}
+			c.JSON(http.StatusOK, internalCreateContentItemResponse{
+				ID: existing.PublicID.String(), TenantID: existing.TenantID, Status: string(existing.Status),
+				Created: false, SourceRunAttributed: true, CreatedAt: existing.CreatedAt.UTC().Format(time.RFC3339), DeliveryMode: deliveryMode,
+			})
+			return
+		}
+		var requests []models.ContentStageRequest
+		disposition := "no_change"
+		sourceRunAttributed := false
+		if manifestErr := db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=?", existing.PublicID).First(&existing).Error; err != nil {
+				return err
+			}
+			lane := "news"
+			if existing.Type == models.ContentTypeVideo || existing.Type == models.ContentTypePodcast {
+				lane = "pods"
+			}
+			if err := lifecycle.Check(tx, lifecycle.Scope{
+				TenantID: existing.TenantID,
+				Lane:     lane,
+				SourceID: lifecycleSourceID(existing.ContentSourceID),
+				ItemID:   existing.PublicID.String(),
+			}, lifecycle.PhaseContentWrite); err != nil {
+				return err
+			}
+			previousDigest := ""
+			if existing.ProcessingInputDigest != nil {
+				previousDigest = *existing.ProcessingInputDigest
+			}
+			// The idempotency identity is stable, but source observations may carry
+			// corrected text or a replaced media reference. Compare those inputs in
+			// CMS; Redis and Aggregation must not guess whether work is current.
+			sameSource := contentSourceID != nil && existing.ContentSourceID != nil && *contentSourceID == *existing.ContentSourceID
+			if contentSourceID != nil && (existing.ContentSourceID == nil || *contentSourceID != *existing.ContentSourceID) {
+				return errors.New("idempotency identity is already owned by another content source")
+			}
+			sameSourceRun := sourceRunRequestID != nil && existing.SourceRunRequestID != nil && *sourceRunRequestID == *existing.SourceRunRequestID
+			if (contentSourceID == nil && existing.ContentSourceID == nil) || sameSource {
+				existing.Title = &req.Title
+				existing.BodyText = req.BodyText
+				existing.Excerpt = req.Excerpt
+				existing.ContentLanguage = normalizeContentLanguage(req.ContentLanguage)
+				existing.SourceFeedURL = req.SourceFeedURL
+				existing.OriginalURL = &req.OriginalURL
+			}
+			if sameSource && sameSourceRun && req.SourceRunAttribution != nil {
+				attribution, attributionErr := validateSourceRunAttribution(tx, existing.TenantID, contentSourceID, req.SourceRunRequestID, req.SourceRunAttribution)
+				if attributionErr != nil {
+					return attributionErr
+				}
+				mergedMetadata, attributed := mergeSourceRunAttribution(existing.Metadata, attribution)
+				if !attributed {
+					return errInvalidSourceRunAttribution
+				}
+				existing.Metadata = mergedMetadata
+				sourceRunAttributed = true
+			}
+			// media_url, thumbnail_url, and duration_sec are produced artifacts
+			// after materialization; duplicate intake must never overwrite them
+			// with the original provider reference.
+			if err := tx.Save(&existing).Error; err != nil {
+				return err
+			}
+			if identityBinding != nil && sameSource {
+				if err := sourceidentity.RegisterMaterialized(tx, identityBinding, existing.PublicID); err != nil {
+					return err
+				}
+			}
+			var changed bool
+			var reconcileErr error
+			requests, changed, reconcileErr = contentstage.ReconcileManifest(tx, &existing, previousDigest)
+			if changed {
+				disposition = "changed"
+			}
+			return reconcileErr
+		}); manifestErr != nil {
+			if errors.Is(manifestErr, errInvalidSourceRunAttribution) {
+				c.JSON(http.StatusConflict, gin.H{"error": "Source-run content attribution is no longer current", "code": "SOURCE_RUN_ATTRIBUTION_INVALID"})
+				return
+			}
+			if strings.Contains(manifestErr.Error(), "idempotency identity is already owned by another content source") {
+				c.JSON(http.StatusConflict, gin.H{"error": "Idempotency identity belongs to another content source", "code": "CONTENT_IDENTITY_SOURCE_CONFLICT"})
+				return
+			}
+			if lifecycle.IsConflict(manifestErr) {
+				c.JSON(http.StatusConflict, gin.H{"error": "content mutation conflicts with an active lifecycle campaign", "code": "OPERATION_CONFLICT"})
+				return
+			}
+			if errors.Is(manifestErr, sourceidentity.ErrIdentityConflict) || errors.Is(manifestErr, sourceidentity.ErrIdentityCorrupt) || errors.Is(manifestErr, sourceidentity.ErrInvalidObservation) {
+				c.JSON(http.StatusConflict, gin.H{"error": manifestErr.Error(), "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile content stage manifest"})
+			return
+		}
+		deliveryMode, modeErr := contentstage.DeliveryMode(db, existing.TenantID, existing.Type)
+		if modeErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
+			return
+		}
+		c.JSON(http.StatusOK, internalCreateContentItemResponse{
+			ID:                  existing.PublicID.String(),
+			TenantID:            existing.TenantID,
+			Status:              string(existing.Status),
+			Created:             false,
+			SourceRunAttributed: sourceRunAttributed,
+			CreatedAt:           existing.CreatedAt.UTC().Format(time.RFC3339),
+			DeliveryMode:        deliveryMode,
+			ManifestDisposition: contentstage.SummarizeForItem(db, existing, requests, disposition),
+		})
+		return
+	} else if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check idempotency"})
+		return
+	}
+
+	var publishedAt *time.Time
+	if req.PublishedAt != nil && *req.PublishedAt != "" {
+		if parsed, err := time.Parse(time.RFC3339, *req.PublishedAt); err == nil {
+			publishedAt = &parsed
+		}
+	}
+
+	metadataJSON, _ := json.Marshal(stripSourceRunAttributionMetadata(req.Metadata))
 
 	// Normalize kind + format. New callers send type='NEWS' with an explicit
 	// format. Back-compat: legacy callers may still send type=ARTICLE/TWEET/
@@ -619,6 +979,7 @@ func InternalCreateContentItem(c *gin.Context) {
 	}
 
 	item := models.ContentItem{
+		PublicID:           uuid.New(),
 		TenantID:           lineageTenantID,
 		Type:               kind,
 		Format:             format,
@@ -649,8 +1010,40 @@ func InternalCreateContentItem(c *gin.Context) {
 		item.ChapteringStatus = &waiting
 	}
 
+	sourceRunAttributed := false
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		lane := "news"
+		if kind == models.ContentTypeVideo || kind == models.ContentTypePodcast {
+			lane = "pods"
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{
+			TenantID: lineageTenantID,
+			Lane:     lane,
+			SourceID: lifecycleSourceID(contentSourceID),
+			ItemID:   item.PublicID.String(),
+		}, lifecycle.PhaseContentCreate); err != nil {
+			return err
+		}
+		if req.SourceRunAttribution != nil {
+			attribution, attributionErr := validateSourceRunAttribution(tx, lineageTenantID, contentSourceID, req.SourceRunRequestID, req.SourceRunAttribution)
+			if attributionErr != nil {
+				return attributionErr
+			}
+			mergedMetadata, attributed := mergeSourceRunAttribution(item.Metadata, attribution)
+			if !attributed {
+				return errInvalidSourceRunAttribution
+			}
+			item.Metadata = mergedMetadata
+			sourceRunAttributed = true
+		}
 		if err := tx.Create(&item).Error; err != nil {
+			return err
+		}
+		if identityBinding != nil && identityBinding.ReconstructionGrant != nil {
+			if err := sourceidentity.ConsumeReconstructionGrant(tx, identityInput, req.ReconstructionGrant, item.PublicID); err != nil {
+				return err
+			}
+		} else if err := sourceidentity.RegisterMaterialized(tx, identityBinding, item.PublicID); err != nil {
 			return err
 		}
 		if _, err := contentstage.EnsureManifest(tx, &item); err != nil {
@@ -668,6 +1061,25 @@ func InternalCreateContentItem(c *gin.Context) {
 			Payload: lineagePayload(map[string]interface{}{"content_type": string(item.Type), "status": string(item.Status)}), OccurredAt: time.Now().UTC(),
 		})
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errInvalidSourceRunAttribution) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Source-run content attribution is no longer current", "code": "SOURCE_RUN_ATTRIBUTION_INVALID"})
+			return
+		}
+		if errors.Is(err, sourceidentity.ErrInvalidReconstructionGrant) || errors.Is(err, sourceidentity.ErrReconstructionGrantScope) || errors.Is(err, sourceidentity.ErrReconstructionGrantUsed) {
+			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant is no longer current for this item", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+			return
+		}
+		if strings.Contains(err.Error(), "idempotency identity is already owned by another content source") {
+			c.JSON(http.StatusConflict, gin.H{"error": "Idempotency identity belongs to another content source", "code": "CONTENT_IDENTITY_SOURCE_CONFLICT"})
+			return
+		}
+		if errors.Is(err, sourceidentity.ErrIdentityConflict) || errors.Is(err, sourceidentity.ErrIdentityCorrupt) || errors.Is(err, sourceidentity.ErrInvalidObservation) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create content item"})
 		return
 	}
@@ -689,10 +1101,19 @@ func InternalCreateContentItem(c *gin.Context) {
 		TenantID:            item.TenantID,
 		Status:              string(item.Status),
 		Created:             true,
+		SourceRunAttributed: sourceRunAttributed,
 		CreatedAt:           item.CreatedAt.UTC().Format(time.RFC3339),
 		DeliveryMode:        deliveryMode,
 		ManifestDisposition: contentstage.SummarizeForItem(db, item, stageRequests, "created"),
 	})
+}
+
+func validateContentResetReplayIngest(purpose string, req internalCreateContentItemRequest) error {
+	if purpose == "content_reset_replay" && (strings.TrimSpace(req.ReconstructionGrant) == "" ||
+		strings.TrimSpace(req.SourceObservationID) == "" || strings.TrimSpace(req.SourceUpstreamItemID) == "" || req.SourceRunAttribution == nil) {
+		return errors.New("Content Reset replay requires a reconstruction grant, observation and fenced normalization unit")
+	}
+	return nil
 }
 
 // InternalUpdateContentItem handles PUT /internal/content-items/:id
@@ -757,6 +1178,9 @@ func InternalUpdateContentItem(c *gin.Context) {
 
 	changed := false
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
@@ -764,6 +1188,9 @@ func InternalUpdateContentItem(c *gin.Context) {
 		changed = manifestChanged
 		return err
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update content item"})
 		return
 	}
@@ -821,6 +1248,9 @@ func InternalUpdateContentStatus(c *gin.Context) {
 				item.Status = models.ContentStatusReady
 				setFeedUnitDurationBucket(&item)
 				if err := db.Transaction(func(tx *gorm.DB) error {
+					if err := checkContentLifecycleMutation(tx, item); err != nil {
+						return err
+					}
 					if err := tx.Save(&item).Error; err != nil {
 						return err
 					}
@@ -831,7 +1261,10 @@ func InternalUpdateContentStatus(c *gin.Context) {
 						return err
 					}
 					return appendItemProcessingEvent(tx, item, "content_status", "completed", "cms", "artifact_complete_reconciled", map[string]interface{}{"status": string(item.Status)})
-				}).Error; err != nil {
+				}); err != nil {
+					if writeLifecycleConflict(c, err) {
+						return
+					}
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile artifact-complete status"})
 					return
 				}
@@ -864,6 +1297,9 @@ func InternalUpdateContentStatus(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		if err := tx.Save(&item).Error; err != nil {
 			return err
 		}
@@ -875,6 +1311,9 @@ func InternalUpdateContentStatus(c *gin.Context) {
 		}
 		return appendItemProcessingEvent(tx, item, "content_status", "completed", "aggregation", "content_status_updated", map[string]interface{}{"status": string(item.Status)})
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update status"})
 		return
 	}
@@ -979,6 +1418,9 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 			}
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		applyArtifactRequest(&item, req)
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -997,6 +1439,9 @@ func InternalUpdateContentArtifacts(c *gin.Context) {
 		}
 		return appendItemProcessingEvent(tx, item, "media_artifacts", "completed", "aggregation", "media_artifacts_persisted", map[string]interface{}{"playback_ready": item.PlaybackURL != nil, "has_thumbnail": item.ThumbnailURL != nil})
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		if strings.Contains(err.Error(), "artifact target version is stale") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Artifact target version is stale"})
 		} else {
@@ -1187,6 +1632,9 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		vec := pgvector.NewVector(req.Embedding)
 		item.Embedding = &vec
 		item.EmbeddingModel = stampOrNil(req.Model)
@@ -1209,6 +1657,9 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		if req.PipelineRepair != nil {
 			c.JSON(http.StatusConflict, gin.H{"error": "Pipeline repair embedding writeback is stale"})
 		} else {
@@ -1294,6 +1745,9 @@ func InternalUpdateContentTopicTags(c *gin.Context) {
 			First(&item).Error; err != nil {
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		item.TopicTags = cleaned
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -1302,6 +1756,9 @@ func InternalUpdateContentTopicTags(c *gin.Context) {
 			"tag_count": len(cleaned),
 		})
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update topic tags"})
 		return
 	}
@@ -1372,6 +1829,9 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		vec := pgvector.NewVector(req.Embedding)
 		item.ImageEmbedding = &vec
 		item.ImageEmbeddingModel = stampOrNil(req.Model)
@@ -1391,6 +1851,9 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update image embedding"})
 		return
 	}
@@ -1413,12 +1876,15 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 // Filtering by canonical content kind, NEWS format, and excluded ids is built in.
 
 type internalKNNDenseRequest struct {
-	Embedding  []float32 `json:"embedding"`
-	SpaceID    string    `json:"space_id"`
-	Types      []string  `json:"types"`       // optional — when empty, no type filter
-	Formats    []string  `json:"formats"`     // optional NEWS format filter, independent of type
-	K          int       `json:"k"`           // required, >0
-	ExcludeIDs []string  `json:"exclude_ids"` // optional public_ids to skip
+	Embedding         []float32 `json:"embedding"`
+	SpaceID           string    `json:"space_id"`
+	TenantID          string    `json:"tenant_id"`
+	NewsGenerationID  string    `json:"news_generation_id"`
+	MediaGenerationID string    `json:"media_generation_id"`
+	Types             []string  `json:"types"`       // optional — when empty, no type filter
+	Formats           []string  `json:"formats"`     // optional NEWS format filter, independent of type
+	K                 int       `json:"k"`           // required, >0
+	ExcludeIDs        []string  `json:"exclude_ids"` // optional public_ids to skip
 }
 
 type internalKNNHit struct {
@@ -1439,8 +1905,11 @@ type internalKNNResponse struct {
 }
 
 type internalEmbeddingsResponse struct {
-	Embedding        []float32 `json:"embedding"` // 1024 dense, null if missing
-	EmbeddingSpaceID string    `json:"embedding_space_id,omitempty"`
+	Embedding         []float32 `json:"embedding"` // 1024 dense, null if missing
+	EmbeddingSpaceID  string    `json:"embedding_space_id,omitempty"`
+	TenantID          string    `json:"tenant_id"`
+	NewsGenerationID  string    `json:"news_generation_id"`
+	MediaGenerationID string    `json:"media_generation_id"`
 }
 
 // InternalGetContentEmbeddings handles GET /internal/content-items/:id/embeddings.
@@ -1456,13 +1925,39 @@ func InternalGetContentEmbeddings(c *gin.Context) {
 	}
 
 	var item models.ContentItem
-	if err := db.Where("public_id = ?", id).
-		Select("embedding", "embedding_space_id").
+	var tenantID string
+	if err := db.Model(&models.ContentItem{}).Where("public_id = ?", id).Pluck("tenant_id", &tenantID).Error; err != nil || strings.TrimSpace(tenantID) == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
+		return
+	}
+	requestedTenant := strings.TrimSpace(c.Query("tenant_id"))
+	requestedNews := strings.TrimSpace(c.Query("news_generation_id"))
+	requestedMedia := strings.TrimSpace(c.Query("media_generation_id"))
+	viewProvided := requestedTenant != "" || requestedNews != "" || requestedMedia != ""
+	var view feedcontract.ServingView
+	if viewProvided {
+		view, err = parseInternalServingView(requestedTenant, requestedNews, requestedMedia)
+		if err != nil || view.TenantID != tenantID {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid serving view for content tenant"})
+			return
+		}
+	} else {
+		var supported, complete bool
+		view, supported, complete = feedcontract.LoadActiveServingView(db, tenantID)
+		if !supported || !complete {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Content is not available in a complete active feed view"})
+			return
+		}
+	}
+	if err := feedcontract.ApplyServingViewMembership(db, db.Model(&models.ContentItem{}).
+		Scopes(publicContentBaseQuery).
+		Where("public_id = ?", id).
+		Select("embedding", "embedding_space_id"), view).
 		First(&item).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Content not found"})
 		return
 	}
-	resp := internalEmbeddingsResponse{}
+	resp := internalEmbeddingsResponse{TenantID: tenantID, NewsGenerationID: view.NewsGenerationID.String(), MediaGenerationID: view.MediaGenerationID.String()}
 	if item.Embedding != nil {
 		resp.Embedding = item.Embedding.Slice()
 		if item.EmbeddingSpaceID != nil {
@@ -1498,9 +1993,14 @@ func InternalKNNDense(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "space_id is required for dense kNN"})
 		return
 	}
+	view, err := parseInternalServingView(req.TenantID, req.NewsGenerationID, req.MediaGenerationID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	hits := runKNNQuery(db, "embedding", utils.PgvectorToLiteral(req.Embedding),
-		req.SpaceID, req.Types, req.Formats, req.K, req.ExcludeIDs)
+		req.SpaceID, req.Types, req.Formats, req.K, req.ExcludeIDs, view)
 	c.JSON(http.StatusOK, internalKNNResponse{Hits: hits})
 }
 
@@ -1518,7 +2018,10 @@ func InternalKNNSparse(c *gin.Context) {
 // tuple for the small post-RRF candidate set (typically top-30).
 
 type internalBatchTextRequest struct {
-	IDs []string `json:"ids"`
+	IDs               []string `json:"ids"`
+	TenantID          string   `json:"tenant_id"`
+	NewsGenerationID  string   `json:"news_generation_id"`
+	MediaGenerationID string   `json:"media_generation_id"`
 }
 
 type internalBatchTextItem struct {
@@ -1561,6 +2064,11 @@ func InternalBatchText(c *gin.Context) {
 		})
 		return
 	}
+	view, err := parseInternalServingView(req.TenantID, req.NewsGenerationID, req.MediaGenerationID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Parse UUIDs; skip malformed ones silently. Caller may interleave
 	// invalid ids without us bailing on the whole batch.
@@ -1585,8 +2093,10 @@ func InternalBatchText(c *gin.Context) {
 		PublishedAt *time.Time
 	}
 	var rows []row
-	if err := db.Model(&models.ContentItem{}).
+	if err := feedcontract.ApplyServingViewMembership(db, db.Model(&models.ContentItem{}).
+		Scopes(publicContentBaseQuery).
 		Where("public_id IN ?", parsed).
+		Where(`type <> 'NEWS' OR COALESCE(news_retention_state, 'full') = 'full' OR news_feed_role IN ('lead', 'representative')`), view).
 		Select("public_id, type, title, excerpt, body_text, source_name, published_at").
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch batch text"})
@@ -1701,6 +2211,9 @@ func InternalReconcileArtifactCompleteStatuses(c *gin.Context) {
 			if !contentItemHasRequiredArtifact(&item) {
 				return nil
 			}
+			if err := checkContentLifecycleMutation(tx, item); err != nil {
+				return err
+			}
 			item.Status = models.ContentStatusReady
 			metadata := map[string]interface{}{}
 			if len(item.Metadata) > 0 {
@@ -1729,6 +2242,9 @@ func InternalReconcileArtifactCompleteStatuses(c *gin.Context) {
 			reconciled++
 			return nil
 		}); err != nil {
+			if writeLifecycleConflict(c, err) {
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reconcile artifact-complete status"})
 			return
 		}
@@ -1738,11 +2254,11 @@ func InternalReconcileArtifactCompleteStatuses(c *gin.Context) {
 
 // runKNNQuery is the shared dense-vector kNN body. The RRF fusion in
 // Enrichment only uses rank, not the raw cosine score.
-func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string) []internalKNNHit {
-	q := db.Model(&models.ContentItem{}).
-		Where("status = ?", models.ContentStatusReady).
-		Where("type <> ? OR COALESCE(news_retention_state, 'full') = 'full'", models.ContentTypeNews).
-		Where(column + " IS NOT NULL")
+func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats []string, k int, excludeIDs []string, view feedcontract.ServingView) []internalKNNHit {
+	q := feedcontract.ApplyServingViewMembership(db, db.Model(&models.ContentItem{}).
+		Scopes(publicContentBaseQuery).
+		Where(`type <> 'NEWS' OR COALESCE(news_retention_state, 'full') = 'full' OR news_feed_role IN ('lead', 'representative')`).
+		Where(column+" IS NOT NULL"), view)
 	if column == "embedding" {
 		q = q.Where("embedding_space_id = ?", spaceID)
 	}
@@ -1808,6 +2324,22 @@ func runKNNQuery(db *gorm.DB, column, vecLiteral, spaceID string, types, formats
 	return hits
 }
 
+func parseInternalServingView(tenantID, newsGenerationID, mediaGenerationID string) (feedcontract.ServingView, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return feedcontract.ServingView{}, errors.New("tenant_id is required")
+	}
+	newsID, err := uuid.Parse(strings.TrimSpace(newsGenerationID))
+	if err != nil {
+		return feedcontract.ServingView{}, errors.New("news_generation_id must be a UUID")
+	}
+	mediaID, err := uuid.Parse(strings.TrimSpace(mediaGenerationID))
+	if err != nil {
+		return feedcontract.ServingView{}, errors.New("media_generation_id must be a UUID")
+	}
+	view := feedcontract.ServingView{TenantID: tenantID, NewsGenerationID: newsID, MediaGenerationID: mediaID}
+	return view, feedcontract.ValidateServingView(view)
+}
+
 // InternalLinkTranscript handles PATCH /internal/content-items/:id/transcript
 func InternalLinkTranscript(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
@@ -1861,6 +2393,9 @@ func InternalLinkTranscript(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		item.TranscriptID = &transcriptUUID
 		if err := tx.Save(&item).Error; err != nil {
 			return err
@@ -1876,6 +2411,9 @@ func InternalLinkTranscript(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link transcript"})
 		return
 	}
@@ -1996,6 +2534,20 @@ func InternalGetContentItem(c *gin.Context) {
 		s := item.PublishedAt.UTC().Format(time.RFC3339)
 		publishedAt = &s
 	}
+	var servingView any
+	var publicID uuid.UUID
+	if view, supported, complete := feedcontract.LoadActiveServingView(db, item.TenantID); supported && complete {
+		query := publicContentBaseQuery(db).Model(&models.ContentItem{}).
+			Where("content_items.tenant_id = ? AND content_items.public_id = ?", item.TenantID, item.PublicID).
+			Select("content_items.public_id")
+		if err := feedcontract.ApplyServingViewMembership(db, query, view).Take(&publicID).Error; err == nil {
+			servingView = gin.H{
+				"tenant_id":           view.TenantID,
+				"news_generation_id":  view.NewsGenerationID.String(),
+				"media_generation_id": view.MediaGenerationID.String(),
+			}
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"id":        item.PublicID.String(),
 		"tenant_id": item.TenantID,
@@ -2014,6 +2566,7 @@ func InternalGetContentItem(c *gin.Context) {
 		"content_language":             item.ContentLanguage,
 		"source_name":                  item.SourceName,
 		"published_at":                 publishedAt,
+		"serving_view":                 servingView,
 		"media_url":                    item.MediaURL,
 		"thumbnail_url":                item.ThumbnailURL,
 		"storage_tier":                 item.StorageTier, // nil = primary

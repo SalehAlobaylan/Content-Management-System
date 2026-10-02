@@ -101,6 +101,7 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/freeze", "source-runs.units.freeze", agg, false},
 		{http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations", "source-runs.observations.write", agg, false},
 		{http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/upstream-observations/:observation/disposition", "source-runs.observations.materialize", agg, false},
+		{http.MethodPost, "/source-runs/:request/attempts/:attempt/units/:unit/content-reset-grants", "content-reset.reconstruction_grants.issue", agg, false},
 		{http.MethodPost, "/source-runs/:request/seal", "source-runs.manifest.seal", agg, false},
 		{http.MethodPost, "/source-run-verification-tasks/claim", "source-runs.verification.claim", agg, false},
 		{http.MethodPost, "/source-run-verification-tasks/claim-next", "source-runs.verification.claim_next", agg, false},

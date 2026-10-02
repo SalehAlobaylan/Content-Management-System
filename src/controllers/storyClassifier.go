@@ -2,10 +2,12 @@ package controllers
 
 import (
 	"content-management-system/src/feedstate"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/spaceid"
 	"content-management-system/src/utils"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
@@ -44,6 +46,20 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	if item.Embedding == nil {
 		return
 	}
+	instance, err := feedstate.CampaignInstanceForItem(db, item.TenantID, item.PublicID)
+	if err != nil {
+		return
+	}
+	if instance != nil && instance.State == "staged" {
+		threshold := loadTenantConfig(db, item.TenantID).StoryMatchThreshold
+		if threshold <= 0 {
+			threshold = storyMatchThresholdDefault
+		}
+		if err := db.Transaction(func(tx *gorm.DB) error { return feedstate.ClassifyStagedNews(tx, item, threshold) }); err != nil {
+			log.Print("Isolated News classification awaits valid candidate evidence")
+		}
+		return
+	}
 	// Unknown-space vectors are debt, never classification inputs. During a
 	// target-space campaign, hold new classification until active story
 	// centroids have crossed to the same space; otherwise the partial catalog
@@ -69,7 +85,7 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 		Distance float64
 	}
 	var nearest nearestRow
-	_ = db.Model(&models.Story{}).
+	_ = feedstate.ActiveNewsStoryQuery(db, item.TenantID).
 		Select("public_id, (embedding <=> '"+lit+"') AS distance").
 		Where("tenant_id = ? AND embedding IS NOT NULL AND embedding_space_id = ?", item.TenantID, *item.EmbeddingSpaceID).
 		Where("last_member_at IS NULL OR last_member_at BETWEEN ? AND ?", windowStart, windowEnd).
@@ -163,19 +179,53 @@ func holdStoryClassification(db *gorm.DB, tenantID, itemSpaceID string) bool {
 // transaction with a row lock so concurrent classifications don't clobber the
 // centroid. Decrements the previous topic's count when an item is moved.
 func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID, emb []float32) {
-	alreadyMember := item.StoryID != nil && *item.StoryID == topicID
-
+	alreadyMember := false
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if item.StoryID != nil && *item.StoryID != topicID {
+		instance, err := feedstate.CampaignInstanceForItem(tx, item.TenantID, item.PublicID)
+		if err != nil {
+			return err
+		}
+		if instance != nil && instance.State == "staged" {
+			return errors.New("staged News requires view-scoped classification")
+		}
+		sourceID := ""
+		if item.ContentSourceID != nil {
+			sourceID = item.ContentSourceID.String()
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{
+			TenantID: item.TenantID, Lane: models.ContentStageLaneNews,
+			SourceID: sourceID, ItemID: item.PublicID.String(),
+		}, lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND public_id = ?", item.TenantID, item.PublicID).
+			First(&current).Error; err != nil {
+			return err
+		}
+		if current.Type != models.ContentTypeNews || !current.UpdatedAt.Equal(item.UpdatedAt) ||
+			current.ProcessingGeneration != item.ProcessingGeneration ||
+			(current.ContentSourceID == nil) != (item.ContentSourceID == nil) ||
+			(current.ContentSourceID != nil && *current.ContentSourceID != *item.ContentSourceID) ||
+			(current.EmbeddingSpaceID == nil) != (item.EmbeddingSpaceID == nil) ||
+			(current.EmbeddingSpaceID != nil && *current.EmbeddingSpaceID != *item.EmbeddingSpaceID) {
+			return fmt.Errorf("news item changed before story membership update")
+		}
+		if current.EmbeddingSpaceID == nil {
+			return fmt.Errorf("news item has no embedding space for story membership update")
+		}
+		alreadyMember = current.StoryID != nil && *current.StoryID == topicID
+		if current.StoryID != nil && *current.StoryID != topicID {
 			tx.Model(&models.Story{}).
-				Where("public_id = ?", *item.StoryID).
+				Where("tenant_id = ? AND public_id = ?", current.TenantID, *current.StoryID).
 				UpdateColumn("article_count", gorm.Expr("GREATEST(article_count - 1, 0)"))
 		}
 
 		if !alreadyMember {
 			var topic models.Story
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("public_id = ?", topicID).First(&topic).Error; err != nil {
+				Where("tenant_id = ? AND public_id = ?", current.TenantID, topicID).First(&topic).Error; err != nil {
 				return err
 			}
 			var centroid []float32
@@ -186,29 +236,29 @@ func assignTopicToItem(db *gorm.DB, item *models.ContentItem, topicID uuid.UUID,
 			vec := pgvector.NewVector(newCentroid)
 			updates := map[string]interface{}{
 				"embedding":             &vec,
-				"embedding_model":       item.EmbeddingModel,
-				"embedding_space_id":    item.EmbeddingSpaceID,
-				"embedding_producer_id": spaceid.ProducerID(*item.EmbeddingSpaceID, spaceid.RecipeStoryCentroid),
+				"embedding_model":       current.EmbeddingModel,
+				"embedding_space_id":    current.EmbeddingSpaceID,
+				"embedding_producer_id": spaceid.ProducerID(*current.EmbeddingSpaceID, spaceid.RecipeStoryCentroid),
 				"article_count":         topic.ArticleCount + 1,
 			}
 			// Advance the story's activity time when this member is newer —
 			// keeps the activity window tracking real event time.
-			if t := itemTime(*item); topic.LastMemberAt == nil || t.After(*topic.LastMemberAt) {
+			if t := itemTime(current); topic.LastMemberAt == nil || t.After(*topic.LastMemberAt) {
 				updates["last_member_at"] = t
 			}
 			if err := tx.Model(&models.Story{}).
-				Where("public_id = ?", topicID).
+				Where("tenant_id = ? AND public_id = ?", current.TenantID, topicID).
 				Updates(updates).Error; err != nil {
 				return err
 			}
 		}
 
 		if err := tx.Model(&models.ContentItem{}).
-			Where("public_id = ?", item.PublicID).
+			Where("tenant_id = ? AND public_id = ?", current.TenantID, current.PublicID).
 			UpdateColumn("story_id", topicID).Error; err != nil {
 			return err
 		}
-		membershipItem := *item
+		membershipItem := current
 		membershipItem.StoryID = &topicID
 		return feedstate.AttachReadyNewsStory(tx, membershipItem)
 	}); err != nil {

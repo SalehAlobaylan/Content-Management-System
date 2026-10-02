@@ -108,6 +108,11 @@ func InternalUpdateContentItemQuality(c *gin.Context) {
 	var item models.ContentItem
 	var newManifestID, producerEventID, fenceToken uuid.UUID
 	alreadyApplied := false
+	if err := db.Where("public_id = ?", id).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "content item not found"})
+		return
+	}
+	expectedUpdatedAt := item.UpdatedAt
 	if req.BumpVersion {
 		var idErr, producerErr, fenceErr error
 		newManifestID, idErr = uuid.Parse(strings.TrimSpace(req.NewManifestID))
@@ -119,8 +124,14 @@ func InternalUpdateContentItemQuality(c *gin.Context) {
 		}
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ?", id).First(&item).Error; err != nil {
 			return err
+		}
+		if !item.UpdatedAt.Equal(expectedUpdatedAt) {
+			return fmt.Errorf("content changed while its quality update was being prepared")
 		}
 		if item.RetiredPayloadAt != nil || item.Status == models.ContentStatusArchived {
 			return fmt.Errorf("content identity is permanently retired")

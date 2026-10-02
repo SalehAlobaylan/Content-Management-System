@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
@@ -40,6 +41,12 @@ func ClaimNextSupplyActionForOwner(db *gorm.DB, protocol, owner string, leaseFor
 			descriptor, descriptorErr := RequireSupplyActionDescriptor(request.ActionKey, request.TargetType)
 			if descriptorErr != nil || descriptor.ExecutionOwner != protocol {
 				return fmt.Errorf("media supply owner request is not statically admitted")
+			}
+			if err := CheckSupplyActionLifecycle(tx, request); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					continue
+				}
+				return err
 			}
 			allowed, _, controlErr := MayExecuteSupplyAction(tx, request.TenantID, descriptor.Key)
 			if controlErr != nil {

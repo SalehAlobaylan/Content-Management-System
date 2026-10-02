@@ -3,6 +3,7 @@ package controllers
 import (
 	"bytes"
 	"content-management-system/src/contentstage"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -21,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type adminSourceListResponse struct {
@@ -29,6 +31,27 @@ type adminSourceListResponse struct {
 	Page       int                     `json:"page"`
 	Limit      int                     `json:"limit"`
 	TotalPages int                     `json:"total_pages"`
+}
+
+var errSourceConfigChanged = errors.New("source configuration changed while this update was being prepared")
+
+func lifecycleLaneForSourceCategory(category string) string {
+	if strings.EqualFold(strings.TrimSpace(category), models.SourceCategoryMedia) {
+		return "pods"
+	}
+	return "news"
+}
+
+func writeSourceLifecycleConflict(c *gin.Context, err error) bool {
+	if lifecycle.IsConflict(err) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds this source", Code: "OPERATION_CONFLICT"})
+		return true
+	}
+	if lifecycle.IsIntakePaused(err) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Source intake is paused by an active Content Reset operation", Code: "SOURCE_ADMISSION_PAUSED"})
+		return true
+	}
+	return false
 }
 
 type contentSourceResponse struct {
@@ -636,7 +659,6 @@ func GetContentSource(c *gin.Context) {
 		})
 		return
 	}
-
 	response := mapContentSourceResponse(db, source)
 	response.ActiveRun = loadActiveSourceRuns(db, principal.TenantID, []models.ContentSource{source})[source.PublicID]
 	c.JSON(http.StatusOK, response)
@@ -739,7 +761,15 @@ func CreateContentSource(c *gin.Context) {
 		Metadata:             metadata,
 	}
 
-	if err := db.Create(&source).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: principal.TenantID, Lane: lifecycleLaneForSourceCategory(category)}, lifecycle.PhaseSourceAdmission); err != nil {
+			return err
+		}
+		return tx.Create(&source).Error
+	}); err != nil {
+		if writeSourceLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to create source",
 			Code:    "CREATE_FAILED",
@@ -857,7 +887,20 @@ func BulkCreateContentSources(c *gin.Context) {
 			Metadata:             metadata,
 		}
 
-		if err := db.Create(&source).Error; err != nil {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: principal.TenantID, Lane: lifecycleLaneForSourceCategory(bulkCategory)}, lifecycle.PhaseSourceAdmission); err != nil {
+				return err
+			}
+			return tx.Create(&source).Error
+		}); err != nil {
+			if lifecycle.IsConflict(err) {
+				failed = append(failed, bulkCreateFailure{Index: index, Name: name, Message: "An active lifecycle campaign holds this source lane"})
+				continue
+			}
+			if lifecycle.IsIntakePaused(err) {
+				failed = append(failed, bulkCreateFailure{Index: index, Name: name, Message: "Source intake is paused by an active Content Reset operation"})
+				continue
+			}
 			failed = append(failed, bulkCreateFailure{
 				Index:   index,
 				Name:    name,
@@ -912,6 +955,7 @@ func UpdateContentSource(c *gin.Context) {
 		})
 		return
 	}
+	originalConfigVersion := source.SourceConfigVersion
 
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -1000,6 +1044,29 @@ func UpdateContentSource(c *gin.Context) {
 	source.EnsureInitialSchedule(time.Now())
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		var current models.ContentSource
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.SourceConfigVersion != originalConfigVersion {
+			return errSourceConfigChanged
+		}
+		oldLane := current.Category
+		if oldLane == models.SourceCategoryMedia {
+			oldLane = "pods"
+		}
+		newLane := source.Category
+		if newLane == models.SourceCategoryMedia {
+			newLane = "pods"
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: current.TenantID, Lane: oldLane, SourceID: current.PublicID.String()}, lifecycle.PhaseSourceAdmission); err != nil {
+			return err
+		}
+		if newLane != oldLane {
+			if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: current.TenantID, Lane: newLane, SourceID: current.PublicID.String()}, lifecycle.PhaseSourceAdmission); err != nil {
+				return err
+			}
+		}
 		if err := tx.Save(&source).Error; err != nil {
 			return err
 		}
@@ -1009,10 +1076,21 @@ func UpdateContentSource(c *gin.Context) {
 		resolved := contentstage.ResolveMediaAcquisitionMode(tx, models.ContentItem{TenantID: source.TenantID, ContentSourceID: &source.PublicID})
 		return contentstage.ReconcileSourceAcquisitionPolicy(tx, source, resolved)
 	}); err != nil {
+		if writeSourceLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errSourceConfigChanged) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "Source configuration changed; reload it before retrying", Code: "SOURCE_CONFIG_STALE"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to update source and reconcile media acquisition work",
 			Code:    "UPDATE_FAILED",
 		})
+		return
+	}
+	if err := db.Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&source).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Source was updated but could not be reloaded", Code: "SOURCE_READ_FAILED"})
 		return
 	}
 
@@ -1046,7 +1124,23 @@ func DeleteContentSource(c *gin.Context) {
 		return
 	}
 
-	if err := db.Delete(&source).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var current models.ContentSource
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).First(&current).Error; err != nil {
+			return err
+		}
+		lane := current.Category
+		if lane == models.SourceCategoryMedia {
+			lane = "pods"
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{TenantID: current.TenantID, Lane: lane, SourceID: current.PublicID.String()}, lifecycle.PhaseSourceAdmission); err != nil {
+			return err
+		}
+		return tx.Delete(&current).Error
+	}); err != nil {
+		if writeSourceLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to delete source",
 			Code:    "DELETE_FAILED",
@@ -1100,6 +1194,14 @@ func RunContentSource(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, ErrSourceRunAlreadyActive) {
 			c.JSON(http.StatusConflict, authErrorResponse{Message: "A source run is already active for this source", Code: "SOURCE_RUN_ALREADY_ACTIVE"})
+			return
+		}
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "A lifecycle campaign currently holds this source admission boundary", Code: "OPERATION_CONFLICT"})
+			return
+		}
+		if lifecycle.IsIntakePaused(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "Source intake is paused by an active Content Reset operation", Code: "SOURCE_ADMISSION_PAUSED"})
 			return
 		}
 		c.JSON(http.StatusServiceUnavailable, authErrorResponse{Message: "Failed to admit durable source-run request: " + err.Error(), Code: "SOURCE_RUN_ADMISSION_FAILED"})

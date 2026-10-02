@@ -160,6 +160,7 @@ func InternalRecordSourceRunUpstreamObservations(c *gin.Context) {
 		ProviderVersion    string `json:"provider_version"`
 		ProviderPageID     string `json:"provider_page_id"`
 		ProviderCursor     string `json:"provider_cursor"`
+		Disposition        string `json:"disposition"`
 		Items              []struct {
 			UpstreamItemID      string `json:"upstream_item_id"`
 			UpstreamFingerprint string `json:"upstream_fingerprint"`
@@ -173,17 +174,17 @@ func InternalRecordSourceRunUpstreamObservations(c *gin.Context) {
 	for _, item := range body.Items {
 		items = append(items, supply.UpstreamObservationItem{UpstreamItemID: item.UpstreamItemID, UpstreamFingerprint: item.UpstreamFingerprint})
 	}
-	created, err := supply.RecordUpstreamObservations(c.MustGet("db").(*gorm.DB), supply.RecordUpstreamObservationsInput{
+	result, err := supply.RecordUpstreamObservations(c.MustGet("db").(*gorm.DB), supply.RecordUpstreamObservationsInput{
 		TenantID: body.TenantID, RequestID: c.Param("request"), AttemptID: c.Param("attempt"), UnitID: c.Param("unit"),
 		UnitJobID: body.UnitJobID, AttemptFenceToken: body.AttemptFenceToken, ExecutionLeaseToken: body.ExecutionLease,
 		ProviderCapability: body.ProviderCapability, ProviderVersion: body.ProviderVersion, ProviderPageID: body.ProviderPageID,
-		ProviderCursor: body.ProviderCursor, Items: items,
+		ProviderCursor: body.ProviderCursor, Disposition: body.Disposition, Items: items,
 	})
 	if err != nil {
 		writeSourceRunContractError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true, "created": created})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "created": result.Created, "observation_ids": result.ObservationIDs})
 }
 
 func InternalRecordSourceRunUpstreamObservationDisposition(c *gin.Context) {
@@ -192,9 +193,10 @@ func InternalRecordSourceRunUpstreamObservationDisposition(c *gin.Context) {
 	}
 	var body struct {
 		sourceRunEnvelopeBody
-		Disposition   string `json:"disposition"`
-		ContentItemID string `json:"content_item_id"`
-		FilterClass   string `json:"filter_class"`
+		Disposition    string `json:"disposition"`
+		ContentItemID  string `json:"content_item_id"`
+		UpstreamItemID string `json:"upstream_item_id"`
+		FilterClass    string `json:"filter_class"`
 	}
 	if err := decodeStrictJSON(c, &body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid source-run upstream observation disposition"})
@@ -203,7 +205,7 @@ func InternalRecordSourceRunUpstreamObservationDisposition(c *gin.Context) {
 	created, err := supply.RecordUpstreamObservationDisposition(c.MustGet("db").(*gorm.DB), supply.MaterializeUpstreamObservationInput{
 		TenantID: body.TenantID, RequestID: c.Param("request"), AttemptID: c.Param("attempt"), UnitID: c.Param("unit"),
 		UnitJobID: body.UnitJobID, AttemptFenceToken: body.AttemptFenceToken, ExecutionLeaseToken: body.ExecutionLease,
-		ObservationID: c.Param("observation"), Disposition: strings.TrimSpace(body.Disposition), ContentItemID: strings.TrimSpace(body.ContentItemID), FilterClass: strings.TrimSpace(body.FilterClass),
+		ObservationID: c.Param("observation"), UpstreamItemID: strings.TrimSpace(body.UpstreamItemID), Disposition: strings.TrimSpace(body.Disposition), ContentItemID: strings.TrimSpace(body.ContentItemID), FilterClass: strings.TrimSpace(body.FilterClass),
 	})
 	if err != nil {
 		writeSourceRunContractError(c, err)

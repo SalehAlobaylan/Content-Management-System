@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"content-management-system/src/feedstate"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/podsreset"
 	"content-management-system/src/utils"
@@ -1336,6 +1337,108 @@ func podsResetMetadataCounts(db *gorm.DB, tenant string, item models.ContentItem
 	return counts, nil
 }
 
+type podsResetPlanTarget struct {
+	ID                  uuid.UUID                     `json:"content_item_id"`
+	Snapshot            podsreset.Snapshot            `json:"snapshot"`
+	Decisions           []podsreset.DataClassDecision `json:"data_decisions"`
+	Blockers            []podsResetBlocker            `json:"blockers"`
+	StorageTiers        []string                      `json:"storage_tiers"`
+	StorageBindings     []podsreset.StorageBinding    `json:"storage_bindings"`
+	StorageVersionModel string                        `json:"storage_version_model"`
+	MetadataCounts      map[string]int64              `json:"metadata_counts"`
+	Objects             []podsreset.ObjectIdentity    `json:"objects"`
+}
+
+// buildPodsResetPlanTargets materializes the exact Plan 119 preflight for an
+// explicit item set. It performs read-only inventory/provider checks and
+// returns the immutable target snapshot used by both the standalone preview
+// and a campaign-delegated retirement batch.
+func buildPodsResetPlanTargets(db *gorm.DB, tenant string, ids []uuid.UUID) ([]podsResetPlanTarget, int, int64, error) {
+	selected := make(map[uuid.UUID]bool, len(ids))
+	for _, id := range ids {
+		selected[id] = true
+	}
+	targets := make([]podsResetPlanTarget, 0, len(ids))
+	var totalBytes int64
+	var totalObjects int
+	for _, id := range ids {
+		var item models.ContentItem
+		t := podsResetPlanTarget{ID: id, Decisions: podsreset.Decisions(false), Blockers: []podsResetBlocker{}, MetadataCounts: map[string]int64{}, Objects: []podsreset.ObjectIdentity{}}
+		if err := db.Where("tenant_id=? AND public_id=?", tenant, id).First(&item).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				appendPodsResetBlocker(&t.Blockers, "item_not_found", "The explicit ID does not exist in the authenticated tenant.")
+			} else {
+				return nil, 0, 0, errors.New("could not load selected content")
+			}
+		} else {
+			t.Snapshot = podsreset.SnapshotFor(item)
+			t.MetadataCounts, err = podsResetMetadataCounts(db, tenant, item)
+			if err != nil {
+				return nil, 0, 0, errors.New("could not inventory related metadata")
+			}
+			var transcriptShared bool
+			t.Blockers, transcriptShared, err = podsResetItemBlockers(db, tenant, item, selected)
+			if err != nil {
+				return nil, 0, 0, errors.New("could not prove reset dependencies")
+			}
+			var alreadyRetired int64
+			identityHash := podsResetIdentityHash(item.TenantID, t.Snapshot.IdempotencyKey)
+			if identityHash != "" {
+				if err := db.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND identity_hash=?", item.TenantID, identityHash).Count(&alreadyRetired).Error; err != nil {
+					return nil, 0, 0, errors.New("could not inspect retirement identity")
+				}
+				if alreadyRetired > 0 {
+					appendPodsResetBlocker(&t.Blockers, "retired_identity_collision", "The source identity is permanently fenced by a prior reset.")
+				}
+			}
+			t.Decisions = podsreset.Decisions(transcriptShared)
+		}
+		if item.PublicID != uuid.Nil && (item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) {
+			payload := gin.H{"tenant_id": tenant, "content_ids": []string{id.String()}}
+			body, status, callErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", payload)
+			if callErr != nil || status < 200 || status >= 300 {
+				appendPodsResetBlocker(&t.Blockers, "storage_inventory_incomplete", "Aggregation could not prove a complete inventory for this item.")
+			} else {
+				var response podsResetInventoryResponse
+				if err := json.Unmarshal(body, &response); err != nil || !response.Data.Complete || len(response.Data.Items) != 1 || response.Data.Items[0].ContentItemID != id.String() {
+					appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "Aggregation returned an incomplete or mismatched item inventory.")
+				} else {
+					t.StorageTiers = append([]string(nil), response.Data.ConfiguredTiers...)
+					t.StorageBindings = append([]podsreset.StorageBinding(nil), response.Data.StorageBindings...)
+					t.StorageVersionModel = response.Data.VersionModel
+					if t.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" {
+						appendPodsResetBlocker(&t.Blockers, "storage_version_model_unqualified", "Storage object-version semantics are not qualified for exact deletion.")
+					}
+					if len(t.StorageTiers) == 0 || !containsString(t.StorageTiers, "primary") || (len(t.StorageTiers) > 2) || (len(t.StorageTiers) == 2 && !containsString(t.StorageTiers, "cold")) {
+						appendPodsResetBlocker(&t.Blockers, "storage_tier_inventory_invalid", "Aggregation did not provide a valid configured-tier inventory.")
+					}
+					if err := podsreset.ValidateStorageBindings(t.StorageTiers, t.StorageBindings); err != nil {
+						appendPodsResetBlocker(&t.Blockers, "storage_binding_inventory_invalid", "Aggregation did not bind every configured tier to an exact bucket and provider endpoint identity.")
+					}
+					for _, object := range response.Data.Items[0].Objects {
+						t.Objects = append(t.Objects, podsreset.ObjectIdentity{StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes})
+					}
+					if !podsResetObjectsMatchStorageBindings(response.Data.Items[0].Objects, t.StorageBindings) {
+						appendPodsResetBlocker(&t.Blockers, "storage_binding_object_mismatch", "An inventoried object is not in the frozen bucket for its configured storage tier.")
+					}
+					if err := podsreset.ValidateObjectSet(id.String(), t.Objects); err != nil {
+						appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "An object identity was duplicate, incomplete, or outside the exact content prefix.")
+						t.Objects = []podsreset.ObjectIdentity{}
+					} else if ownershipErr := podsResetArtifactOwnershipBlockers(db, tenant, id, t.Objects); ownershipErr != nil {
+						appendPodsResetBlocker(&t.Blockers, "artifact_ownership_unproven", "Artifact registry references a missing, shared, or unlisted object identity.")
+					}
+				}
+			}
+		}
+		totalObjects += len(t.Objects)
+		for _, object := range t.Objects {
+			totalBytes += object.SizeBytes
+		}
+		targets = append(targets, t)
+	}
+	return targets, totalObjects, totalBytes, nil
+}
+
 func CreatePodsResetPlan(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -1377,98 +1480,10 @@ func CreatePodsResetPlan(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reset environment identity is unavailable"})
 		return
 	}
-	type target struct {
-		ID                  uuid.UUID                     `json:"content_item_id"`
-		Snapshot            podsreset.Snapshot            `json:"snapshot"`
-		Decisions           []podsreset.DataClassDecision `json:"data_decisions"`
-		Blockers            []podsResetBlocker            `json:"blockers"`
-		StorageTiers        []string                      `json:"storage_tiers"`
-		StorageBindings     []podsreset.StorageBinding    `json:"storage_bindings"`
-		StorageVersionModel string                        `json:"storage_version_model"`
-		MetadataCounts      map[string]int64              `json:"metadata_counts"`
-		Objects             []podsreset.ObjectIdentity    `json:"objects"`
-	}
-	targets := make([]target, 0, len(ids))
-	var totalBytes int64
-	var totalObjects int
-	for _, id := range ids {
-		var item models.ContentItem
-		t := target{ID: id, Decisions: podsreset.Decisions(false), Blockers: []podsResetBlocker{}, MetadataCounts: map[string]int64{}, Objects: []podsreset.ObjectIdentity{}}
-		if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&item).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				appendPodsResetBlocker(&t.Blockers, "item_not_found", "The explicit ID does not exist in the authenticated tenant.")
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load selected content"})
-				return
-			}
-		} else {
-			t.Snapshot = podsreset.SnapshotFor(item)
-			t.MetadataCounts, err = podsResetMetadataCounts(db, principal.TenantID, item)
-			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inventory related metadata"})
-				return
-			}
-			var transcriptShared bool
-			t.Blockers, transcriptShared, err = podsResetItemBlockers(db, principal.TenantID, item, selected)
-			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not prove reset dependencies"})
-				return
-			}
-			var alreadyRetired int64
-			identityHash := podsResetIdentityHash(item.TenantID, t.Snapshot.IdempotencyKey)
-			if identityHash != "" {
-				if err := db.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND identity_hash=?", item.TenantID, identityHash).Count(&alreadyRetired).Error; err != nil {
-					c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inspect retirement identity"})
-					return
-				}
-				if alreadyRetired > 0 {
-					appendPodsResetBlocker(&t.Blockers, "retired_identity_collision", "The source identity is permanently fenced by a prior reset.")
-				}
-			}
-			t.Decisions = podsreset.Decisions(transcriptShared)
-		}
-		if item.PublicID != uuid.Nil && (item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) {
-			payload := gin.H{"tenant_id": principal.TenantID, "content_ids": []string{id.String()}}
-			body, status, callErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", payload)
-			if callErr != nil || status < 200 || status >= 300 {
-				appendPodsResetBlocker(&t.Blockers, "storage_inventory_incomplete", "Aggregation could not prove a complete inventory for this item.")
-			} else {
-				var response podsResetInventoryResponse
-				if err := json.Unmarshal(body, &response); err != nil || !response.Data.Complete || len(response.Data.Items) != 1 || response.Data.Items[0].ContentItemID != id.String() {
-					appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "Aggregation returned an incomplete or mismatched item inventory.")
-				} else {
-					t.StorageTiers = append([]string(nil), response.Data.ConfiguredTiers...)
-					t.StorageBindings = append([]podsreset.StorageBinding(nil), response.Data.StorageBindings...)
-					t.StorageVersionModel = response.Data.VersionModel
-					if t.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" {
-						appendPodsResetBlocker(&t.Blockers, "storage_version_model_unqualified", "Storage object-version semantics are not qualified for exact deletion.")
-					}
-					if len(t.StorageTiers) == 0 || !containsString(t.StorageTiers, "primary") || (len(t.StorageTiers) > 2) || (len(t.StorageTiers) == 2 && !containsString(t.StorageTiers, "cold")) {
-						appendPodsResetBlocker(&t.Blockers, "storage_tier_inventory_invalid", "Aggregation did not provide a valid configured-tier inventory.")
-					}
-					if err := podsreset.ValidateStorageBindings(t.StorageTiers, t.StorageBindings); err != nil {
-						appendPodsResetBlocker(&t.Blockers, "storage_binding_inventory_invalid", "Aggregation did not bind every configured tier to an exact bucket and provider endpoint identity.")
-					}
-					for _, object := range response.Data.Items[0].Objects {
-						t.Objects = append(t.Objects, podsreset.ObjectIdentity{StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes})
-					}
-					if !podsResetObjectsMatchStorageBindings(response.Data.Items[0].Objects, t.StorageBindings) {
-						appendPodsResetBlocker(&t.Blockers, "storage_binding_object_mismatch", "An inventoried object is not in the frozen bucket for its configured storage tier.")
-					}
-					if err := podsreset.ValidateObjectSet(id.String(), t.Objects); err != nil {
-						appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "An object identity was duplicate, incomplete, or outside the exact content prefix.")
-						t.Objects = []podsreset.ObjectIdentity{}
-					} else if ownershipErr := podsResetArtifactOwnershipBlockers(db, principal.TenantID, id, t.Objects); ownershipErr != nil {
-						appendPodsResetBlocker(&t.Blockers, "artifact_ownership_unproven", "Artifact registry references a missing, shared, or unlisted object identity.")
-					}
-				}
-			}
-		}
-		totalObjects += len(t.Objects)
-		for _, object := range t.Objects {
-			totalBytes += object.SizeBytes
-		}
-		targets = append(targets, t)
+	targets, totalObjects, totalBytes, err := buildPodsResetPlanTargets(db, principal.TenantID, ids)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
 	}
 	if totalObjects > podsreset.MaxRunObjects || totalBytes > podsreset.MaxRunBytes {
 		for index := range targets {
@@ -1701,6 +1716,10 @@ func ApprovePodsResetPlan(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Pods reset plan not found"})
 		return
 	}
+	if run.ContentResetCampaignID != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "campaign-delegated Pods reset runs are controlled through the Content Reset coordinator", "code": "CAMPAIGN_DELEGATED"})
+		return
+	}
 	var items []models.PodsResetItem
 	if err := db.Where("run_id=?", run.PublicID).Order("ordinal").Find(&items).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load reset items"})
@@ -1754,6 +1773,9 @@ func CancelPodsResetPlan(c *gin.Context) {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, run.PublicID).First(&run).Error; err != nil {
 			return err
 		}
+		if run.ContentResetCampaignID != nil {
+			return fmt.Errorf("campaign-delegated Pods reset runs are controlled through the Content Reset coordinator")
+		}
 		if run.State != "preview" && run.State != "approved" && run.State != "executing" && run.State != "partial" {
 			return fmt.Errorf("reset is not in a cancellable state")
 		}
@@ -1792,6 +1814,10 @@ func RequestPodsResetPause(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Pods reset run not found"})
 		return
 	}
+	if run.ContentResetCampaignID != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "campaign-delegated Pods reset runs are controlled through the Content Reset coordinator", "code": "CAMPAIGN_DELEGATED"})
+		return
+	}
 	err = db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, run.PublicID).First(&run).Error; err != nil {
 			return err
@@ -1826,6 +1852,10 @@ func ResumePodsResetRun(c *gin.Context) {
 	run, err := loadPodsResetRun(db, principal.TenantID, c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Pods reset run not found"})
+		return
+	}
+	if run.ContentResetCampaignID != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "campaign-delegated Pods reset runs are controlled through the Content Reset coordinator", "code": "CAMPAIGN_DELEGATED"})
 		return
 	}
 	err = db.Transaction(func(tx *gorm.DB) error {
@@ -1906,356 +1936,37 @@ func ExecutePodsResetRun(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Pods reset run not found"})
 		return
 	}
-	if err := requireRetentionCapability(db, principal.TenantID, retentionCapabilityPodsReset); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "RESET_DISABLED"})
+	if run.ContentResetCampaignID != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "campaign-delegated Pods reset runs execute through the Content Reset coordinator", "code": "CAMPAIGN_DELEGATED"})
 		return
 	}
-	if run.PauseRequested {
-		c.JSON(http.StatusConflict, gin.H{"error": "reset is paused; explicitly resume it before execution", "code": "RESET_PAUSED"})
-		return
-	}
-	if run.State != "approved" && run.State != "executing" && run.State != "partial" {
-		c.JSON(http.StatusConflict, gin.H{"error": "run is not approved or resumable"})
-		return
-	}
-	if run.State == "approved" && time.Now().UTC().After(run.ExpiresAt) {
-		c.JSON(http.StatusConflict, gin.H{"error": "approval expired; create a fresh preview"})
-		return
-	}
-	if run.PolicyVersion != podsreset.PolicyVersion {
-		c.JSON(http.StatusConflict, gin.H{"error": "reset policy changed after preview; create a fresh preview", "code": "POLICY_DRIFT"})
-		return
-	}
-	currentSchema, err := podsResetSchemaFingerprint(db)
-	if err != nil || currentSchema != run.SchemaFingerprint {
-		c.JSON(http.StatusConflict, gin.H{"error": "content reference schema changed after preview; no further actions allowed", "code": "SCHEMA_DRIFT"})
-		return
-	}
-	manifestHash, err := podsResetManifestHash(run.Manifest)
-	if err != nil || manifestHash != run.ManifestHash {
-		c.JSON(http.StatusConflict, gin.H{"error": "persisted manifest failed integrity validation"})
-		return
-	}
-	run, err = podsResetAcquireExecutionClaim(db, principal.TenantID, run.PublicID)
+	outcome, err := executePodsResetRunInProcess(db, principal, run)
 	if err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "RESET_EXECUTOR_BUSY"})
-		return
-	}
-	defer func() { _ = podsResetReleaseExecutionClaim(db, run) }()
-	var items []models.PodsResetItem
-	if err := db.Where("run_id=?", run.PublicID).Order("ordinal").Find(&items).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load reset state"})
-		return
-	}
-	processedItems := 0
-	pauseAtBoundary := false
-	verificationWait := false
-	for _, item := range items {
-		if item.State == "complete" {
-			continue
-		}
-		if processedItems >= podsreset.MaxBatchItems {
-			break
-		}
-		processedItems++
-		var pauseRequested bool
-		if err := db.Model(&models.PodsResetRun{}).Select("pause_requested").Where("public_id=?", run.PublicID).Scan(&pauseRequested).Error; err != nil {
-			podsResetMarkPartial(db, &run, &item, "could not read pause control at item boundary")
-			break
-		}
-		if pauseRequested {
-			pauseAtBoundary = true
-			break
-		}
-		if item.State == "blocked" {
-			c.JSON(http.StatusConflict, gin.H{"error": "approved run contains a blocked target"})
+		var execErr *podsResetExecutionError
+		if errors.As(err, &execErr) {
+			body := gin.H{"error": execErr.Message}
+			if execErr.Code != "" {
+				body["code"] = execErr.Code
+			}
+			c.JSON(execErr.Status, body)
 			return
 		}
-		if err := podsResetRenewExecutionClaim(db, &run); err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "reset execution lease was lost", "code": "RESET_EXECUTOR_FENCE_LOST"})
-			return
-		}
-		if item.State == "planned" {
-			var content models.ContentItem
-			if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, item.ContentItemID).First(&content).Error; err != nil {
-				podsResetMarkPartial(db, &run, &item, "selected content identity disappeared before fence")
-				break
-			}
-			hash, _ := podsreset.Hash(podsreset.SnapshotFor(content))
-			if hash != item.SnapshotHash {
-				podsResetMarkPartial(db, &run, &item, "selected content changed after preview")
-				break
-			}
-			var allIDs []uuid.UUID
-			for _, row := range items {
-				allIDs = append(allIDs, row.ContentItemID)
-			}
-			if blockers, _, checkErr := podsResetItemBlockers(db, principal.TenantID, content, uuidSet(allIDs)); checkErr != nil || len(blockers) > 0 {
-				reason := "preflight protection or work state changed after approval"
-				if checkErr != nil {
-					reason = "preflight revalidation failed: " + checkErr.Error()
-				}
-				podsResetMarkPartial(db, &run, &item, reason)
-				break
-			}
-			var frozenManifest struct {
-				Targets []podsResetManifestTarget `json:"targets"`
-			}
-			if err := json.Unmarshal(run.Manifest, &frozenManifest); err != nil {
-				podsResetMarkPartial(db, &run, &item, "approved object inventory could not be decoded")
-				break
-			}
-			var frozenTarget *podsResetManifestTarget
-			for index := range frozenManifest.Targets {
-				if frozenManifest.Targets[index].ID == item.ContentItemID {
-					frozenTarget = &frozenManifest.Targets[index]
-					break
-				}
-			}
-			if frozenTarget == nil {
-				podsResetMarkPartial(db, &run, &item, "approved target inventory is missing")
-				break
-			}
-			inventoryBody, inventoryStatus, inventoryErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", gin.H{"tenant_id": run.TenantID, "content_ids": []string{item.ContentItemID.String()}})
-			var latestInventory podsResetInventoryResponse
-			if inventoryErr != nil || inventoryStatus < 200 || inventoryStatus >= 300 || json.Unmarshal(inventoryBody, &latestInventory) != nil || !latestInventory.Data.Complete || len(latestInventory.Data.Items) != 1 || latestInventory.Data.Items[0].ContentItemID != item.ContentItemID.String() {
-				podsResetMarkPartial(db, &run, &item, "storage inventory could not be revalidated before retirement")
-				break
-			}
-			if frozenTarget.StorageVersionModel != latestInventory.Data.VersionModel || frozenTarget.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" || !podsResetSameStrings(frozenTarget.StorageTiers, latestInventory.Data.ConfiguredTiers) || podsreset.ValidateStorageBindings(frozenTarget.StorageTiers, latestInventory.Data.StorageBindings) != nil || !podsreset.SameStorageBindings(frozenTarget.StorageBindings, latestInventory.Data.StorageBindings) || !podsResetObjectsMatchStorageBindings(latestInventory.Data.Items[0].Objects, latestInventory.Data.StorageBindings) || podsResetInventoryChanged(frozenTarget.Objects, latestInventory.Data.Items[0].Objects) {
-				podsResetMarkPartial(db, &run, &item, "storage tiers or object fingerprints changed after approval; create a fresh preview")
-				break
-			}
-			if err := podsResetFenceItem(db, run, &item, &content, uuidSet(allIDs)); err != nil {
-				podsResetMarkPartial(db, &run, &item, "retirement fence failed: "+err.Error())
-				break
-			}
-			item.State = "fenced"
-		}
-		if !podsResetItemNeedsProcessing(item.State) {
-			continue
-		}
-		if item.State == "fenced" {
-			var objectRows []models.PodsResetObject
-			if err := db.Where("run_id=? AND content_item_id=?", run.PublicID, item.ContentItemID).Order("storage_tier,bucket,object_key").Find(&objectRows).Error; err != nil {
-				podsResetMarkPartial(db, &run, &item, "could not load frozen object set")
-				break
-			}
-			for _, row := range objectRows {
-				if row.State == "blocked" {
-					podsResetMarkPartial(db, &run, &item, "a frozen object is blocked")
-					break
-				}
-			}
-			if run.State == "partial" {
-				break
-			}
-			if err := db.Model(&models.PodsResetObject{}).Where("run_id=? AND content_item_id=? AND state='planned'", run.PublicID, item.ContentItemID).Updates(map[string]interface{}{"state": "deleting", "attempt_count": gorm.Expr("attempt_count + 1"), "updated_at": time.Now().UTC()}).Error; err != nil {
-				podsResetMarkPartial(db, &run, &item, "could not persist object deletion attempt")
-				break
-			}
-			objects := make([]podsResetObjectWire, 0, len(objectRows))
-			for _, row := range objectRows {
-				objects = append(objects, podsResetObjectWire{StorageTier: row.StorageTier, Bucket: row.Bucket, ObjectKey: row.ObjectKey, ETag: row.ETag, SizeBytes: row.SizeBytes})
-			}
-			storageTarget := itemStorageTarget(run.Manifest, item.ContentItemID)
-			if storageTarget == nil {
-				podsResetMarkPartial(db, &run, &item, "approved storage binding is missing")
-				break
-			}
-			payload := gin.H{"run_id": run.PublicID.String(), "tenant_id": run.TenantID, "content_item_id": item.ContentItemID.String(), "manifest_hash": run.ManifestHash, "fencing_token": run.FencingToken.String(), "execution_token": run.ExecutionToken.String(), "storage_bindings": storageTarget.StorageBindings, "objects": objects}
-			body, status, callErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/delete-media-item", payload)
-			if callErr != nil || status < 200 || status >= 300 {
-				message := "Aggregation exact deletion failed or returned an unknown result"
-				if callErr != nil {
-					message += ": " + callErr.Error()
-				}
-				podsResetMarkPartial(db, &run, &item, message)
-				break
-			}
-			var response podsResetDeleteResponse
-			if err := json.Unmarshal(body, &response); err != nil || !response.Data.ObjectsAbsent || response.Data.ContentItemID != item.ContentItemID.String() || response.Data.FencingToken != run.FencingToken.String() || !podsreset.SameStorageBindings(storageTarget.StorageBindings, response.Data.StorageBindings) {
-				podsResetMarkPartial(db, &run, &item, "provider result did not prove exact object absence")
-				break
-			}
-			actualDeleted := podsResetObjectSet(response.Data.DeletedObjects)
-			absent := podsResetObjectSet(response.Data.AlreadyAbsentObjects)
-			if outcomeErr := podsResetValidateObjectOutcomes(objectRows, response.Data.DeletedObjects, response.Data.AlreadyAbsentObjects, response.Data.DeletedCount); outcomeErr != nil {
-				podsResetMarkPartial(db, &run, &item, outcomeErr.Error())
-				break
-			}
-			var freedBytes int64
-			for _, row := range objectRows {
-				if row.State == "deleted" {
-					continue
-				}
-				identity := podsResetObjectKey(row.StorageTier, row.Bucket, row.ObjectKey)
-				if !actualDeleted[identity] && !absent[identity] {
-					podsResetMarkPartial(db, &run, &item, "provider result omitted an approved object outcome")
-					break
-				}
-				freed := int64(0)
-				if actualDeleted[identity] {
-					freed = row.SizeBytes
-					freedBytes += freed
-				}
-				if err := db.Model(&models.PodsResetObject{}).Where("run_id=? AND storage_tier=? AND bucket=? AND object_key=?", run.PublicID, row.StorageTier, row.Bucket, row.ObjectKey).
-					Updates(map[string]interface{}{"state": "deleted", "deleted_by_run": actualDeleted[identity], "freed_bytes": freed, "deleted_at": time.Now().UTC(), "error": "", "updated_at": time.Now().UTC()}).Error; err != nil {
-					podsResetMarkPartial(db, &run, &item, "could not persist exact object outcome")
-					break
-				}
-			}
-			if run.State == "partial" {
-				break
-			}
-			storageTarget = itemStorageTarget(run.Manifest, item.ContentItemID)
-			if storageTarget == nil {
-				podsResetMarkPartial(db, &run, &item, "approved storage target is missing after deletion")
-				break
-			}
-			probeAt := time.Now().UTC()
-			verificationEvidence, err := podsResetAppendVerificationProbe(item.VerificationEvidence, podsResetVerificationProbe{
-				Number: 1, ObservedAt: probeAt, ObjectsAbsent: true, ObservedObjectCount: 0,
-				StorageVersionModel: storageTarget.StorageVersionModel,
-				StorageTiers:        append([]string(nil), storageTarget.StorageTiers...),
-				StorageBindings:     append([]podsreset.StorageBinding(nil), storageTarget.StorageBindings...),
-			})
-			if err != nil {
-				podsResetMarkPartial(db, &run, &item, "could not persist first origin-absence evidence")
-				break
-			}
-			nextProbeAt := probeAt.Add(podsreset.VerificationProbeInterval)
-			itemResult := db.Model(&models.PodsResetItem{}).Where("id=? AND state='fenced'", item.ID).Updates(map[string]interface{}{
-				"state": "verification_pending", "verification_probe_count": 1,
-				"verification_not_before": nextProbeAt, "verification_evidence": verificationEvidence,
-				"last_error": "", "updated_at": probeAt,
-			})
-			if itemResult.Error != nil || itemResult.RowsAffected != 1 {
-				podsResetMarkPartial(db, &run, &item, "could not persist object absence proof")
-				break
-			}
-			item.State = "verification_pending"
-			item.VerificationProbeCount = 1
-			item.VerificationNotBefore = &nextProbeAt
-			item.VerificationEvidence = verificationEvidence
-			_ = freedBytes
-		}
-		if item.State == "verification_pending" {
-			if item.VerificationProbeCount != 1 || item.VerificationNotBefore == nil {
-				podsResetMarkPartial(db, &run, &item, "durable second-probe state is incomplete")
-				break
-			}
-			now := time.Now().UTC()
-			if now.Before(*item.VerificationNotBefore) {
-				verificationWait = true
-				_ = db.Model(&models.PodsResetItem{}).Where("id=? AND state='verification_pending'", item.ID).Update("last_error", "verification_probe_not_due").Error
-				continue
-			}
-			inventoryBody, inventoryStatus, inventoryErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", gin.H{"tenant_id": run.TenantID, "content_ids": []string{item.ContentItemID.String()}})
-			var latestInventory podsResetInventoryResponse
-			if inventoryErr != nil || inventoryStatus < 200 || inventoryStatus >= 300 || json.Unmarshal(inventoryBody, &latestInventory) != nil || !latestInventory.Data.Complete || len(latestInventory.Data.Items) != 1 || latestInventory.Data.Items[0].ContentItemID != item.ContentItemID.String() {
-				podsResetMarkPartial(db, &run, &item, "second storage verification could not prove a complete inventory")
-				break
-			}
-			frozenTarget := itemStorageTarget(run.Manifest, item.ContentItemID)
-			if frozenTarget == nil || frozenTarget.StorageVersionModel != latestInventory.Data.VersionModel || frozenTarget.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" || !podsResetSameStrings(frozenTarget.StorageTiers, latestInventory.Data.ConfiguredTiers) || podsreset.ValidateStorageBindings(frozenTarget.StorageTiers, latestInventory.Data.StorageBindings) != nil || !podsreset.SameStorageBindings(frozenTarget.StorageBindings, latestInventory.Data.StorageBindings) {
-				podsResetMarkPartial(db, &run, &item, "storage tier or version model changed before the second verification")
-				break
-			}
-			observedObjects := latestInventory.Data.Items[0].Objects
-			if len(observedObjects) != 0 {
-				podsResetMarkPartial(db, &run, &item, "second storage verification found a late or unapproved object; it was not deleted")
-				break
-			}
-			probeCount, code := podsreset.AdvanceVerificationProbe(item.VerificationProbeCount, true, now, *item.VerificationNotBefore)
-			if code != "" {
-				podsResetMarkPartial(db, &run, &item, code)
-				break
-			}
-			verificationEvidence, err := podsResetAppendVerificationProbe(item.VerificationEvidence, podsResetVerificationProbe{
-				Number: 2, ObservedAt: now, ObjectsAbsent: true, ObservedObjectCount: len(observedObjects),
-				StorageVersionModel: latestInventory.Data.VersionModel,
-				StorageTiers:        append([]string(nil), latestInventory.Data.ConfiguredTiers...),
-				StorageBindings:     append([]podsreset.StorageBinding(nil), latestInventory.Data.StorageBindings...),
-			})
-			if err != nil {
-				podsResetMarkPartial(db, &run, &item, "could not persist second origin-absence evidence")
-				break
-			}
-			itemResult := db.Model(&models.PodsResetItem{}).Where("id=? AND state='verification_pending' AND verification_probe_count=1", item.ID).Updates(map[string]interface{}{
-				"state": "objects_deleted", "verification_probe_count": probeCount,
-				"verification_not_before": nil, "verification_evidence": verificationEvidence,
-				"last_error": "", "updated_at": now,
-			})
-			if itemResult.Error != nil || itemResult.RowsAffected != 1 {
-				podsResetMarkPartial(db, &run, &item, "could not durably persist the second origin-absence proof")
-				break
-			}
-			item.State = "objects_deleted"
-			item.VerificationProbeCount = probeCount
-		}
-		if item.State == "objects_deleted" {
-			if err := podsResetFinalizeItem(db, run, &item); err != nil {
-				podsResetMarkPartial(db, &run, &item, "metadata finalization failed: "+err.Error())
-				break
-			}
-			item.State = "complete"
-		}
-	}
-	if err := db.Where("run_id=?", run.PublicID).Order("ordinal").Find(&items).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read back reset progress"})
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	var persistedRun models.PodsResetRun
-	if err := db.Select("public_id", "state", "phase").Where("tenant_id=? AND public_id=?", principal.TenantID, run.PublicID).First(&persistedRun).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read back reset run state"})
-		return
+	data := gin.H{"id": outcome.Run.PublicID, "state": outcome.State, "phase": outcome.Phase, "rollback": outcome.Rollback, "items": outcome.Items, "totals": outcome.Totals}
+	if outcome.Warning != "" {
+		data["warning"] = outcome.Warning
 	}
-	if persistedRun.State == "cancelled" {
-		c.JSON(http.StatusOK, gin.H{"data": gin.H{"id": run.PublicID, "state": "cancelled", "phase": persistedRun.Phase, "items": items, "rollback": "no irreversible effect began"}})
-		return
+	status := http.StatusOK
+	if outcome.State == "partial" {
+		status = http.StatusAccepted
+		data["resume_allowed"] = true
 	}
-	var remaining int64
-	if err := db.Model(&models.PodsResetItem{}).Where("run_id=? AND state <> 'complete'", run.PublicID).Count(&remaining).Error; err != nil {
-		podsResetMarkPartial(db, &run, &models.PodsResetItem{RunID: run.PublicID}, "could not verify terminal item accounting")
-		c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"id": run.PublicID, "state": "partial", "resume_allowed": true, "rollback": "unavailable", "error": "terminal accounting is unavailable"}})
-		return
+	if outcome.State == "complete" {
+		data["outcome"] = "purge_only"
 	}
-	if remaining == 0 {
-		totals, totalsErr := podsResetResultTotals(db, run.PublicID)
-		if totalsErr != nil {
-			podsResetMarkPartial(db, &run, &models.PodsResetItem{RunID: run.PublicID}, "completed rows have incomplete result accounting")
-			_ = podsResetReleaseExecutionClaim(db, run)
-			c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"id": run.PublicID, "state": "partial", "resume_allowed": true, "error": "result totals unavailable"}})
-			return
-		}
-		completion := db.Model(&models.PodsResetRun{}).Where("tenant_id=? AND public_id=? AND state='executing' AND execution_token=?", principal.TenantID, run.PublicID, run.ExecutionToken).
-			Updates(map[string]interface{}{"state": "complete", "phase": "purge_only_complete", "error": "", "execution_token": nil, "execution_lease_until": nil, "updated_at": time.Now().UTC()})
-		if completion.Error != nil || completion.RowsAffected != 1 {
-			podsResetMarkPartial(db, &run, &models.PodsResetItem{RunID: run.PublicID}, "could not durably record reset completion")
-			c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"id": run.PublicID, "state": "partial", "resume_allowed": true, "error": "completion write did not persist; retry to verify"}})
-			return
-		}
-		retentionAudit(db, principal, "pods_reset.complete", run.PublicID.String(), "success", map[string]interface{}{"manifest_hash": run.ManifestHash})
-		if err := podsResetReleaseExecutionClaim(db, run); err != nil {
-			c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"id": run.PublicID, "state": "complete", "totals": totals, "warning": "execution lease cleanup pending"}})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"data": gin.H{"id": run.PublicID, "state": "complete", "outcome": "purge_only", "rollback": "unavailable", "items": items, "totals": totals}})
-		return
-	}
-	run.State = "partial"
-	phase := "batch_complete"
-	if pauseAtBoundary {
-		phase = "paused"
-	} else if verificationWait {
-		phase = "verification_wait"
-	}
-	_ = db.Model(&models.PodsResetRun{}).Where("tenant_id=? AND public_id=? AND state='executing' AND execution_token=?", principal.TenantID, run.PublicID, run.ExecutionToken).Updates(map[string]interface{}{"state": "partial", "phase": phase, "updated_at": time.Now().UTC()}).Error
-	_ = podsResetReleaseExecutionClaim(db, run)
-	retentionAudit(db, principal, "pods_reset.partial", run.PublicID.String(), "partial", map[string]interface{}{"manifest_hash": run.ManifestHash})
-	totals, _ := podsResetResultTotals(db, run.PublicID)
-	c.JSON(http.StatusAccepted, gin.H{"data": gin.H{"id": run.PublicID, "state": "partial", "resume_allowed": true, "rollback": "unavailable", "items": items, "totals": totals}})
+	c.JSON(status, gin.H{"data": data})
 }
 
 func podsResetAcquireExecutionClaim(db *gorm.DB, tenant string, runID uuid.UUID) (models.PodsResetRun, error) {
@@ -2270,11 +1981,54 @@ func podsResetAcquireExecutionClaim(db *gorm.DB, tenant string, runID uuid.UUID)
 		if run.PauseRequested {
 			return fmt.Errorf("reset is paused; explicitly resume it before execution")
 		}
+		// The delegating campaign is the authority for a delegated run. Its
+		// execution row is locked in the same transaction as the executor
+		// claim so a pause or terminal transition committed before admission
+		// cannot be overtaken by the pass.
+		if run.ContentResetCampaignID != nil {
+			var campaign models.ContentResetCampaign
+			if err := tx.Where("tenant_id=? AND id=?", tenant, *run.ContentResetCampaignID).First(&campaign).Error; err != nil {
+				return fmt.Errorf("delegating Content Reset campaign is unavailable")
+			}
+			switch campaign.State {
+			case "executing", "published", "cleanup_pending", "partial":
+			default:
+				return fmt.Errorf("delegating Content Reset campaign is not active")
+			}
+			var execution models.ContentResetExecution
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND campaign_id=?", tenant, campaign.ID).First(&execution).Error; err != nil {
+				return fmt.Errorf("delegating Content Reset campaign has no durable execution")
+			}
+			if execution.PauseRequested {
+				return fmt.Errorf("delegating Content Reset campaign is paused")
+			}
+			if execution.CompletedAt != nil || execution.RolledBackAt != nil {
+				return fmt.Errorf("delegating Content Reset campaign is terminal")
+			}
+		}
 		if run.State != "approved" && run.State != "executing" && run.State != "partial" {
 			return fmt.Errorf("run is not approved or resumable")
 		}
-		if run.State == "approved" && now.After(run.ExpiresAt) {
+		if run.State == "approved" && run.ContentResetCampaignID == nil && now.After(run.ExpiresAt) {
 			return fmt.Errorf("approval expired; create a fresh preview")
+		}
+		var targets []models.PodsResetItem
+		if err := tx.Where("tenant_id = ? AND run_id = ?", tenant, run.PublicID).
+			Order("content_item_id ASC").Find(&targets).Error; err != nil {
+			return fmt.Errorf("load exact Pods reset targets: %w", err)
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("Pods reset target ledger is empty")
+		}
+		resources := make([]lifecycle.Resource, 0, len(targets))
+		for _, target := range targets {
+			resources = append(resources, lifecycle.Resource{
+				Type: lifecycle.ResourceItem,
+				Key:  "pods/-/" + target.ContentItemID.String(),
+			})
+		}
+		if err := lifecycle.CheckResources(tx, tenant, resources, lifecycle.PhaseContentWrite); err != nil {
+			return err
 		}
 		if run.ExecutionToken != nil && run.ExecutionLeaseUntil != nil && run.ExecutionLeaseUntil.After(now) {
 			return fmt.Errorf("another executor holds a live reset lease")
@@ -2411,6 +2165,12 @@ func podsResetFenceItem(db *gorm.DB, run models.PodsResetRun, resetItem *models.
 		var activeRun models.PodsResetRun
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND state='executing' AND execution_token=? AND fencing_token=? AND execution_lease_until>?", run.TenantID, run.PublicID, run.ExecutionToken, run.FencingToken, time.Now().UTC()).First(&activeRun).Error; err != nil {
 			return fmt.Errorf("reset executor fence is no longer active: %w", err)
+		}
+		// A delegated run's admission fence includes the live parent campaign
+		// pause/authority, checked under the campaign execution row lock so a
+		// pause acknowledged before this effect cannot be overtaken.
+		if err := delegatedPodsCampaignAdmissionLocked(tx, run); err != nil {
+			return err
 		}
 		if err := podsResetSetWriteFence(tx, run); err != nil {
 			return err

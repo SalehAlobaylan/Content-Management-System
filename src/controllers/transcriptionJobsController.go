@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/contentstage"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"crypto/sha256"
@@ -222,9 +223,8 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 	err := db.Transaction(func(tx *gorm.DB) error {
 		// Serialize all job admissions for this content item, not merely Studio's
 		// callers. The active-job recheck closes the evaluate→create race.
-		var current models.ContentItem
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("public_id = ? AND tenant_id = ?", item.PublicID, item.TenantID).First(&current).Error; err != nil {
+		current, err := lockContentForLifecycleMutation(tx, item.TenantID, item.PublicID)
+		if err != nil {
 			return err
 		}
 		var active int64
@@ -784,6 +784,9 @@ func CreateTranscriptionJob(c *gin.Context) {
 	}
 	job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, trigger, req.Force)
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to create transcription job", Code: "CREATE_FAILED"})
 		return
 	}
@@ -1229,6 +1232,9 @@ func CreateTranscriptionBatch(c *gin.Context) {
 	}
 	batch, items, err := createPersistedTranscriptionBatch(db, principal.TenantID, principal.Email, req.ContentIDs, force)
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}
@@ -1271,14 +1277,34 @@ func createPersistedTranscriptionBatch(db *gorm.DB, tenantID, actor string, rawI
 	}
 	items := make([]models.TranscriptionBatchItem, 0, len(ids))
 	err := db.Transaction(func(tx *gorm.DB) error {
-		var ownedCount int64
-		if err := tx.Model(&models.ContentItem{}).
-			Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
-			Count(&ownedCount).Error; err != nil {
+		var contentItems []models.ContentItem
+		if err := tx.Where("tenant_id = ? AND public_id IN ?", tenantID, ids).
+			Order("public_id ASC").Find(&contentItems).Error; err != nil {
 			return err
 		}
-		if ownedCount != int64(len(ids)) {
+		if len(contentItems) != len(ids) {
 			return fmt.Errorf("one or more content items were not found")
+		}
+		resources := make([]lifecycle.Resource, 0, len(contentItems))
+		for _, item := range contentItems {
+			lane := models.ContentStageLaneNews
+			if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+				lane = models.ContentStageLanePods
+			}
+			sourceID := ""
+			if item.ContentSourceID != nil {
+				sourceID = item.ContentSourceID.String()
+			}
+			itemResources, err := lifecycle.ResourcesForScope(lifecycle.Scope{
+				TenantID: tenantID, Lane: lane, SourceID: sourceID, ItemID: item.PublicID.String(),
+			})
+			if err != nil {
+				return err
+			}
+			resources = append(resources, itemResources...)
+		}
+		if err := lifecycle.CheckResources(tx, tenantID, resources, lifecycle.PhaseContentWrite); err != nil {
+			return err
 		}
 		if err := tx.Create(&batch).Error; err != nil {
 			return err
@@ -1522,6 +1548,9 @@ func BulkCreateTranscriptionJobs(c *gin.Context) {
 	}
 	batch, items, err := createPersistedTranscriptionBatch(db, principal.TenantID, principal.Email, req.ContentIDs, req.Force)
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: err.Error(), Code: "INVALID_REQUEST"})
 		return
 	}

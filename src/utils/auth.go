@@ -56,6 +56,58 @@ func ParseFeedRecoveryReauthProof(tokenString string, secret []byte) (*FeedRecov
 	return claims, nil
 }
 
+// ContentResetReauthClaims is a distinct, short-lived proof for a single
+// campaign manifest. It cannot be reused as Feed Recovery authorization.
+type ContentResetReauthClaims struct {
+	UserID       string `json:"user_id"`
+	Email        string `json:"email"`
+	TenantID     string `json:"tenant_id"`
+	Purpose      string `json:"purpose"`
+	Action       string `json:"action"`
+	PlanID       string `json:"plan_id"`
+	ManifestHash string `json:"manifest_hash"`
+	AuthTime     int64  `json:"auth_time"`
+	jwt.RegisteredClaims
+}
+
+func ParseContentResetReauthProof(tokenString string, secret []byte) (*ContentResetReauthClaims, error) {
+	claims := &ContentResetReauthClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if token.Method != jwt.SigningMethodHS256 {
+			return nil, ErrTokenInvalid
+		}
+		return secret, nil
+	})
+	if err != nil || !token.Valid || !isAllowedIssuer(claims.Issuer) || claims.Subject == "" || claims.Subject != claims.UserID ||
+		claims.ID == "" || claims.TenantID == "" || claims.Purpose != "content_reset" || claims.PlanID == "" ||
+		!validContentResetReauthAction(claims.Action) || len(claims.ManifestHash) != 64 || claims.AuthTime == 0 || claims.ExpiresAt == nil || claims.IssuedAt == nil || !hasAudience(claims.Audience, "wahb-content-reset-reauth") {
+		return nil, ErrTokenInvalid
+	}
+	authTime := time.Unix(claims.AuthTime, 0)
+	if !claims.ExpiresAt.Time.After(authTime) || claims.ExpiresAt.Time.After(authTime.Add(5*time.Minute)) || claims.IssuedAt.Time.After(time.Now().UTC().Add(30*time.Second)) {
+		return nil, ErrTokenInvalid
+	}
+	if authTime.After(time.Now().UTC().Add(30 * time.Second)) {
+		return nil, ErrTokenInvalid
+	}
+	if time.Since(authTime) > 5*time.Minute {
+		return nil, ErrTokenExpired
+	}
+	return claims, nil
+}
+
+func validContentResetReauthAction(action string) bool {
+	if action != strings.TrimSpace(action) {
+		return false
+	}
+	switch action {
+	case "start", "publish", "cleanup", "rollback", "news_exception", "history_retirement", "resume_intake", "control":
+		return true
+	default:
+		return false
+	}
+}
+
 func hasAudience(values jwt.ClaimStrings, expected string) bool {
 	for _, value := range values {
 		if strings.EqualFold(value, expected) {

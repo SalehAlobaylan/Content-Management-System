@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 
@@ -523,6 +524,12 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			if err = checkCandidate(tx, c, &r.PublicID); err != nil {
 				continue
 			}
+			if err = checkRepairLifecycle(tx, c.Item); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					continue
+				}
+				return err
+			}
 			// A claim that expired before Begin is proven not to have crossed the
 			// effect boundary. Reclaim its same attempt/fence/job identity instead
 			// of allocating a second repair attempt. The dispatcher replaces the
@@ -577,6 +584,21 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 		}
 	}
 	return claim, true, nil
+}
+
+func checkRepairLifecycle(tx *gorm.DB, item models.ContentItem) error {
+	lane := "news"
+	if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+		lane = "pods"
+	}
+	scope := lifecycle.Scope{TenantID: item.TenantID, Lane: lane, ItemID: item.PublicID.String()}
+	if item.ContentSourceID != nil {
+		scope.SourceID = item.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+		return err
+	}
+	return lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite)
 }
 
 func reclaimUnstartedAttempt(tx *gorm.DB, request models.PipelineRepairRequest, owner string, now time.Time) (Claim, bool, error) {

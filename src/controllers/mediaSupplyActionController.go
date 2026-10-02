@@ -584,6 +584,9 @@ func queueOperatorMediaSupplyRecovery(db *gorm.DB, tenantID, actorID string, acc
 // A queued action never becomes visible to an owner before its exact native
 // request/repair exists; rollback removes both records on any stale preflight.
 func initializeApprovedMediaSupplyAction(db *gorm.DB, request models.MediaSupplyActionRequest) error {
+	if err := supply.CheckSupplyActionLifecycle(db, request); err != nil {
+		return err
+	}
 	switch request.ActionKey {
 	case supply.SupplyActionPipelineResumeExactStage:
 		_, err := pipeline.CreateApprovedRepair(db, request)

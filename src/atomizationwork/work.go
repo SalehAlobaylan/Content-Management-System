@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 	"github.com/google/uuid"
@@ -100,6 +101,12 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			}
 			parent, transcript, _, fingerprint, err := Candidate(tx, request.TenantID, request.ParentContentItemID)
 			if err == nil {
+				if lifecycleErr := checkAtomizationLifecycle(tx, parent); lifecycleErr != nil {
+					if lifecycle.IsConflict(lifecycleErr) || lifecycle.IsIntakePaused(lifecycleErr) {
+						continue
+					}
+					return lifecycleErr
+				}
 				admitted, slotErr := podsflow.Acquire(tx, parent)
 				if slotErr != nil {
 					return slotErr
@@ -185,6 +192,17 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 		return Claim{}, false, accessErr
 	}
 	return claim, true, nil
+}
+
+func checkAtomizationLifecycle(tx *gorm.DB, parent models.ContentItem) error {
+	scope := lifecycle.Scope{TenantID: parent.TenantID, Lane: "pods", ItemID: parent.PublicID.String()}
+	if parent.ContentSourceID != nil {
+		scope.SourceID = parent.ContentSourceID.String()
+	}
+	if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+		return err
+	}
+	return lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite)
 }
 
 // Begin keeps a variadic fence argument for source compatibility with the

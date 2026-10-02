@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/podsflow"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"testing"
 	"time"
 )
@@ -166,7 +167,7 @@ func TestActiveFamilyCandidatePrecedesOlderWaitingEpisode(t *testing.T) {
 	filter := claimCandidateFilter{tenantID: active.TenantID, lane: request.Lane, expectedOwner: request.Owner, now: time.Now()}
 	var candidates []models.ContentStageRequest
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		return lockedClaimCandidateScope(tx, filter, 1).Find(&candidates).Error
+		return claimCandidateScope(tx, filter, 1).Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Find(&candidates).Error
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -77,138 +77,233 @@ func GetPodsFeed(c *gin.Context) {
 	return
 	/* Legacy implementation retained below during the compatibility window. */
 	/*
-	db := c.MustGet("db").(*gorm.DB)
-	tenantID, tenantErr := trustedPublicFeedTenant(c)
-	if tenantErr != nil {
-		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
-		return
-	}
-	availability := currentFeedAvailability(db, tenantID, "media")
-	if availability != nil && availability.RetryAfterSeconds != nil {
-		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
-	}
-	deliveryLanguage, ok := parseDeliveryLanguage(c.Query("content_language"))
-	if !ok {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "content_language must be ar, en, or both"})
-		return
-	}
-
-	// Parse cursor pagination
-	pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, utils.HTTPError{
-			Code:    http.StatusBadRequest,
-			Message: "Invalid cursor: " + err.Error(),
-		})
-		return
-	}
-
-	// Identity for interaction status / seen-filtering. Authenticated callers
-	// are scoped to their verified user id only; anonymous callers to their own
-	// session_id. A client-supplied ?user_id is never trusted, and an
-	// authenticated caller cannot pass ?session_id to read someone else's state.
-	userIDStr, sessionID := readIdentity(c)
-	// Repetition suppression is applied while an identity is present. Frozen
-	// sessions may deliberately place soft-suppressed items after unseen items
-	// when the corpus is exhausted; explicit hides are never recycled.
-	var seenIDs []uuid.UUID
-	if sessionID != "" || userIDStr != "" {
-		seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, tenantID), time.Now().UTC())
-	}
-	recycleSuppressed, _ := c.Get(podsRecycleSuppressedContextKey)
-	allowSuppressedRecycle, _ := recycleSuppressed.(bool)
-
-	config := loadTenantConfig(db, tenantID)
-	durationTargetMinutes := parseDurationPreference(c.Query("duration"))
-	atomizedFeedSchema := supportsAtomizedPodsSchema(db)
-
-	// ------ Ranked path (when intelligence is active) ------
-	if config.IsActive {
-		// Fetch items for ranking — try time window first, then fall back to all
-		var allItems []models.ContentItem
-		baseQuery := podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema)
-		baseQuery = applyDeliveryLanguage(baseQuery, deliveryLanguage)
-		baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
-
-		// First try: items from the configured freshness window (minimum 30 days)
-		windowDays := config.FreshnessDecayHours / 24
-		if windowDays < 30 {
-			windowDays = 30
+		db := c.MustGet("db").(*gorm.DB)
+		tenantID, tenantErr := trustedPublicFeedTenant(c)
+		if tenantErr != nil {
+			c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
+			return
 		}
-		broadQuery := baseQuery.Session(&gorm.Session{}).
-			Where("COALESCE(published_at, created_at) > ?", time.Now().AddDate(0, 0, -windowDays)).
-			Order("COALESCE(published_at, created_at) DESC").Limit(200)
-		if err := broadQuery.Find(&allItems).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to fetch feed: " + err.Error()})
+		availability := currentFeedAvailability(db, tenantID, "media")
+		if availability != nil && availability.RetryAfterSeconds != nil {
+			c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
+		}
+		deliveryLanguage, ok := parseDeliveryLanguage(c.Query("content_language"))
+		if !ok {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{Code: http.StatusBadRequest, Message: "content_language must be ar, en, or both"})
 			return
 		}
 
-		// Fallback: if not enough items to fill multiple pages, fetch all READY items
-		if len(allItems) < 200 {
-			baseQuery.Session(&gorm.Session{}).Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allItems)
+		// Parse cursor pagination
+		pagination, err := utils.ParseCursorParams(c.Query("cursor"), c.Query("limit"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, utils.HTTPError{
+				Code:    http.StatusBadRequest,
+				Message: "Invalid cursor: " + err.Error(),
+			})
+			return
 		}
-		allItems = excludeCollapsedRedundancyMembers(db, tenantID, allItems)
 
-		// Score items
-		contentIDs := extractPublicIDs(allItems)
-		flagMap := LoadContentFlags(db, tenantID, contentIDs)
-		velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
-		scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
-		scored, preferenceEligible := applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
-		scored = applyIntelligenceFeedHooks(db, tenantID, scored)
-		scored = spaceScoredSiblingChapters(scored)
-		// Filter out already-seen items
-		if len(seenIDs) > 0 {
-			if allowSuppressedRecycle && !hasCursor(pagination) {
-				scored = prioritizeScoredPodsForSession(scored, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
-			} else {
-				scored = filterScoredPodsByIDs(scored, seenIDs)
-			}
+		// Identity for interaction status / seen-filtering. Authenticated callers
+		// are scoped to their verified user id only; anonymous callers to their own
+		// session_id. A client-supplied ?user_id is never trusted, and an
+		// authenticated caller cannot pass ?session_id to read someone else's state.
+		userIDStr, sessionID := readIdentity(c)
+		// Repetition suppression is applied while an identity is present. Frozen
+		// sessions may deliberately place soft-suppressed items after unseen items
+		// when the corpus is exhausted; explicit hides are never recycled.
+		var seenIDs []uuid.UUID
+		if sessionID != "" || userIDStr != "" {
+			seenIDs = fetchPodsSuppressedIDs(db, sessionID, userIDStr, loadTenantConfig(db, tenantID), time.Now().UTC())
 		}
-		// Lifetime engagement and accumulated quality signals are intentionally
-		// retained for the non-reserved positions. The same deterministic
-		// first-page transformation is rebuilt for cursor requests as well, so a
-		// promoted item cannot reappear later at its old score position.
-		scored = reserveFreshPodsFirstPage(scored, time.Now().UTC())
-		// Apply cursor-based pagination over scored results
-		startIdx := 0
-		if !pagination.Timestamp.IsZero() {
-			found := false
-			for i, s := range scored {
-				if s.Item.PublicID == pagination.LastID {
-					startIdx = i + 1
-					found = true
-					break
+		recycleSuppressed, _ := c.Get(podsRecycleSuppressedContextKey)
+		allowSuppressedRecycle, _ := recycleSuppressed.(bool)
+
+		config := loadTenantConfig(db, tenantID)
+		durationTargetMinutes := parseDurationPreference(c.Query("duration"))
+		atomizedFeedSchema := supportsAtomizedPodsSchema(db)
+
+		// ------ Ranked path (when intelligence is active) ------
+		if config.IsActive {
+			// Fetch items for ranking — try time window first, then fall back to all
+			var allItems []models.ContentItem
+			baseQuery := podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema)
+			baseQuery = applyDeliveryLanguage(baseQuery, deliveryLanguage)
+			baseQuery = applyDurationPreference(baseQuery, durationTargetMinutes)
+
+			// First try: items from the configured freshness window (minimum 30 days)
+			windowDays := config.FreshnessDecayHours / 24
+			if windowDays < 30 {
+				windowDays = 30
+			}
+			broadQuery := baseQuery.Session(&gorm.Session{}).
+				Where("COALESCE(published_at, created_at) > ?", time.Now().AddDate(0, 0, -windowDays)).
+				Order("COALESCE(published_at, created_at) DESC").Limit(200)
+			if err := broadQuery.Find(&allItems).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to fetch feed: " + err.Error()})
+				return
+			}
+
+			// Fallback: if not enough items to fill multiple pages, fetch all READY items
+			if len(allItems) < 200 {
+				baseQuery.Session(&gorm.Session{}).Order("COALESCE(published_at, created_at) DESC").Limit(200).Find(&allItems)
+			}
+			allItems = excludeCollapsedRedundancyMembers(db, tenantID, allItems)
+
+			// Score items
+			contentIDs := extractPublicIDs(allItems)
+			flagMap := LoadContentFlags(db, tenantID, contentIDs)
+			velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, time.Now())
+			scored := ScoreItems(allItems, config, flagMap, velocityData, time.Now())
+			scored, preferenceEligible := applyPreferenceFeedHook(db, tenantID, userIDStr, scored)
+			scored = applyIntelligenceFeedHooks(db, tenantID, scored)
+			scored = spaceScoredSiblingChapters(scored)
+			// Filter out already-seen items
+			if len(seenIDs) > 0 {
+				if allowSuppressedRecycle && !hasCursor(pagination) {
+					scored = prioritizeScoredPodsForSession(scored, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
+				} else {
+					scored = filterScoredPodsByIDs(scored, seenIDs)
 				}
 			}
-			// Fallback: if the cursor item wasn't found (scores shifted between requests),
-			// find the closest position by timestamp to avoid restarting from page 1
-			if !found {
+			// Lifetime engagement and accumulated quality signals are intentionally
+			// retained for the non-reserved positions. The same deterministic
+			// first-page transformation is rebuilt for cursor requests as well, so a
+			// promoted item cannot reappear later at its old score position.
+			scored = reserveFreshPodsFirstPage(scored, time.Now().UTC())
+			// Apply cursor-based pagination over scored results
+			startIdx := 0
+			if !pagination.Timestamp.IsZero() {
+				found := false
 				for i, s := range scored {
-					var itemTs time.Time
-					if s.Item.PublishedAt != nil {
-						itemTs = *s.Item.PublishedAt
-					} else {
-						itemTs = s.Item.CreatedAt
-					}
-					if !itemTs.After(pagination.Timestamp) {
-						startIdx = i
+					if s.Item.PublicID == pagination.LastID {
+						startIdx = i + 1
+						found = true
 						break
 					}
 				}
+				// Fallback: if the cursor item wasn't found (scores shifted between requests),
+				// find the closest position by timestamp to avoid restarting from page 1
+				if !found {
+					for i, s := range scored {
+						var itemTs time.Time
+						if s.Item.PublishedAt != nil {
+							itemTs = *s.Item.PublishedAt
+						} else {
+							itemTs = s.Item.CreatedAt
+						}
+						if !itemTs.After(pagination.Timestamp) {
+							startIdx = i
+							break
+						}
+					}
+				}
 			}
+
+			endIdx := startIdx + pagination.Limit
+			var nextCursor *string
+			hasMore := endIdx < len(scored)
+			if endIdx > len(scored) {
+				endIdx = len(scored)
+			}
+
+			pageItems := scored[startIdx:endIdx]
+			if hasMore && len(pageItems) > 0 {
+				lastItem := pageItems[len(pageItems)-1].Item
+				var ts time.Time
+				if lastItem.PublishedAt != nil {
+					ts = *lastItem.PublishedAt
+				} else {
+					ts = lastItem.CreatedAt
+				}
+				cursor := utils.EncodeCursor(ts, lastItem.PublicID)
+				nextCursor = &cursor
+			}
+
+			// Extract items for interaction lookup
+			items := make([]models.ContentItem, len(pageItems))
+			for i, s := range pageItems {
+				items[i] = s.Item
+			}
+
+			likedMap := make(map[uuid.UUID]bool)
+			bookmarkedMap := make(map[uuid.UUID]bool)
+			if sessionID != "" || userIDStr != "" {
+				likedMap, bookmarkedMap = getInteractionStatus(db, items, sessionID, userIDStr)
+			}
+
+			responseItems := make([]PodsItem, len(items))
+			for i, item := range items {
+				responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
+			}
+
+			c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination), Meta: availability})
+			if !isFeedIntegritySynthetic(c) {
+				recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
+			}
+			boosted := int64(0)
+			for _, item := range pageItems {
+				if item.ScoreBreakdown.Preference > 0 {
+					boosted++
+				}
+			}
+			if !isFeedIntegritySynthetic(c) {
+				recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(items)))
+			}
+			return
 		}
 
-		endIdx := startIdx + pagination.Limit
+		// ------ Chronological path (default) ------
+
+		// Query for VIDEO and PODCAST content with a valid media URL.
+		// Use COALESCE(published_at, created_at) so items with NULL published_at
+		// are still ordered and reachable by cursor pagination.
+		query := applyDeliveryLanguage(podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema), deliveryLanguage).
+			Order("COALESCE(published_at, created_at) DESC, public_id DESC")
+		query = applyDurationPreference(query, durationTargetMinutes)
+
+		// Apply cursor if provided
+		if !pagination.Timestamp.IsZero() {
+			query = query.Where(
+				"(COALESCE(published_at, created_at) < ? OR (COALESCE(published_at, created_at) = ? AND public_id < ?))",
+				pagination.Timestamp, pagination.Timestamp, pagination.LastID,
+			)
+		}
+
+		// Exclude already-seen items
+		if len(seenIDs) > 0 && !(allowSuppressedRecycle && !hasCursor(pagination)) {
+			query = query.Where("public_id NOT IN ?", seenIDs)
+		}
+
+		// Fetch items + 1 to check for next page
+		var items []models.ContentItem
+		if err := query.Limit((pagination.Limit * 3) + 1).Find(&items).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{
+				Code:    http.StatusInternalServerError,
+				Message: "Failed to fetch feed: " + err.Error(),
+			})
+			return
+		}
+		items = excludeCollapsedRedundancyMembers(db, tenantID, items)
+		if allowSuppressedRecycle && !hasCursor(pagination) && len(seenIDs) > 0 {
+			items = prioritizePodsForSession(items, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
+		}
+
+		// Keep the cursor boundary chronological even when preferences reorder the
+		// returned page. That makes the cursor stable while allowing a deliberately
+		// bounded preference boost within the current chronological window.
+		items = spaceSiblingChapters(items)
 		var nextCursor *string
-		hasMore := endIdx < len(scored)
-		if endIdx > len(scored) {
-			endIdx = len(scored)
+		hasMore := len(items) > pagination.Limit
+		var cursorItem *models.ContentItem
+		if hasMore {
+			boundary := items[pagination.Limit-1]
+			cursorItem = &boundary
+			items = items[:pagination.Limit] // trim to limit
 		}
 
-		pageItems := scored[startIdx:endIdx]
-		if hasMore && len(pageItems) > 0 {
-			lastItem := pageItems[len(pageItems)-1].Item
+		// Get last item for cursor
+		if cursorItem != nil {
+			lastItem := *cursorItem
 			var ts time.Time
 			if lastItem.PublishedAt != nil {
 				ts = *lastItem.PublishedAt
@@ -219,126 +314,31 @@ func GetPodsFeed(c *gin.Context) {
 			nextCursor = &cursor
 		}
 
-		// Extract items for interaction lookup
-		items := make([]models.ContentItem, len(pageItems))
-		for i, s := range pageItems {
-			items[i] = s.Item
-		}
+		items, boosted, preferenceEligible := applyChronologicalPreferenceOrder(db, tenantID, userIDStr, items)
 
+		// Get interaction status if session/user provided
 		likedMap := make(map[uuid.UUID]bool)
 		bookmarkedMap := make(map[uuid.UUID]bool)
 		if sessionID != "" || userIDStr != "" {
 			likedMap, bookmarkedMap = getInteractionStatus(db, items, sessionID, userIDStr)
 		}
 
+		// Map to response
 		responseItems := make([]PodsItem, len(items))
 		for i, item := range items {
 			responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
 		}
 
-		c.JSON(http.StatusOK, PodsResponse{Cursor: nextCursor, Items: responseItems, CaughtUp: len(responseItems) == 0 && !hasCursor(pagination), Meta: availability})
+		c.JSON(http.StatusOK, PodsResponse{
+			Cursor:   nextCursor,
+			Items:    responseItems,
+			CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
+			Meta:     availability,
+		})
 		if !isFeedIntegritySynthetic(c) {
 			recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
+			recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
 		}
-		boosted := int64(0)
-		for _, item := range pageItems {
-			if item.ScoreBreakdown.Preference > 0 {
-				boosted++
-			}
-		}
-		if !isFeedIntegritySynthetic(c) {
-			recordPreferenceServes(db, tenantID, preferenceEligible, boosted, int64(len(items)))
-		}
-		return
-	}
-
-	// ------ Chronological path (default) ------
-
-	// Query for VIDEO and PODCAST content with a valid media URL.
-	// Use COALESCE(published_at, created_at) so items with NULL published_at
-	// are still ordered and reachable by cursor pagination.
-	query := applyDeliveryLanguage(podsEligibleMediaQuery(db, tenantID, atomizedFeedSchema), deliveryLanguage).
-		Order("COALESCE(published_at, created_at) DESC, public_id DESC")
-	query = applyDurationPreference(query, durationTargetMinutes)
-
-	// Apply cursor if provided
-	if !pagination.Timestamp.IsZero() {
-		query = query.Where(
-			"(COALESCE(published_at, created_at) < ? OR (COALESCE(published_at, created_at) = ? AND public_id < ?))",
-			pagination.Timestamp, pagination.Timestamp, pagination.LastID,
-		)
-	}
-
-	// Exclude already-seen items
-	if len(seenIDs) > 0 && !(allowSuppressedRecycle && !hasCursor(pagination)) {
-		query = query.Where("public_id NOT IN ?", seenIDs)
-	}
-
-	// Fetch items + 1 to check for next page
-	var items []models.ContentItem
-	if err := query.Limit((pagination.Limit * 3) + 1).Find(&items).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, utils.HTTPError{
-			Code:    http.StatusInternalServerError,
-			Message: "Failed to fetch feed: " + err.Error(),
-		})
-		return
-	}
-	items = excludeCollapsedRedundancyMembers(db, tenantID, items)
-	if allowSuppressedRecycle && !hasCursor(pagination) && len(seenIDs) > 0 {
-		items = prioritizePodsForSession(items, seenIDs, fetchPodsHardHiddenIDs(db, sessionID, userIDStr))
-	}
-
-	// Keep the cursor boundary chronological even when preferences reorder the
-	// returned page. That makes the cursor stable while allowing a deliberately
-	// bounded preference boost within the current chronological window.
-	items = spaceSiblingChapters(items)
-	var nextCursor *string
-	hasMore := len(items) > pagination.Limit
-	var cursorItem *models.ContentItem
-	if hasMore {
-		boundary := items[pagination.Limit-1]
-		cursorItem = &boundary
-		items = items[:pagination.Limit] // trim to limit
-	}
-
-	// Get last item for cursor
-	if cursorItem != nil {
-		lastItem := *cursorItem
-		var ts time.Time
-		if lastItem.PublishedAt != nil {
-			ts = *lastItem.PublishedAt
-		} else {
-			ts = lastItem.CreatedAt
-		}
-		cursor := utils.EncodeCursor(ts, lastItem.PublicID)
-		nextCursor = &cursor
-	}
-
-	items, boosted, preferenceEligible := applyChronologicalPreferenceOrder(db, tenantID, userIDStr, items)
-
-	// Get interaction status if session/user provided
-	likedMap := make(map[uuid.UUID]bool)
-	bookmarkedMap := make(map[uuid.UUID]bool)
-	if sessionID != "" || userIDStr != "" {
-		likedMap, bookmarkedMap = getInteractionStatus(db, items, sessionID, userIDStr)
-	}
-
-	// Map to response
-	responseItems := make([]PodsItem, len(items))
-	for i, item := range items {
-		responseItems[i] = mapToPodsItem(item, likedMap[item.PublicID], bookmarkedMap[item.PublicID])
-	}
-
-	c.JSON(http.StatusOK, PodsResponse{
-		Cursor:   nextCursor,
-		Items:    responseItems,
-		CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
-		Meta:     availability,
-	})
-	if !isFeedIntegritySynthetic(c) {
-		recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
-		recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
-	}
 	*/
 }
 
@@ -461,6 +461,11 @@ func GetNewsFeed(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
 		return
 	}
+	newsGenerationID, generationSupported, generationActive := feedcontract.ActiveGeneration(db, tenantID, "news")
+	if generationSupported && !generationActive {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "News serving generation is unavailable", "code": "FEED_VIEW_UNAVAILABLE"})
+		return
+	}
 	availability := currentFeedAvailability(db, tenantID, "news")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
@@ -474,6 +479,16 @@ func GetNewsFeed(c *gin.Context) {
 			Message: "Invalid cursor: " + err.Error(),
 		})
 		return
+	}
+	if c.Query("cursor") != "" {
+		if generationSupported && pagination.ViewID != newsGenerationID {
+			c.JSON(http.StatusConflict, gin.H{"error": "News cursor belongs to an older feed view; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
+		if !generationSupported && pagination.ViewID != uuid.Nil {
+			c.JSON(http.StatusConflict, gin.H{"error": "News cursor view is no longer available; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
 	}
 
 	// For news, we want slides (1 featured + 3 related each)
@@ -521,6 +536,22 @@ func GetNewsFeed(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "News feed is temporarily unavailable"})
 		return
+	}
+	if generationSupported {
+		currentGenerationID, supported, active := feedcontract.ActiveGeneration(db, tenantID, "news")
+		if !supported || !active || currentGenerationID != newsGenerationID {
+			c.JSON(http.StatusConflict, gin.H{"error": "News feed changed while this page was loading; refresh the feed", "code": "FEED_CURSOR_STALE"})
+			return
+		}
+		if nextCursor != nil {
+			timestamp, storyID, _, decodeErr := utils.DecodeCursorWithView(*nextCursor)
+			if decodeErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "News feed produced an invalid page cursor"})
+				return
+			}
+			pinnedCursor := utils.EncodeCursorWithView(timestamp, storyID, newsGenerationID)
+			nextCursor = &pinnedCursor
+		}
 	}
 	// A story snapshot is shared across viewers, while like/bookmark state is
 	// identity-specific. Hydrate only the lead content IDs after assembly so a

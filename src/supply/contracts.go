@@ -233,7 +233,7 @@ func (i RequestIdentity) Validate() error {
 		return fmt.Errorf("policy and argument fingerprints are required")
 	}
 	switch strings.TrimSpace(i.Purpose) {
-	case "baseline", "exploration", "deferred_drain", "circulation", "operator_run_once", "manual", "missed_admission_repair", "partial_repair":
+	case "baseline", "exploration", "deferred_drain", "circulation", "operator_run_once", "manual", "missed_admission_repair", "partial_repair", "content_reset_replay":
 	default:
 		return fmt.Errorf("source-run purpose is not registered")
 	}

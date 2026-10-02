@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -66,6 +67,7 @@ func InternalCreateTranscript(c *gin.Context) {
 
 	var item models.ContentItem
 	haveItem := db.Where("public_id = ?", contentUUID).First(&item).Error == nil
+	expectedItemUpdatedAt := item.UpdatedAt
 	var recoveryRequest models.ArtifactCoverageRequest
 	var recoveryAttempt models.ArtifactCoverageAttempt
 	var stageRequest models.ContentStageRequest
@@ -151,6 +153,13 @@ func InternalCreateTranscript(c *gin.Context) {
 			return
 		}
 		err = db.Transaction(func(tx *gorm.DB) error {
+			current, err := lockContentForLifecycleMutation(tx, item.TenantID, item.PublicID)
+			if err != nil {
+				return err
+			}
+			if !current.UpdatedAt.Equal(expectedItemUpdatedAt) {
+				return errors.New("transcript target changed while writeback was being committed")
+			}
 			// A caller that lost the response reuses the producer event. Return the
 			// first durable effect instead of creating a duplicate transcript.
 			var existingReceipt models.ContentStageReceipt
@@ -170,8 +179,13 @@ func InternalCreateTranscript(c *gin.Context) {
 			if createErr := tx.Create(&transcript).Error; createErr != nil {
 				return createErr
 			}
-			if linkErr := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", item.TenantID, contentUUID).Updates(map[string]any{"transcript_id": transcript.PublicID, "caption_state": captionState, "transcript_source": source}).Error; linkErr != nil {
-				return linkErr
+			link := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=? AND updated_at=?", item.TenantID, contentUUID, expectedItemUpdatedAt).
+				Updates(map[string]any{"transcript_id": transcript.PublicID, "caption_state": captionState, "transcript_source": source})
+			if link.Error != nil {
+				return link.Error
+			}
+			if link.RowsAffected != 1 {
+				return errors.New("transcript target changed while writeback was being committed")
 			}
 			return contentstage.RecordPersistence(tx, stageRequest, stageAttempt, req.ContentStage.correlation(), models.ContentStageOwnerMedia, transcript.PublicID.String(), map[string]any{"transcript_id": transcript.PublicID.String(), "provider": req.Provider})
 		})
@@ -187,11 +201,6 @@ func InternalCreateTranscript(c *gin.Context) {
 		return
 	}
 
-	if err := db.Create(&transcript).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transcript"})
-		return
-	}
-
 	var transcriptionJob *models.TranscriptionJob
 	if req.TranscriptionJobID != nil && *req.TranscriptionJobID != "" {
 		if id, err := uuid.Parse(*req.TranscriptionJobID); err == nil {
@@ -201,6 +210,50 @@ func InternalCreateTranscript(c *gin.Context) {
 			}
 		}
 	}
+	captionState := models.CaptionStateForSource(source)
+	if haveItem {
+		err = db.Transaction(func(tx *gorm.DB) error {
+			current, err := lockContentForLifecycleMutation(tx, item.TenantID, item.PublicID)
+			if err != nil {
+				return err
+			}
+			if !current.UpdatedAt.Equal(expectedItemUpdatedAt) {
+				return errors.New("transcript target changed while writeback was being committed")
+			}
+			if err := tx.Create(&transcript).Error; err != nil {
+				return err
+			}
+			if transcriptionJob != nil && transcriptionJob.Canceled {
+				return nil
+			}
+			tid := transcript.PublicID
+			result := tx.Model(&models.ContentItem{}).
+				Where("tenant_id=? AND public_id=? AND updated_at=?", current.TenantID, current.PublicID, expectedItemUpdatedAt).
+				Updates(map[string]any{"transcript_id": tid, "caption_state": captionState, "transcript_source": source})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("transcript target changed while writeback was being committed")
+			}
+			item = current
+			item.TranscriptID = &tid
+			item.CaptionState = &captionState
+			item.TranscriptSource = &source
+			return nil
+		})
+		if err != nil {
+			if writeLifecycleConflict(c, err) {
+				return
+			}
+			c.JSON(http.StatusConflict, gin.H{"error": "Transcript target changed or lifecycle ownership blocked writeback"})
+			return
+		}
+	} else if err := db.Create(&transcript).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transcript"})
+		return
+	}
+
 	if transcriptionJob != nil && transcriptionJob.Canceled {
 		status := models.TranscriptionJobStatusCanceled
 		writebackStatus := "ignored_canceled"
@@ -235,17 +288,11 @@ func InternalCreateTranscript(c *gin.Context) {
 		snapshotTranscriptVersion(db, item.TenantID, &item, *previousTranscriptID)
 	}
 
-	// Link the transcript + set the lightweight caption_state/transcript_source on
-	// the content item so feed/console can filter+badge without joining transcripts.
-	// Derive source/state with a sane default for legacy callers (no source field).
-	captionState := models.CaptionStateForSource(source)
-
 	if haveItem {
 		tid := transcript.PublicID
 		item.TranscriptID = &tid
 		item.CaptionState = &captionState
 		item.TranscriptSource = &source
-		_ = db.Save(&item).Error
 		quality := computeAndStoreTranscriptQuality(db, &item, &transcript, req.LanguageProbability)
 
 		if req.TranscriptionJobID != nil && *req.TranscriptionJobID != "" {

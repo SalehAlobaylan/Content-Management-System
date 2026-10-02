@@ -39,13 +39,15 @@ func GetTranscript(c *gin.Context) {
 	}
 
 	var transcript models.Transcript
-	// A transcript is public only through its READY parent and only when it is
-	// that parent's active transcript. This avoids exposing superseded, orphaned,
-	// or hidden-parent transcript text by UUID.
-	if err := db.Model(&models.Transcript{}).
-		Joins("JOIN content_items ON content_items.public_id = transcripts.content_item_id").
-		Where("transcripts.public_id = ? AND content_items.transcript_id = transcripts.public_id AND content_items.status = ?", transcriptID, models.ContentStatusReady).
-		First(&transcript).Error; err != nil {
+	// A transcript is public only through a currently eligible parent and only
+	// when it is that parent's active transcript. Keeping this as one SQL query
+	// pins the parent and transcript check to the same statement while applying
+	// the active News/Pods generation membership fence used by public details.
+	if err := publicContentQuery(db).
+		Joins("JOIN transcripts ON transcripts.content_item_id = content_items.public_id").
+		Where("transcripts.public_id = ? AND content_items.transcript_id = transcripts.public_id", transcriptID).
+		Select("transcripts.*").
+		Take(&transcript).Error; err != nil {
 		c.JSON(http.StatusNotFound, utils.HTTPError{
 			Code:    http.StatusNotFound,
 			Message: "Transcript not found",

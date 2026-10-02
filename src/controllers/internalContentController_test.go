@@ -77,6 +77,34 @@ func TestNormalizeContentLanguageAcceptsOnlyVerifiedDeliveryLanguages(t *testing
 	}
 }
 
+func TestContentResetReplayIngestCannotOmitGrantOrObservation(t *testing.T) {
+	fixture := internalCreateContentItemRequest{ReconstructionGrant: "opaque", SourceObservationID: uuid.NewString(), SourceUpstreamItemID: "item", SourceRunAttribution: &internalSourceRunAttribution{}}
+	if err := validateContentResetReplayIngest("content_reset_replay", fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"grant", "observation", "identity", "unit"} {
+		t.Run(field, func(t *testing.T) {
+			req := fixture
+			switch field {
+			case "grant":
+				req.ReconstructionGrant = " "
+			case "observation":
+				req.SourceObservationID = ""
+			case "identity":
+				req.SourceUpstreamItemID = ""
+			case "unit":
+				req.SourceRunAttribution = nil
+			}
+			if validateContentResetReplayIngest("content_reset_replay", req) == nil {
+				t.Fatal("replay without scoped reconstruction authority accepted")
+			}
+		})
+	}
+	if err := validateContentResetReplayIngest("baseline", internalCreateContentItemRequest{}); err != nil {
+		t.Fatal("ordinary ingestion now requires reset authority")
+	}
+}
+
 func TestInternalMergeEnrichmentMetadataRejectsUnownedFieldsBeforeDB(t *testing.T) {
 	db, mock := newMockGorm(t)
 	w := callInternalMerge(db, uuid.NewString(), `{"fields":{"ingest_source":"forbidden"}}`)

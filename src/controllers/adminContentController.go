@@ -2,9 +2,11 @@ package controllers
 
 import (
 	"content-management-system/src/contentstage"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -15,6 +17,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+var (
+	errBulkDeleteScopeTooLarge = errors.New("bulk content deletion is limited to 500 exact rows per request")
+	errBulkDeletePodsRequired  = errors.New("Pods content must be retired through the Pods Reset owner")
 )
 
 type adminContentListResponse struct {
@@ -817,8 +825,28 @@ func UpdateContentStatus(c *gin.Context) {
 		return
 	}
 
-	item.Status = models.ContentStatus(status)
-	if err := db.Save(&item).Error; err != nil {
+	expectedUpdatedAt := item.UpdatedAt
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, item.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return errors.New("content changed while its status update was being prepared")
+		}
+		current.Status = models.ContentStatus(status)
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		item = current
+		return nil
+	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
 			Message: "Failed to update status",
 			Code:    "UPDATE_FAILED",
@@ -861,28 +889,48 @@ func UpdateContentSuitability(c *gin.Context) {
 		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Content not found", Code: "NOT_FOUND"})
 		return
 	}
-	item.MediaSuitability = verdict
-	if req.MediaSuitabilityConfidence != nil {
-		conf := *req.MediaSuitabilityConfidence
-		if conf < 0 {
-			conf = 0
+	expectedUpdatedAt := item.UpdatedAt
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
 		}
-		if conf > 1 {
-			conf = 1
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, item.PublicID).First(&current).Error; err != nil {
+			return err
 		}
-		item.MediaSuitabilityConfidence = &conf
-	}
-	if req.MediaSuitabilityReasons != nil {
-		if raw, err := json.Marshal(req.MediaSuitabilityReasons); err == nil {
-			item.MediaSuitabilityReasons = raw
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return errors.New("content changed while its suitability review was being prepared")
 		}
-	}
-	now := time.Now().UTC()
-	item.MediaSuitabilityReviewedAt = &now
-	if reviewer, err := uuid.Parse(principal.UserID); err == nil {
-		item.MediaSuitabilityReviewedBy = &reviewer
-	}
-	if err := db.Save(&item).Error; err != nil {
+		current.MediaSuitability = verdict
+		if req.MediaSuitabilityConfidence != nil {
+			conf := *req.MediaSuitabilityConfidence
+			if conf < 0 {
+				conf = 0
+			}
+			if conf > 1 {
+				conf = 1
+			}
+			current.MediaSuitabilityConfidence = &conf
+		}
+		if req.MediaSuitabilityReasons != nil {
+			if raw, err := json.Marshal(req.MediaSuitabilityReasons); err == nil {
+				current.MediaSuitabilityReasons = raw
+			}
+		}
+		now := time.Now().UTC()
+		current.MediaSuitabilityReviewedAt = &now
+		if reviewer, err := uuid.Parse(principal.UserID); err == nil {
+			current.MediaSuitabilityReviewedBy = &reviewer
+		}
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		item = current
+		return nil
+	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update suitability", Code: "UPDATE_FAILED"})
 		return
 	}
@@ -1237,17 +1285,127 @@ func BulkDeleteContent(c *gin.Context) {
 		return
 	}
 
-	result := query.Session(&gorm.Session{}).Delete(&models.ContentItem{})
-	if result.Error != nil {
+	var deletedCount int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		deleteQuery := tx.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
+		if hasIDs {
+			deleteQuery = deleteQuery.Where("public_id IN ?", req.IDs)
+		} else {
+			if req.Status != "" {
+				deleteQuery = deleteQuery.Where("status = ?", strings.ToUpper(req.Status))
+			}
+			if req.SourceName != "" {
+				deleteQuery = deleteQuery.Where("source_name = ?", req.SourceName)
+			}
+			if req.Type != "" {
+				deleteQuery = deleteQuery.Where("type = ?", strings.ToUpper(req.Type))
+			}
+			if req.Topic != "" {
+				deleteQuery = deleteQuery.Where("? = ANY(topic_tags)", req.Topic)
+			}
+			if req.StoryID != "" {
+				if strings.EqualFold(req.StoryID, "none") {
+					deleteQuery = deleteQuery.Where("story_id IS NULL")
+				} else {
+					deleteQuery = deleteQuery.Where("story_id = ?", req.StoryID)
+				}
+			}
+			if req.CreatedBefore != "" {
+				parsedTime, _ := time.Parse(time.RFC3339, req.CreatedBefore)
+				deleteQuery = deleteQuery.Where("created_at < ?", parsedTime)
+			}
+		}
+
+		var targets []models.ContentItem
+		if err := deleteQuery.Order("id ASC").Limit(bulkDeleteIDsLimit + 1).Find(&targets).Error; err != nil {
+			return err
+		}
+		if len(targets) > bulkDeleteIDsLimit {
+			return errBulkDeleteScopeTooLarge
+		}
+		if len(targets) == 0 {
+			return nil
+		}
+
+		resources := make([]lifecycle.Resource, 0, len(targets))
+		for _, item := range targets {
+			lane := ""
+			switch item.Type {
+			case models.ContentTypeNews, models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
+				lane = "news"
+			case models.ContentTypeVideo, models.ContentTypePodcast:
+				return errBulkDeletePodsRequired
+			default:
+				return errors.New("bulk deletion encountered an unsupported content type")
+			}
+			sourceID := "-"
+			if item.ContentSourceID != nil {
+				sourceID = item.ContentSourceID.String()
+			}
+			resources = append(resources, lifecycle.Resource{Type: lifecycle.ResourceItem, Key: lane + "/" + sourceID + "/" + item.PublicID.String()})
+		}
+		if err := lifecycle.CheckResources(tx, principal.TenantID, resources, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		ids := make([]uuid.UUID, 0, len(targets))
+		selectedUpdatedAt := make(map[uuid.UUID]time.Time, len(targets))
+		for _, item := range targets {
+			ids = append(ids, item.PublicID)
+			selectedUpdatedAt[item.PublicID] = item.UpdatedAt
+		}
+		var lockedTargets []models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).
+			Order("id ASC").Find(&lockedTargets).Error; err != nil {
+			return err
+		}
+		if len(lockedTargets) != len(targets) {
+			return errors.New("bulk delete scope changed before its exact rows were locked")
+		}
+		var stillMatching int64
+		if err := deleteQuery.Where("public_id IN ?", ids).Count(&stillMatching).Error; err != nil {
+			return err
+		}
+		if stillMatching != int64(len(targets)) {
+			return errors.New("bulk delete filters changed before their exact rows were locked")
+		}
+		for _, item := range lockedTargets {
+			if !item.UpdatedAt.Equal(selectedUpdatedAt[item.PublicID]) {
+				return errors.New("bulk delete scope changed before its exact rows were locked")
+			}
+		}
+		result := tx.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).Delete(&models.ContentItem{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(targets)) {
+			return errors.New("bulk delete scope changed before its exact rows were removed")
+		}
+		deletedCount = result.RowsAffected
+		return nil
+	})
+	if errors.Is(err, errBulkDeleteScopeTooLarge) {
+		c.JSON(http.StatusRequestEntityTooLarge, authErrorResponse{Message: err.Error(), Code: "TOO_MANY_DELETE_TARGETS"})
+		return
+	}
+	if errors.Is(err, errBulkDeletePodsRequired) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Direct content deletion is disabled for Pods media; use the explicit Pods Reset owner workflow", Code: "PODS_RESET_REQUIRED"})
+		return
+	}
+	if lifecycle.IsConflict(err) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds one or more selected items", Code: "OPERATION_CONFLICT"})
+		return
+	}
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to delete content: " + result.Error.Error(),
+			Message: "Failed to delete content: " + err.Error(),
 			Code:    "DELETE_FAILED",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, bulkDeleteContentResponse{
-		DeletedCount: result.RowsAffected,
+		DeletedCount: deletedCount,
 		Message:      "Successfully deleted content items",
 	})
 }
@@ -1378,18 +1536,71 @@ func BulkStatusChange(c *gin.Context) {
 			})
 			return
 		}
-
-		result := query.Update("status", toStatus)
-		if result.Error != nil {
+		var updated int64
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var targets []models.ContentItem
+			if err := tx.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, req.IDs).Order("id ASC").Find(&targets).Error; err != nil {
+				return err
+			}
+			if len(targets) == 0 {
+				return nil
+			}
+			resources := make([]lifecycle.Resource, 0, len(targets))
+			for _, item := range targets {
+				lane := "news"
+				if item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast {
+					lane = "pods"
+				} else if item.Type != models.ContentTypeNews && item.Type != models.ContentTypeArticle && item.Type != models.ContentTypeTweet && item.Type != models.ContentTypeComment {
+					return errors.New("bulk status update encountered an unsupported content type")
+				}
+				sourceID := "-"
+				if item.ContentSourceID != nil {
+					sourceID = item.ContentSourceID.String()
+				}
+				resources = append(resources, lifecycle.Resource{Type: lifecycle.ResourceItem, Key: lane + "/" + sourceID + "/" + item.PublicID.String()})
+			}
+			if err := lifecycle.CheckResources(tx, principal.TenantID, resources, lifecycle.PhaseContentWrite); err != nil {
+				return err
+			}
+			ids := make([]uuid.UUID, 0, len(targets))
+			selectedAt := make(map[uuid.UUID]time.Time, len(targets))
+			for _, item := range targets {
+				ids = append(ids, item.PublicID)
+				selectedAt[item.PublicID] = item.UpdatedAt
+			}
+			var locked []models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).Order("id ASC").Find(&locked).Error; err != nil {
+				return err
+			}
+			if len(locked) != len(targets) {
+				return errors.New("bulk status scope changed before its exact rows were locked")
+			}
+			for _, item := range locked {
+				if !item.UpdatedAt.Equal(selectedAt[item.PublicID]) {
+					return errors.New("bulk status scope changed before its exact rows were locked")
+				}
+			}
+			result := tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).Update("status", toStatus)
+			if result.Error != nil {
+				return result.Error
+			}
+			updated = result.RowsAffected
+			return nil
+		})
+		if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds one or more selected items", Code: "OPERATION_CONFLICT"})
+			return
+		}
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, authErrorResponse{
-				Message: "Failed to update status: " + result.Error.Error(),
+				Message: "Failed to update status: " + err.Error(),
 				Code:    "UPDATE_FAILED",
 			})
 			return
 		}
 
 		c.JSON(http.StatusOK, bulkStatusChangeResponse{
-			UpdatedCount: result.RowsAffected,
+			UpdatedCount: updated,
 			Message:      "Updated selected items to " + strings.ToLower(toStatus),
 		})
 		return
@@ -1471,28 +1682,61 @@ func BulkStatusChange(c *gin.Context) {
 		return
 	}
 
-	var result *gorm.DB
-	if limit > 0 {
-		// Bounded update — subquery caps the number of rows touched.
-		subQuery := applyFilters(db.Model(&models.ContentItem{}).Select("id")).Limit(limit)
-		result = db.Model(&models.ContentItem{}).
-			Where("id IN (?)", subQuery).
-			Update("status", toStatus)
-	} else {
-		// Uncapped — update the entire matching set in a single statement.
-		result = applyFilters(db.Model(&models.ContentItem{})).Update("status", toStatus)
+	var updated int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var contentTypes []models.ContentType
+		if err := applyFilters(tx.Model(&models.ContentItem{})).Distinct("type").Pluck("type", &contentTypes).Error; err != nil {
+			return err
+		}
+		laneResources := make([]lifecycle.Resource, 0, 2)
+		seenLanes := map[string]bool{}
+		for _, contentType := range contentTypes {
+			lane := "news"
+			switch contentType {
+			case models.ContentTypeVideo, models.ContentTypePodcast:
+				lane = "pods"
+			case models.ContentTypeNews, models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
+			default:
+				return errors.New("bulk status update encountered an unsupported content type")
+			}
+			if !seenLanes[lane] {
+				seenLanes[lane] = true
+				laneResources = append(laneResources, lifecycle.Resource{Type: lifecycle.ResourceLane, Key: lane})
+			}
+		}
+		if len(laneResources) == 0 {
+			return nil
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID, laneResources, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		var result *gorm.DB
+		if limit > 0 {
+			subQuery := applyFilters(tx.Model(&models.ContentItem{}).Select("id")).Order("id ASC").Limit(limit)
+			result = tx.Model(&models.ContentItem{}).Where("id IN (?)", subQuery).Update("status", toStatus)
+		} else {
+			result = applyFilters(tx.Model(&models.ContentItem{})).Update("status", toStatus)
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		return nil
+	})
+	if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds one or more matching items", Code: "OPERATION_CONFLICT"})
+		return
 	}
-
-	if result.Error != nil {
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to update status: " + result.Error.Error(),
+			Message: "Failed to update status: " + err.Error(),
 			Code:    "UPDATE_FAILED",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, bulkStatusChangeResponse{
-		UpdatedCount: result.RowsAffected,
+		UpdatedCount: updated,
 		Message:      "Updated " + strings.ToLower(fromStatus) + " items to " + strings.ToLower(toStatus),
 	})
 }

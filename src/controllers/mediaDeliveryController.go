@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Delivery policy resolution intentionally has a code-safe fallback. A newly
@@ -136,43 +139,14 @@ func InternalCreateMediaRenditionGeneration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "delivery decision digests do not match snapshots"})
 		return
 	}
-	var item models.ContentItem
-	if err := db.Where("public_id=? AND tenant_id=?", contentID, tenant).First(&item).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "content item not found"})
-		return
-	}
-	var sourceID *uuid.UUID
-	if raw := strings.TrimSpace(req.SourceManifestID); raw != "" {
-		parsed, parseErr := uuid.Parse(raw)
-		if parseErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid source_manifest_id"})
-			return
-		}
-		var manifest models.MediaArtifactManifest
-		if err := db.Where("public_id=? AND tenant_id=? AND artifact_role='source' AND state IN ?", parsed, tenant, []string{"verified", "active"}).First(&manifest).Error; err != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "source manifest is not verified"})
-			return
-		}
-		sourceID = &parsed
-	}
-	var existing models.MediaRenditionGeneration
-	if err := db.Where("tenant_id=? AND content_item_id=? AND route_digest=? AND probe_digest=? AND policy_digest=? AND state IN ?", tenant, contentID, req.RouteDigest, req.ProbeDigest, req.PolicyDigest, []string{"planning", "running", "verifying", "active"}).First(&existing).Error; err == nil {
-		c.JSON(http.StatusOK, existing)
-		return
-	} else if err != gorm.ErrRecordNotFound {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "rendition generation lookup failed"})
-		return
-	}
-	var next int
-	_ = db.Model(&models.MediaRenditionGeneration{}).Where("tenant_id=? AND content_item_id=?", tenant, contentID).Select("COALESCE(MAX(generation_number),0)").Scan(&next).Error
-	gen := models.MediaRenditionGeneration{PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID, GenerationNumber: next + 1, SourceManifestID: sourceID, RouteDecision: longFormJSON(req.RouteDecision), RouteDigest: req.RouteDigest, ProbeSnapshot: longFormJSON(req.ProbeSnapshot), ProbeDigest: req.ProbeDigest, PolicySnapshot: longFormJSON(req.PolicySnapshot), PolicyDigest: req.PolicyDigest, RenditionSet: longFormJSON([]any{}), State: "planning", TerminalProof: longFormJSON(map[string]any{})}
+	var attemptID, fenceToken *uuid.UUID
 	if raw := strings.TrimSpace(req.AttemptID); raw != "" {
 		value, e := uuid.Parse(raw)
 		if e != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid attempt_id"})
 			return
 		}
-		gen.AttemptID = &value
+		attemptID = &value
 	}
 	if raw := strings.TrimSpace(req.FenceToken); raw != "" {
 		value, e := uuid.Parse(raw)
@@ -180,10 +154,60 @@ func InternalCreateMediaRenditionGeneration(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid fence_token"})
 			return
 		}
-		gen.FenceToken = &value
+		fenceToken = &value
 	}
-	if err := db.Create(&gen).Error; err != nil {
+	var gen models.MediaRenditionGeneration
+	var existing bool
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if _, err := lockContentForLifecycleMutation(tx, tenant, contentID); err != nil {
+			return err
+		}
+		var sourceID *uuid.UUID
+		if raw := strings.TrimSpace(req.SourceManifestID); raw != "" {
+			parsed, parseErr := uuid.Parse(raw)
+			if parseErr != nil {
+				return errors.New("invalid source_manifest_id")
+			}
+			var manifest models.MediaArtifactManifest
+			if err := tx.Where("public_id=? AND tenant_id=? AND artifact_role='source' AND state IN ?", parsed, tenant, []string{"verified", "active"}).First(&manifest).Error; err != nil {
+				return fmt.Errorf("source manifest is not verified: %w", err)
+			}
+			sourceID = &parsed
+		}
+		if err := tx.Where("tenant_id=? AND content_item_id=? AND route_digest=? AND probe_digest=? AND policy_digest=? AND state IN ?", tenant, contentID, req.RouteDigest, req.ProbeDigest, req.PolicyDigest, []string{"planning", "running", "verifying", "active"}).First(&gen).Error; err == nil {
+			existing = true
+			return nil
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("rendition generation lookup failed: %w", err)
+		}
+		var next int
+		if err := tx.Model(&models.MediaRenditionGeneration{}).Where("tenant_id=? AND content_item_id=?", tenant, contentID).Select("COALESCE(MAX(generation_number),0)").Scan(&next).Error; err != nil {
+			return fmt.Errorf("rendition generation sequence lookup failed: %w", err)
+		}
+		gen = models.MediaRenditionGeneration{
+			PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID,
+			GenerationNumber: next + 1, SourceManifestID: sourceID,
+			RouteDecision: longFormJSON(req.RouteDecision), RouteDigest: req.RouteDigest,
+			ProbeSnapshot: longFormJSON(req.ProbeSnapshot), ProbeDigest: req.ProbeDigest,
+			PolicySnapshot: longFormJSON(req.PolicySnapshot), PolicyDigest: req.PolicyDigest,
+			RenditionSet: longFormJSON([]any{}), State: "planning",
+			TerminalProof: longFormJSON(map[string]any{}), AttemptID: attemptID, FenceToken: fenceToken,
+		}
+		return tx.Create(&gen).Error
+	})
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "content item or source manifest not found"})
+			return
+		}
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusConflict, gin.H{"error": "rendition generation creation rejected"})
+		return
+	}
+	if existing {
+		c.JSON(http.StatusOK, gen)
 		return
 	}
 	c.JSON(http.StatusCreated, gen)
@@ -392,7 +416,29 @@ func InternalTransitionMediaRenditionGeneration(c *gin.Context) {
 	if req.TerminalProof != nil {
 		updates["terminal_proof"] = longFormJSON(req.TerminalProof)
 	}
-	if err = db.Model(&gen).Updates(updates).Error; err != nil {
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if _, err := lockContentForLifecycleMutation(tx, tenant, gen.ContentItemID); err != nil {
+			return err
+		}
+		var current models.MediaRenditionGeneration
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=?", id, tenant).First(&current).Error; err != nil {
+			return err
+		}
+		if current.State != gen.State || (current.FenceToken == nil) != (gen.FenceToken == nil) ||
+			(current.FenceToken != nil && *current.FenceToken != *gen.FenceToken) {
+			return errors.New("rendition generation authority changed")
+		}
+		if len(req.RenditionSet) > 0 {
+			if err := validateRenditionSet(tx, &current, tenant, req.RenditionSet); err != nil {
+				return err
+			}
+		}
+		return tx.Model(&current).Updates(updates).Error
+	})
+	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "rendition generation transition failed"})
 		return
 	}
@@ -431,8 +477,8 @@ func InternalActivateMediaRenditionGeneration(c *gin.Context) {
 		if gen.FenceToken != nil && strings.TrimSpace(req.FenceToken) != gen.FenceToken.String() {
 			return gorm.ErrInvalidData
 		}
-		var content models.ContentItem
-		if err := tx.Where("public_id=? AND tenant_id=?", gen.ContentItemID, tenant).First(&content).Error; err != nil {
+		content, err := lockContentForLifecycleMutation(tx, tenant, gen.ContentItemID)
+		if err != nil {
 			return err
 		}
 		now := time.Now().UTC()
@@ -1175,6 +1221,9 @@ func AdminRollbackMediaDeliveryGeneration(c *gin.Context) {
 		var renditions []map[string]any
 		if json.Unmarshal(target.RenditionSet, &renditions) != nil || validateRenditionSet(tx, &target, principal.TenantID, renditions) != nil {
 			return gorm.ErrInvalidData
+		}
+		if _, err := lockContentForLifecycleMutation(tx, principal.TenantID, target.ContentItemID); err != nil {
+			return err
 		}
 		now := time.Now().UTC()
 		if err := tx.Model(&models.MediaRenditionGeneration{}).Where("tenant_id=? AND content_item_id=? AND state='active'", principal.TenantID, target.ContentItemID).Updates(map[string]any{"state": "superseded", "updated_at": now}).Error; err != nil {

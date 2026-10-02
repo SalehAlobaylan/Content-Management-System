@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"net/http"
@@ -44,6 +45,10 @@ type ContentItemResponse struct {
 // detail and interaction endpoints must never reveal or mutate workflow-only
 // items merely because their UUID was guessed.
 func publicContentQuery(db *gorm.DB) *gorm.DB {
+	return feedcontract.ApplyPublicItemGenerationMembership(db, publicContentBaseQuery(db))
+}
+
+func publicContentBaseQuery(db *gorm.DB) *gorm.DB {
 	// UUID-addressable public content must satisfy the same publication
 	// baseline as its public feed surface. In particular, a READY workflow
 	// state alone must not expose a hidden atomization parent/child or an item
@@ -54,17 +59,21 @@ func publicContentQuery(db *gorm.DB) *gorm.DB {
 		models.StorageStateRecoveryPending,
 		models.StorageStateUnrecoverable,
 	}
-	return db.
+	query := db.
 		Where("content_items.status = ?", models.ContentStatusReady).
 		Where("content_items.feed_visibility = ?", feedVisibilityVisible).
 		Where("(content_items.storage_state IS NULL OR content_items.storage_state NOT IN ?)", storageUnavailable).
+		Where(`content_items.type <> 'NEWS' OR (
+			COALESCE(content_items.news_retention_state, 'full') = 'full' OR
+			content_items.news_feed_role IN ('lead', 'representative')
+		)`).
 		Where(`content_items.type NOT IN ? OR (
 			content_items.is_feed_unit = TRUE AND
 			content_items.duration_sec BETWEEN ? AND ? AND
 			COALESCE(content_items.playback_url, content_items.media_url) IS NOT NULL AND
-			COALESCE(content_items.playback_url, content_items.media_url) <> '' AND
-			content_items.thumbnail_url IS NOT NULL AND content_items.thumbnail_url <> ''
+			COALESCE(content_items.playback_url, content_items.media_url) <> ''
 		)`, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}, podsMinDurationSec, podsHardMaxDurationSec)
+	return query
 }
 
 // GetContentItem returns a single content item by ID

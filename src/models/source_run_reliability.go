@@ -38,27 +38,28 @@ const (
 // is renewable; FenceToken is immutable for the attempt and is carried through
 // every authorized execution unit and receipt.
 type SourceRunAttempt struct {
-	ID                       uint       `gorm:"primaryKey" json:"-"`
-	PublicID                 uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID                 string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	SourceRunRequestID       uuid.UUID  `gorm:"type:uuid;not null;index" json:"source_run_request_id"`
-	ContentSourceID          uuid.UUID  `gorm:"type:uuid;not null;index" json:"content_source_id"`
-	AttemptNumber            int        `gorm:"not null" json:"attempt_number"`
-	State                    string     `gorm:"type:varchar(32);not null" json:"state"`
-	FenceToken               uuid.UUID  `gorm:"type:uuid;not null" json:"fence_token"`
-	DispatcherOwner          string     `gorm:"type:varchar(128)" json:"dispatcher_owner,omitempty"`
-	DispatcherToken          *uuid.UUID `gorm:"type:uuid" json:"-"`
-	DispatcherEpoch          int64      `gorm:"not null;default:0" json:"dispatcher_epoch"`
-	DispatcherLeaseExpiresAt *time.Time `gorm:"type:timestamptz;index" json:"dispatcher_lease_expires_at,omitempty"`
-	HeartbeatAt              *time.Time `gorm:"type:timestamptz" json:"heartbeat_at,omitempty"`
-	RootExecutionUnitID      *uuid.UUID `gorm:"type:uuid;index" json:"root_execution_unit_id,omitempty"`
-	StartedAt                *time.Time `gorm:"type:timestamptz" json:"started_at,omitempty"`
-	FinishedAt               *time.Time `gorm:"type:timestamptz" json:"finished_at,omitempty"`
-	VerificationRequiredAt   *time.Time `gorm:"type:timestamptz" json:"verification_required_at,omitempty"`
-	FailureClass             string     `gorm:"type:varchar(100)" json:"failure_class,omitempty"`
-	FailureSummary           string     `gorm:"type:varchar(1000)" json:"failure_summary,omitempty"`
-	CreatedAt                time.Time  `json:"created_at"`
-	UpdatedAt                time.Time  `json:"updated_at"`
+	ID                        uint       `gorm:"primaryKey" json:"-"`
+	PublicID                  uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID                  string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	SourceRunRequestID        uuid.UUID  `gorm:"type:uuid;not null;index" json:"source_run_request_id"`
+	ContentSourceID           uuid.UUID  `gorm:"type:uuid;not null;index" json:"content_source_id"`
+	AttemptNumber             int        `gorm:"not null" json:"attempt_number"`
+	State                     string     `gorm:"type:varchar(32);not null" json:"state"`
+	FenceToken                uuid.UUID  `gorm:"type:uuid;not null" json:"fence_token"`
+	DispatcherOwner           string     `gorm:"type:varchar(128)" json:"dispatcher_owner,omitempty"`
+	DispatcherToken           *uuid.UUID `gorm:"type:uuid" json:"-"`
+	DispatcherEpoch           int64      `gorm:"not null;default:0" json:"dispatcher_epoch"`
+	DispatcherLeaseExpiresAt  *time.Time `gorm:"type:timestamptz;index" json:"dispatcher_lease_expires_at,omitempty"`
+	HeartbeatAt               *time.Time `gorm:"type:timestamptz" json:"heartbeat_at,omitempty"`
+	RootExecutionUnitID       *uuid.UUID `gorm:"type:uuid;index" json:"root_execution_unit_id,omitempty"`
+	StartedAt                 *time.Time `gorm:"type:timestamptz" json:"started_at,omitempty"`
+	FinishedAt                *time.Time `gorm:"type:timestamptz" json:"finished_at,omitempty"`
+	VerificationRequiredAt    *time.Time `gorm:"type:timestamptz" json:"verification_required_at,omitempty"`
+	ProviderEffectsReleasedAt *time.Time `gorm:"type:timestamptz;->" json:"provider_effects_released_at,omitempty"`
+	FailureClass              string     `gorm:"type:varchar(100)" json:"failure_class,omitempty"`
+	FailureSummary            string     `gorm:"type:varchar(1000)" json:"failure_summary,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 func (SourceRunAttempt) TableName() string { return "source_run_attempts" }

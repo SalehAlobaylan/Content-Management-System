@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -273,31 +274,56 @@ func BulkEditTags(c *gin.Context) {
 		return
 	}
 
-	var result *gorm.DB
-	if hasSet {
-		// Replace the entire tag array.
-		result = applySelection(db.Model(&models.ContentItem{})).
-			Update("topic_tags", pq.StringArray(setTags))
-	} else {
-		// Add then remove, de-duplicated, in one set-based expression evaluated
-		// against each row's current topic_tags.
-		expr := "(SELECT COALESCE(array_agg(DISTINCT e), '{}') " +
-			"FROM unnest(COALESCE(topic_tags, '{}') || ?::text[]) AS e " +
-			"WHERE e <> ALL(?::text[]))"
-		result = applySelection(db.Model(&models.ContentItem{})).
-			Update("topic_tags", gorm.Expr(expr, pq.StringArray(addTags), pq.StringArray(removeTags)))
-	}
-
-	if result.Error != nil {
+	var updated int64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLanePods}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		var result *gorm.DB
+		if hasSet {
+			// Replace the entire tag array.
+			result = applySelection(tx.Model(&models.ContentItem{})).
+				Update("topic_tags", pq.StringArray(setTags))
+		} else {
+			// Add then remove, de-duplicated, in one set-based expression evaluated
+			// against each row's current topic_tags.
+			expr := "(SELECT COALESCE(array_agg(DISTINCT e), '{}') " +
+				"FROM unnest(COALESCE(topic_tags, '{}') || ?::text[]) AS e " +
+				"WHERE e <> ALL(?::text[]))"
+			result = applySelection(tx.Model(&models.ContentItem{})).
+				Update("topic_tags", gorm.Expr(expr, pq.StringArray(addTags), pq.StringArray(removeTags)))
+		}
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to update tags: " + result.Error.Error(),
+			Message: "Failed to update tags: " + err.Error(),
 			Code:    "TAGS_UPDATE_FAILED",
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, bulkEditTagsResponse{
-		UpdatedCount: result.RowsAffected,
+		UpdatedCount: updated,
 		Message:      "Updated tags on content items",
 	})
 }
@@ -340,14 +366,34 @@ func RenameTopic(c *gin.Context) {
 		return
 	}
 
-	res := db.Model(&models.Story{}).
-		Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).
-		Update("label", label)
-	if res.Error != nil {
+	var renamed int64
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
+		result := tx.Model(&models.Story{}).
+			Where("public_id = ? AND tenant_id = ?", id, principal.TenantID).
+			Update("label", label)
+		if result.Error == nil {
+			renamed = result.RowsAffected
+		}
+		return result.Error
+	})
+	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to rename topic", Code: "RENAME_FAILED"})
 		return
 	}
-	if res.RowsAffected == 0 {
+	if renamed == 0 {
 		c.JSON(http.StatusNotFound, authErrorResponse{Message: "Topic not found", Code: "NOT_FOUND"})
 		return
 	}
@@ -391,6 +437,16 @@ func MergeTopics(c *gin.Context) {
 
 	var moved int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
 		// Lock the destination in the caller's tenant before re-pointing any
 		// rows. A public UUID is globally unique, but it is not an authority to
 		// attach this tenant's content to another tenant's story.
@@ -424,6 +480,9 @@ func MergeTopics(c *gin.Context) {
 			c.JSON(http.StatusNotFound, authErrorResponse{Message: "Target topic not found", Code: "NOT_FOUND"})
 			return
 		}
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to merge topics: " + err.Error(), Code: "MERGE_FAILED"})
 		return
 	}
@@ -447,6 +506,16 @@ func DeleteTopic(c *gin.Context) {
 
 	var deleted int64
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if e := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); e != nil {
+			return e
+		}
+		if e := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); e != nil {
+			return e
+		}
 		if e := tx.Model(&models.ContentItem{}).
 			Where("story_id = ? AND tenant_id = ?", id, principal.TenantID).
 			Update("story_id", nil).Error; e != nil {
@@ -460,6 +529,9 @@ func DeleteTopic(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to delete topic", Code: "DELETE_FAILED"})
 		return
 	}
@@ -566,6 +638,16 @@ func BulkAssignTopic(c *gin.Context) {
 
 	var updated int64
 	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
 		if targetID != nil {
 			var targetStory models.Story
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -591,6 +673,9 @@ func BulkAssignTopic(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, authErrorResponse{Message: "Target topic not found", Code: "NOT_FOUND"})
+			return
+		}
+		if writeLifecycleConflict(c, err) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to assign topic: " + err.Error(), Code: "ASSIGN_FAILED"})
@@ -687,6 +772,10 @@ func ReclusterTopics(c *gin.Context) {
 	if contentType == "" {
 		contentType = "NEWS"
 	}
+	if contentType != string(models.ContentTypeNews) {
+		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Story re-clustering is supported only for News", Code: "NEWS_ONLY"})
+		return
+	}
 
 	var n int64
 	db.Model(&models.ContentItem{}).
@@ -702,6 +791,16 @@ func ReclusterTopics(c *gin.Context) {
 
 	// Wipe assignments + taxonomy, then let the threshold backfill rebuild.
 	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, principal.TenantID,
+			[]lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}},
+			lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
 		if e := tx.Model(&models.ContentItem{}).
 			Where("tenant_id = ? AND type = ?", principal.TenantID, contentType).
 			Update("story_id", nil).Error; e != nil {
@@ -710,6 +809,9 @@ func ReclusterTopics(c *gin.Context) {
 		return tx.Where("tenant_id = ?", principal.TenantID).Delete(&models.Story{}).Error
 	})
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Re-cluster failed: " + err.Error(), Code: "RECLUSTER_FAILED"})
 		return
 	}
@@ -730,6 +832,24 @@ type labelBatchRequest struct {
 type labelBatchResponse struct {
 	Processed int   `json:"processed"`
 	Remaining int64 `json:"remaining"`
+}
+
+func updateTopicLabelUnderLifecycle(db *gorm.DB, tenantID string, topicID uuid.UUID, label string) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		resources := []lifecycle.Resource{{Type: lifecycle.ResourceLane, Key: models.ContentStageLaneNews}}
+		if err := lifecycle.CheckExclusiveResources(tx, tenantID, resources, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		if err := lifecycle.CheckExclusiveResources(tx, tenantID, resources, lifecycle.PhaseFeedMembership); err != nil {
+			return err
+		}
+		updates := map[string]interface{}{"labeled": true}
+		if label != "" {
+			updates["label"] = label
+		}
+		result := tx.Model(&models.Story{}).Where("tenant_id = ? AND public_id = ?", tenantID, topicID).Updates(updates)
+		return result.Error
+	})
 }
 
 // LabelTopicsBatch handles POST /admin/stories/label-batch — names a batch of
@@ -764,7 +884,13 @@ func LabelTopicsBatch(c *gin.Context) {
 		if len(texts) == 0 {
 			// No member text to name from — keep the placeholder but mark it
 			// labeled so the loop terminates.
-			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
+			if err := updateTopicLabelUnderLifecycle(db, principal.TenantID, t.PublicID, ""); err != nil {
+				if writeLifecycleConflict(c, err) {
+					return
+				}
+				c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update topic label", Code: "LABELING_FAILED"})
+				return
+			}
 			processed++
 			continue
 		}
@@ -782,15 +908,28 @@ func LabelTopicsBatch(c *gin.Context) {
 
 		label = strings.TrimSpace(label)
 		if label == "" {
-			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).Update("labeled", true)
+			if err := updateTopicLabelUnderLifecycle(db, principal.TenantID, t.PublicID, ""); err != nil {
+				if writeLifecycleConflict(c, err) {
+					return
+				}
+				c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update topic label", Code: "LABELING_FAILED"})
+				return
+			}
 			processed++
 			continue
 		}
-		if err := db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
-			Updates(map[string]interface{}{"label": label, "labeled": true}).Error; err != nil {
+		if err := updateTopicLabelUnderLifecycle(db, principal.TenantID, t.PublicID, label); err != nil {
+			if writeLifecycleConflict(c, err) {
+				return
+			}
 			// Unique (tenant,label) collision — disambiguate with a short suffix.
-			db.Model(&models.Story{}).Where("public_id = ?", t.PublicID).
-				Updates(map[string]interface{}{"label": label + " " + t.PublicID.String()[:4], "labeled": true})
+			if retryErr := updateTopicLabelUnderLifecycle(db, principal.TenantID, t.PublicID, label+" "+t.PublicID.String()[:4]); retryErr != nil {
+				if writeLifecycleConflict(c, retryErr) {
+					return
+				}
+				c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update topic label", Code: "LABELING_FAILED"})
+				return
+			}
 		}
 		processed++
 	}

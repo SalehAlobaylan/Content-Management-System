@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"encoding/json"
@@ -463,6 +464,14 @@ func ApproveSuggestion(c *gin.Context) {
 
 	source, err := approveSuggestionTx(db, principal.TenantID, &suggestion)
 	if err != nil {
+		if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+			if lifecycle.IsIntakePaused(err) {
+				c.JSON(http.StatusConflict, authErrorResponse{Message: "Source intake is paused by an active Content Reset operation", Code: "SOURCE_ADMISSION_PAUSED"})
+			} else {
+				c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds this source lane", Code: "OPERATION_CONFLICT"})
+			}
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to approve suggestion", Code: "APPROVE_FAILED"})
 		return
 	}

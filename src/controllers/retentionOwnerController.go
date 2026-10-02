@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/gin-gonic/gin"
@@ -233,8 +234,15 @@ func ExecuteRetentionOwnerRequest(c *gin.Context) {
 		if !ownerReq.ExpiresAt.After(time.Now().UTC()) {
 			return errors.New("owner request has expired; prepare a new bounded request")
 		}
+		if err := lifecycle.CheckTenantEffect(tx, principal.TenantID, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
 		return tx.Model(&models.RetentionOwnerRequest{}).Where("id=?", ownerReq.ID).Update("status", "running").Error
 	}); err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign conflicts with this Retention owner effect", Code: "OPERATION_CONFLICT"})
+			return
+		}
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}

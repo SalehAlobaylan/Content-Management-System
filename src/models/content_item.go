@@ -95,6 +95,9 @@ type ContentItem struct {
 	ID       uint      `gorm:"primaryKey" json:"-"`
 	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_content_items_public_id" json:"id"`
 	TenantID string    `gorm:"type:varchar(64);not null;default:default;index:idx_content_items_tenant_id;uniqueIndex:idx_content_items_tenant_idempotency,priority:1" json:"tenant_id"`
+	// InventorySequence is assigned by the database on insert. Content Reset
+	// uses the per-tenant sequence as a stable boundary across paginated scans.
+	InventorySequence int64 `gorm:"column:inventory_sequence;->" json:"-"`
 
 	// Classification
 	Type ContentType `gorm:"type:varchar(20);not null" json:"type"`

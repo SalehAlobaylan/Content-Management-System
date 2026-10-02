@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 
@@ -105,6 +106,43 @@ func claimOneStudioClearance(db *gorm.DB) (studioClearanceClaim, bool, error) {
 				continue
 			}
 			if studioChildSetDigest(ids) != request.ChildSetDigest {
+				continue
+			}
+			var childItems []models.ContentItem
+			if err := tx.Where("tenant_id=? AND public_id IN ?", request.TenantID, ids).Find(&childItems).Error; err != nil {
+				return err
+			}
+			if len(childItems) != len(ids) {
+				continue
+			}
+			resources := make([]lifecycle.Resource, 0, len(childItems))
+			for _, item := range childItems {
+				resources = append(resources, lifecycle.Resource{Type: lifecycle.ResourceItem, Key: "pods/" + lifecycleSourceID(item.ContentSourceID) + "/" + item.PublicID.String()})
+			}
+			if err := lifecycle.CheckResources(tx, request.TenantID, resources, lifecycle.PhaseSourceDispatch); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					continue
+				}
+				return err
+			}
+			if err := lifecycle.CheckResources(tx, request.TenantID, resources, lifecycle.PhaseContentWrite); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					continue
+				}
+				return err
+			}
+			paused := false
+			for _, item := range childItems {
+				scope := lifecycle.Scope{TenantID: item.TenantID, Lane: "pods", SourceID: lifecycleSourceID(item.ContentSourceID), ItemID: item.PublicID.String()}
+				if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+					if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+						paused = true
+						break
+					}
+					return err
+				}
+			}
+			if paused {
 				continue
 			}
 			var attempts int64

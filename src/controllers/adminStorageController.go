@@ -3,6 +3,7 @@ package controllers
 import (
 	"bytes"
 	"content-management-system/src/intelligence"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -148,6 +150,7 @@ type storageCandidate struct {
 	ViewCount           int     `json:"view_count"`
 	FileSizeBytes       int64   `json:"file_size_bytes"`
 	CreatedAt           string  `json:"created_at"`
+	UpdatedAt           string  `json:"updated_at"`
 	PublishedAt         *string `json:"published_at,omitempty"`
 	MediaURL            *string `json:"media_url,omitempty"`
 	ThumbnailURL        *string `json:"thumbnail_url,omitempty"`
@@ -456,6 +459,7 @@ func mapStorageCandidate(it models.ContentItem) storageCandidate {
 		ViewCount:           it.ViewCount,
 		FileSizeBytes:       it.FileSizeBytes,
 		CreatedAt:           it.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:           it.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		PublishedAt:         pub,
 		MediaURL:            it.MediaURL,
 		ThumbnailURL:        it.ThumbnailURL,
@@ -582,6 +586,46 @@ func PurgeStorage(c *gin.Context) {
 		artifacts = append(artifacts, "thumbnail")
 	}
 
+	sagas := make(map[uuid.UUID]*models.StorageOperationSaga, len(items))
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		for _, selected := range items {
+			var current models.ContentItem
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", principal.TenantID, selected.PublicID).First(&current).Error; err != nil {
+				return err
+			}
+			if !current.UpdatedAt.Equal(selected.UpdatedAt) || current.FileSizeBytes != selected.FileSizeBytes || stringValue(current.MediaURL) != stringValue(selected.MediaURL) || stringValue(current.ThumbnailURL) != stringValue(selected.ThumbnailURL) {
+				return errStorageItemChanged
+			}
+			if err := checkContentLifecycleMutation(tx, current); err != nil {
+				return err
+			}
+			idempotencyKey := "manual:" + retentionSHA256("storage-purge/v1", current.PublicID.String(), current.UpdatedAt.UTC().Format(time.RFC3339Nano), fmt.Sprint(current.FileSizeBytes), strings.Join(artifacts, ","))
+			saga, err := createPreparedStorageSaga(tx, principal.TenantID, current, "recoverable_delete", idempotencyKey, "", "", "", map[string]interface{}{
+				"manual": true, "requested_artifacts": artifacts, "preserve_thumbnails": preserveThumbs,
+				"old_size_bytes": current.FileSizeBytes, "old_media_url": stringValue(current.MediaURL),
+			})
+			if err != nil {
+				return err
+			}
+			if !saga.Created {
+				return fmt.Errorf("storage operation already exists in %s; reconciliation required", saga.State)
+			}
+			sagas[current.PublicID] = saga
+		}
+		return nil
+	}); err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds one or more selected items", Code: "OPERATION_CONFLICT"})
+			return
+		}
+		if errors.Is(err, errStorageItemChanged) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "One or more storage candidates changed; refresh the preview", Code: "STORAGE_CANDIDATE_STALE"})
+			return
+		}
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Storage effect is already recorded or requires reconciliation: " + err.Error(), Code: "STORAGE_RECONCILIATION_REQUIRED"})
+		return
+	}
+
 	delResp, err := callAggregationDeleteObjects(c.GetHeader("Authorization"), aggDeleteRequest{
 		ContentIDs: contentIDs,
 		Artifacts:  artifacts,
@@ -593,45 +637,107 @@ func PurgeStorage(c *gin.Context) {
 		})
 		return
 	}
+	receipts := make(map[uuid.UUID]aggDeleteItemReceipt, len(delResp.Results))
+	for _, receipt := range delResp.Results {
+		contentID, parseErr := uuid.Parse(receipt.ContentID)
+		if parseErr != nil {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "Aggregation returned an invalid per-item deletion receipt; reconciliation is required", Code: "STORAGE_RECEIPT_UNCERTAIN"})
+			return
+		}
+		if _, duplicate := receipts[contentID]; duplicate {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "Aggregation returned duplicate per-item deletion receipts; reconciliation is required", Code: "STORAGE_RECEIPT_UNCERTAIN"})
+			return
+		}
+		receipts[contentID] = receipt
+	}
+	for _, item := range items {
+		receipt, ok := receipts[item.PublicID]
+		if !ok || !receipt.RequestedArtifactsAbsent || len(receipt.Errors) > 0 {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "One or more object deletions lack exact absence evidence; recovery is required", Code: "STORAGE_RECEIPT_UNCERTAIN"})
+			return
+		}
+	}
 
 	now := time.Now().UTC()
 	var freed int64
 	for _, it := range items {
 		freed += it.FileSizeBytes
-		updates := map[string]interface{}{
-			"file_size_bytes":         0,
-			"media_url":               nil,
-			"storage_state":           models.StorageStateRecoverableDeleted,
-			"storage_state_reason":    "manual_purge",
-			"storage_recovery_status": models.StorageRecoveryRecoverable,
-			"storage_deleted_at":      &now,
-		}
-		if !preserveThumbs {
-			updates["thumbnail_url"] = nil
-		}
-		if err := db.Model(&models.ContentItem{}).Where("id = ?", it.ID).Updates(updates).Error; err != nil {
-			// Don't abort the whole batch; just log and continue
-			fmt.Println("storage purge: failed to update content item", it.PublicID, err)
-		} else {
-			_, _ = createStorageArtifactEvent(db, storageArtifactEventInput{
-				TenantID:              it.TenantID,
-				ContentItemID:         it.PublicID,
-				ParentContentItemID:   it.ParentContentItemID,
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		for _, item := range items {
+			if err := checkContentLifecycleMutation(tx, item); err != nil {
+				return err
+			}
+			receipt := receipts[item.PublicID]
+			saga := sagas[item.PublicID]
+			objectEvidence := storageJSON(map[string]interface{}{
+				"deleted_count": receipt.DeletedCount, "freed_bytes": receipt.FreedBytes,
+				"objects_absent": receipt.ObjectsAbsent, "requested_artifacts_absent": receipt.RequestedArtifactsAbsent,
+				"artifacts": artifacts,
+			})
+			marked := tx.Model(&models.StorageOperationSaga{}).Where("id=? AND state=?", saga.ID, "prepared").Updates(map[string]interface{}{"state": "object_applied", "object_evidence": objectEvidence})
+			if marked.Error != nil {
+				return marked.Error
+			}
+			if marked.RowsAffected != 1 {
+				return errors.New("storage saga lost its prepared state")
+			}
+			updates := map[string]interface{}{
+				"file_size_bytes": 0, "media_url": nil,
+				"storage_state":           models.StorageStateRecoverableDeleted,
+				"storage_state_reason":    "manual_purge",
+				"storage_recovery_status": models.StorageRecoveryRecoverable,
+				"storage_deleted_at":      &now,
+			}
+			if !preserveThumbs {
+				updates["thumbnail_url"] = nil
+			}
+			updated := tx.Model(&models.ContentItem{}).Where("id=? AND tenant_id=? AND public_id=? AND updated_at=?", item.ID, item.TenantID, item.PublicID, item.UpdatedAt).Updates(updates)
+			if updated.Error != nil {
+				return updated.Error
+			}
+			if updated.RowsAffected != 1 {
+				return errStorageItemChanged
+			}
+			if _, err := createStorageArtifactEvent(tx, storageArtifactEventInput{
+				TenantID:              item.TenantID,
+				ContentItemID:         item.PublicID,
+				ParentContentItemID:   item.ParentContentItemID,
 				EventType:             models.StorageArtifactEventRecoverableDeleted,
 				Status:                models.StorageArtifactEventStatusSuccess,
 				Reason:                "Manual storage purge",
 				Trigger:               triggerFromPurge(req),
 				Source:                "cms_admin",
-				OldMediaURL:           stringValue(it.MediaURL),
-				OldSizeBytes:          it.FileSizeBytes,
-				DeletedBytes:          it.FileSizeBytes,
-				FreedBytes:            it.FileSizeBytes,
-				RecoveryPayload:       storageRecoveryPayloadForItem(it),
+				OldMediaURL:           stringValue(item.MediaURL),
+				OldSizeBytes:          item.FileSizeBytes,
+				DeletedBytes:          receipt.FreedBytes,
+				FreedBytes:            receipt.FreedBytes,
+				ArtifactKeys:          storageJSON(map[string]interface{}{"requested_artifacts": artifacts}),
+				RecoveryPayload:       storageRecoveryPayloadForItem(item),
 				StorageState:          models.StorageStateRecoverableDeleted,
 				StorageStateReason:    "manual_purge",
 				StorageRecoveryStatus: models.StorageRecoveryRecoverable,
+			}); err != nil {
+				return err
+			}
+			completed := tx.Model(&models.StorageOperationSaga{}).Where("id=? AND state=?", saga.ID, "object_applied").Updates(map[string]interface{}{
+				"state": "cms_committed", "cms_evidence": storageJSON(map[string]interface{}{"storage_state": models.StorageStateRecoverableDeleted, "freed_bytes": receipt.FreedBytes}), "completed_at": now,
 			})
+			if completed.Error != nil {
+				return completed.Error
+			}
+			if completed.RowsAffected != 1 {
+				return errors.New("storage saga lost its object-applied state")
+			}
 		}
+		return nil
+	}); err != nil {
+		if lifecycle.IsConflict(err) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: "An active lifecycle campaign holds one or more selected items", Code: "OPERATION_CONFLICT"})
+			return
+		}
+		c.JSON(http.StatusConflict, authErrorResponse{Message: "Object deletion completed but CMS did not commit the matching item state; recovery is required", Code: "STORAGE_RECONCILIATION_REQUIRED"})
+		return
 	}
 
 	// Best-effort sweep-run record for manual purges
@@ -1320,9 +1426,19 @@ type aggDeleteRequest struct {
 }
 
 type aggDeleteResponse struct {
-	DeletedCount int      `json:"deleted_count"`
-	FreedBytes   int64    `json:"freed_bytes"`
-	Errors       []string `json:"errors,omitempty"`
+	DeletedCount int                    `json:"deleted_count"`
+	FreedBytes   int64                  `json:"freed_bytes"`
+	Errors       []string               `json:"errors,omitempty"`
+	Results      []aggDeleteItemReceipt `json:"results,omitempty"`
+}
+
+type aggDeleteItemReceipt struct {
+	ContentID                string   `json:"content_id"`
+	DeletedCount             int      `json:"deleted_count"`
+	FreedBytes               int64    `json:"freed_bytes"`
+	ObjectsAbsent            bool     `json:"objects_absent"`
+	RequestedArtifactsAbsent bool     `json:"requested_artifacts_absent"`
+	Errors                   []string `json:"errors,omitempty"`
 }
 
 func aggregationBaseURL() (string, error) {

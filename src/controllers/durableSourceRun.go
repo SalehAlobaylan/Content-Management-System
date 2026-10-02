@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 
@@ -37,11 +38,20 @@ func createDurableSourceRun(
 			First(&current).Error; err != nil {
 			return err
 		}
+		lifecycleLane := current.Category
+		if lifecycleLane == models.SourceCategoryMedia {
+			lifecycleLane = "pods"
+		}
+		if err := lifecycle.Check(tx, lifecycle.Scope{
+			TenantID: current.TenantID,
+			Lane:     lifecycleLane,
+			SourceID: current.PublicID.String(),
+		}, lifecycle.PhaseSourceAdmission); err != nil {
+			return err
+		}
 
-		var active int64
-		if err := tx.Model(&models.SourceRunRequest{}).
-			Where("tenant_id = ? AND content_source_id = ? AND state IN ?", current.TenantID, current.PublicID, models.SourceRunActiveStates).
-			Count(&active).Error; err != nil {
+		active, err := supply.CountSourceAdmissionBlockers(tx, current.TenantID, current.PublicID)
+		if err != nil {
 			return err
 		}
 		if active > 0 {

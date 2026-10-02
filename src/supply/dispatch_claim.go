@@ -1,14 +1,17 @@
 package supply
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // DispatchClaim is the only CMS-issued envelope from which Aggregation may
@@ -45,49 +48,93 @@ func ClaimNextDispatchableRequest(db *gorm.DB, owner string, dispatcherLease, ex
 			// explicitly provisioned and the global protocol is activated.
 			continue
 		}
-		var source models.ContentSource
-		if err := db.Where("public_id = ? AND tenant_id = ? AND is_active = TRUE", candidate.ContentSourceID, candidate.TenantID).First(&source).Error; err != nil {
+		var result DispatchClaim
+		var skipCandidate bool
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var source models.ContentSource
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ? AND is_active = TRUE", candidate.ContentSourceID, candidate.TenantID).First(&source).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					skipCandidate = true
+					return nil
+				}
+				return err
+			}
+			lane := source.Category
+			if lane == models.SourceCategoryMedia {
+				lane = "pods"
+			}
+			if err := lifecycle.Check(tx, lifecycle.Scope{
+				TenantID: candidate.TenantID,
+				Lane:     lane,
+				SourceID: source.PublicID.String(),
+			}, lifecycle.PhaseSourceDispatch); err != nil {
+				if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+					skipCandidate = true
+					return nil
+				}
+				return err
+			}
+
+			var lease AttemptLease
+			if candidate.Purpose == "content_reset_replay" {
+				if _, err := ValidateContentResetReplayRequest(tx, candidate); err != nil {
+					skipCandidate = true
+					return nil
+				}
+			}
+			if candidate.State == string(RequestRequested) {
+				var err error
+				lease, err = CreateAttemptAndRootUnit(tx, candidate.TenantID, candidate.PublicID.String())
+				if err != nil {
+					// A competing dispatcher may have won this candidate. Re-read
+					// bounded candidates rather than treating it as provider failure.
+					skipCandidate = true
+					return nil
+				}
+			} else {
+				var attempt models.SourceRunAttempt
+				if err := tx.Where("tenant_id = ? AND source_run_request_id = ? AND state IN ?", candidate.TenantID, candidate.PublicID, []string{string(AttemptAuthorized), string(AttemptClaimed), string(AttemptRunning)}).Order("attempt_number DESC").First(&attempt).Error; err != nil {
+					skipCandidate = true
+					return nil
+				}
+				if attempt.RootExecutionUnitID == nil {
+					skipCandidate = true
+					return nil
+				}
+				var root models.SourceRunExecutionUnit
+				if err := tx.Where("public_id = ? AND tenant_id = ?", *attempt.RootExecutionUnitID, candidate.TenantID).First(&root).Error; err != nil {
+					skipCandidate = true
+					return nil
+				}
+				lease = AttemptLease{Attempt: attempt, RootExecutionUnit: root}
+			}
+			claimed, err := ClaimAttempt(tx, candidate.TenantID, lease.Attempt.PublicID.String(), owner, dispatcherLease)
+			if err != nil {
+				return err
+			}
+			if claimed.DispatcherToken == nil {
+				return fmt.Errorf("CMS did not issue a dispatcher claim token")
+			}
+			unitLease, err := AcquireUnitExecution(tx, candidate.TenantID, lease.RootExecutionUnit.PublicID.String(), owner, executionLease)
+			if err != nil {
+				return err
+			}
+			if err := tx.Model(&models.SourceRunRequest{}).Where("public_id = ? AND tenant_id = ? AND state = ?", candidate.PublicID, candidate.TenantID, string(RequestRequested)).Updates(map[string]any{"state": string(RequestAccepted), "accepted_at": now}).Error; err != nil {
+				return err
+			}
+			candidate.State, candidate.AcceptedAt = string(RequestAccepted), &now
+			result = DispatchClaim{Request: candidate, Source: source, Attempt: claimed, RootUnit: unitLease.Unit, DispatcherToken: *claimed.DispatcherToken, ExecutionToken: unitLease.LeaseToken}
+			return nil
+		})
+		if err != nil {
+			return DispatchClaim{}, false, err
+		}
+		if skipCandidate {
 			continue
 		}
-		var lease AttemptLease
-		var err error
-		if candidate.State == string(RequestRequested) {
-			lease, err = CreateAttemptAndRootUnit(db, candidate.TenantID, candidate.PublicID.String())
-			if err != nil {
-				// A competing dispatcher may have won this candidate. Re-read bounded
-				// candidates rather than treating a conflict as a provider failure.
-				continue
-			}
-		} else {
-			var attempt models.SourceRunAttempt
-			if err := db.Where("tenant_id = ? AND source_run_request_id = ? AND state IN ?", candidate.TenantID, candidate.PublicID, []string{string(AttemptAuthorized), string(AttemptClaimed), string(AttemptRunning)}).Order("attempt_number DESC").First(&attempt).Error; err != nil {
-				continue
-			}
-			if attempt.RootExecutionUnitID == nil {
-				continue
-			}
-			var root models.SourceRunExecutionUnit
-			if err := db.Where("public_id = ? AND tenant_id = ?", *attempt.RootExecutionUnitID, candidate.TenantID).First(&root).Error; err != nil {
-				continue
-			}
-			lease = AttemptLease{Attempt: attempt, RootExecutionUnit: root}
+		if result.Request.PublicID != uuid.Nil {
+			return result, true, nil
 		}
-		claimed, err := ClaimAttempt(db, candidate.TenantID, lease.Attempt.PublicID.String(), owner, dispatcherLease)
-		if err != nil {
-			return DispatchClaim{}, false, err
-		}
-		if claimed.DispatcherToken == nil {
-			return DispatchClaim{}, false, fmt.Errorf("CMS did not issue a dispatcher claim token")
-		}
-		unitLease, err := AcquireUnitExecution(db, candidate.TenantID, lease.RootExecutionUnit.PublicID.String(), owner, executionLease)
-		if err != nil {
-			return DispatchClaim{}, false, err
-		}
-		if err := db.Model(&models.SourceRunRequest{}).Where("public_id = ? AND tenant_id = ? AND state = ?", candidate.PublicID, candidate.TenantID, string(RequestRequested)).Updates(map[string]any{"state": string(RequestAccepted), "accepted_at": now}).Error; err != nil {
-			return DispatchClaim{}, false, err
-		}
-		candidate.State, candidate.AcceptedAt = string(RequestAccepted), &now
-		return DispatchClaim{Request: candidate, Source: source, Attempt: claimed, RootUnit: unitLease.Unit, DispatcherToken: *claimed.DispatcherToken, ExecutionToken: unitLease.LeaseToken}, true, nil
 	}
 	return DispatchClaim{}, false, nil
 }

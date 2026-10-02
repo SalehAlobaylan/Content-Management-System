@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 
 	"github.com/google/uuid"
@@ -90,8 +91,8 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 			if err := RequireDurableAdmission(tx, source.TenantID, source.Category); err != nil {
 				return nil
 			}
-			var active int64
-			if err := tx.Model(&models.SourceRunRequest{}).Where("tenant_id=? AND content_source_id=? AND state IN ?", source.TenantID, source.PublicID, models.SourceRunActiveStates).Count(&active).Error; err != nil {
+			active, err := CountSourceAdmissionBlockers(tx, source.TenantID, source.PublicID)
+			if err != nil {
 				return err
 			}
 			if active > 0 {
@@ -118,6 +119,9 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 			return err
 		})
 		if err != nil {
+			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+				continue
+			}
 			return admitted, err
 		}
 		if created {
@@ -127,10 +131,10 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 	return admitted, nil
 }
 
-// AdmitDeferredObservationRuns drains retained upstream identities before
-// baseline polling. Each request owns exactly one observation so Aggregation
-// never receives a browser/provider-selected replay target or an ambiguous
-// batch. The observation reservation and request are committed atomically.
+// AdmitDeferredObservationRuns drains unresolved retained upstream identities
+// before baseline polling. Each request owns exactly one observation so
+// Aggregation never receives a browser/provider-selected replay target or an
+// ambiguous batch. The observation reservation and request are committed atomically.
 func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceRunRequest, error) {
 	if db == nil || limit < 1 || limit > sourceRunSchedulerBatch {
 		return nil, fmt.Errorf("deferred observation admission requires a bounded batch")
@@ -143,11 +147,16 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 		LEFT JOIN source_upstream_observation_dispositions d
 		  ON d.tenant_id=o.tenant_id AND d.observation_id=o.public_id
 		WHERE o.replay_until IS NOT NULL AND o.replay_until > ?
-		  AND COALESCE(d.disposition, 'deferred') IN ('deferred','replay_expiring')
+		  AND COALESCE(d.disposition, 'deferred') IN ('observed','deferred','replay_expiring')
 		  AND NOT EXISTS (
 			SELECT 1 FROM source_upstream_observation_events e
 			WHERE e.tenant_id=o.tenant_id AND e.observation_id=o.public_id
 			  AND e.event_type='materialization_reserved'
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_upstream_observation_events terminal_event
+			WHERE terminal_event.tenant_id=o.tenant_id AND terminal_event.observation_id=o.public_id
+			  AND terminal_event.event_type IN ('materialized','filtered','unrecoverable','authorized_abandonment')
 		  )
 	) ranked WHERE ranked.tenant_rank <= 2
 	ORDER BY ranked.tenant_rank ASC, ranked.replay_until ASC, ranked.observed_at ASC, ranked.tenant_id ASC LIMIT ?`, now, limit).Scan(&observations).Error; err != nil {
@@ -170,9 +179,18 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 				}
 				return err
 			}
+			var terminalEvents int64
+			if err := tx.Model(&models.SourceUpstreamObservationEvent{}).
+				Where("tenant_id=? AND observation_id=? AND event_type IN ?", observation.TenantID, observation.PublicID, []string{"materialized", "filtered", "unrecoverable", "authorized_abandonment"}).
+				Count(&terminalEvents).Error; err != nil {
+				return err
+			}
+			if terminalEvents > 0 {
+				return nil
+			}
 			var disposition models.SourceUpstreamObservationDisposition
 			if err := tx.Where("tenant_id=? AND observation_id=?", observation.TenantID, observation.PublicID).First(&disposition).Error; err == nil {
-				if disposition.Disposition != "deferred" && disposition.Disposition != "replay_expiring" {
+				if disposition.Disposition != "observed" && disposition.Disposition != "deferred" && disposition.Disposition != "replay_expiring" {
 					return nil
 				}
 			} else if err != gorm.ErrRecordNotFound {
@@ -221,6 +239,9 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 			return tx.Create(&models.SourceRunProjectionWork{PublicID: uuid.New(), TenantID: observation.TenantID, EvidenceKind: "upstream_observation_event", EvidenceID: event.PublicID, ReducerVersion: "source-run-upstream-observation/v1", State: "queued"}).Error
 		})
 		if err != nil {
+			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+				continue
+			}
 			return admitted, err
 		}
 		if created {

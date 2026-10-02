@@ -189,19 +189,31 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", receipt.ExecutionUnitID, receipt.TenantID).First(&unit).Error; err != nil {
 		return err
 	}
+	var request models.SourceRunRequest
+	if err := tx.Select("public_id, tenant_id, content_source_id, purpose").Where(
+		"public_id = ? AND tenant_id = ?", receipt.SourceRunRequestID, receipt.TenantID,
+	).First(&request).Error; err != nil {
+		return fmt.Errorf("load source-run purpose for receipt projection: %w", err)
+	}
+	if request.ContentSourceID != receipt.ContentSourceID {
+		return fmt.Errorf("source-run receipt source does not match its request")
+	}
+	contentResetReplay := request.Purpose == "content_reset_replay"
 	if IsTerminalUnit(ExecutionUnitState(unit.State)) {
 		return nil
 	}
 	now := receipt.ObservedAt.UTC()
-	if err := applySourceYieldReceipt(tx, receipt, now); err != nil {
-		return err
+	if !contentResetReplay {
+		if err := applySourceYieldReceipt(tx, receipt, now); err != nil {
+			return err
+		}
 	}
-	if receipt.EventType == string(ReceiptEventProviderRequestStarted) {
+	if receipt.EventType == string(ReceiptEventProviderRequestStarted) && !contentResetReplay {
 		if err := tx.Model(&models.ContentSource{}).Where("public_id = ? AND tenant_id = ?", receipt.ContentSourceID, receipt.TenantID).Updates(map[string]any{"last_attempted_at": now}).Error; err != nil {
 			return err
 		}
 	}
-	terminal := terminalUnitState(ReceiptEvent(receipt.EventType), SourceRunOutcome(receipt.Outcome))
+	terminal := terminalUnitStateForRequest(ReceiptEvent(receipt.EventType), SourceRunOutcome(receipt.Outcome), request.Purpose)
 	if terminal == "" {
 		return nil
 	}
@@ -217,8 +229,13 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 	updates := map[string]any{"state": string(terminal), "terminal_outcome": receipt.Outcome, "finished_at": now, "verification_required": false}
 	if terminal == UnitSucceeded && (receipt.EventType == string(ReceiptEventProviderTerminal) || receipt.EventType == string(ReceiptEventFinalization)) {
 		updates["terminal_outcome"] = receipt.Outcome
-		if err := applySourceCheckpoint(tx, receipt); err != nil {
-			return err
+		// A Fresh Start replay has an independent campaign boundary. Updating
+		// ContentSource's regular due time or success health here can postpone
+		// live intake or make replay-only yield look like ordinary source yield.
+		if !contentResetReplay {
+			if err := applySourceCheckpoint(tx, receipt); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Model(&unit).Updates(updates).Error; err != nil {
@@ -226,7 +243,7 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 	}
 	if terminal == UnitFailed {
 		if receipt.Stage == string(ReceiptStageFetch) && (receipt.Outcome == string(OutcomeProviderFailed) || receipt.Outcome == string(OutcomeDeadLettered)) {
-			if err := applySourceFailureCheckpoint(tx, receipt); err != nil {
+			if err := applySourceFailureForBranch(tx, receipt, contentResetReplay); err != nil {
 				return err
 			}
 		}
@@ -247,10 +264,11 @@ func applySourceYieldReceipt(tx *gorm.DB, receipt models.SourceRunReceipt, obser
 		EventType string
 		Payload   []byte
 	}
-	if err := tx.Model(&models.SourceRunReceipt{}).
-		Select("event_type, payload").
-		Where("tenant_id=? AND content_source_id=? AND observed_at>=? AND observed_at<? AND event_type IN ?", receipt.TenantID, receipt.ContentSourceID, dayStart, dayStart.Add(24*time.Hour), []string{string(ReceiptEventProviderTerminal), string(ReceiptEventNormalizeTerminal)}).
-		Order("observed_at ASC, public_id ASC").Limit(2049).Scan(&receipts).Error; err != nil {
+	if err := tx.Table("source_run_receipts receipt").
+		Select("receipt.event_type, receipt.payload").
+		Joins("JOIN source_run_requests request ON request.tenant_id=receipt.tenant_id AND request.public_id=receipt.source_run_request_id").
+		Where("receipt.tenant_id=? AND receipt.content_source_id=? AND receipt.observed_at>=? AND receipt.observed_at<? AND receipt.event_type IN ? AND request.purpose <> 'content_reset_replay'", receipt.TenantID, receipt.ContentSourceID, dayStart, dayStart.Add(24*time.Hour), []string{string(ReceiptEventProviderTerminal), string(ReceiptEventNormalizeTerminal)}).
+		Order("receipt.observed_at ASC, receipt.public_id ASC").Limit(2049).Scan(&receipts).Error; err != nil {
 		return err
 	}
 	if len(receipts) > 2048 {
@@ -294,6 +312,10 @@ func applySourceYieldReceipt(tx *gorm.DB, receipt models.SourceRunReceipt, obser
 }
 
 func applySourceFailureCheckpoint(tx *gorm.DB, receipt models.SourceRunReceipt) error {
+	return applySourceFailureForBranch(tx, receipt, false)
+}
+
+func applySourceFailureForBranch(tx *gorm.DB, receipt models.SourceRunReceipt, replay bool) error {
 	var source models.ContentSource
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=?", receipt.ContentSourceID, receipt.TenantID).First(&source).Error; err != nil {
 		return err
@@ -307,8 +329,13 @@ func applySourceFailureCheckpoint(tx *gorm.DB, receipt models.SourceRunReceipt) 
 		backoff = 6 * time.Hour
 	}
 	observedAt := receipt.ProducedAt.UTC()
-	updates := map[string]any{"failure_streak": streak, "next_due_at": observedAt.Add(backoff)}
-	if streak >= 3 {
+	updates := map[string]any{"failure_streak": streak}
+	if !replay {
+		updates["next_due_at"] = observedAt.Add(backoff)
+	}
+	// Replay failures still back off provider access for the entire source.
+	// A replay success never clears this shared circuit or moves live due time.
+	if replay || streak >= 3 {
 		updates["intake_circuit_until"] = observedAt.Add(backoff)
 	}
 	return tx.Model(&source).Updates(updates).Error
@@ -326,6 +353,16 @@ func applyReconciliationProjection(tx *gorm.DB, event models.SourceRunReconcilia
 		return reconcileAttemptAndRequest(tx, event.TenantID, unit.SourceRunAttemptID, unit.SourceRunRequestID)
 	}
 	return rebuildRequestCounters(tx, event.TenantID, unit.SourceRunRequestID)
+}
+
+func terminalUnitStateForRequest(event ReceiptEvent, outcome SourceRunOutcome, purpose string) ExecutionUnitState {
+	// Ordinary intake may accept useful partial output. Reset replay requires
+	// complete page/normalization coverage; partial evidence cannot report success.
+	if purpose == "content_reset_replay" && outcome == OutcomePartial &&
+		(event == ReceiptEventProviderTerminal || event == ReceiptEventNormalizeTerminal || event == ReceiptEventFinalization) {
+		return UnitFailed
+	}
+	return terminalUnitState(event, outcome)
 }
 
 func terminalUnitState(event ReceiptEvent, outcome SourceRunOutcome) ExecutionUnitState {

@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func claimQueryDryRunDB(t *testing.T) *gorm.DB {
@@ -91,7 +92,7 @@ func TestClaimCandidateQueriesKeepAggregateAndLockingStatementsIndependent(t *te
 	rowFilter := filter
 	rowFilter.tenantID = "tenant-a"
 	var rows []models.ContentStageRequest
-	rowQuery := lockedClaimCandidateScope(db, rowFilter, 1).Find(&rows)
+	rowQuery := claimCandidateScope(db, rowFilter, 1).Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Find(&rows)
 	if rowQuery.Error != nil {
 		t.Fatal(rowQuery.Error)
 	}

@@ -35,7 +35,13 @@ type RecordUpstreamObservationsInput struct {
 	ProviderVersion     string
 	ProviderPageID      string
 	ProviderCursor      string
+	Disposition         string
 	Items               []UpstreamObservationItem
+}
+
+type RecordUpstreamObservationsResult struct {
+	Created        int
+	ObservationIDs map[string]string
 }
 
 type MaterializeUpstreamObservationInput struct {
@@ -47,38 +53,40 @@ type MaterializeUpstreamObservationInput struct {
 	AttemptFenceToken   string
 	ExecutionLeaseToken string
 	ObservationID       string
+	UpstreamItemID      string
 	Disposition         string
 	ContentItemID       string
 	FilterClass         string
 }
 
-// RecordUpstreamObservations preserves only replay identities and digests for
-// a CMS-authorized fetch page whose intake budget is zero. Raw provider
-// payloads, URLs, queue names, and arbitrary replay arguments are never stored.
-func RecordUpstreamObservations(db *gorm.DB, input RecordUpstreamObservationsInput) (int, error) {
+// RecordUpstreamObservations preserves bounded provider identity evidence for
+// one CMS-authorized fetch page. Raw provider payloads, URLs, queue names, and
+// arbitrary replay arguments are never stored.
+func RecordUpstreamObservations(db *gorm.DB, input RecordUpstreamObservationsInput) (RecordUpstreamObservationsResult, error) {
+	result := RecordUpstreamObservationsResult{ObservationIDs: make(map[string]string)}
 	if db == nil {
-		return 0, fmt.Errorf("upstream observation store requires a database")
+		return result, fmt.Errorf("upstream observation store requires a database")
 	}
 	input.TenantID = strings.TrimSpace(input.TenantID)
 	input.ProviderCapability = strings.TrimSpace(input.ProviderCapability)
 	input.ProviderVersion = strings.TrimSpace(input.ProviderVersion)
 	input.ProviderPageID = strings.TrimSpace(input.ProviderPageID)
+	input.Disposition = strings.TrimSpace(input.Disposition)
 	if input.ProviderCapability != "replayable_listing" && input.ProviderCapability != "peek" {
-		return 0, fmt.Errorf("provider observation capability is not registered")
+		return result, fmt.Errorf("provider observation capability is not registered")
+	}
+	if input.Disposition != "deferred" && input.Disposition != "observed" {
+		return result, fmt.Errorf("provider observation disposition is not registered")
 	}
 	if input.ProviderVersion == "" || len(input.ProviderVersion) > 64 || input.ProviderPageID == "" || len(input.ProviderPageID) > 128 {
-		return 0, fmt.Errorf("provider observation identity is invalid")
+		return result, fmt.Errorf("provider observation identity is invalid")
 	}
 	if len(input.Items) == 0 || len(input.Items) > maxUpstreamObservationsPerPage {
-		return 0, fmt.Errorf("upstream observation batch is outside its bounded contract")
-	}
-	unit, err := VerifyExecutionEnvelope(db, input.TenantID, input.RequestID, input.AttemptID, input.UnitID, input.UnitJobID, input.AttemptFenceToken)
-	if err != nil {
-		return 0, err
+		return result, fmt.Errorf("upstream observation batch is outside its bounded contract")
 	}
 	lease, err := uuid.Parse(strings.TrimSpace(input.ExecutionLeaseToken))
-	if err != nil || unit.ExecutionLeaseToken == nil || *unit.ExecutionLeaseToken != lease || unit.ExecutionLeaseExpiresAt == nil || !unit.ExecutionLeaseExpiresAt.After(time.Now().UTC()) || unit.State != string(UnitRunning) || unit.UnitType != "fetch_page" {
-		return 0, fmt.Errorf("source-run observation lease is not current")
+	if err != nil {
+		return result, fmt.Errorf("source-run observation lease is invalid")
 	}
 	now := time.Now().UTC()
 	var replayUntil *time.Time
@@ -86,8 +94,29 @@ func RecordUpstreamObservations(db *gorm.DB, input RecordUpstreamObservationsInp
 		value := now.Add(24 * time.Hour)
 		replayUntil = &value
 	}
-	created := 0
+	var currentUnit models.SourceRunExecutionUnit
 	err = db.Transaction(func(tx *gorm.DB) error {
+		verified, err := VerifyExecutionEnvelope(tx, input.TenantID, input.RequestID, input.AttemptID, input.UnitID, input.UnitJobID, input.AttemptFenceToken)
+		if err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", input.TenantID, verified.PublicID).First(&currentUnit).Error; err != nil {
+			return err
+		}
+		if currentUnit.ExecutionLeaseToken == nil || *currentUnit.ExecutionLeaseToken != lease || currentUnit.ExecutionLeaseExpiresAt == nil || !currentUnit.ExecutionLeaseExpiresAt.After(time.Now().UTC()) || currentUnit.State != string(UnitRunning) || currentUnit.UnitType != "fetch_page" || currentUnit.PageID != input.ProviderPageID {
+			return fmt.Errorf("source-run observation lease is not current")
+		}
+		var request models.SourceRunRequest
+		if err := tx.Where("tenant_id = ? AND public_id = ? AND content_source_id = ?", input.TenantID, currentUnit.SourceRunRequestID, currentUnit.ContentSourceID).First(&request).Error; err != nil {
+			return fmt.Errorf("source-run observation request is unavailable: %w", err)
+		}
+		if input.Disposition == "deferred" {
+			if request.ItemCap != 0 {
+				return fmt.Errorf("only a zero-intake source run can defer upstream observations")
+			}
+		} else if request.Purpose == "deferred_drain" || request.ItemCap == 0 || !sourceObservationDispositionPurpose(request.Purpose) {
+			return fmt.Errorf("source-run purpose or intake cap does not admit materialized observations")
+		}
 		for _, item := range input.Items {
 			item.UpstreamItemID = strings.TrimSpace(item.UpstreamItemID)
 			item.UpstreamFingerprint = strings.ToLower(strings.TrimSpace(item.UpstreamFingerprint))
@@ -99,38 +128,50 @@ func RecordUpstreamObservations(db *gorm.DB, input RecordUpstreamObservationsInp
 			}
 			locator, _ := json.Marshal(map[string]any{"schema_version": "source-run-replay-locator/v1", "upstream_item_id": item.UpstreamItemID})
 			observation := models.SourceUpstreamObservation{
-				PublicID: uuid.New(), TenantID: input.TenantID, ContentSourceID: unit.ContentSourceID,
-				SourceRunRequestID: &unit.SourceRunRequestID, ProviderCapability: input.ProviderCapability,
+				PublicID: uuid.New(), TenantID: input.TenantID, ContentSourceID: currentUnit.ContentSourceID,
+				SourceRunRequestID: &currentUnit.SourceRunRequestID, ProviderCapability: input.ProviderCapability,
 				ProviderVersion: input.ProviderVersion, UpstreamItemID: item.UpstreamItemID,
 				UpstreamFingerprint: item.UpstreamFingerprint, ReplayLocator: datatypes.JSON(locator),
 				ReplayUntil: replayUntil, ProviderCursor: boundedObservationCursor(input.ProviderCursor),
 				ProviderPageID: input.ProviderPageID, ObservedAt: now,
 			}
-			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&observation)
-			if result.Error != nil {
-				return result.Error
+			insertResult := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&observation)
+			if insertResult.Error != nil {
+				return insertResult.Error
 			}
-			if result.RowsAffected == 0 {
-				continue
+			if insertResult.RowsAffected > 0 {
+				payload, _ := json.Marshal(map[string]any{"schema_version": "source-run-upstream-observation-event/v1", "provider_capability": input.ProviderCapability, "provider_page_id": input.ProviderPageID})
+				eventType := input.Disposition
+				event := models.SourceUpstreamObservationEvent{
+					PublicID: uuid.New(), TenantID: input.TenantID,
+					EventKey:      observationEventKey(input.TenantID, observation.PublicID, eventType),
+					ObservationID: observation.PublicID, EventType: eventType, CausationID: currentUnit.PublicID.String(),
+					Payload: datatypes.JSON(payload), OccurredAt: now,
+				}
+				if err := tx.Create(&event).Error; err != nil {
+					return err
+				}
+				if err := tx.Create(&models.SourceRunProjectionWork{PublicID: uuid.New(), TenantID: input.TenantID, EvidenceKind: "upstream_observation_event", EvidenceID: event.PublicID, ReducerVersion: "source-run-upstream-observation/v1", State: "queued"}).Error; err != nil {
+					return err
+				}
+				result.Created++
 			}
-			created++
-			payload, _ := json.Marshal(map[string]any{"schema_version": "source-run-upstream-observation-event/v1", "provider_capability": input.ProviderCapability, "provider_page_id": input.ProviderPageID})
-			event := models.SourceUpstreamObservationEvent{
-				PublicID: uuid.New(), TenantID: input.TenantID,
-				EventKey:      observationEventKey(input.TenantID, observation.PublicID, "deferred"),
-				ObservationID: observation.PublicID, EventType: "deferred", CausationID: unit.PublicID.String(),
-				Payload: datatypes.JSON(payload), OccurredAt: now,
-			}
-			if err := tx.Create(&event).Error; err != nil {
+			var persisted models.SourceUpstreamObservation
+			if err := tx.Where("tenant_id = ? AND content_source_id = ? AND source_run_request_id = ? AND provider_version = ? AND provider_page_id = ? AND upstream_item_id = ?",
+				input.TenantID, currentUnit.ContentSourceID, currentUnit.SourceRunRequestID, input.ProviderVersion, input.ProviderPageID, item.UpstreamItemID).First(&persisted).Error; err != nil {
 				return err
 			}
-			if err := tx.Create(&models.SourceRunProjectionWork{PublicID: uuid.New(), TenantID: input.TenantID, EvidenceKind: "upstream_observation_event", EvidenceID: event.PublicID, ReducerVersion: "source-run-upstream-observation/v1", State: "queued"}).Error; err != nil {
-				return err
+			if !strings.EqualFold(persisted.UpstreamFingerprint, item.UpstreamFingerprint) {
+				return fmt.Errorf("provider identity changed during an idempotent source-run page")
 			}
+			result.ObservationIDs[item.UpstreamItemID] = persisted.PublicID.String()
 		}
 		return nil
 	})
-	return created, err
+	if err != nil {
+		return RecordUpstreamObservationsResult{}, err
+	}
+	return result, nil
 }
 
 func AppendUpstreamObservationEvent(db *gorm.DB, observation models.SourceUpstreamObservation, eventType, causationID string, occurredAt time.Time) (bool, error) {
@@ -158,51 +199,102 @@ func AppendUpstreamObservationEvent(db *gorm.DB, observation models.SourceUpstre
 	return created, err
 }
 
-// RecordUpstreamObservationDisposition terminalizes one deferred identity only
-// from the current fenced normalization unit of its CMS-created drain request.
+// RecordUpstreamObservationDisposition terminalizes one observed identity only
+// from its current fenced normalization unit or CMS-created drain request.
 func RecordUpstreamObservationDisposition(db *gorm.DB, input MaterializeUpstreamObservationInput) (bool, error) {
 	if input.Disposition != "materialized" && input.Disposition != "filtered" {
 		return false, fmt.Errorf("upstream observation disposition is not registered")
 	}
-	unit, err := VerifyExecutionEnvelope(db, strings.TrimSpace(input.TenantID), input.RequestID, input.AttemptID, input.UnitID, input.UnitJobID, input.AttemptFenceToken)
-	if err != nil {
-		return false, err
-	}
 	lease, err := uuid.Parse(strings.TrimSpace(input.ExecutionLeaseToken))
-	if err != nil || unit.ExecutionLeaseToken == nil || *unit.ExecutionLeaseToken != lease || unit.ExecutionLeaseExpiresAt == nil || !unit.ExecutionLeaseExpiresAt.After(time.Now().UTC()) || unit.State != string(UnitRunning) || unit.UnitType != "normalize_batch" {
+	if err != nil {
 		return false, fmt.Errorf("source-run materialization lease is not current")
 	}
 	observationID, err := uuid.Parse(strings.TrimSpace(input.ObservationID))
 	if err != nil {
 		return false, fmt.Errorf("upstream observation identity is invalid")
 	}
+	input.UpstreamItemID = strings.TrimSpace(input.UpstreamItemID)
+	if input.UpstreamItemID == "" || len(input.UpstreamItemID) > 255 {
+		return false, fmt.Errorf("upstream item identity is invalid")
+	}
 	now := time.Now().UTC()
 	created := false
 	err = db.Transaction(func(tx *gorm.DB) error {
-		var request models.SourceRunRequest
-		if err := tx.Where("tenant_id=? AND public_id=? AND purpose=?", unit.TenantID, unit.SourceRunRequestID, "deferred_drain").First(&request).Error; err != nil {
+		verified, err := VerifyExecutionEnvelope(tx, strings.TrimSpace(input.TenantID), input.RequestID, input.AttemptID, input.UnitID, input.UnitJobID, input.AttemptFenceToken)
+		if err != nil {
 			return err
 		}
-		if !requestMetadataContainsObservation(request.Metadata, observationID.String()) {
+		var unit models.SourceRunExecutionUnit
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", strings.TrimSpace(input.TenantID), verified.PublicID).First(&unit).Error; err != nil {
+			return err
+		}
+		if unit.ExecutionLeaseToken == nil || *unit.ExecutionLeaseToken != lease || unit.ExecutionLeaseExpiresAt == nil || !unit.ExecutionLeaseExpiresAt.After(time.Now().UTC()) || unit.State != string(UnitRunning) || unit.UnitType != "normalize_batch" {
+			return fmt.Errorf("source-run materialization lease is not current")
+		}
+		var request models.SourceRunRequest
+		if err := tx.Where("tenant_id=? AND public_id=?", unit.TenantID, unit.SourceRunRequestID).First(&request).Error; err != nil {
+			return err
+		}
+		if !sourceObservationDispositionPurpose(request.Purpose) {
+			return fmt.Errorf("source-run request purpose does not admit upstream observation dispositions")
+		}
+		if request.Purpose == "deferred_drain" && !requestMetadataContainsObservation(request.Metadata, observationID.String()) {
 			return fmt.Errorf("observation is not reserved by this drain request")
 		}
+		observationQuery := tx.Where("tenant_id=? AND public_id=? AND content_source_id=?", unit.TenantID, observationID, unit.ContentSourceID)
+		if request.Purpose != "deferred_drain" {
+			observationQuery = observationQuery.Where("source_run_request_id = ?", request.PublicID)
+		}
 		var observation models.SourceUpstreamObservation
-		if err := tx.Where("tenant_id=? AND public_id=? AND content_source_id=?", unit.TenantID, observationID, unit.ContentSourceID).First(&observation).Error; err != nil {
+		if err := observationQuery.Clauses(clause.Locking{Strength: "UPDATE"}).First(&observation).Error; err != nil {
 			return err
 		}
-		payload := map[string]any{"schema_version": "source-run-upstream-observation-event/v1", "drain_request_id": request.PublicID, "execution_unit_id": unit.PublicID}
+		if observation.UpstreamItemID != input.UpstreamItemID {
+			return fmt.Errorf("upstream observation does not match the normalized item")
+		}
+		if request.Purpose == "deferred_drain" {
+			var reservations int64
+			if err := tx.Model(&models.SourceUpstreamObservationEvent{}).
+				Where("tenant_id=? AND observation_id=? AND event_type=? AND causation_id=?", unit.TenantID, observation.PublicID, "materialization_reserved", request.PublicID.String()).
+				Count(&reservations).Error; err != nil {
+				return err
+			}
+			if reservations != 1 {
+				return fmt.Errorf("observation reservation is not owned by this drain request")
+			}
+		}
+		if request.Purpose != "deferred_drain" && (observation.SourceRunRequestID == nil || *observation.SourceRunRequestID != request.PublicID || unit.PageID == "" || observation.ProviderPageID != unit.PageID) {
+			return fmt.Errorf("upstream observation does not belong to this normalization page")
+		}
+		payload := map[string]any{"schema_version": "source-run-upstream-observation-event/v1", "source_run_request_id": request.PublicID, "execution_unit_id": unit.PublicID}
 		if input.Disposition == "materialized" {
 			contentID, parseErr := uuid.Parse(strings.TrimSpace(input.ContentItemID))
 			if parseErr != nil {
 				return fmt.Errorf("materialized content identity is invalid")
 			}
 			var item models.ContentItem
-			if err := tx.Where("tenant_id=? AND public_id=? AND content_source_id=? AND source_run_request_id=?", unit.TenantID, contentID, unit.ContentSourceID, request.ID).First(&item).Error; err != nil {
+			query := tx.Where("tenant_id=? AND public_id=? AND content_source_id=?", unit.TenantID, contentID, unit.ContentSourceID)
+			if request.Purpose == "content_reset_replay" && tx.Migrator().HasTable(&models.ContentResetReplayReuse{}) {
+				query = query.Where(`source_run_request_id=? OR EXISTS (
+                   SELECT 1 FROM content_reset_replay_reuses reuse
+                   JOIN source_item_instances instance ON instance.tenant_id=reuse.tenant_id AND instance.content_item_id=reuse.content_item_id AND instance.instance_generation=reuse.instance_generation AND instance.upstream_fingerprint=reuse.fingerprint
+                   LEFT JOIN content_reset_reconstruction_grants grant ON grant.tenant_id=reuse.tenant_id AND grant.id=reuse.grant_id AND grant.state='consumed' AND grant.campaign_id=reuse.campaign_id AND grant.revision_id=reuse.revision_id AND grant.replacement_content_item_id=reuse.content_item_id AND grant.expected_fingerprint=reuse.fingerprint
+                   LEFT JOIN source_item_identities identity ON identity.tenant_id=instance.tenant_id AND identity.id=instance.identity_id AND identity.current_content_item_id=instance.content_item_id AND identity.current_instance_generation=instance.instance_generation
+                   WHERE reuse.tenant_id=content_items.tenant_id AND reuse.content_item_id=content_items.public_id
+                     AND reuse.observation_id=? AND reuse.source_run_request_id=? AND reuse.execution_unit_id=? AND reuse.fingerprint=?
+                     AND ((reuse.grant_id IS NOT NULL AND grant.id IS NOT NULL AND instance.campaign_id=reuse.campaign_id AND instance.state='staged')
+                       OR (reuse.grant_id IS NULL AND identity.id IS NOT NULL AND instance.state='active'
+                         AND NOT EXISTS (SELECT 1 FROM content_reset_targets target WHERE target.tenant_id=reuse.tenant_id AND target.revision_id=reuse.revision_id AND target.content_item_id=reuse.content_item_id AND target.disposition='selected' AND NOT target.protected)))
+                )`, request.ID, observation.PublicID, request.PublicID, unit.PublicID, strings.ToLower(observation.UpstreamFingerprint))
+			} else {
+				query = query.Where("source_run_request_id=?", request.ID)
+			}
+			if err := query.First(&item).Error; err != nil {
 				return fmt.Errorf("materialized content provenance is not persisted: %w", err)
 			}
 			payload["content_item_id"] = item.PublicID
 		} else {
-			allowed := map[string]bool{"include_keywords": true, "exclude_keywords": true, "min_engagement": true, "moderation_rejected": true, "normalization_unsupported": true, "exact_duplicate": true}
+			allowed := map[string]bool{"include_keywords": true, "exclude_keywords": true, "min_engagement": true, "moderation_rejected": true, "normalization_unsupported": true, "duration_below_minimum": true, "exact_duplicate": true, "retired_source_identity": true}
 			if !allowed[strings.TrimSpace(input.FilterClass)] {
 				return fmt.Errorf("observation filter class is not registered")
 			}
@@ -240,6 +332,16 @@ func requestMetadataContainsObservation(metadata datatypes.JSON, observationID s
 		}
 	}
 	return false
+}
+
+func sourceObservationDispositionPurpose(purpose string) bool {
+	switch strings.TrimSpace(purpose) {
+	case "deferred_drain", "content_reset_replay", "baseline", "exploration", "circulation",
+		"operator_run_once", "manual", "missed_admission_repair", "partial_repair":
+		return true
+	default:
+		return false
+	}
 }
 
 func observationEventKey(tenant string, observationID uuid.UUID, event string) string {

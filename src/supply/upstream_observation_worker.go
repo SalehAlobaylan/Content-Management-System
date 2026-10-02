@@ -39,6 +39,12 @@ func runUpstreamObservationWorkerOnce(db *gorm.DB) {
 	err := db.
 		Where("replay_until IS NOT NULL AND replay_until <= ?", now.Add(time.Hour)).
 		Where(`NOT EXISTS (
+			SELECT 1 FROM source_upstream_observation_events terminal_event
+			WHERE terminal_event.tenant_id = source_upstream_observations.tenant_id
+			  AND terminal_event.observation_id = source_upstream_observations.public_id
+			  AND terminal_event.event_type IN ('materialized','filtered','unrecoverable','authorized_abandonment')
+		)`).
+		Where(`NOT EXISTS (
 			SELECT 1 FROM source_upstream_observation_events expiry_event
 			WHERE expiry_event.observation_id = source_upstream_observations.public_id
 			  AND expiry_event.event_type = CASE

@@ -131,6 +131,12 @@ func observeVerificationTask(db *gorm.DB, tenantID, taskID, owner, claimToken st
 		if err := db.Model(&models.ContentItem{}).Where("tenant_id = ? AND content_source_id = ? AND metadata ->> ? = ?", tenantID, unit.ContentSourceID, "source_run_execution_unit_id", unit.PublicID.String()).Count(&observedContentCount).Error; err != nil {
 			return VerificationObservation{}, err
 		}
+		if observedContentCount == 0 && db.Migrator().HasTable(&models.ContentResetReplayReuse{}) {
+			observedContentCount, err = countNativeMaterializations(db, tenantID, task.SourceRunRequestID, unit.ContentSourceID, []uuid.UUID{unit.PublicID})
+			if err != nil {
+				return VerificationObservation{}, err
+			}
+		}
 	}
 	if !isPodsDeliveryTask(task) && unit.UnitType == "coordinator" {
 		expectedContentCount, observedContentCount, evidenceComplete, err = observeCoordinatorDelivery(db, tenantID, task.SourceRunRequestID, unit.ContentSourceID)
@@ -188,7 +194,26 @@ func observeCoordinatorDelivery(db *gorm.DB, tenantID string, requestID, sourceI
 	if err = db.Model(&models.ContentItem{}).Where("tenant_id = ? AND content_source_id = ? AND metadata ->> ? IN ?", tenantID, sourceID, "source_run_execution_unit_id", unitIDs).Count(&observedContentCount).Error; err != nil {
 		return 0, 0, false, err
 	}
+	if observedContentCount < expectedContentCount && db.Migrator().HasTable(&models.ContentResetReplayReuse{}) {
+		observedContentCount, err = countNativeMaterializations(db, tenantID, requestID, sourceID, unitIDs)
+		if err != nil {
+			return 0, 0, false, err
+		}
+	}
 	return expectedContentCount, observedContentCount, evidenceComplete, nil
+}
+
+func countNativeMaterializations(db *gorm.DB, tenant string, requestID, sourceID uuid.UUID, unitIDs []uuid.UUID) (int64, error) {
+	var count int64
+	err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND content_source_id=?", tenant, sourceID).
+		Where(`metadata->>'source_run_execution_unit_id' IN ? OR EXISTS (
+           SELECT 1 FROM content_reset_replay_reuses reuse
+           JOIN source_item_instances instance ON instance.tenant_id=reuse.tenant_id AND instance.content_item_id=reuse.content_item_id AND instance.instance_generation=reuse.instance_generation AND instance.upstream_fingerprint=reuse.fingerprint AND instance.state IN ('staged','active')
+           JOIN source_upstream_observation_events event ON event.tenant_id=reuse.tenant_id AND event.observation_id=reuse.observation_id AND event.event_type='materialized' AND event.causation_id=reuse.source_run_request_id::text AND event.payload->>'execution_unit_id'=reuse.execution_unit_id::text AND event.payload->>'content_item_id'=reuse.content_item_id::text
+           WHERE reuse.tenant_id=content_items.tenant_id AND reuse.content_item_id=content_items.public_id
+             AND reuse.source_run_request_id=? AND reuse.execution_unit_id IN ?
+        )`, unitIDs, requestID, unitIDs).Count(&count).Error
+	return count, err
 }
 
 // observePodsDelivery verifies the public consumer boundary for the exact

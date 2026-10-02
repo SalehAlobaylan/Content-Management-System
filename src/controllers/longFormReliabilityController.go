@@ -736,6 +736,13 @@ func InternalCreateTranscriptionGeneration(c *gin.Context) {
 	}
 	generation := models.TranscriptionGeneration{PublicID: uuid.New(), TenantID: tenant, ContentItemID: contentID, TranscriptionJobID: jobID, InputDigest: req.InputDigest, AnalysisAudioManifestID: audioID, Provider: req.Provider, Model: req.Model, Language: req.Language, State: unitStateQueued, TotalSegments: len(req.Segments), TerminalProof: longFormJSON(proof)}
 	err = db.Transaction(func(tx *gorm.DB) error {
+		currentItem, err := lockContentForLifecycleMutation(tx, tenant, contentID)
+		if err != nil {
+			return err
+		}
+		if !currentItem.UpdatedAt.Equal(contentItem.UpdatedAt) || currentItem.ProcessingGeneration != contentItem.ProcessingGeneration {
+			return errors.New("transcription content changed before generation admission")
+		}
 		if err := tx.Create(&generation).Error; err != nil {
 			return err
 		}
@@ -805,11 +812,17 @@ func claimTranscriptionUnit(db *gorm.DB, owner string) (*models.TranscriptionSeg
 		if err := tx.Where("tenant_id=? AND public_id=?", generation.TenantID, generation.ContentItemID).First(&item).Error; err != nil {
 			return err
 		}
+		if err := checkContentLifecycleMutation(tx, item); err != nil {
+			return err
+		}
 		root := item
 		if item.ParentContentItemID != nil {
 			if err := tx.Where("tenant_id=? AND public_id=?", item.TenantID, *item.ParentContentItemID).First(&root).Error; err != nil {
 				return err
 			}
+		}
+		if err := checkContentLifecycleMutation(tx, root); err != nil {
+			return err
 		}
 		admitted, err := podsflow.Acquire(tx, root)
 		if err != nil {
@@ -1170,6 +1183,14 @@ func InternalFinalizeTranscriptionGeneration(c *gin.Context) {
 				return fmt.Errorf("content-stage writeback rejected: %w", err)
 			}
 		}
+		currentItem, err := lockContentForLifecycleMutation(tx, item.TenantID, item.PublicID)
+		if err != nil {
+			return err
+		}
+		if currentItem.ProcessingGeneration != item.ProcessingGeneration {
+			return errors.New("transcription content generation changed before writeback")
+		}
+		item = currentItem
 		transcript = models.Transcript{PublicID: uuid.New(), ContentItemID: item.PublicID, FullText: strings.Join(texts, " "), Segments: longFormJSON(allSegments), Source: ptrString("stt_deepgram"), Provider: ptrString(generation.Provider), Language: ptrString(generation.Language)}
 		if err := tx.Create(&transcript).Error; err != nil {
 			return err
@@ -1425,9 +1446,14 @@ func InternalCreateAtomizationGeneration(c *gin.Context) {
 				return err
 			}
 		}
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", tenant, parentID).First(&parent).Error; err != nil {
+		currentParent, err := lockContentForLifecycleMutation(tx, tenant, parentID)
+		if err != nil {
 			return err
 		}
+		if !currentParent.UpdatedAt.Equal(parent.UpdatedAt) || currentParent.ProcessingGeneration != parent.ProcessingGeneration {
+			return errors.New("atomization parent changed before generation admission")
+		}
+		parent = currentParent
 		if parent.DurationSec == nil || *parent.DurationSec <= 2400 {
 			return errors.New("parent duration is not atomization-eligible")
 		}
@@ -1549,6 +1575,9 @@ func claimAtomizationUnit(db *gorm.DB, owner string, generationID string) (*mode
 		}
 		var root models.ContentItem
 		if err := tx.Where("tenant_id=? AND public_id=?", gen.TenantID, gen.ParentContentItemID).First(&root).Error; err != nil {
+			return err
+		}
+		if err := checkContentLifecycleMutation(tx, root); err != nil {
 			return err
 		}
 		admitted, err := podsflow.Acquire(tx, root)
@@ -1843,6 +1872,11 @@ func InternalFinalizeAtomizationGeneration(c *gin.Context) {
 	}
 	children := make([]map[string]any, 0, len(units))
 	err = db.Transaction(func(tx *gorm.DB) error {
+		currentParent, err := lockContentForLifecycleMutation(tx, parent.TenantID, parent.PublicID)
+		if err != nil {
+			return err
+		}
+		parent = currentParent
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
 		if request.ContentStage != nil {

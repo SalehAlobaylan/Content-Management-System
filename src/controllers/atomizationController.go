@@ -3,11 +3,13 @@ package controllers
 import (
 	"content-management-system/src/contentstage"
 	"content-management-system/src/feedstate"
+	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/podsflow"
 	"content-management-system/src/utils"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -37,6 +39,9 @@ const (
 	atomizationOverrideDisabled    = "disabled"
 	atomizationOverrideEnabled     = "enabled"
 )
+
+var errAtomizationParentChanged = errors.New("atomization parent changed; refresh the operation")
+var errAtomizationSourceChanged = errors.New("atomization source policy changed; refresh and retry")
 
 const (
 	mediaPublicationPathAtomized           = "atomized"
@@ -669,6 +674,72 @@ type saveAtomizationPlanRequest struct {
 	Chapters []atomizationChapterRequest `json:"chapters"`
 }
 
+func checkAtomizationLifecycle(tx *gorm.DB, parent models.ContentItem) error {
+	return checkAtomizationItemsLifecycle(tx, parent)
+}
+
+func atomizationLifecycleResource(item models.ContentItem) lifecycle.Resource {
+	sourceID := "-"
+	if item.ContentSourceID != nil {
+		sourceID = item.ContentSourceID.String()
+	}
+	return lifecycle.Resource{Type: lifecycle.ResourceItem, Key: "pods/" + sourceID + "/" + item.PublicID.String()}
+}
+
+func checkAtomizationItemsLifecycle(tx *gorm.DB, items ...models.ContentItem) error {
+	if len(items) == 0 {
+		return errors.New("atomization lifecycle check requires at least one content item")
+	}
+	tenant := strings.TrimSpace(items[0].TenantID)
+	resources := make([]lifecycle.Resource, 0, len(items))
+	seen := make(map[lifecycle.Resource]bool, len(items))
+	for _, item := range items {
+		if item.TenantID != tenant || item.PublicID == uuid.Nil {
+			return errors.New("atomization lifecycle items must belong to one tenant and have public IDs")
+		}
+		resource := atomizationLifecycleResource(item)
+		if !seen[resource] {
+			seen[resource] = true
+			resources = append(resources, resource)
+		}
+	}
+	if err := lifecycle.CheckResources(tx, tenant, resources, lifecycle.PhaseSourceDispatch); err != nil {
+		return err
+	}
+	if err := lifecycle.CheckResources(tx, tenant, resources, lifecycle.PhaseContentWrite); err != nil {
+		return err
+	}
+	// CheckResources takes the complete, sorted lock set; the scope checks below
+	// add restart-stable source-intake pauses to the same transaction.
+	seenScopes := make(map[string]bool, len(items))
+	for _, item := range items {
+		sourceID := ""
+		if item.ContentSourceID != nil {
+			sourceID = item.ContentSourceID.String()
+		}
+		scope := lifecycle.Scope{TenantID: tenant, Lane: "pods", SourceID: sourceID, ItemID: item.PublicID.String()}
+		key := sourceID + "/" + item.PublicID.String()
+		if seenScopes[key] {
+			continue
+		}
+		seenScopes[key] = true
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkAtomizationFamilyLifecycle(tx *gorm.DB, parent models.ContentItem) error {
+	items := []models.ContentItem{parent}
+	var children []models.ContentItem
+	if err := tx.Select("tenant_id", "public_id", "content_source_id").Where("tenant_id = ? AND parent_content_item_id = ?", parent.TenantID, parent.PublicID).Order("public_id ASC").Find(&children).Error; err != nil {
+		return fmt.Errorf("read atomization child lifecycle scope: %w", err)
+	}
+	items = append(items, children...)
+	return checkAtomizationItemsLifecycle(tx, items...)
+}
+
 func InternalSaveAtomizationPlan(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	item, transcript, ok := loadAtomizationParent(c, db)
@@ -683,21 +754,43 @@ func InternalSaveAtomizationPlan(c *gin.Context) {
 	policy := atomizationPolicyForItem(db, item)
 	rows := chaptersFromAtomizationRequest(item.TenantID, transcript.PublicID, req.Chapters, policy)
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkAtomizationFamilyLifecycle(tx, *item); err != nil {
+			return err
+		}
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(item.UpdatedAt) {
+			return errors.New("atomization parent changed; refresh the review plan")
+		}
 		if err := tx.Where("transcript_id = ? AND tenant_id = ? AND source = ?", transcript.PublicID, item.TenantID, models.ChapterSourceDerived).
 			Delete(&models.Chapter{}).Error; err != nil {
 			return err
 		}
 		if len(rows) > 0 {
-			return tx.Create(&rows).Error
+			if err := tx.Create(&rows).Error; err != nil {
+				return err
+			}
 		}
+		status := "planned"
+		current.ChapteringStatus = &status
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		*item = current
 		return nil
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if strings.Contains(err.Error(), "refresh the review plan") {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "ATOMIZATION_PLAN_STALE"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save atomization plan"})
 		return
 	}
-	status := "planned"
-	item.ChapteringStatus = &status
-	_ = db.Save(item).Error
 	c.JSON(http.StatusOK, gin.H{"chapters": chaptersToDTO(rows, durationMs(item))})
 }
 
@@ -855,7 +948,19 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 	}
 	policy := atomizationPolicyForItem(db, parent)
 	children := []map[string]interface{}{}
+	expectedParentUpdatedAt := parent.UpdatedAt
 	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkAtomizationFamilyLifecycle(tx, *parent); err != nil {
+			return err
+		}
+		var currentParent models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", parent.TenantID, parent.PublicID).First(&currentParent).Error; err != nil {
+			return err
+		}
+		if !currentParent.UpdatedAt.Equal(expectedParentUpdatedAt) {
+			return errAtomizationParentChanged
+		}
+		*parent = currentParent
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
 		if req.ContentStage != nil {
@@ -864,9 +969,6 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 			if err != nil {
 				return err
 			}
-		}
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", parent.TenantID, parent.PublicID).First(parent).Error; err != nil {
-			return err
 		}
 		if !policy.ParentFeedVisible {
 			parent.IsFeedUnit = false
@@ -918,6 +1020,13 @@ func InternalCreateAtomizedChildren(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errAtomizationParentChanged) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "ATOMIZATION_PARENT_STALE"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create atomized children: " + err.Error()})
 		return
 	}
@@ -950,6 +1059,9 @@ func InternalReportAtomizationRun(c *gin.Context) {
 	now := time.Now().UTC()
 	run := models.MediaAtomizationRun{}
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := checkAtomizationFamilyLifecycle(tx, parent); err != nil {
+			return err
+		}
 		// Serialize by parent before touching run rows (including FK locks).
 		// Taking run/FK locks first and upgrading the parent afterward can
 		// deadlock with concurrent reports or child persistence.
@@ -1016,6 +1128,9 @@ func InternalReportAtomizationRun(c *gin.Context) {
 		return tx.Model(&models.ContentItem{}).Where("tenant_id = ? AND public_id = ?", parent.TenantID, parent.PublicID).Update("chaptering_status", parentStatus).Error
 	})
 	if err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save atomization run"})
 		return
 	}
@@ -1389,25 +1504,38 @@ func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	model := getOrCreateMediaAtomizationPolicy(db, principal.TenantID)
-	updated := applyAtomizationPolicyPatch(policyFromModel(model), req)
-	model.ChapteringEnabled = updated.ChapteringEnabled
-	model.AutoPublishHighConfidence = updated.AutoPublishHighConfidence
-	model.ParentFeedVisible = updated.ParentFeedVisible
-	model.PreserveVideo = updated.PreserveVideo
-	model.RemoveSponsorSegments = updated.RemoveSponsorSegments
-	model.MinChapterMinutes = updated.MinChapterMinutes
-	model.MinFeedUnitSeconds = updated.MinFeedUnitSeconds
-	model.SoftMaxChapterMinutes = updated.SoftMaxChapterMinutes
-	model.HardMaxChapterMinutes = updated.HardMaxChapterMinutes
-	model.AtomizationMinParentSeconds = updated.AtomizationMinParentSeconds
-	model.MaxChaptersPerParent = updated.MaxChaptersPerParent
-	model.ChapteringMode = updated.ChapteringMode
-	model.HighConfidenceThreshold = updated.HighConfidenceThreshold
-	model.PreferredPlaybackRendition = updated.PreferredPlaybackRendition
-	model.FallbackPlaybackRendition = updated.FallbackPlaybackRendition
-	model.AudioOnlyAllowed = updated.AudioOnlyAllowed
-	if err := db.Save(&model).Error; err != nil {
+	var updated atomizationPolicy
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		scope := lifecycle.Scope{TenantID: principal.TenantID, Lane: "pods"}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		model := getOrCreateMediaAtomizationPolicy(tx, principal.TenantID)
+		updated = applyAtomizationPolicyPatch(policyFromModel(model), req)
+		model.ChapteringEnabled = updated.ChapteringEnabled
+		model.AutoPublishHighConfidence = updated.AutoPublishHighConfidence
+		model.ParentFeedVisible = updated.ParentFeedVisible
+		model.PreserveVideo = updated.PreserveVideo
+		model.RemoveSponsorSegments = updated.RemoveSponsorSegments
+		model.MinChapterMinutes = updated.MinChapterMinutes
+		model.MinFeedUnitSeconds = updated.MinFeedUnitSeconds
+		model.SoftMaxChapterMinutes = updated.SoftMaxChapterMinutes
+		model.HardMaxChapterMinutes = updated.HardMaxChapterMinutes
+		model.AtomizationMinParentSeconds = updated.AtomizationMinParentSeconds
+		model.MaxChaptersPerParent = updated.MaxChaptersPerParent
+		model.ChapteringMode = updated.ChapteringMode
+		model.HighConfidenceThreshold = updated.HighConfidenceThreshold
+		model.PreferredPlaybackRendition = updated.PreferredPlaybackRendition
+		model.FallbackPlaybackRendition = updated.FallbackPlaybackRendition
+		model.AudioOnlyAllowed = updated.AudioOnlyAllowed
+		return tx.Save(&model).Error
+	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -1469,11 +1597,40 @@ func AdminUpdateMediaAtomizationSourcePolicy(c *gin.Context) {
 		c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Source not found"})
 		return
 	}
-	cfg, _ := parseSourceAPIConfig(source.APIConfig)
-	applyAtomizationPatchToConfig(cfg, req)
-	raw, _ := json.Marshal(cfg)
-	source.APIConfig = datatypes.JSON(raw)
-	if err := db.Save(&source).Error; err != nil {
+	expectedUpdatedAt := source.UpdatedAt
+	var cfg map[string]interface{}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		scope := lifecycle.Scope{TenantID: source.TenantID, Lane: lifecycleLaneForSourceCategory(source.Category), SourceID: source.PublicID.String()}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
+			return err
+		}
+		if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
+			return err
+		}
+		var current models.ContentSource
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return errAtomizationSourceChanged
+		}
+		cfg, _ = parseSourceAPIConfig(current.APIConfig)
+		applyAtomizationPatchToConfig(cfg, req)
+		raw, _ := json.Marshal(cfg)
+		current.APIConfig = datatypes.JSON(raw)
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		source = current
+		return nil
+	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errAtomizationSourceChanged) {
+			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: err.Error()})
+			return
+		}
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -1562,20 +1719,44 @@ func AdminUpdateMediaAtomizationParentOverride(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	now := time.Now().UTC()
-	parent.AtomizationOverride = &override
-	parent.AtomizationOverrideReason = req.Reason
-	if principal.UserID != "" {
-		if id, err := uuid.Parse(principal.UserID); err == nil {
-			parent.AtomizationOverrideBy = &id
+	expectedUpdatedAt := parent.UpdatedAt
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := checkAtomizationFamilyLifecycle(tx, *parent); err != nil {
+			return err
 		}
-	}
-	parent.AtomizationOverrideAt = &now
-	if override == atomizationOverrideInherit {
-		parent.AtomizationOverrideReason = nil
-		parent.AtomizationOverrideBy = nil
-		parent.AtomizationOverrideAt = nil
-	}
-	if err := db.Save(parent).Error; err != nil {
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, parent.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return errAtomizationParentChanged
+		}
+		current.AtomizationOverride = &override
+		current.AtomizationOverrideReason = req.Reason
+		if principal.UserID != "" {
+			if id, err := uuid.Parse(principal.UserID); err == nil {
+				current.AtomizationOverrideBy = &id
+			}
+		}
+		current.AtomizationOverrideAt = &now
+		if override == atomizationOverrideInherit {
+			current.AtomizationOverrideReason = nil
+			current.AtomizationOverrideBy = nil
+			current.AtomizationOverrideAt = nil
+		}
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		*parent = current
+		return nil
+	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errAtomizationParentChanged) {
+			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: err.Error()})
+			return
+		}
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -1688,11 +1869,25 @@ func adminQueueMediaParentAtomization(c *gin.Context, reatomize bool) {
 	parent.ManualAtomizationRequestedAt = &now
 	status := "queued"
 	parent.ChapteringStatus = &status
+	expectedUpdatedAt := parent.UpdatedAt
 	if err := db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(parent).Error; err != nil {
+		if err := checkAtomizationFamilyLifecycle(tx, *parent); err != nil {
 			return err
 		}
-		run := models.MediaAtomizationRun{TenantID: parent.TenantID, ParentContentItemID: parent.PublicID, Status: "queued", Phase: "planning", StartedAt: &now, Trigger: &trigger}
+		var current models.ContentItem
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", parent.TenantID, parent.PublicID).First(&current).Error; err != nil {
+			return err
+		}
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return errAtomizationParentChanged
+		}
+		current.ManualAtomizationRequestedAt = &now
+		current.ChapteringStatus = &status
+		if err := tx.Save(&current).Error; err != nil {
+			return err
+		}
+		*parent = current
+		run := models.MediaAtomizationRun{TenantID: current.TenantID, ParentContentItemID: current.PublicID, Status: "queued", Phase: "planning", StartedAt: &now, Trigger: &trigger}
 		if principal.UserID != "" {
 			if id, err := uuid.Parse(principal.UserID); err == nil {
 				run.RequestedBy = &id
@@ -1700,6 +1895,13 @@ func adminQueueMediaParentAtomization(c *gin.Context, reatomize bool) {
 		}
 		return tx.Create(&run).Error
 	}); err != nil {
+		if writeLifecycleConflict(c, err) {
+			return
+		}
+		if errors.Is(err, errAtomizationParentChanged) {
+			c.JSON(http.StatusConflict, utils.HTTPError{Code: http.StatusConflict, Message: err.Error()})
+			return
+		}
 		mediaAtomizationQueryError(c, err)
 		return
 	}
@@ -3731,6 +3933,20 @@ func applyAtomizedChapterReviewWithOptions(db *gorm.DB, tenantID string, chapter
 		newChapterStatus = feedVisibilityEmbeddingPending
 	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		lifecycleItems := []models.ContentItem{child}
+		if child.ParentContentItemID != nil {
+			var root models.ContentItem
+			if err := tx.Where("tenant_id=? AND public_id=?", tenantID, *child.ParentContentItemID).First(&root).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return errChapterReviewStale
+				}
+				return err
+			}
+			lifecycleItems = append(lifecycleItems, root)
+		}
+		if err := checkAtomizationItemsLifecycle(tx, lifecycleItems...); err != nil {
+			return err
+		}
 		// Re-read and lock both rows in the same transaction as the mutation. The
 		// preliminary reads above provide useful 404s; these are the authoritative
 		// values for any automation decision.
@@ -3860,6 +4076,9 @@ func applyAtomizedChapterReviewWithOptions(db *gorm.DB, tenantID string, chapter
 		}
 		return feedstate.SyncMediaMembership(tx, child)
 	}); err != nil {
+		if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+			return nil, &chapterReviewError{http.StatusConflict, "operation_conflict", "Chapter review conflicts with an active content lifecycle operation"}
+		}
 		if errors.Is(err, errChapterReviewStale) {
 			return nil, &chapterReviewError{http.StatusConflict, chapterReviewErrStale, "Chapter is no longer awaiting review"}
 		}

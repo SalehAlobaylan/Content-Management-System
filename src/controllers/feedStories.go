@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 
@@ -233,7 +234,9 @@ func assembleStoryNewsFeed(
 	topicsCh := make(chan topicsResult, 1)
 	go func() {
 		var topics []models.Story
-		result := db.Select(topicMetaColumns).Where("tenant_id = ?", tenantID).Find(&topics)
+		topicsQuery := feedstate.ActiveNewsStoryQuery(db, tenantID).Select(topicMetaColumns)
+		topicsQuery = applyActiveGenerationMembership(db, topicsQuery, tenantID, "news", "story", "stories.public_id")
+		result := topicsQuery.Find(&topics)
 		byID := make(map[uuid.UUID]models.Story, len(topics))
 		for _, t := range topics {
 			byID[t.PublicID] = t
@@ -243,7 +246,7 @@ func assembleStoryNewsFeed(
 
 	windowStart := circ.Window.QueryStart
 	var members []models.ContentItem
-	membersQuery := db.Select(storyScoreColumns).
+	membersQuery := db.Model(&models.ContentItem{}).Select(storyScoreColumns).
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IS NOT NULL",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady).
 		Where(newsRetentionFeedPredicate).
@@ -251,6 +254,7 @@ func assembleStoryNewsFeed(
 		Order("COALESCE(published_at, created_at) DESC").
 		Limit(storyMemberPoolLimit)
 	membersQuery = applyActiveGenerationMembership(db, membersQuery, tenantID, "news", "story", "content_items.story_id")
+	membersQuery = applyActiveGenerationMembership(db, membersQuery, tenantID, "news", "news_item", "content_items.public_id")
 	if err := membersQuery.Find(&members).Error; err != nil {
 		return nil, nil, err
 	}
@@ -496,14 +500,9 @@ func assembleStoryNewsFeed(
 		maxHydrate = 500
 	}
 	var pageMembers []models.ContentItem
-	if err := db.Select(storyFeedColumns).
-		Where("tenant_id = ? AND type = ? AND status = ? AND story_id IN ?",
-			tenantID, models.ContentTypeNews, models.ContentStatusReady, pageStoryIDs).
-		Where(newsRetentionFeedPredicate).
-		Where("COALESCE(published_at, created_at) > ?", windowStart).
-		Order("COALESCE(published_at, created_at) DESC").
-		Limit(maxHydrate).
-		Find(&pageMembers).Error; err != nil {
+	pageMemberQuery := applyActiveGenerationMembership(db, db.Model(&models.ContentItem{}).Where("tenant_id = ? AND type = ? AND status = ? AND story_id IN ?", tenantID, models.ContentTypeNews, models.ContentStatusReady, pageStoryIDs).Where(newsRetentionFeedPredicate).Where("COALESCE(published_at, created_at) > ?", windowStart), tenantID, "news", "story", "content_items.story_id")
+	pageMemberQuery = applyActiveGenerationMembership(db, pageMemberQuery, tenantID, "news", "news_item", "content_items.public_id")
+	if err := pageMemberQuery.Select(storyFeedColumns).Order("COALESCE(published_at, created_at) DESC").Limit(maxHydrate).Find(&pageMembers).Error; err != nil {
 		return nil, nil, err
 	}
 	membersByStory := make(map[uuid.UUID][]models.ContentItem, len(page))
@@ -976,7 +975,7 @@ func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) [
 		Embedding string
 		SpaceID   string
 	}
-	db.Model(&models.Story{}).
+	feedstate.ActiveNewsStoryQuery(db, tenantID).
 		Select("embedding::text AS embedding, embedding_space_id AS space_id").
 		Where("public_id = ? AND embedding IS NOT NULL AND embedding_space_id IS NOT NULL", storyID).
 		Scan(&anchor)
@@ -985,7 +984,7 @@ func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) [
 	}
 	relatedFloor := time.Now().AddDate(0, 0, -storyRelatedWindowDays)
 	var relIDs []uuid.UUID
-	db.Model(&models.Story{}).
+	feedstate.ActiveNewsStoryQuery(db, tenantID).
 		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND embedding_space_id = ? AND article_count > 0", tenantID, storyID, anchor.SpaceID).
 		Where("last_member_at IS NULL OR last_member_at > ?", relatedFloor).
 		Where("embedding <=> '"+anchor.Embedding+"' <= ?", 1-storyRelatedMinSimilarity).
@@ -1012,12 +1011,12 @@ func leadSummariesByStory(
 		return out
 	}
 	var leads []models.ContentItem
-	db.Raw(
-		"SELECT DISTINCT ON (story_id) "+storyFeedColumns+
-			" FROM content_items WHERE tenant_id = ? AND story_id IN ? AND status = ? AND "+newsRetentionFeedPredicate+
-			" ORDER BY story_id, CASE WHEN COALESCE(news_retention_state, 'full') <> 'full' AND news_feed_role = 'lead' THEN 0 ELSE 1 END, like_count*3 + share_count*5 + comment_count*2 DESC",
-		tenantID, storyIDs, models.ContentStatusReady,
-	).Scan(&leads)
+	leadsQuery := db.Model(&models.ContentItem{}).
+		Select("DISTINCT ON (story_id) "+storyFeedColumns).
+		Where("tenant_id = ? AND story_id IN ? AND status = ? AND "+newsRetentionFeedPredicate, tenantID, storyIDs, models.ContentStatusReady)
+	leadsQuery = applyActiveGenerationMembership(db, leadsQuery, tenantID, "news", "story", "content_items.story_id")
+	leadsQuery = applyActiveGenerationMembership(db, leadsQuery, tenantID, "news", "news_item", "content_items.public_id")
+	leadsQuery.Order("story_id, CASE WHEN COALESCE(news_retention_state, 'full') <> 'full' AND news_feed_role = 'lead' THEN 0 ELSE 1 END, like_count*3 + share_count*5 + comment_count*2 DESC").Find(&leads)
 	sourceImageByFeedURL := loadSourceImagesByFeedURL(db, tenantID, leads)
 	for _, top := range leads {
 		if top.StoryID == nil {
@@ -1073,7 +1072,13 @@ func buildRelatedStories(
 
 	cands := make([]uuid.UUID, 0, len(relIDs))
 	for _, rid := range relIDs {
+		// Related IDs are a cached, write-time projection and can outlive a
+		// serving-head change. Keep only stories present in the page's already
+		// pinned active story projection before hydrating any member text.
 		if !excludeIDs[rid] {
+			if _, activeInView := topicByID[rid]; !activeInView {
+				continue
+			}
 			cands = append(cands, rid)
 		}
 	}
@@ -1506,13 +1511,17 @@ const storyDigestMemberLimit = 12
 func storyDigestMemberTexts(db *gorm.DB, tenantID string, storyID uuid.UUID) []string {
 	windowStart := time.Now().AddDate(0, 0, -storyRelatedWindowDays)
 	var members []models.ContentItem
-	db.Select("title, excerpt, LEFT(body_text, 600) AS body_text, published_at, created_at").
+	query := db.Model(&models.ContentItem{}).Select("title, excerpt, LEFT(body_text, 600) AS body_text, published_at, created_at").
 		Where("tenant_id = ? AND type = ? AND status = ? AND story_id = ?",
 			tenantID, models.ContentTypeNews, models.ContentStatusReady, storyID).
 		Where("COALESCE(published_at, created_at) > ?", windowStart).
 		Order("COALESCE(published_at, created_at) DESC").
-		Limit(storyDigestMemberLimit).
-		Find(&members)
+		Limit(storyDigestMemberLimit)
+	query = applyActiveGenerationMembership(db, query, tenantID, "news", "story", "content_items.story_id")
+	query = applyActiveGenerationMembership(db, query, tenantID, "news", "news_item", "content_items.public_id")
+	if query.Find(&members).Error != nil {
+		return nil
+	}
 
 	texts := make([]string, 0, len(members))
 	for _, m := range members {
@@ -1546,9 +1555,13 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 
 	storySummaryWorkers <- struct{}{}
 	defer func() { <-storySummaryWorkers }()
+	scope, err := feedstate.CaptureNewsMetadataScope(db, tenantID, storyID)
+	if err != nil {
+		return
+	}
 
 	var topic models.Story
-	if err := db.Select(topicMetaColumns).
+	if err := feedstate.ActiveNewsStoryQuery(db, tenantID).Select(topicMetaColumns).
 		Where("tenant_id = ? AND public_id = ?", tenantID, storyID).
 		First(&topic).Error; err != nil {
 		return
@@ -1584,14 +1597,12 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		return
 	}
 	now := time.Now()
-	db.Model(&models.Story{}).
-		Where("public_id = ?", storyID).
-		Updates(map[string]interface{}{
-			"summary":          summary,
-			"bullets":          datatypes.JSON(bulletsJSON),
-			"summary_built_at": now,
-			"category":         normalizeStoryCategory(category),
-		})
+	_ = feedstate.WriteNewsMetadata(db, tenantID, storyID, scope, map[string]interface{}{
+		"summary":          summary,
+		"bullets":          datatypes.JSON(bulletsJSON),
+		"summary_built_at": now,
+		"category":         normalizeStoryCategory(category),
+	})
 }
 
 // normalizeStoryCategory keeps the stored slug non-empty so the backfill's
@@ -1617,6 +1628,10 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 
 	storyRelatedWorkers <- struct{}{}
 	defer func() { <-storyRelatedWorkers }()
+	scope, err := feedstate.CaptureNewsMetadataScope(db, tenantID, storyID)
+	if err != nil {
+		return
+	}
 
 	// NOTE: an empty result is STORED (as []) — "computed, nothing genuinely
 	// related" is a real answer that stops the read path from re-running a
@@ -1630,7 +1645,7 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		all = append(all, ids...)
 		all = append(all, storyID)
 		var metas []models.Story
-		db.Select(topicMetaColumns).
+		feedstate.ActiveNewsStoryQuery(db, tenantID).Select(topicMetaColumns).
 			Where("tenant_id = ? AND public_id IN ?", tenantID, all).
 			Find(&metas)
 		metaByID := make(map[uuid.UUID]models.Story, len(metas))
@@ -1668,9 +1683,7 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 	if err != nil {
 		return
 	}
-	db.Model(&models.Story{}).
-		Where("public_id = ?", storyID).
-		UpdateColumn("related_ids", datatypes.JSON(data))
+	_ = feedstate.WriteNewsMetadata(db, tenantID, storyID, scope, map[string]any{"related_ids": datatypes.JSON(data)})
 }
 
 type storyRerankResponse struct {

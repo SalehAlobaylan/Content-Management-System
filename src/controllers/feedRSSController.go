@@ -48,8 +48,7 @@ func fetchFeedItems(db *gorm.DB, q feedQuery) ([]feedItem, error) {
 		limit = 50
 	}
 
-	query := db.Model(&models.ContentItem{}).
-		Where("status = ?", models.ContentStatusReady).
+	query := publicContentQuery(db).
 		Order("published_at DESC NULLS LAST, created_at DESC").
 		Limit(limit)
 
