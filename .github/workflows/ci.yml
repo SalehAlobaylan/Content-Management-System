@@ -32,6 +32,8 @@ jobs:
         with:
           go-version: '1.24'
           cache: true
+      - name: Check migration classifications and qualified SQL
+        run: go test ./src/utils -run 'TestCanonicalMigrationsHaveReviewedLocalPolicies|TestQualifiedSchemaManifestPinsExactCanonicalBytes' -count=1
       - name: Build
         run: go build ./...
       - name: Vet

@@ -21,7 +21,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	_ "github.com/joho/godotenv/autoload"
+	"github.com/joho/godotenv"
 	"gorm.io/gorm"
 )
 
@@ -171,6 +171,10 @@ func databaseWriterFenceMiddleware(db *gorm.DB) gin.HandlerFunc {
 }
 
 func main() {
+	if os.Getenv("WAHB_MANAGED_ENV") != "1" {
+		_ = godotenv.Load()
+	}
+
 	log.Println("Starting Content Management System...")
 	log.Printf("Environment: %s", os.Getenv("ENV"))
 	logCMSConnectionTargets()

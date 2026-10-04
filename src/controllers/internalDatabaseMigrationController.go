@@ -35,33 +35,25 @@ type migrationInflightEvidence struct {
 	State   string `json:"state"`
 }
 
-var cmsInflightQueries = []struct{ subject, query string }{
-	{"source_run_attempts", `SELECT count(*) FROM source_run_attempts WHERE state IN ('claimed','running','verifying','uncertain','reconciling')`},
-	{"content_stage_attempts", `SELECT count(*) FROM content_stage_attempts WHERE state IN ('claimed','running','verifying','uncertain','reconciling')`},
-	{"pipeline_repair_requests", `SELECT count(*) FROM pipeline_repair_requests WHERE state IN ('claimed','running','verifying','uncertain')`},
-	{"artifact_coverage_requests", `SELECT count(*) FROM artifact_coverage_requests WHERE state IN ('claimed','running','verifying','uncertain')`},
-	{"atomization_work_requests", `SELECT count(*) FROM atomization_work_requests WHERE state IN ('claimed','running','verifying','uncertain')`},
-	{"studio_clearance_requests", `SELECT count(*) FROM studio_clearance_requests WHERE state IN ('claimed','running','verifying','uncertain')`},
-	{"media_supply_actions", `SELECT count(*) FROM media_supply_actions WHERE state IN ('claimed','running','verifying','uncertain')`},
-}
+var cmsInflightQueries = utils.CMSMigrationInflightQueries
 
 // Additive feature ledgers may not exist until their owner migration has run.
 // When present, unresolved reset ownership must keep migration quiescence open.
-var optionalResetInflightQueries = []struct{ subject, query string }{
-	{"content_reset_campaigns", `SELECT count(*) FROM content_reset_campaigns WHERE state IN ('approved','executing','partial','published','cleanup_pending')`},
-	{"lifecycle_operation_claims", `SELECT count(*) FROM lifecycle_operation_claims WHERE state='active'`},
-	{"content_reset_steps", `SELECT count(*) FROM content_reset_steps WHERE state IN ('claimed','outcome_unknown')`},
-	{"content_reset_intake_pauses", `SELECT count(*) FROM content_reset_intake_pauses WHERE state='active'`},
-	{"pipeline_repair_requests", `SELECT count(*) FROM pipeline_repair_requests WHERE state IN ('awaiting_approval','queued','claimed','running','verifying','uncertain')`},
-	{"artifact_coverage_requests", `SELECT count(*) FROM artifact_coverage_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
-	{"atomization_work_requests", `SELECT count(*) FROM atomization_work_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
-	{"media_atomization_runs", `SELECT count(*) FROM media_atomization_runs WHERE status IN ('queued','processing','running')`},
-	{"studio_clearance_requests", `SELECT count(*) FROM studio_clearance_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
-	{"media_supply_action_requests", `SELECT count(*) FROM media_supply_action_requests WHERE state IN ('awaiting_approval','queued','claimed','running','verifying','uncertain')`},
-	{"pods_reset_runs", `SELECT count(*) FROM pods_reset_runs WHERE state IN ('approved','executing','partial')`},
-	{"storage_operation_sagas", `SELECT count(*) FROM storage_operation_sagas WHERE state NOT IN ('cms_committed','cancelled','failed')`},
-	{"retention_owner_requests", `SELECT count(*) FROM retention_owner_requests WHERE status IN ('approved','submitted')`},
-	{"source_run_requests", `SELECT count(*) FROM source_run_requests WHERE state IN ('requested','accepted','running','verification_required')`},
+var optionalResetInflightQueries = []utils.MigrationInflightProbe{
+	{Subject: "content_reset_campaigns", Query: `SELECT count(*) FROM content_reset_campaigns WHERE state IN ('approved','executing','partial','published','cleanup_pending')`},
+	{Subject: "lifecycle_operation_claims", Query: `SELECT count(*) FROM lifecycle_operation_claims WHERE state='active'`},
+	{Subject: "content_reset_steps", Query: `SELECT count(*) FROM content_reset_steps WHERE state IN ('claimed','outcome_unknown')`},
+	{Subject: "content_reset_intake_pauses", Query: `SELECT count(*) FROM content_reset_intake_pauses WHERE state='active'`},
+	{Subject: "pipeline_repair_requests", Query: `SELECT count(*) FROM pipeline_repair_requests WHERE state IN ('awaiting_approval','queued','claimed','running','verifying','uncertain')`},
+	{Subject: "artifact_coverage_requests", Query: `SELECT count(*) FROM artifact_coverage_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
+	{Subject: "atomization_work_requests", Query: `SELECT count(*) FROM atomization_work_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
+	{Subject: "media_atomization_runs", Query: `SELECT count(*) FROM media_atomization_runs WHERE status IN ('queued','processing','running')`},
+	{Subject: "studio_clearance_requests", Query: `SELECT count(*) FROM studio_clearance_requests WHERE state IN ('queued','claimed','running','verifying','uncertain')`},
+	{Subject: "media_supply_action_requests", Query: `SELECT count(*) FROM media_supply_action_requests WHERE state IN ('awaiting_approval','queued','claimed','running','verifying','uncertain')`},
+	{Subject: "pods_reset_runs", Query: `SELECT count(*) FROM pods_reset_runs WHERE state IN ('approved','executing','partial')`},
+	{Subject: "storage_operation_sagas", Query: `SELECT count(*) FROM storage_operation_sagas WHERE state NOT IN ('cms_committed','cancelled','failed')`},
+	{Subject: "retention_owner_requests", Query: `SELECT count(*) FROM retention_owner_requests WHERE status IN ('approved','submitted')`},
+	{Subject: "source_run_requests", Query: `SELECT count(*) FROM source_run_requests WHERE state IN ('requested','accepted','running','verification_required')`},
 }
 
 func readMigrationOwnerControl(db *gorm.DB) (migrationOwnerControl, error) {
@@ -76,15 +68,15 @@ func readCMSInflight(db *gorm.DB) ([]migrationInflightEvidence, int64, bool) {
 	complete := true
 	for _, item := range cmsInflightQueries {
 		var exists bool
-		table := strings.Split(item.subject, ".")[0]
+		table := strings.Split(item.Subject, ".")[0]
 		if err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, "public."+table).Scan(&exists).Error; err != nil || !exists {
-			items = append(items, migrationInflightEvidence{Subject: item.subject, State: "unknown"})
+			items = append(items, migrationInflightEvidence{Subject: item.Subject, State: "unknown"})
 			complete = false
 			continue
 		}
 		var count int64
-		if err := db.Raw(item.query).Scan(&count).Error; err != nil {
-			items = append(items, migrationInflightEvidence{Subject: item.subject, State: "unknown"})
+		if err := db.Raw(item.Query).Scan(&count).Error; err != nil {
+			items = append(items, migrationInflightEvidence{Subject: item.Subject, State: "unknown"})
 			complete = false
 			continue
 		}
@@ -92,24 +84,24 @@ func readCMSInflight(db *gorm.DB) ([]migrationInflightEvidence, int64, bool) {
 		if count > 0 {
 			state = "present"
 		}
-		items = append(items, migrationInflightEvidence{Subject: item.subject, Count: count, State: state})
+		items = append(items, migrationInflightEvidence{Subject: item.Subject, Count: count, State: state})
 		total += count
 	}
 	for _, item := range optionalResetInflightQueries {
 		var exists bool
-		table := strings.Split(item.subject, ".")[0]
+		table := strings.Split(item.Subject, ".")[0]
 		if err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, "public."+table).Scan(&exists).Error; err != nil {
-			items = append(items, migrationInflightEvidence{Subject: item.subject, State: "unknown"})
+			items = append(items, migrationInflightEvidence{Subject: item.Subject, State: "unknown"})
 			complete = false
 			continue
 		}
 		if !exists {
-			items = append(items, migrationInflightEvidence{Subject: item.subject, State: "not_installed"})
+			items = append(items, migrationInflightEvidence{Subject: item.Subject, State: "not_installed"})
 			continue
 		}
 		var count int64
-		if err := db.Raw(item.query).Scan(&count).Error; err != nil {
-			items = append(items, migrationInflightEvidence{Subject: item.subject, State: "unknown"})
+		if err := db.Raw(item.Query).Scan(&count).Error; err != nil {
+			items = append(items, migrationInflightEvidence{Subject: item.Subject, State: "unknown"})
 			complete = false
 			continue
 		}
@@ -117,7 +109,7 @@ func readCMSInflight(db *gorm.DB) ([]migrationInflightEvidence, int64, bool) {
 		if count > 0 {
 			state = "present"
 		}
-		items = append(items, migrationInflightEvidence{Subject: item.subject, Count: count, State: state})
+		items = append(items, migrationInflightEvidence{Subject: item.Subject, Count: count, State: state})
 		total += count
 	}
 	return items, total, complete
@@ -127,17 +119,17 @@ func readResetSensitiveOwnerWork(db *gorm.DB) ([]migrationInflightEvidence, bool
 	evidence := make([]migrationInflightEvidence, 0, len(optionalResetInflightQueries))
 	active := false
 	for _, item := range optionalResetInflightQueries {
-		table := strings.Split(item.subject, ".")[0]
+		table := strings.Split(item.Subject, ".")[0]
 		var exists bool
 		if err := db.Raw(`SELECT to_regclass(?) IS NOT NULL`, "public."+table).Scan(&exists).Error; err != nil {
 			return evidence, false, err
 		}
 		if !exists {
-			evidence = append(evidence, migrationInflightEvidence{Subject: item.subject, State: "not_installed"})
+			evidence = append(evidence, migrationInflightEvidence{Subject: item.Subject, State: "not_installed"})
 			continue
 		}
 		var count int64
-		if err := db.Raw(item.query).Scan(&count).Error; err != nil {
+		if err := db.Raw(item.Query).Scan(&count).Error; err != nil {
 			return evidence, false, err
 		}
 		state := "absent"
@@ -145,7 +137,7 @@ func readResetSensitiveOwnerWork(db *gorm.DB) ([]migrationInflightEvidence, bool
 			state = "present"
 			active = true
 		}
-		evidence = append(evidence, migrationInflightEvidence{Subject: item.subject, Count: count, State: state})
+		evidence = append(evidence, migrationInflightEvidence{Subject: item.Subject, Count: count, State: state})
 	}
 	return evidence, active, nil
 }

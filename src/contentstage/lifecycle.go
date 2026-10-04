@@ -1251,6 +1251,9 @@ func VerifyRequest(db *gorm.DB, requestID uuid.UUID) error {
 			if err := appendEvent(tx, request, nil, "verified", proof); err != nil {
 				return err
 			}
+			if err := settleVerifiedAttemptReceipts(tx, request); err != nil {
+				return err
+			}
 			if request.Stage == models.ContentStagePodsMediaArtifacts {
 				if err := settleConditionalPodsStages(tx, item); err != nil {
 					return err

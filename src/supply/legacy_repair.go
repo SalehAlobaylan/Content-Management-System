@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/utils"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -117,8 +118,10 @@ func loadLegacyTerminalEvidence(db *gorm.DB, requests []models.SourceRunRequest)
 		requestIDs = append(requestIDs, request.ID)
 	}
 	var events []models.ContentProcessingEvent
-	if err := db.Where("source_run_request_id IN ? AND state IN ?", requestIDs,
-		[]string{models.SourceRunCompleted, models.SourceRunSucceeded, models.SourceRunFailed, models.SourceRunCancelled, models.SourceRunExpired}).
+	// A completed repair is not evidence that provider work completed. Its
+	// request outcome is recorded separately in the audit payload.
+	if err := db.Where("source_run_request_id IN ? AND state IN ? AND stage <> ? AND event_class <> ?", requestIDs,
+		[]string{models.SourceRunCompleted, models.SourceRunSucceeded, models.SourceRunFailed, models.SourceRunCancelled, models.SourceRunExpired}, "source_run.repair", "legacy_source_run_repaired").
 		Order("source_run_request_id ASC, occurred_at DESC, id DESC").Find(&events).Error; err != nil {
 		return nil, err
 	}
@@ -158,6 +161,20 @@ func ApplyLegacySourceRunRepair(db *gorm.DB, expectedDigest, actor string, now t
 		return report, fmt.Errorf("repair preview digest changed; preview again")
 	}
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := utils.CheckLocalPreparationAuthority(tx); err != nil {
+			return err
+		}
+		if err := tx.Exec("LOCK TABLE source_run_requests, content_processing_events IN SHARE ROW EXCLUSIVE MODE").Error; err != nil {
+			return err
+		}
+		current, err := PreviewLegacySourceRunRepair(tx, now)
+		if err != nil {
+			return err
+		}
+		if current.VerificationDigest != expectedDigest {
+			return fmt.Errorf("repair preview changed at execution boundary")
+		}
+
 		for _, action := range report.Actions {
 			var request models.SourceRunRequest
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", action.RequestID, action.TenantID).First(&request).Error; err != nil {
@@ -176,10 +193,10 @@ func ApplyLegacySourceRunRepair(db *gorm.DB, expectedDigest, actor string, now t
 			if result.RowsAffected != 1 {
 				return fmt.Errorf("source-run request %s changed during repair", action.RequestID)
 			}
-			payload, _ := json.Marshal(map[string]any{"schema_version": report.SchemaVersion, "reason": action.Reason, "evidence_state": action.EvidenceState, "preview_digest": expectedDigest, "actor": actor})
+			payload, _ := json.Marshal(map[string]any{"schema_version": report.SchemaVersion, "reason": action.Reason, "evidence_state": action.EvidenceState, "request_target_state": action.TargetState, "preview_digest": expectedDigest, "actor": actor})
 			if err := tx.Create(&models.ContentProcessingEvent{
 				TenantID: action.TenantID, ContentSourceID: &action.ContentSourceID, SourceRunRequestID: &request.ID,
-				Stage: "source_run.repair", State: action.TargetState, Producer: "cms", EventClass: "legacy_source_run_repaired",
+				Stage: "source_run.repair", State: "completed", Producer: "cms", EventClass: "legacy_source_run_repaired",
 				Payload: payload, OccurredAt: finished,
 			}).Error; err != nil {
 				return err

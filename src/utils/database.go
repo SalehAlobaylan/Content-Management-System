@@ -14,7 +14,11 @@ import (
 )
 
 func cmsDatabaseLogger() gormlogger.Interface {
-	return gormlogger.New(log.New(os.Stdout, "", log.LstdFlags), gormlogger.Config{
+	output := os.Stdout
+	if os.Getenv("WAHB_MANAGED_ENV") == "1" {
+		output = os.Stderr
+	}
+	return gormlogger.New(log.New(output, "", log.LstdFlags), gormlogger.Config{
 		SlowThreshold:             200 * time.Millisecond,
 		LogLevel:                  gormlogger.Warn,
 		IgnoreRecordNotFoundError: true,

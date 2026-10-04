@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,7 @@ import (
 
 	"content-management-system/src/utils"
 
-	_ "github.com/joho/godotenv/autoload"
+	"github.com/joho/godotenv"
 	"gorm.io/gorm"
 )
 
@@ -55,11 +56,17 @@ var legacyTransactionalMigrations = map[string]struct{}{
 }
 
 func main() {
+	if os.Getenv("WAHB_MANAGED_ENV") != "1" {
+		_ = godotenv.Load()
+	}
+
 	var (
 		applyAll         = flag.Bool("all", false, "apply every migration not recorded in schema_migrations")
 		status           = flag.Bool("status", false, "print migration ledger status without applying files")
 		check            = flag.Bool("check", false, "validate every pending migration without applying it")
 		verify           = flag.Bool("verify", false, "verify checksums and require no pending migration")
+		workPreview      = flag.Bool("work-preview", false, "read possibly effecting work that blocks local migration; never change work or schema")
+		localSchema      = flag.Bool("local-schema-upgrade", false, "apply qualified schema-only changes while retaining expired processing history")
 		inspectDrift     = flag.String("inspect-checksum-drift", "", "inspect one supported applied migration whose canonical file checksum drifted")
 		repairDrift      = flag.String("repair-checksum-drift", "", "repair one supported checksum drift after replaying its additive SQL and verifying schema postconditions")
 		expectedChecksum = flag.String("expected-recorded-checksum", "", "exact checksum currently stored in the ledger for checksum repair")
@@ -71,6 +78,9 @@ func main() {
 		dir              = flag.String("dir", "migrations", "directory containing CMS SQL migrations")
 	)
 	flag.Parse()
+	if *workPreview && (*status || *check || *verify || *inspectDrift != "" || *repairDrift != "" || *applyAll || *baseline != "" || *allowDestructive || *bootstrapEmpty || flag.NArg() != 0) {
+		log.Fatal("--work-preview is a read-only operation; it cannot be combined with another migration operation")
+	}
 	if *inspectDrift != "" && *repairDrift != "" {
 		log.Fatal("--inspect-checksum-drift and --repair-checksum-drift cannot be combined")
 	}
@@ -88,16 +98,66 @@ func main() {
 	if *baseline != "" && (*applyAll || flag.NArg() > 0) {
 		log.Fatal("--baseline-through cannot be combined with --all or explicit migration files")
 	}
-	if !*status && !*check && !*verify && !driftCommand && !*applyAll && *baseline == "" && flag.NArg() == 0 {
+	if !*workPreview && !*status && !*check && !*verify && !driftCommand && !*applyAll && *baseline == "" && flag.NArg() == 0 {
 		log.Fatal("no migrations selected. Use --status, --check, --verify, --inspect-checksum-drift, --repair-checksum-drift, --all, --baseline-through, or pass explicit migration filenames")
 	}
 	if *bootstrapEmpty && (!*applyAll || *status || *check || *baseline != "") {
 		log.Fatal("--bootstrap-empty is only valid with --all and an apply operation")
 	}
+	if *localSchema && (os.Getenv("WAHB_LOCAL_PREPARATION") != "1" || *workPreview || *status || *check || *verify || driftCommand || *baseline != "" || *bootstrapEmpty) {
+		log.Fatal("qualified schema mode requires a managed local migration apply; it cannot change recovery, baseline or bootstrap authority")
+	}
 
 	db, err := utils.ConnectDB()
 	if err != nil {
 		log.Fatalf("connect database: %v", err)
+	}
+	if *workPreview {
+		files, err := listMigrationFiles(*dir)
+		if err != nil {
+			log.Fatal(err)
+		}
+		var report utils.MigrationWorkReport
+		err = db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL statement_timeout = '10s'").Error; err != nil {
+				return err
+			}
+			var err error
+			report, err = utils.InspectCMSMigrationWork(tx)
+			if err != nil {
+				return err
+			}
+			applied, err := appliedVersions(tx)
+			if err != nil {
+				return err
+			}
+			if err := verifyAppliedChecksums(files, applied); err != nil {
+				return err
+			}
+			pending, err := selectMigrations(files, applied, true, nil)
+			if err != nil {
+				return err
+			}
+			if len(pending) > 0 {
+				err := utils.CheckLocalMigrationWork(tx, localMigrationIdentities(pending))
+				var blocked *utils.MigrationWorkBlockedError
+				if errors.As(err, &blocked) {
+					report.BlockedBy = &blocked.Blocker
+				} else if err != nil {
+					return err // Unreadable work cannot become migration authority.
+				} else if report.State == "blocked" {
+					report.SchemaUpgradeReady = true
+				}
+			}
+			return nil
+		}, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+		if err != nil {
+			log.Fatalf("migration work preview: %v", err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	files, err := listMigrationFiles(*dir)
@@ -108,7 +168,33 @@ func main() {
 	// Inspection must not turn an unknown database into a partially initialized
 	// one. Only effect-bearing commands may create or upgrade the ledger.
 	if (!*status && !*check && !*verify && !driftCommand) || *repairDrift != "" {
-		if err := ensureLedger(db); err != nil {
+		ensure := func(tx *gorm.DB) error {
+			if err := tx.Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
+				return err
+			}
+			authority := utils.CheckLocalPreparationAuthority
+			if *localSchema {
+				authority = func(tx *gorm.DB) error {
+					applied, err := appliedVersions(tx)
+					if err != nil {
+						return err
+					}
+					if err := verifyAppliedChecksums(files, applied); err != nil {
+						return err
+					}
+					pending, err := selectMigrations(files, applied, true, nil)
+					if err != nil {
+						return err
+					}
+					return utils.CheckLocalSchemaPreparationAuthority(tx, localMigrationIdentities(pending)...)
+				}
+			}
+			if err := authority(tx); err != nil {
+				return err
+			}
+			return ensureLedger(tx)
+		}
+		if err := db.Transaction(ensure); err != nil {
 			log.Fatalf("ensure migration ledger: %v", err)
 		}
 	}
@@ -135,6 +221,11 @@ func main() {
 			log.Printf("Live schema is missing %d supported postcondition(s): %s", len(issues), strings.Join(issues, ", "))
 		}
 		if *repairDrift == "" {
+			if os.Getenv("WAHB_MANAGED_ENV") == "1" {
+				if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"file": file.Version, "recorded_checksum": record.Checksum, "canonical_checksum": file.Checksum, "postcondition_issues": issues}); err != nil {
+					log.Fatal(err)
+				}
+			}
 			return
 		}
 		if err := repairAppliedChecksumDrift(db, file, *expectedChecksum, *repairReason, *repairAck); err != nil {
@@ -221,7 +312,7 @@ func main() {
 		if record, exists := applied[file.Version]; exists {
 			returnFatalApplied(file, record)
 		}
-		if err := applyMigration(db, file); err != nil {
+		if err := applyMigrationMode(db, file, *localSchema); err != nil {
 			log.Fatalf("apply %s: %v", file.Version, err)
 		}
 		log.Printf("Applied %s", file.Version)
@@ -243,6 +334,9 @@ func main() {
 // to produce the artifacts that shadow verification would observe.
 func activateEmptyBootstrapContentStages(db *gorm.DB) error {
 	return db.Transaction(func(tx *gorm.DB) error {
+		if err := utils.CheckLocalPreparationAuthority(tx); err != nil {
+			return err
+		}
 		for _, table := range []string{"content_items", "content_sources"} {
 			var count int64
 			if err := tx.Table(table).Count(&count).Error; err != nil {
@@ -376,10 +470,24 @@ func requireLargeTableMigrationSafety(files []migrationFile) error {
 	return nil
 }
 
+func localMigrationIdentities(files []migrationFile) []utils.LocalMigration {
+	result := make([]utils.LocalMigration, 0, len(files))
+	for _, file := range files {
+		result = append(result, utils.LocalMigration{Version: file.Version, Checksum: file.Checksum})
+	}
+	return result
+}
+
 func migrationIsDestructive(file migrationFile) (bool, error) {
 	sql, err := os.ReadFile(file.Path)
 	if err != nil {
 		return false, err
+	}
+	// The qualified reset foundations install deletion trigger functions. They
+	// execute no content deletion; exact bytes are required for this exception.
+	sum := sha256.Sum256(sql)
+	if utils.QualifiedDeletionDefinitions(file.Version, hex.EncodeToString(sum[:])) {
+		return false, nil
 	}
 	return destructiveSQL.Match(sql), nil
 }
@@ -580,6 +688,9 @@ func repairAppliedChecksumDrift(db *gorm.DB, file migrationFile, expectedChecksu
 		return err
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		if err := utils.CheckLocalPreparationAuthority(tx); err != nil {
+			return err
+		}
 		if err := tx.Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
 			return err
 		}
@@ -771,7 +882,17 @@ func appliedVersions(db *gorm.DB) (map[string]migrationRecord, error) {
 	if !ledgerExists {
 		return map[string]migrationRecord{}, nil
 	}
-	rows, err := db.Raw("SELECT version, applied_at, COALESCE(checksum_sha256, '') FROM cms_schema_migrations").Rows()
+	// Historical ledgers may predate checksums. Read their evidence without
+	// altering the ledger before authority checks have completed.
+	var hasChecksum bool
+	if err := db.Raw("SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='cms_schema_migrations' AND column_name='checksum_sha256')").Scan(&hasChecksum).Error; err != nil {
+		return nil, err
+	}
+	checksumExpression := "''"
+	if hasChecksum {
+		checksumExpression = "COALESCE(checksum_sha256, '')"
+	}
+	rows, err := db.Raw("SELECT version, applied_at, " + checksumExpression + " FROM cms_schema_migrations").Rows()
 	if err != nil {
 		return nil, err
 	}
@@ -839,9 +960,16 @@ func selectMigrations(files []migrationFile, applied map[string]migrationRecord,
 }
 
 func applyMigration(db *gorm.DB, file migrationFile) error {
+	return applyMigrationMode(db, file, false)
+}
+func applyMigrationMode(db *gorm.DB, file migrationFile, localSchema bool) error {
 	sqlBytes, err := os.ReadFile(file.Path)
 	if err != nil {
 		return err
+	}
+	sum := sha256.Sum256(sqlBytes)
+	if hex.EncodeToString(sum[:]) != file.Checksum {
+		return errors.New("migration bytes changed after selection")
 	}
 	sql := strings.TrimSpace(string(sqlBytes))
 	if sql == "" {
@@ -852,16 +980,41 @@ func applyMigration(db *gorm.DB, file migrationFile) error {
 		return errors.New("migration contains top-level transaction control; legacy migrations must be adopted through the audited baseline command")
 	}
 	if legacy {
+		if os.Getenv("WAHB_LOCAL_PREPARATION") == "1" && os.Getenv("WAHB_PREPARATION_EMPTY") != "1" {
+			return errors.New("self-transactional historical migration requires explicit owner recovery; replay is unavailable in managed preparation")
+		}
+		managed := os.Getenv("WAHB_LOCAL_PREPARATION") == "1"
+		if managed {
+			if err := db.Transaction(func(tx *gorm.DB) error { return utils.CheckLocalPreparationAuthority(tx) }); err != nil {
+				return err
+			}
+			if err := journalLegacy(file, "started"); err != nil {
+				return err
+			}
+		}
 		if err := db.Exec(sql).Error; err != nil {
 			return migrationExecutionError(err)
 		}
-		return db.Exec("INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'legacy')", file.Version, file.Checksum).Error
+		if err := db.Exec("INSERT INTO cms_schema_migrations (version, applied_at, checksum_sha256, execution_mode) VALUES (?, now(), ?, 'legacy')", file.Version, file.Checksum).Error; err != nil {
+			return err
+		}
+		if managed {
+			return journalLegacy(file, "recorded")
+		}
+		return nil
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
-		// Fail fast on DDL lock contention instead of consuming the provider's
-		// full statement timeout while waiting for a busy live table.
 		if err := tx.Exec("SET LOCAL lock_timeout = '10s'").Error; err != nil {
+			return err
+		}
+		authority := utils.CheckLocalPreparationAuthority
+		if localSchema {
+			authority = func(tx *gorm.DB) error {
+				return utils.CheckLocalSchemaMigrationAuthority(tx, file.Version, file.Checksum)
+			}
+		}
+		if err := authority(tx); err != nil {
 			return err
 		}
 		if err := tx.Exec(sql).Error; err != nil {

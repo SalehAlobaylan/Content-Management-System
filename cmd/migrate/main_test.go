@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"gorm.io/driver/postgres"
@@ -405,5 +406,79 @@ func TestAppliedVersionsTreatsMissingLedgerAsEmpty(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestApplyRechecksFileBytesBeforeAnySQL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20261002000000_change.sql")
+	os.WriteFile(path, []byte("SELECT 1;"), 0600)
+	files, err := listMigrationFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(path, []byte("DELETE FROM content_items;"), 0600)
+	// A nil DB makes any attempted SQL a panic. A changed file must be rejected
+	// before a connection or ledger write is used.
+	if err = applyMigration(nil, files[0]); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatal("changed bytes reached execution", err)
+	}
+}
+
+func TestDeletionInQualifiedFunctionDefinitionsRequiresExactBytes(t *testing.T) {
+	files, err := listMigrationFiles(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Version != "20260929100000_content_reset_campaign_foundation.sql" && file.Version != "20260929110000_news_generation_item_membership.sql" {
+			continue
+		}
+		b, err := os.ReadFile(file.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !destructiveSQL.Match(b) {
+			t.Fatal("fixture no longer contains deletion function", file.Version)
+		}
+		if destructive, err := migrationIsDestructive(file); err != nil || destructive {
+			t.Fatal("installed function treated as executed content deletion", err)
+		}
+		path := filepath.Join(t.TempDir(), file.Version)
+		if err := os.WriteFile(path, append(b, []byte("\nDELETE FROM content_items;\n")...), 0600); err != nil {
+			t.Fatal(err)
+		}
+		file.Path = path
+		if destructive, err := migrationIsDestructive(file); err != nil || !destructive {
+			t.Fatal("modified SQL lost destructive guard", err)
+		}
+	}
+}
+
+func TestAppliedVersionsReadsLegacyChecksumEvidenceWithoutChangingLedger(t *testing.T) {
+	for _, hasChecksum := range []bool{false, true} {
+		sqlDB, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sqlDB.Close() })
+		db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mock.ExpectQuery(`SELECT to_regclass`).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+		mock.ExpectQuery(`SELECT EXISTS.*information_schema.columns`).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(hasChecksum))
+		query, checksum := "SELECT version, applied_at, '' FROM cms_schema_migrations", ""
+		if hasChecksum {
+			query, checksum = "SELECT version, applied_at, COALESCE(checksum_sha256, '') FROM cms_schema_migrations", strings.Repeat("a", 64)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta(query)).WillReturnRows(sqlmock.NewRows([]string{"version", "applied_at", "checksum"}).AddRow("legacy.sql", time.Now(), checksum))
+		records, err := appliedVersions(db)
+		if err != nil || records["legacy.sql"].Checksum != checksum || len(records) != 1 {
+			t.Fatal(records, err)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
