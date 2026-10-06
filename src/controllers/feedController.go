@@ -814,7 +814,7 @@ func mapToPodsItem(item models.ContentItem, isLiked, isBookmarked bool) PodsItem
 		result.TranscriptID = &tid
 	}
 
-	return result
+	return normalizeLegacyPodcastPresentation(result, item.Source, item.Metadata, item.RenditionSetVersion)
 }
 
 type storedPlaybackRendition struct {

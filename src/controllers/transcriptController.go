@@ -43,7 +43,7 @@ func GetTranscript(c *gin.Context) {
 	// when it is that parent's active transcript. Keeping this as one SQL query
 	// pins the parent and transcript check to the same statement while applying
 	// the active News/Pods generation membership fence used by public details.
-	if err := publicContentQuery(db).
+	if err := publicContentQuery(db.Model(&models.ContentItem{})).
 		Joins("JOIN transcripts ON transcripts.content_item_id = content_items.public_id").
 		Where("transcripts.public_id = ? AND content_items.transcript_id = transcripts.public_id", transcriptID).
 		Select("transcripts.*").

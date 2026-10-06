@@ -150,7 +150,7 @@ func visibleFrozenPodsPage(db *gorm.DB, tenantID string, items []PodsItem, offse
 	for _, item := range items[offset:] {
 		ids = append(ids, item.ID)
 	}
-	var visibleIDs []uuid.UUID
+	var visibleItems []models.ContentItem
 	// A frozen ordering is valid only within its captured generation. The
 	// session handler rejects a stale generation; this query also applies the
 	// active membership predicate so a head swap racing the handler cannot
@@ -159,17 +159,20 @@ func visibleFrozenPodsPage(db *gorm.DB, tenantID string, items []PodsItem, offse
 	query = feedcontract.ApplyActiveGenerationMembership(db, query, tenantID, "media", "feed_unit", "content_items.public_id")
 	_ = query.
 		Where("content_items.public_id IN ?", ids).
-		Pluck("content_items.public_id", &visibleIDs).Error
-	visible := make(map[uuid.UUID]struct{}, len(visibleIDs))
-	for _, id := range visibleIDs {
-		visible[id] = struct{}{}
+		Select("content_items.public_id, content_items.source, jsonb_build_object('enclosureType', content_items.metadata->>'enclosureType') AS metadata, content_items.rendition_set_version").
+		Find(&visibleItems).Error
+	visible := make(map[uuid.UUID]models.ContentItem, len(visibleItems))
+	for _, item := range visibleItems {
+		visible[item.PublicID] = item
 	}
 
 	page := make([]PodsItem, 0, limit)
 	index := offset
 	for ; index < len(items) && len(page) < limit; index += 1 {
-		if _, ok := visible[items[index].ID]; ok {
-			page = append(page, items[index])
+		if current, ok := visible[items[index].ID]; ok {
+			// Keep the frozen order/URLs while applying current source evidence
+			// to the legacy black-video presentation, including pre-fix sessions.
+			page = append(page, normalizeLegacyPodcastPresentation(items[index], current.Source, current.Metadata, current.RenditionSetVersion))
 		}
 	}
 	return page, index
