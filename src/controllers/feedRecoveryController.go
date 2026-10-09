@@ -6,7 +6,6 @@ import (
 	"content-management-system/src/feedcontract"
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
-	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -1806,15 +1805,15 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var req struct {
-		ReauthProof string `json:"reauth_proof"`
+		ManifestHash       string `json:"manifest_hash"`
+		ConfirmedItemCount *int   `json:"confirmed_item_count"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "execution confirmation required"})
 		return
 	}
-	// Validate the fresh password proof before claiming a run or acquiring any
-	// recovery lease. Plan approval is phrase/JWT-only; this proof is required
-	// only at the final Execute action.
+	// Validate the typed item count and frozen manifest before claiming a run
+	// or acquiring a recovery lease. Route middleware retains feed:manage.
 	var pendingRun models.FeedRecoveryRun
 	if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&pendingRun).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
@@ -1829,14 +1828,12 @@ func ExecuteFeedRecoveryRun(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed execution is disabled; no destructive recovery action was started"})
 		return
 	}
-	secret, err := utils.GetJWTSecret()
-	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "execution re-auth unavailable"})
+	if plan.Level != "repair" && plan.Level != "rotate" {
+		c.JSON(http.StatusConflict, gin.H{"error": "unsupported recovery execution level"})
 		return
 	}
-	proof, err := utils.ParseFeedRecoveryReauthProof(strings.TrimSpace(req.ReauthProof), secret)
-	if err != nil || proof.UserID != principal.UserID || proof.TenantID != principal.TenantID || proof.PlanID != plan.PublicID.String() || proof.ManifestHash != plan.ManifestHash {
-		c.JSON(http.StatusForbidden, gin.H{"error": "fresh execution confirmation does not match this plan"})
+	if req.ConfirmedItemCount == nil || *req.ConfirmedItemCount != 0 || plan.TargetCount != 0 || req.ManifestHash == "" || req.ManifestHash != plan.ManifestHash {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "execution confirmation must match this manifest and its item deletion count (0 for Repair and Rotate)"})
 		return
 	}
 	run, err := claimRecoveryRun(db, principal.TenantID, id)

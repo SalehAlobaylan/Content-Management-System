@@ -274,21 +274,7 @@ func RecordUpstreamObservationDisposition(db *gorm.DB, input MaterializeUpstream
 			}
 			var item models.ContentItem
 			query := tx.Where("tenant_id=? AND public_id=? AND content_source_id=?", unit.TenantID, contentID, unit.ContentSourceID)
-			if request.Purpose == "content_reset_replay" && tx.Migrator().HasTable(&models.ContentResetReplayReuse{}) {
-				query = query.Where(`source_run_request_id=? OR EXISTS (
-                   SELECT 1 FROM content_reset_replay_reuses reuse
-                   JOIN source_item_instances instance ON instance.tenant_id=reuse.tenant_id AND instance.content_item_id=reuse.content_item_id AND instance.instance_generation=reuse.instance_generation AND instance.upstream_fingerprint=reuse.fingerprint
-                   LEFT JOIN content_reset_reconstruction_grants grant ON grant.tenant_id=reuse.tenant_id AND grant.id=reuse.grant_id AND grant.state='consumed' AND grant.campaign_id=reuse.campaign_id AND grant.revision_id=reuse.revision_id AND grant.replacement_content_item_id=reuse.content_item_id AND grant.expected_fingerprint=reuse.fingerprint
-                   LEFT JOIN source_item_identities identity ON identity.tenant_id=instance.tenant_id AND identity.id=instance.identity_id AND identity.current_content_item_id=instance.content_item_id AND identity.current_instance_generation=instance.instance_generation
-                   WHERE reuse.tenant_id=content_items.tenant_id AND reuse.content_item_id=content_items.public_id
-                     AND reuse.observation_id=? AND reuse.source_run_request_id=? AND reuse.execution_unit_id=? AND reuse.fingerprint=?
-                     AND ((reuse.grant_id IS NOT NULL AND grant.id IS NOT NULL AND instance.campaign_id=reuse.campaign_id AND instance.state='staged')
-                       OR (reuse.grant_id IS NULL AND identity.id IS NOT NULL AND instance.state='active'
-                         AND NOT EXISTS (SELECT 1 FROM content_reset_targets target WHERE target.tenant_id=reuse.tenant_id AND target.revision_id=reuse.revision_id AND target.content_item_id=reuse.content_item_id AND target.disposition='selected' AND NOT target.protected)))
-                )`, request.ID, observation.PublicID, request.PublicID, unit.PublicID, strings.ToLower(observation.UpstreamFingerprint))
-			} else {
-				query = query.Where("source_run_request_id=?", request.ID)
-			}
+			query = query.Where("source_run_request_id=?", request.ID)
 			if err := query.First(&item).Error; err != nil {
 				return fmt.Errorf("materialized content provenance is not persisted: %w", err)
 			}

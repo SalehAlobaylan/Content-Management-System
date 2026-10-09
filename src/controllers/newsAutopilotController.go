@@ -1018,6 +1018,10 @@ func callAggregationInternalJSON(method, path string, payload interface{}) (inte
 }
 
 func callAggregationInternal(method, path string, payload interface{}) ([]byte, int, error) {
+	return callAggregationInternalWithTimeout(method, path, payload, 30*time.Second)
+}
+
+func callAggregationInternalWithTimeout(method, path string, payload interface{}, timeout time.Duration) ([]byte, int, error) {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv("AGGREGATION_BASE_URL")), "/")
 	if base == "" {
 		return nil, 0, fmt.Errorf("aggregation service URL is not configured")
@@ -1042,7 +1046,7 @@ func callAggregationInternal(method, path string, payload interface{}) ([]byte, 
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err

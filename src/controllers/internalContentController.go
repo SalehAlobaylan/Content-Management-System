@@ -644,6 +644,10 @@ func InternalCreateContentItem(c *gin.Context) {
 		return
 	}
 
+	if err := validateContentResetReplayIngest("", req); err != nil {
+		c.JSON(http.StatusGone, gin.H{"error": err.Error(), "code": "CONTENT_RESET_DISCONTINUED"})
+		return
+	}
 	idempotencyKey := normalizeIdempotencyKey(req.IdempotencyKey)
 	lineageTenantID := strings.TrimSpace(req.TenantID)
 	if lineageTenantID == "" {
@@ -671,10 +675,10 @@ func InternalCreateContentItem(c *gin.Context) {
 				return
 			}
 			sourceRunRequestID = &runRequest.ID
-			// Durable replay purpose requires a scoped reconstruction grant even
-			// when a stale worker omits its optional observation/replay context.
+			// Reject durable replay even when a stale worker omits its optional
+			// observation/replay context.
 			if err := validateContentResetReplayIngest(runRequest.Purpose, req); err != nil {
-				c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
+				c.JSON(http.StatusGone, gin.H{"error": err.Error(), "code": "CONTENT_RESET_DISCONTINUED"})
 				return
 			}
 		}
@@ -719,39 +723,10 @@ func InternalCreateContentItem(c *gin.Context) {
 			return
 		}
 	}
-	if strings.TrimSpace(req.ReconstructionGrant) != "" {
-		if identityInput == nil || req.SourceRunAttribution == nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant requires source identity and a current normalization unit", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
-			return
-		}
-		if len(identityInput.ExpectedFingerprint) != 64 {
-			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset replay fingerprint is invalid", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
-			return
-		}
-		if _, fingerprintErr := hex.DecodeString(identityInput.ExpectedFingerprint); fingerprintErr != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset replay fingerprint is invalid", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
-			return
-		}
-	}
-	var identityBinding *sourceidentity.Binding
-	if strings.TrimSpace(req.ReconstructionGrant) != "" {
-		identityBinding, identityErr = sourceidentity.ResolveReconstructionGrant(db, identityInput, req.ReconstructionGrant)
-	} else {
-		identityBinding, identityErr = sourceidentity.Resolve(db, identityInput)
-	}
+	identityBinding, identityErr := sourceidentity.Resolve(db, identityInput)
 	if identityErr != nil {
-		code := "SOURCE_OBSERVATION_INVALID"
-		message := "Source item observation is not authorized for this materialization"
-		if strings.TrimSpace(req.ReconstructionGrant) != "" {
-			code = "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"
-			message = "Content Reset reconstruction grant is invalid or outside its approved scope"
-		}
-		c.JSON(http.StatusConflict, gin.H{"error": message, "code": code})
+		c.JSON(http.StatusConflict, gin.H{"error": "Source item observation is not authorized for this materialization", "code": "SOURCE_OBSERVATION_INVALID"})
 		return
-	}
-	if identityBinding != nil && identityBinding.ReconstructionGrant != nil {
-		grant := identityBinding.ReconstructionGrant
-		idempotencyKey = fmt.Sprintf("content-reset-instance:%s:%d", identityBinding.IdentityPublicID, grant.ReplacementInstanceGeneration)
 	}
 
 	// Identity resolution is tenant-scoped. A matching provider key in another
@@ -760,26 +735,12 @@ func InternalCreateContentItem(c *gin.Context) {
 	var lookupErr error
 	if identityBinding != nil && identityBinding.HasIdentity {
 		if identityBinding.CurrentContentItemID == nil {
-			grantAllowsNewIdentity := identityBinding.ReconstructionGrant != nil &&
-				identityBinding.ReconstructionGrant.State == "issued" &&
-				identityBinding.ReconstructionGrant.GrantKind == "new_identity" &&
-				identityBinding.CurrentInstance == 0
-			if !grantAllowsNewIdentity {
-				c.JSON(http.StatusConflict, gin.H{"error": "Source item identity registry is inconsistent", "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
-				return
-			}
-			lookupErr = gorm.ErrRecordNotFound
-		} else if identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "issued" {
-			// Fresh Start must create a separate content instance. Reusing the old
-			// row would keep its retired identity and idempotency key in place.
-			lookupErr = gorm.ErrRecordNotFound
-		} else {
-			lookupErr = db.Where("tenant_id = ? AND public_id = ?", lineageTenantID, *identityBinding.CurrentContentItemID).First(&existing).Error
+			c.JSON(http.StatusConflict, gin.H{"error": "Source item identity registry is inconsistent", "code": "SOURCE_ITEM_IDENTITY_CONFLICT"})
+			return
 		}
-		if errors.Is(lookupErr, gorm.ErrRecordNotFound) && identityBinding.ReconstructionGrant == nil {
-			c.JSON(http.StatusOK, internalCreateContentItemResponse{
-				ID: identityBinding.CurrentContentItemID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true,
-			})
+		lookupErr = db.Where("tenant_id = ? AND public_id = ?", lineageTenantID, *identityBinding.CurrentContentItemID).First(&existing).Error
+		if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusOK, internalCreateContentItemResponse{ID: identityBinding.CurrentContentItemID.String(), Status: string(models.ContentStatusArchived), Created: false, Retired: true})
 			return
 		}
 		if lookupErr == nil && (existing.ContentSourceID == nil || *existing.ContentSourceID != identityBinding.Input.ContentSourceID) {
@@ -789,28 +750,9 @@ func InternalCreateContentItem(c *gin.Context) {
 	} else {
 		lookupErr = db.Where("tenant_id = ? AND idempotency_key = ?", lineageTenantID, idempotencyKey).First(&existing).Error
 	}
-	if errors.Is(lookupErr, gorm.ErrRecordNotFound) && identityBinding != nil && identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "consumed" {
-		c.JSON(http.StatusConflict, gin.H{"error": "Consumed Content Reset replacement is missing from the content store", "code": "CONTENT_RESET_REPLACEMENT_MISSING"})
-		return
-	}
+
 	if lookupErr == nil {
-		if identityBinding != nil && identityBinding.ReconstructionGrant != nil && identityBinding.ReconstructionGrant.State == "consumed" {
-			grant := identityBinding.ReconstructionGrant
-			if grant.ReplacementContentItemID == nil || existing.PublicID != *grant.ReplacementContentItemID {
-				c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant no longer points to its replacement", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
-				return
-			}
-			deliveryMode, modeErr := contentstage.DeliveryMode(db, existing.TenantID, existing.Type)
-			if modeErr != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to resolve content delivery mode"})
-				return
-			}
-			c.JSON(http.StatusOK, internalCreateContentItemResponse{
-				ID: existing.PublicID.String(), TenantID: existing.TenantID, Status: string(existing.Status),
-				Created: false, SourceRunAttributed: true, CreatedAt: existing.CreatedAt.UTC().Format(time.RFC3339), DeliveryMode: deliveryMode,
-			})
-			return
-		}
+
 		var requests []models.ContentStageRequest
 		disposition := "no_change"
 		sourceRunAttributed := false
@@ -1039,11 +981,7 @@ func InternalCreateContentItem(c *gin.Context) {
 		if err := tx.Create(&item).Error; err != nil {
 			return err
 		}
-		if identityBinding != nil && identityBinding.ReconstructionGrant != nil {
-			if err := sourceidentity.ConsumeReconstructionGrant(tx, identityInput, req.ReconstructionGrant, item.PublicID); err != nil {
-				return err
-			}
-		} else if err := sourceidentity.RegisterMaterialized(tx, identityBinding, item.PublicID); err != nil {
+		if err := sourceidentity.RegisterMaterialized(tx, identityBinding, item.PublicID); err != nil {
 			return err
 		}
 		if _, err := contentstage.EnsureManifest(tx, &item); err != nil {
@@ -1068,10 +1006,7 @@ func InternalCreateContentItem(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "Source-run content attribution is no longer current", "code": "SOURCE_RUN_ATTRIBUTION_INVALID"})
 			return
 		}
-		if errors.Is(err, sourceidentity.ErrInvalidReconstructionGrant) || errors.Is(err, sourceidentity.ErrReconstructionGrantScope) || errors.Is(err, sourceidentity.ErrReconstructionGrantUsed) {
-			c.JSON(http.StatusConflict, gin.H{"error": "Content Reset reconstruction grant is no longer current for this item", "code": "CONTENT_RESET_RECONSTRUCTION_GRANT_INVALID"})
-			return
-		}
+
 		if strings.Contains(err.Error(), "idempotency identity is already owned by another content source") {
 			c.JSON(http.StatusConflict, gin.H{"error": "Idempotency identity belongs to another content source", "code": "CONTENT_IDENTITY_SOURCE_CONFLICT"})
 			return
@@ -1109,9 +1044,8 @@ func InternalCreateContentItem(c *gin.Context) {
 }
 
 func validateContentResetReplayIngest(purpose string, req internalCreateContentItemRequest) error {
-	if purpose == "content_reset_replay" && (strings.TrimSpace(req.ReconstructionGrant) == "" ||
-		strings.TrimSpace(req.SourceObservationID) == "" || strings.TrimSpace(req.SourceUpstreamItemID) == "" || req.SourceRunAttribution == nil) {
-		return errors.New("Content Reset replay requires a reconstruction grant, observation and fenced normalization unit")
+	if purpose == "content_reset_replay" || strings.TrimSpace(req.ReconstructionGrant) != "" {
+		return errors.New("Content Reset replay and reconstruction grants are discontinued")
 	}
 	return nil
 }

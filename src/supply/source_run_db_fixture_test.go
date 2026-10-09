@@ -35,8 +35,26 @@ func openSupplyFixtureDB(t *testing.T) *gorm.DB {
 	); err != nil {
 		t.Fatalf("migrate supply fixture schema: %v", err)
 	}
+	// These canonical composite keys are SQL-owned, so AutoMigrate cannot
+	// supply the constraints used by owner idempotency and receipt admission.
+	for _, statement := range []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_request_identity ON source_run_requests (tenant_id,idempotency_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_attempt_number ON source_run_attempts (tenant_id,source_run_request_id,attempt_number)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_attempt_fence ON source_run_attempts (tenant_id,fence_token)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_unit_key ON source_run_execution_units (tenant_id,source_run_attempt_id,unit_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_unit_job ON source_run_execution_units (tenant_id,job_id)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_receipt_key ON source_run_receipts (tenant_id,producer_event_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_retained_receipt_key ON source_run_retained_receipts (tenant_id,producer_event_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_verification_key ON source_run_verification_tasks (tenant_id,task_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_reconciliation_key ON source_run_reconciliation_events (tenant_id,event_key)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS fixture_projection_key ON source_run_projection_work (tenant_id,evidence_kind,evidence_id,reducer_version)`,
+	} {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatalf("create supply fixture constraint: %v", err)
+		}
+	}
 	clearSupplyTables(t, db,
-		"source_run_projection_work", "source_run_verification_tasks", "source_run_reconciliation_events", "source_run_retained_receipts", "source_run_receipts", "source_run_execution_units", "source_run_attempts", "content_processing_events", "source_run_requests", "source_run_admission_cutovers", "source_run_admission_protocols", "media_supply_controls", "content_items", "content_sources",
+		"source_run_projection_work", "source_run_verification_tasks", "source_run_reconciliation_events", "source_run_retained_receipts", "source_run_receipts", "source_run_execution_units", "source_run_attempts", "content_processing_events", "source_run_requests", "source_run_admission_cutovers", (models.SourceRunAdmissionProtocol{}).TableName(), "media_supply_controls", "content_items", "content_sources",
 	)
 	return db
 }

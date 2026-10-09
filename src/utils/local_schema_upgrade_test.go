@@ -214,7 +214,9 @@ func Test196UnresolvedRecordsPermitQualifiedSchemaWithoutSettlingThem(t *testing
 	}
 	migrations := []LocalMigration{}
 	for version, policy := range localMigrationPolicies {
-		migrations = append(migrations, LocalMigration{version, policy.Checksum})
+		if policy.WorkScope == PreservesExpiredProcessingHistory {
+			migrations = append(migrations, LocalMigration{version, policy.Checksum})
+		}
 	}
 	for _, probe := range probes {
 		exists := probe.Subject == "content_stage_attempts" || probe.Subject == "pipeline_repair_requests"
@@ -228,6 +230,32 @@ func Test196UnresolvedRecordsPermitQualifiedSchemaWithoutSettlingThem(t *testing
 	}
 	// No UPDATE, DELETE or ledger writes are allowed by this SQL mock: attempts
 	// and receipts stay untouched by qualification of the pending schema.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResetCompatibilityRequiresReconciliationOfUnresolvedWork(t *testing.T) {
+	const version = "20261006100000_pods_reset_campaign_reference_compatibility.sql"
+	policy := localMigrationPolicies[version]
+	if policy.WorkScope != RequiresOwnerReconciliation || QualifiedLocalSchemaMigration(version, policy.Checksum) {
+		t.Fatal("reset compatibility must not inherit expired-history qualification")
+	}
+	db, mock := migrationWorkDB(t)
+	for _, probe := range append([]MigrationInflightProbe{{"lifecycle_operation_claims", ""}}, CMSMigrationInflightQueries...) {
+		exists := probe.Subject == "content_stage_attempts"
+		mock.ExpectQuery(`SELECT to_regclass`).WithArgs("public." + probe.Subject).WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(exists))
+		if exists {
+			mock.ExpectQuery(regexp.QuoteMeta(probe.Query)).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(195))
+			mock.ExpectQuery(`SELECT count\(\*\) FROM content_stage_attempts.*lease_expires_at IS NULL OR lease_expires_at > now`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+			break
+		}
+	}
+	var blocked *MigrationWorkBlockedError
+	err := CheckLocalMigrationWork(db, []LocalMigration{{version, policy.Checksum}})
+	if !errors.As(err, &blocked) || blocked.Blocker.Reason != "owner_reconciliation_required" || blocked.Blocker.Migration != version {
+		t.Fatalf("unresolved owner work was accepted: %v", err)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
 	}

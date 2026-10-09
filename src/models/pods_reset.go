@@ -68,7 +68,7 @@ type PodsResetObject struct {
 	StorageTier   string     `gorm:"type:varchar(16);not null;uniqueIndex:uq_pods_reset_object,priority:3" json:"storage_tier"`
 	Bucket        string     `gorm:"type:varchar(255);not null;uniqueIndex:uq_pods_reset_object,priority:4" json:"bucket"`
 	ObjectKey     string     `gorm:"type:text;not null;uniqueIndex:uq_pods_reset_object,priority:5" json:"object_key"`
-	ETag          string     `gorm:"type:text;not null" json:"etag"`
+	ETag          string     `gorm:"column:etag;type:text;not null" json:"etag"`
 	SizeBytes     int64      `gorm:"not null" json:"size_bytes"`
 	State         string     `gorm:"type:varchar(24);not null;index" json:"state"`
 	AttemptCount  int        `gorm:"not null;default:0" json:"attempt_count"`

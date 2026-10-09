@@ -43,7 +43,6 @@ type Binding struct {
 	Observation          models.SourceUpstreamObservation
 	CurrentInstance      int
 	CurrentContentItemID *uuid.UUID
-	ReconstructionGrant  *models.ContentResetReconstructionGrant
 	HasIdentity          bool
 }
 
@@ -105,15 +104,7 @@ func Resolve(db *gorm.DB, input *Input) (*Binding, error) {
 	binding.IdentityPublicID = identity.PublicID
 	binding.CurrentInstance = identity.CurrentInstanceGeneration
 	binding.CurrentContentItemID = identity.CurrentContentItemID
-	if identity.CurrentInstanceGeneration == 0 && identity.CurrentContentItemID == nil {
-		reserved, err := identityReserved(db, input.TenantID, identity.ID)
-		if err != nil {
-			return nil, err
-		}
-		if reserved {
-			return nil, ErrIdentityConflict
-		}
-	}
+
 	if identity.CurrentInstanceGeneration < 1 || identity.CurrentContentItemID == nil {
 		return nil, ErrIdentityCorrupt
 	}
@@ -168,13 +159,6 @@ func RegisterMaterialized(tx *gorm.DB, binding *Binding, contentItemID uuid.UUID
 	}
 	if identity.CurrentInstanceGeneration != 0 || identity.CurrentContentItemID != nil {
 		return ErrIdentityCorrupt
-	}
-	reserved, err := identityReserved(tx, binding.Input.TenantID, identity.ID)
-	if err != nil {
-		return err
-	}
-	if reserved {
-		return ErrIdentityConflict
 	}
 	instance := models.SourceItemInstance{
 		PublicID: uuid.New(), TenantID: binding.Input.TenantID, IdentityID: identity.ID,

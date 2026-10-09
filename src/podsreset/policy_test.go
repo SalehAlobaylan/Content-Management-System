@@ -70,6 +70,7 @@ func TestRelationshipPolicyRegistryIsExplicitAndUnambiguous(t *testing.T) {
 		"retention_compaction_manifests.anchor_content_ids",
 		"retention_compaction_manifests.protected_content_ids",
 		"retention_compaction_manifests.retire_content_ids",
+		"quality_history.content_item_id",
 	} {
 		table, column, ok := strings.Cut(key, ".")
 		if !ok {
@@ -155,6 +156,27 @@ func TestValidateObjectSetRequiresExactOwnedStableIdentities(t *testing.T) {
 				t.Fatal("invalid identity was accepted")
 			}
 		})
+	}
+}
+
+func TestObjectBudgetAppliesToEachItemAcrossLargeSelections(t *testing.T) {
+	for index := 0; index < 435; index++ {
+		id := uuid.New().String()
+		object := ObjectIdentity{StorageTier: "primary", Bucket: "hot", ObjectKey: "content/" + id + "/media", ETag: "etag", SizeBytes: MaxItemBytes}
+		if err := ValidateObjectSet(id, []ObjectIdentity{object}); err != nil {
+			t.Fatalf("valid item %d in a large selection rejected: %v", index, err)
+		}
+		object.SizeBytes++
+		if err := ValidateObjectSet(id, []ObjectIdentity{object}); err == nil {
+			t.Fatal("oversized item inventory accepted")
+		}
+	}
+	objects := []ObjectIdentity{
+		{StorageTier: "primary", Bucket: "hot", ObjectKey: "content/item/first", ETag: "a", SizeBytes: MaxItemBytes},
+		{StorageTier: "primary", Bucket: "hot", ObjectKey: "content/item/second", ETag: "b", SizeBytes: 1},
+	}
+	if err := ValidateObjectSet("item", objects); err == nil {
+		t.Fatal("combined item bytes exceeded their limit")
 	}
 }
 

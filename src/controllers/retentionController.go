@@ -92,11 +92,6 @@ const (
 	retentionCapabilityOwnerRuns           = "owner_runs"
 	retentionCapabilityRecoveryRotate      = "feed_recovery_rotate"
 	retentionCapabilityRecoveryPurge       = "feed_recovery_purge_reseed"
-	retentionCapabilityPodsReset           = "pods_reset"
-	// This build contains the workflow but has not passed the scoped disposable
-	// qualification gate. Flip only in a separately reviewed release after the
-	// documented test matrix and canary prerequisites are satisfied.
-	podsResetQualificationPassed = false
 )
 
 func retentionCapabilityEnabled(control models.RetentionExecutionControl, capability string) bool {
@@ -111,10 +106,8 @@ func retentionCapabilityEnabled(control models.RetentionExecutionControl, capabi
 		return control.FeedRecoveryRotateEnabled
 	case retentionCapabilityRecoveryPurge:
 		// Kept readable for old records, but the legacy combined operation has
-		// no executable path. New reset uses the explicit Pods Reset capability.
+		// no executable path. Manual reset uses its own approved manifest.
 		return false
-	case retentionCapabilityPodsReset:
-		return podsResetQualificationPassed && control.PodsResetEnabled
 	default:
 		return false
 	}
@@ -632,7 +625,6 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		OwnerRunsEnabled           *bool  `json:"owner_runs_enabled"`
 		FeedRecoveryRotateEnabled  *bool  `json:"feed_recovery_rotate_enabled"`
 		FeedRecoveryPurgeEnabled   *bool  `json:"feed_recovery_purge_enabled"`
-		PodsResetEnabled           *bool  `json:"pods_reset_enabled"`
 		Reason                     string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&patch); err != nil || len(strings.TrimSpace(patch.Reason)) < 10 {
@@ -640,11 +632,7 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		return
 	}
 	if patch.FeedRecoveryPurgeEnabled != nil && *patch.FeedRecoveryPurgeEnabled {
-		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed cannot be enabled; use the separately qualified Pods Reset control"})
-		return
-	}
-	if patch.PodsResetEnabled != nil && *patch.PodsResetEnabled && !podsResetQualificationPassed {
-		c.JSON(http.StatusConflict, gin.H{"error": "Pods Reset execution cannot be enabled until the scoped disposable qualification passes and a reviewed release marks it qualified"})
+		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed cannot be enabled; use manual Pods Reset"})
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
@@ -672,12 +660,6 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 			control.FeedRecoveryRotateEnabled = *patch.FeedRecoveryRotateEnabled
 		}
 		control.FeedRecoveryPurgeEnabled = false
-		if patch.PodsResetEnabled != nil && podsResetQualificationPassed {
-			control.PodsResetEnabled = *patch.PodsResetEnabled
-		}
-		if !podsResetQualificationPassed {
-			control.PodsResetEnabled = false
-		}
 		control.UpdatedBy = principal.Email
 		control.UpdatedAt = time.Now().UTC()
 		return tx.Model(&control).Updates(map[string]interface{}{
@@ -686,7 +668,6 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 			"owner_runs_enabled":           control.OwnerRunsEnabled,
 			"feed_recovery_rotate_enabled": control.FeedRecoveryRotateEnabled,
 			"feed_recovery_purge_enabled":  control.FeedRecoveryPurgeEnabled,
-			"pods_reset_enabled":           control.PodsResetEnabled,
 			"updated_by":                   control.UpdatedBy,
 			"updated_at":                   control.UpdatedAt,
 		}).Error

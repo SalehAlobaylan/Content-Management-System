@@ -50,14 +50,7 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	if err != nil {
 		return
 	}
-	if instance != nil && instance.State == "staged" {
-		threshold := loadTenantConfig(db, item.TenantID).StoryMatchThreshold
-		if threshold <= 0 {
-			threshold = storyMatchThresholdDefault
-		}
-		if err := db.Transaction(func(tx *gorm.DB) error { return feedstate.ClassifyStagedNews(tx, item, threshold) }); err != nil {
-			log.Print("Isolated News classification awaits valid candidate evidence")
-		}
+	if instance != nil && (instance.State == "staged" || instance.CampaignID != nil) {
 		return
 	}
 	// Unknown-space vectors are debt, never classification inputs. During a

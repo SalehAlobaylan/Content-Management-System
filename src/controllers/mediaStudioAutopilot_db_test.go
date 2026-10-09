@@ -45,11 +45,12 @@ func studioTrustAudit(t *testing.T, db *gorm.DB, tenantID, userID, email, action
 func mediaStudioTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t)
-	if err := db.AutoMigrate(&models.ContentSource{}, &models.MediaAtomizationPolicy{}, &models.ContentItem{}, &models.Chapter{}, &models.MediaCirculationOverride{}, &models.MediaStudioAutopilotPolicy{}, &models.MediaStudioRun{}, &models.MediaStudioAction{}, &models.TranscriptionConfig{}, &models.TranscriptionJob{}, &models.TranscriptQuality{}, &models.AuditLog{}); err != nil {
+	// The existing caption guard reads transcripts inside the claim transaction.
+	if err := db.AutoMigrate(&models.ContentSource{}, &models.MediaAtomizationPolicy{}, &models.ContentItem{}, &models.Transcript{}, &models.Chapter{}, &models.MediaCirculationOverride{}, &models.MediaStudioAutopilotPolicy{}, &models.MediaStudioRun{}, &models.MediaStudioAction{}, &models.TranscriptionConfig{}, &models.TranscriptionJob{}, &models.TranscriptQuality{}, &models.AuditLog{}); err != nil {
 		t.Fatalf("migrate Media Studio fixture: %v", err)
 	}
 	clear := func() {
-		for _, table := range []string{"audit_logs", "media_studio_actions", "media_studio_runs", "media_studio_autopilot_policies", "transcription_jobs", "transcript_quality", "transcription_configs", "media_circulation_overrides", "chapters", "content_items", "content_sources", "media_atomization_policies"} {
+		for _, table := range []string{"audit_logs", "media_studio_actions", "media_studio_runs", "media_studio_autopilot_policies", "transcription_jobs", "transcript_quality", "transcription_configs", "media_circulation_overrides", "chapters", "transcripts", "content_items", "content_sources", "media_atomization_policies"} {
 			_ = db.Exec("DELETE FROM " + table).Error
 		}
 	}
@@ -68,6 +69,7 @@ func studioTranscriptRepairFixture(t *testing.T, db *gorm.DB, tenantID string) (
 		t.Fatal(err)
 	}
 	config := models.DefaultTranscriptionConfig(tenantID)
+	config.AutoSttEnabled = true
 	config.AutoRepairEnabled = true
 	if err := db.Create(&config).Error; err != nil {
 		t.Fatal(err)

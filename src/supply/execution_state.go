@@ -87,12 +87,7 @@ func AuthorizeChildUnit(db *gorm.DB, input ChildUnitInput) (models.SourceRunExec
 			return fmt.Errorf("source-run manifest is not open for child authorization")
 		}
 		if request.Purpose == "content_reset_replay" {
-			if _, err := ValidateContentResetReplayRequest(tx, request); err != nil {
-				return err
-			}
-			if input.UnitType == "fetch_page" && (input.PageID != "initial" || input.UnitKey != "fetch:initial") {
-				return fmt.Errorf("replay request permits only its single initial provider page")
-			}
+			return fmt.Errorf("Content Reset replay is discontinued")
 		}
 		var attempt models.SourceRunAttempt
 		if err := tx.Where("public_id = ? AND tenant_id = ? AND source_run_request_id = ?", attemptID, input.TenantID, requestID).First(&attempt).Error; err != nil {

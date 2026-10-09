@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"content-management-system/src/feedstate"
@@ -23,12 +25,18 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 const podsResetApprovalTemplate = "RESET PODS %d %s IRREVERSIBLE"
+
+// Compatibility failures contain reviewed schema names, not database errors or credentials.
+type podsResetSchemaCompatibilityError string
+
+func (e podsResetSchemaCompatibilityError) Error() string { return string(e) }
 
 type podsResetCandidateStage struct {
 	ProcessingGeneration int64     `json:"processing_generation"`
@@ -40,6 +48,7 @@ type podsResetCandidateStage struct {
 
 type podsResetCandidate struct {
 	ContentItemID               uuid.UUID                 `json:"content_item_id"`
+	Title                       *string                   `json:"title,omitempty"`
 	Type                        models.ContentType        `json:"type"`
 	Source                      models.SourceType         `json:"source"`
 	Status                      models.ContentStatus      `json:"status"`
@@ -51,11 +60,6 @@ type podsResetCandidate struct {
 	ProcessingProvenance        string                    `json:"processing_provenance"`
 	ProvenanceNote              string                    `json:"provenance_note"`
 	StageEvidence               []podsResetCandidateStage `json:"stage_evidence"`
-}
-
-func formatPodsResetBytes(value int64) string {
-	const gib = int64(1024 * 1024 * 1024)
-	return fmt.Sprintf("%d GiB", value/gib)
 }
 
 type podsResetObjectWire struct {
@@ -137,7 +141,19 @@ func podsResetTriggerDefinitionUsable(enabled, definition, expectedFunction, exp
 	if enabled != "O" && enabled != "A" {
 		return false
 	}
-	if !strings.Contains(strings.ToUpper(definition), strings.ToUpper(expectedEvents)) {
+	eventStart := strings.Index(strings.ToUpper(definition), " BEFORE ")
+	eventEnd := strings.Index(strings.ToUpper(definition), " ON ")
+	if eventStart < 0 || eventEnd <= eventStart {
+		return false
+	}
+	actual := strings.Split(strings.TrimSpace(strings.ToUpper(definition[eventStart+8:eventEnd])), " OR ")
+	expected := strings.Split(strings.TrimPrefix(strings.ToUpper(expectedEvents), "BEFORE "), " OR ")
+	for i, event := range actual {
+		if strings.HasPrefix(event, "UPDATE OF ") && expectedFunction != "enforce_pods_reset_retirement_fence" {
+			actual[i] = "UPDATE"
+		}
+	}
+	if !podsResetSameStrings(actual, expected) {
 		return false
 	}
 	marker := "EXECUTE FUNCTION "
@@ -314,7 +330,7 @@ func podsResetSchemaFingerprint(db *gorm.DB) (string, error) {
 			continue
 		}
 		if _, ok := podsreset.RelationshipPolicyFor(column.Table, column.Column); !ok {
-			return "", fmt.Errorf("content reference %s.%s has no explicit reset disposition", column.Table, column.Column)
+			return "", podsResetSchemaCompatibilityError(fmt.Sprintf("content reference %s.%s has no explicit reset disposition", column.Table, column.Column))
 		}
 		name := podsResetFenceTriggerName(column.Table)
 		function := "enforce_pods_reset_retirement_fence"
@@ -362,11 +378,11 @@ func podsResetSchemaFingerprint(db *gorm.DB) (string, error) {
 			}
 		}
 		if !usableTrigger(column.Table, name, function, events) {
-			return "", fmt.Errorf("content reference table %s lacks an enabled retirement trigger", column.Table)
+			return "", podsResetSchemaCompatibilityError(fmt.Sprintf("content reference table %s lacks an enabled retirement trigger", column.Table))
 		}
 	}
 	if !usableTrigger("content_items", "pods_reset_content_identity_fence", "enforce_pods_reset_retirement_fence", "BEFORE INSERT OR UPDATE OR DELETE") {
-		return "", fmt.Errorf("content_items lacks an enabled permanent identity retirement trigger")
+		return "", podsResetSchemaCompatibilityError("content_items lacks an enabled permanent identity retirement trigger")
 	}
 	for _, required := range []struct{ table, name, function, events string }{
 		{"content_items", "pods_reset_transcript_link_fence", "enforce_pods_reset_transcript_link_fence", "BEFORE INSERT OR UPDATE"},
@@ -380,7 +396,7 @@ func podsResetSchemaFingerprint(db *gorm.DB) (string, error) {
 		{"feed_recovery_plan_targets", "pods_reset_feed_recovery_target_fence", "enforce_pods_reset_feed_recovery_target_fence", "BEFORE INSERT OR UPDATE"},
 	} {
 		if !usableTrigger(required.table, required.name, required.function, required.events) {
-			return "", fmt.Errorf("%s lacks an enabled %s race guard", required.table, required.function)
+			return "", podsResetSchemaCompatibilityError(fmt.Sprintf("%s lacks an enabled %s race guard", required.table, required.function))
 		}
 	}
 	var externalReferenceCount int64
@@ -394,12 +410,12 @@ func podsResetSchemaFingerprint(db *gorm.DB) (string, error) {
 		return "", fmt.Errorf("could not inspect cross-schema content references: %w", err)
 	}
 	if externalReferenceCount > 0 {
-		return "", fmt.Errorf("content identity has %d incoming reference(s) outside the fenced schema", externalReferenceCount)
+		return "", podsResetSchemaCompatibilityError(fmt.Sprintf("content identity has %d incoming reference(s) outside the fenced schema", externalReferenceCount))
 	}
 	var constraints []constraint
 	if err := db.Raw(`
 		SELECT conrelid::regclass::text AS table_name, conname AS constraint_name,
-		       pg_get_constraintdef(oid) AS definition
+		       pg_get_constraintdef(fk.oid) AS definition
 		FROM pg_constraint fk
 		JOIN pg_class local_table ON local_table.oid=fk.conrelid
 		JOIN pg_namespace local_schema ON local_schema.oid=local_table.relnamespace
@@ -619,8 +635,8 @@ func appendPodsResetBlocker(blockers *[]podsResetBlocker, code, message string) 
 }
 
 // ListPodsResetCandidates is a bounded, read-only discovery surface. It never
-// labels age or current visibility as legacy eligibility; operators must
-// explicitly select the returned UUIDs for a normal reset preview.
+// labels age or visibility as deletion eligibility. Quantity selection gathers
+// these pages and freezes exact UUIDs in the normal reset preview.
 func ListPodsResetCandidates(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -660,7 +676,7 @@ func ListPodsResetCandidates(c *gin.Context) {
 	}
 
 	query := c.MustGet("db").(*gorm.DB).Model(&models.ContentItem{}).
-		Where("tenant_id=? AND type IN ?", principal.TenantID, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast})
+		Where("tenant_id=? AND type IN ? AND retired_payload_at IS NULL", principal.TenantID, []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast})
 	if contentType := strings.ToUpper(strings.TrimSpace(c.Query("type"))); contentType != "" && contentType != "ALL" {
 		if contentType != string(models.ContentTypeVideo) && contentType != string(models.ContentTypePodcast) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "type must be VIDEO, PODCAST, or ALL"})
@@ -688,7 +704,6 @@ func ListPodsResetCandidates(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "cursor must be a UUID"})
 			return
 		}
-		query = query.Where("public_id > ?", cursor)
 	}
 	if createdAfter != nil {
 		query = query.Where("created_at >= ?", *createdAfter)
@@ -703,9 +718,17 @@ func ListPodsResetCandidates(c *gin.Context) {
 	if processingBefore != nil {
 		query = query.Where("("+latestStageTime+") IS NOT NULL AND ("+latestStageTime+") < ?", *processingBefore)
 	}
+	var totalCount int64
+	if err := query.Session(&gorm.Session{}).Count(&totalCount).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not count matching content inventory"})
+		return
+	}
+	if cursor := strings.TrimSpace(c.Query("cursor")); cursor != "" {
+		query = query.Where("public_id > ?", cursor)
+	}
 
 	var rows []models.ContentItem
-	if err := query.Select("public_id", "type", "source", "status", "content_source_id", "created_at", "updated_at", "processing_generation", "idempotency_key").Order("public_id ASC").Limit(limit + 1).Find(&rows).Error; err != nil {
+	if err := query.Select("public_id", "title", "type", "source", "status", "content_source_id", "created_at", "updated_at", "processing_generation", "idempotency_key").Order("public_id ASC").Limit(limit + 1).Find(&rows).Error; err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not read candidate content inventory"})
 		return
 	}
@@ -739,23 +762,30 @@ func ListPodsResetCandidates(c *gin.Context) {
 	for _, row := range rows {
 		identityAvailable := row.IdempotencyKey != nil && strings.TrimSpace(*row.IdempotencyKey) != ""
 		candidates = append(candidates, podsResetCandidate{
-			ContentItemID: row.PublicID, Type: row.Type, Source: row.Source, Status: row.Status,
+			ContentItemID: row.PublicID, Title: row.Title, Type: row.Type, Source: row.Source, Status: row.Status,
 			ContentSourceID: row.ContentSourceID, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 			ProcessingGeneration: row.ProcessingGeneration, RetirementIdentityAvailable: identityAvailable,
 			ProcessingProvenance: "unknown",
 			ProvenanceNote:       "CMS has no recorded Pods infrastructure-rule version for this item; timestamps and stage history do not prove legacy eligibility.",
-			StageEvidence:        stageByItem[row.PublicID],
+			StageEvidence:        append([]podsResetCandidateStage{}, stageByItem[row.PublicID]...),
 		})
 	}
 	nextCursor := ""
 	if hasMore && len(rows) > 0 {
 		nextCursor = rows[len(rows)-1].PublicID.String()
 	}
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": candidates, "has_more": hasMore, "next_cursor": nextCursor, "page_size": limit, "provenance_policy": "unknown_without_rule_version"}})
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": candidates, "total_count": totalCount, "has_more": hasMore, "next_cursor": nextCursor, "page_size": limit, "provenance_policy": "unknown_without_rule_version"}})
 }
 
 func podsResetItemBlockers(db *gorm.DB, tenant string, item models.ContentItem, selected map[uuid.UUID]bool) ([]podsResetBlocker, bool, error) {
 	blockers := []podsResetBlocker{}
+	legacyReference, err := podsResetHasCampaignReference(db, tenant, item.PublicID)
+	if err != nil {
+		return blockers, false, err
+	}
+	if legacyReference {
+		appendPodsResetBlocker(&blockers, "legacy_campaign_reference", "This item still has discontinued campaign evidence; retain the prior owner runtime and resolve it before reset.")
+	}
 	if item.Type != models.ContentTypeVideo && item.Type != models.ContentTypePodcast {
 		appendPodsResetBlocker(&blockers, "not_pods_media", "Only VIDEO and PODCAST items are in scope.")
 	}
@@ -787,6 +817,14 @@ func podsResetItemBlockers(db *gorm.DB, tenant string, item models.ContentItem, 
 	}
 	if activeStageCount > 0 {
 		appendPodsResetBlocker(&blockers, "active_content_stage", "One or more durable processing stages are not terminal.")
+	}
+	var activeStageEffects int64
+	if err := db.Table("content_stage_attempts attempt").Joins("JOIN content_stage_requests request ON request.public_id=attempt.request_id AND request.tenant_id=attempt.tenant_id").
+		Where("request.tenant_id=? AND request.content_item_id=? AND attempt.state NOT IN ('verified','failed','cancelled','superseded','deferred') AND (attempt.effect_started_at IS NOT NULL OR attempt.lease_expires_at>?)", tenant, item.PublicID, time.Now().UTC()).Count(&activeStageEffects).Error; err != nil {
+		return blockers, false, err
+	}
+	if activeStageEffects > 0 {
+		appendPodsResetBlocker(&blockers, "active_stage_effect", "A processing owner still has a live claim or unresolved provider effect. Stop and reconcile that owner before deleting its files.")
 	}
 	var activeStorageSweepCount int64
 	if err := db.Model(&models.StorageSweepRun{}).Where("tenant_id=? AND finished_at IS NULL", tenant).Count(&activeStorageSweepCount).Error; err != nil {
@@ -1150,75 +1188,38 @@ func podsResetOwnedTranscriptIDs(db *gorm.DB, item models.ContentItem) ([]uuid.U
 
 func podsResetMetadataCounts(db *gorm.DB, tenant string, item models.ContentItem) (map[string]int64, error) {
 	counts := map[string]int64{"content_items": 1}
-	count := func(table, query string, args ...interface{}) error {
-		var value int64
-		if err := db.Table(table).Where(query, args...).Count(&value).Error; err != nil {
-			return fmt.Errorf("could not inventory %s: %w", table, err)
-		}
-		counts[table] = value
-		return nil
+	// Keep the existing predicates, but send their independent counts in one read.
+	var queries []string
+	var arguments []interface{}
+	countQuery := func(name, query string, args ...interface{}) {
+		queries = append(queries, "SELECT ?::text AS name, ("+query+") AS count")
+		arguments = append(arguments, name)
+		arguments = append(arguments, args...)
 	}
-	countQuery := func(name, query string, args ...interface{}) error {
-		var value int64
-		if err := db.Raw(query, args...).Scan(&value).Error; err != nil {
-			return fmt.Errorf("could not inventory %s: %w", name, err)
-		}
-		counts[name] = value
-		return nil
+	count := func(table, query string, args ...interface{}) {
+		countQuery(table, "SELECT COUNT(*) FROM "+db.Statement.Quote(table)+" WHERE "+query, args...)
 	}
 	transcriptIDs, err := podsResetOwnedTranscriptIDs(db, item)
 	if err != nil {
 		return nil, err
 	}
-	if err := count("content_item_topics", "content_item_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("user_interactions", "content_item_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("content_flags", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("experience_events", "tenant_id=? AND content_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("enrichment_autopilot_actions", "tenant_id=? AND content_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("moderation_reports", "tenant_id=? AND target_type='content' AND target_id=? AND status='open'", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("retention_holds", "tenant_id=? AND target_type='content' AND target_id=? AND released_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_circulation_overrides", "tenant_id=? AND subject_kind IN ? AND subject_id=? AND override_type IN ? AND (expires_at IS NULL OR expires_at>NOW())", tenant, []string{"item", "family"}, item.PublicID, []string{models.MediaCirculationOverrideEditorialHold, models.MediaCirculationOverrideNeverArchive, models.MediaCirculationOverrideKeepLatestNHot}); err != nil {
-		return nil, err
-	}
-	if err := count("media_circulation_recommendations", "tenant_id=? AND unit_type='item_family' AND subject_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_supply_action_previews", "tenant_id=? AND target_type='content_item' AND target_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_supply_action_requests", "tenant_id=? AND target_type='content_item' AND target_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("news_month_archive_story_sources", "original_content_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("news_ingest_tombstones", "tenant_id=? AND original_content_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("news_month_archive_stories", "lead_content_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("feed_recovery_plan_targets", "tenant_id=? AND target_type='media_content' AND target_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := countQuery("retention_compaction_batches", "SELECT COUNT(*) FROM retention_compaction_batches WHERE tenant_id=? AND jsonb_exists(target_ids, ?)", tenant, item.PublicID.String()); err != nil {
-		return nil, err
-	}
-	if err := countQuery("retention_compaction_manifests", `
+	count("content_item_topics", "content_item_id=?", item.PublicID)
+	count("user_interactions", "content_item_id=?", item.PublicID)
+	count("content_flags", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("experience_events", "tenant_id=? AND content_id=?", tenant, item.PublicID)
+	count("enrichment_autopilot_actions", "tenant_id=? AND content_id=?", tenant, item.PublicID)
+	count("moderation_reports", "tenant_id=? AND target_type='content' AND target_id=? AND status='open'", tenant, item.PublicID)
+	count("retention_holds", "tenant_id=? AND target_type='content' AND target_id=? AND released_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())", tenant, item.PublicID)
+	count("media_circulation_overrides", "tenant_id=? AND subject_kind IN ? AND subject_id=? AND override_type IN ? AND (expires_at IS NULL OR expires_at>NOW())", tenant, []string{"item", "family"}, item.PublicID, []string{models.MediaCirculationOverrideEditorialHold, models.MediaCirculationOverrideNeverArchive, models.MediaCirculationOverrideKeepLatestNHot})
+	count("media_circulation_recommendations", "tenant_id=? AND unit_type='item_family' AND subject_id=?", tenant, item.PublicID)
+	count("media_supply_action_previews", "tenant_id=? AND target_type='content_item' AND target_id=?", tenant, item.PublicID)
+	count("media_supply_action_requests", "tenant_id=? AND target_type='content_item' AND target_id=?", tenant, item.PublicID)
+	count("news_month_archive_story_sources", "original_content_id=?", item.PublicID)
+	count("news_ingest_tombstones", "tenant_id=? AND original_content_id=?", tenant, item.PublicID)
+	count("news_month_archive_stories", "lead_content_id=?", item.PublicID)
+	count("feed_recovery_plan_targets", "tenant_id=? AND target_type='media_content' AND target_id=?", tenant, item.PublicID)
+	countQuery("retention_compaction_batches", "SELECT COUNT(*) FROM retention_compaction_batches WHERE tenant_id=? AND jsonb_exists(target_ids, ?)", tenant, item.PublicID.String())
+	countQuery("retention_compaction_manifests", `
 		SELECT COUNT(DISTINCT manifest.id)
 		FROM retention_compaction_manifests manifest
 		CROSS JOIN LATERAL jsonb_array_elements_text(
@@ -1226,100 +1227,42 @@ func podsResetMetadataCounts(db *gorm.DB, tenant string, item models.ContentItem
 			COALESCE(manifest.protected_content_ids, '[]'::jsonb) ||
 			COALESCE(manifest.retire_content_ids, '[]'::jsonb)
 		) target(value)
-		WHERE manifest.tenant_id=? AND target.value=?`, tenant, item.PublicID.String()); err != nil {
-		return nil, err
-	}
-	if err := countQuery("story_retention_holds", "SELECT COUNT(*) FROM retention_holds h JOIN content_items c ON c.story_id=h.target_id WHERE c.tenant_id=? AND c.public_id=? AND h.tenant_id=? AND h.target_type='story' AND h.released_at IS NULL AND (h.expires_at IS NULL OR h.expires_at>NOW())", tenant, item.PublicID, tenant); err != nil {
-		return nil, err
-	}
+		WHERE manifest.tenant_id=? AND target.value=?`, tenant, item.PublicID.String())
+	countQuery("story_retention_holds", "SELECT COUNT(*) FROM retention_holds h JOIN content_items c ON c.story_id=h.target_id WHERE c.tenant_id=? AND c.public_id=? AND h.tenant_id=? AND h.target_type='story' AND h.released_at IS NULL AND (h.expires_at IS NULL OR h.expires_at>NOW())", tenant, item.PublicID, tenant)
 	if len(transcriptIDs) == 0 {
 		counts["transcripts"] = 0
 		counts["chapters"] = 0
 		counts["transcript_versions"] = 0
 		counts["approved_transcript_versions"] = 0
 	} else {
-		if err := count("transcripts", "content_item_id=? OR public_id IN ?", item.PublicID, transcriptIDs); err != nil {
-			return nil, err
-		}
-		if err := count("chapters", "tenant_id=? AND transcript_id IN ?", tenant, transcriptIDs); err != nil {
-			return nil, err
-		}
-		if err := count("transcript_versions", "transcript_id IN ?", transcriptIDs); err != nil {
-			return nil, err
-		}
-		if err := countQuery("approved_transcript_versions", "SELECT COUNT(*) FROM transcript_versions WHERE transcript_id IN ? AND (approved_at IS NOT NULL OR source=?)", transcriptIDs, models.TranscriptSourceYouTubeHuman); err != nil {
-			return nil, err
-		}
+		count("transcripts", "content_item_id=? OR public_id IN ?", item.PublicID, transcriptIDs)
+		count("chapters", "tenant_id=? AND transcript_id IN ?", tenant, transcriptIDs)
+		count("transcript_versions", "transcript_id IN ?", transcriptIDs)
+		countQuery("approved_transcript_versions", "SELECT COUNT(*) FROM transcript_versions WHERE transcript_id IN ? AND (approved_at IS NOT NULL OR source=?)", transcriptIDs, models.TranscriptSourceYouTubeHuman)
 	}
-	if err := countQuery("chapters_child_references", "SELECT COUNT(*) FROM chapters ch WHERE ch.child_content_item_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_artifact_manifests", "tenant_id=? AND (content_item_id=? OR (content_item_id IS NULL AND parent_content_item_id=?))", tenant, item.PublicID, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_rendition_generations", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_hls_packages", "tenant_id=? AND rendition_generation_id IN (SELECT public_id FROM media_rendition_generations WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_hls_access_points", "tenant_id=? AND package_id IN (SELECT public_id FROM media_hls_packages WHERE tenant_id=? AND rendition_generation_id IN (SELECT public_id FROM media_rendition_generations WHERE tenant_id=? AND content_item_id=?))", tenant, tenant, tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("transcription_generations", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("transcription_batch_items", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("transcription_segment_units", "tenant_id=? AND generation_id IN (SELECT public_id FROM transcription_generations WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("atomization_generations", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_atomization_runs", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("atomization_chapter_units", "tenant_id=? AND generation_id IN (SELECT public_id FROM atomization_generations WHERE tenant_id=? AND parent_content_item_id=?)", tenant, tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("content_stage_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("content_stage_events", "tenant_id=? AND request_id IN (SELECT public_id FROM content_stage_requests WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("pipeline_repair_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("artifact_coverage_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("atomization_work_requests", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("feed_recovery_media_purge_items", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("feed_generation_membership_repairs", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("feed_generation_memberships", "member_type='feed_unit' AND member_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_intelligence_scores", "content_item_id=?", item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("transcript_quality", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("media_storage_artifact_events", "tenant_id=? AND (content_item_id=? OR parent_content_item_id=?)", tenant, item.PublicID, item.PublicID); err != nil {
-		return nil, err
-	}
-	if err := count("storage_operation_sagas", "tenant_id=? AND content_item_id=?", tenant, item.PublicID); err != nil {
-		return nil, err
-	}
+	countQuery("chapters_child_references", "SELECT COUNT(*) FROM chapters ch WHERE ch.child_content_item_id=?", item.PublicID)
+	count("media_artifact_manifests", "tenant_id=? AND (content_item_id=? OR (content_item_id IS NULL AND parent_content_item_id=?))", tenant, item.PublicID, item.PublicID)
+	count("media_rendition_generations", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("media_hls_packages", "tenant_id=? AND rendition_generation_id IN (SELECT public_id FROM media_rendition_generations WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID)
+	count("media_hls_access_points", "tenant_id=? AND package_id IN (SELECT public_id FROM media_hls_packages WHERE tenant_id=? AND rendition_generation_id IN (SELECT public_id FROM media_rendition_generations WHERE tenant_id=? AND content_item_id=?))", tenant, tenant, tenant, item.PublicID)
+	count("transcription_generations", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("transcription_batch_items", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("transcription_segment_units", "tenant_id=? AND generation_id IN (SELECT public_id FROM transcription_generations WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID)
+	count("atomization_generations", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID)
+	count("media_atomization_runs", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID)
+	count("atomization_chapter_units", "tenant_id=? AND generation_id IN (SELECT public_id FROM atomization_generations WHERE tenant_id=? AND parent_content_item_id=?)", tenant, tenant, item.PublicID)
+	count("content_stage_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("content_stage_events", "tenant_id=? AND request_id IN (SELECT public_id FROM content_stage_requests WHERE tenant_id=? AND content_item_id=?)", tenant, tenant, item.PublicID)
+	count("pipeline_repair_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("artifact_coverage_requests", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("atomization_work_requests", "tenant_id=? AND parent_content_item_id=?", tenant, item.PublicID)
+	count("feed_recovery_media_purge_items", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("feed_generation_membership_repairs", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("feed_generation_memberships", "member_type='feed_unit' AND member_id=?", item.PublicID)
+	count("media_intelligence_scores", "content_item_id=?", item.PublicID)
+	count("transcript_quality", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
+	count("media_storage_artifact_events", "tenant_id=? AND (content_item_id=? OR parent_content_item_id=?)", tenant, item.PublicID, item.PublicID)
+	count("storage_operation_sagas", "tenant_id=? AND content_item_id=?", tenant, item.PublicID)
 	for _, dependency := range []struct{ table, predicate string }{
 		{table: "redundancy_pairs", predicate: "item_a_id=? OR item_b_id=?"},
 		{table: "redundancy_families", predicate: "canonical_content_item_id=?"},
@@ -1330,9 +1273,17 @@ func podsResetMetadataCounts(db *gorm.DB, tenant string, item models.ContentItem
 		if dependency.table == "redundancy_pairs" {
 			args = append(args, item.PublicID)
 		}
-		if err := count(dependency.table, dependency.predicate, args...); err != nil {
-			return nil, err
-		}
+		count(dependency.table, dependency.predicate, args...)
+	}
+	var results []struct {
+		Name  string
+		Count int64
+	}
+	if err := db.Raw(strings.Join(queries, " UNION ALL "), arguments...).Scan(&results).Error; err != nil {
+		return nil, fmt.Errorf("could not inventory reset metadata: %w", err)
+	}
+	for _, result := range results {
+		counts[result.Name] = result.Count
 	}
 	return counts, nil
 }
@@ -1342,6 +1293,7 @@ type podsResetPlanTarget struct {
 	Snapshot            podsreset.Snapshot            `json:"snapshot"`
 	Decisions           []podsreset.DataClassDecision `json:"data_decisions"`
 	Blockers            []podsResetBlocker            `json:"blockers"`
+	OverriddenBlockers  []podsResetBlocker            `json:"overridden_blockers,omitempty"`
 	StorageTiers        []string                      `json:"storage_tiers"`
 	StorageBindings     []podsreset.StorageBinding    `json:"storage_bindings"`
 	StorageVersionModel string                        `json:"storage_version_model"`
@@ -1351,92 +1303,132 @@ type podsResetPlanTarget struct {
 
 // buildPodsResetPlanTargets materializes the exact Plan 119 preflight for an
 // explicit item set. It performs read-only inventory/provider checks and
-// returns the immutable target snapshot used by both the standalone preview
-// and a campaign-delegated retirement batch.
+// returns the immutable target snapshot used by the standalone preview.
 func buildPodsResetPlanTargets(db *gorm.DB, tenant string, ids []uuid.UUID) ([]podsResetPlanTarget, int, int64, error) {
 	selected := make(map[uuid.UUID]bool, len(ids))
 	for _, id := range ids {
 		selected[id] = true
 	}
-	targets := make([]podsResetPlanTarget, 0, len(ids))
+	// Read-only preflight concurrency is bounded independently of selection size.
+	targets := make([]podsResetPlanTarget, len(ids))
+	checks, ctx := errgroup.WithContext(db.Statement.Context)
+	checks.SetLimit(8)
+	for index, id := range ids {
+		checks.Go(func() error {
+			target, err := buildPodsResetPlanTarget(db.WithContext(ctx), tenant, id, selected)
+			if err == nil {
+				targets[index] = target
+			}
+			return err
+		})
+	}
+	if err := checks.Wait(); err != nil {
+		return nil, 0, 0, err
+	}
 	var totalBytes int64
 	var totalObjects int
-	for _, id := range ids {
-		var item models.ContentItem
-		t := podsResetPlanTarget{ID: id, Decisions: podsreset.Decisions(false), Blockers: []podsResetBlocker{}, MetadataCounts: map[string]int64{}, Objects: []podsreset.ObjectIdentity{}}
-		if err := db.Where("tenant_id=? AND public_id=?", tenant, id).First(&item).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				appendPodsResetBlocker(&t.Blockers, "item_not_found", "The explicit ID does not exist in the authenticated tenant.")
-			} else {
-				return nil, 0, 0, errors.New("could not load selected content")
-			}
-		} else {
-			t.Snapshot = podsreset.SnapshotFor(item)
-			t.MetadataCounts, err = podsResetMetadataCounts(db, tenant, item)
-			if err != nil {
-				return nil, 0, 0, errors.New("could not inventory related metadata")
-			}
-			var transcriptShared bool
-			t.Blockers, transcriptShared, err = podsResetItemBlockers(db, tenant, item, selected)
-			if err != nil {
-				return nil, 0, 0, errors.New("could not prove reset dependencies")
-			}
-			var alreadyRetired int64
-			identityHash := podsResetIdentityHash(item.TenantID, t.Snapshot.IdempotencyKey)
-			if identityHash != "" {
-				if err := db.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND identity_hash=?", item.TenantID, identityHash).Count(&alreadyRetired).Error; err != nil {
-					return nil, 0, 0, errors.New("could not inspect retirement identity")
-				}
-				if alreadyRetired > 0 {
-					appendPodsResetBlocker(&t.Blockers, "retired_identity_collision", "The source identity is permanently fenced by a prior reset.")
-				}
-			}
-			t.Decisions = podsreset.Decisions(transcriptShared)
-		}
-		if item.PublicID != uuid.Nil && (item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) {
-			payload := gin.H{"tenant_id": tenant, "content_ids": []string{id.String()}}
-			body, status, callErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", payload)
-			if callErr != nil || status < 200 || status >= 300 {
-				appendPodsResetBlocker(&t.Blockers, "storage_inventory_incomplete", "Aggregation could not prove a complete inventory for this item.")
-			} else {
-				var response podsResetInventoryResponse
-				if err := json.Unmarshal(body, &response); err != nil || !response.Data.Complete || len(response.Data.Items) != 1 || response.Data.Items[0].ContentItemID != id.String() {
-					appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "Aggregation returned an incomplete or mismatched item inventory.")
-				} else {
-					t.StorageTiers = append([]string(nil), response.Data.ConfiguredTiers...)
-					t.StorageBindings = append([]podsreset.StorageBinding(nil), response.Data.StorageBindings...)
-					t.StorageVersionModel = response.Data.VersionModel
-					if t.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" {
-						appendPodsResetBlocker(&t.Blockers, "storage_version_model_unqualified", "Storage object-version semantics are not qualified for exact deletion.")
-					}
-					if len(t.StorageTiers) == 0 || !containsString(t.StorageTiers, "primary") || (len(t.StorageTiers) > 2) || (len(t.StorageTiers) == 2 && !containsString(t.StorageTiers, "cold")) {
-						appendPodsResetBlocker(&t.Blockers, "storage_tier_inventory_invalid", "Aggregation did not provide a valid configured-tier inventory.")
-					}
-					if err := podsreset.ValidateStorageBindings(t.StorageTiers, t.StorageBindings); err != nil {
-						appendPodsResetBlocker(&t.Blockers, "storage_binding_inventory_invalid", "Aggregation did not bind every configured tier to an exact bucket and provider endpoint identity.")
-					}
-					for _, object := range response.Data.Items[0].Objects {
-						t.Objects = append(t.Objects, podsreset.ObjectIdentity{StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes})
-					}
-					if !podsResetObjectsMatchStorageBindings(response.Data.Items[0].Objects, t.StorageBindings) {
-						appendPodsResetBlocker(&t.Blockers, "storage_binding_object_mismatch", "An inventoried object is not in the frozen bucket for its configured storage tier.")
-					}
-					if err := podsreset.ValidateObjectSet(id.String(), t.Objects); err != nil {
-						appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "An object identity was duplicate, incomplete, or outside the exact content prefix.")
-						t.Objects = []podsreset.ObjectIdentity{}
-					} else if ownershipErr := podsResetArtifactOwnershipBlockers(db, tenant, id, t.Objects); ownershipErr != nil {
-						appendPodsResetBlocker(&t.Blockers, "artifact_ownership_unproven", "Artifact registry references a missing, shared, or unlisted object identity.")
-					}
-				}
-			}
-		}
-		totalObjects += len(t.Objects)
-		for _, object := range t.Objects {
+	for _, target := range targets {
+		totalObjects += len(target.Objects)
+		for _, object := range target.Objects {
 			totalBytes += object.SizeBytes
 		}
-		targets = append(targets, t)
 	}
 	return targets, totalObjects, totalBytes, nil
+}
+
+func podsResetInventoryFailureMessage(status int, err error) string {
+	// Report only reviewed diagnostics; transport errors and owner bodies may contain credentials.
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return "Aggregation is not reachable, so files could not be verified. Restore the storage owner service and create a new preview."
+	}
+	if err != nil {
+		return "CMS could not contact Aggregation or read its file inventory. Check the storage owner service and create a new preview."
+	}
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return "Aggregation rejected the service credentials for file verification. Fix the service connection and create a new preview."
+	case http.StatusNotFound:
+		return "Aggregation does not provide the required file inventory endpoint. Check the storage owner version and create a new preview."
+	default:
+		return fmt.Sprintf("Aggregation could not complete file verification (HTTP %d). Resolve the storage owner failure and create a new preview.", status)
+	}
+}
+
+func buildPodsResetPlanTarget(db *gorm.DB, tenant string, id uuid.UUID, selected map[uuid.UUID]bool) (podsResetPlanTarget, error) {
+	var item models.ContentItem
+	t := podsResetPlanTarget{ID: id, Decisions: podsreset.Decisions(false), Blockers: []podsResetBlocker{}, MetadataCounts: map[string]int64{}, Objects: []podsreset.ObjectIdentity{}}
+	if err := db.Where("tenant_id=? AND public_id=?", tenant, id).First(&item).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			appendPodsResetBlocker(&t.Blockers, "item_not_found", "The explicit ID does not exist in the authenticated tenant.")
+		} else {
+			return t, errors.New("could not load selected content")
+		}
+	} else {
+		t.Snapshot = podsreset.SnapshotFor(item)
+		t.MetadataCounts, err = podsResetMetadataCounts(db, tenant, item)
+		if err != nil {
+			return t, errors.New("could not inventory related metadata")
+		}
+		var transcriptShared bool
+		t.Blockers, transcriptShared, err = podsResetItemBlockers(db, tenant, item, selected)
+		if err != nil {
+			return t, errors.New("could not prove reset dependencies")
+		}
+		var alreadyRetired int64
+		identityHash := podsResetIdentityHash(item.TenantID, t.Snapshot.IdempotencyKey)
+		if identityHash != "" {
+			if err := db.Model(&models.PodsResetRetirement{}).Where("tenant_id=? AND identity_hash=?", item.TenantID, identityHash).Count(&alreadyRetired).Error; err != nil {
+				return t, errors.New("could not inspect retirement identity")
+			}
+			if alreadyRetired > 0 {
+				appendPodsResetBlocker(&t.Blockers, "retired_identity_collision", "The source identity is permanently fenced by a prior reset.")
+			}
+		}
+		t.Decisions = podsreset.Decisions(transcriptShared)
+	}
+	if item.PublicID != uuid.Nil && (item.Type == models.ContentTypeVideo || item.Type == models.ContentTypePodcast) {
+		payload := gin.H{"tenant_id": tenant, "content_ids": []string{id.String()}}
+		body, status, callErr := callAggregationInternal(http.MethodPost, "/internal/pods-reset/inventory", payload)
+		if callErr != nil || status < 200 || status >= 300 {
+			appendPodsResetBlocker(&t.Blockers, "storage_inventory_incomplete", podsResetInventoryFailureMessage(status, callErr))
+		} else {
+			var response podsResetInventoryResponse
+			if err := json.Unmarshal(body, &response); err != nil || !response.Data.Complete || len(response.Data.Items) != 1 || response.Data.Items[0].ContentItemID != id.String() {
+				appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "Aggregation returned an incomplete or mismatched item inventory.")
+			} else {
+				t.StorageTiers = append([]string(nil), response.Data.ConfiguredTiers...)
+				t.StorageBindings = append([]podsreset.StorageBinding(nil), response.Data.StorageBindings...)
+				t.StorageVersionModel = response.Data.VersionModel
+				if t.StorageVersionModel != "cloudflare-r2-current-key-delete-v1" {
+					appendPodsResetBlocker(&t.Blockers, "storage_version_model_unqualified", "Storage object-version semantics are not qualified for exact deletion.")
+				}
+				if len(t.StorageTiers) == 0 || !containsString(t.StorageTiers, "primary") || (len(t.StorageTiers) > 2) || (len(t.StorageTiers) == 2 && !containsString(t.StorageTiers, "cold")) {
+					appendPodsResetBlocker(&t.Blockers, "storage_tier_inventory_invalid", "Aggregation did not provide a valid configured-tier inventory.")
+				}
+				if err := podsreset.ValidateStorageBindings(t.StorageTiers, t.StorageBindings); err != nil {
+					appendPodsResetBlocker(&t.Blockers, "storage_binding_inventory_invalid", "Aggregation did not bind every configured tier to an exact bucket and provider endpoint identity.")
+				}
+				for _, object := range response.Data.Items[0].Objects {
+					t.Objects = append(t.Objects, podsreset.ObjectIdentity{StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes})
+				}
+				if !podsResetObjectsMatchStorageBindings(response.Data.Items[0].Objects, t.StorageBindings) {
+					appendPodsResetBlocker(&t.Blockers, "storage_binding_object_mismatch", "An inventoried object is not in the frozen bucket for its configured storage tier.")
+				}
+				if err := podsreset.ValidateObjectSet(id.String(), t.Objects); err != nil {
+					appendPodsResetBlocker(&t.Blockers, "storage_inventory_invalid", "An object identity was duplicate, incomplete, or outside the exact content prefix.")
+					t.Objects = []podsreset.ObjectIdentity{}
+				} else {
+					if ownershipErr := podsResetArtifactOwnershipBlockers(db, tenant, id, t.Objects); ownershipErr != nil {
+						appendPodsResetBlocker(&t.Blockers, "artifact_ownership_unproven", "Artifact registry references a missing, shared, or unlisted object identity.")
+					}
+					if err := podsResetExclusiveFileScope(db, tenant, id, t.Objects, selected); err != nil {
+						appendPodsResetBlocker(&t.Blockers, "artifact_external_reference", "Files have another artifact owner or a content reference outside this deletion plan. Include the related content or reconcile ownership before deletion.")
+					}
+				}
+			}
+		}
+	}
+	return t, nil
 }
 
 func CreatePodsResetPlan(c *gin.Context) {
@@ -1447,14 +1439,22 @@ func CreatePodsResetPlan(c *gin.Context) {
 	var request struct {
 		ContentIDs      []string `json:"content_ids"`
 		SelectionReason string   `json:"selection_reason"`
+		OverrideCodes   []string `json:"protection_override_codes"`
+		OverrideReason  string   `json:"protection_override_reason"`
 	}
-	if err := c.ShouldBindJSON(&request); err != nil || len(request.ContentIDs) == 0 || len(request.ContentIDs) > podsreset.MaxItems {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "content_ids must contain 1 to 30 explicit UUIDs"})
+	if err := c.ShouldBindJSON(&request); err != nil || len(request.ContentIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "content_ids must contain at least one explicit UUID"})
 		return
 	}
 	request.SelectionReason = strings.TrimSpace(request.SelectionReason)
 	if request.SelectionReason == "" || len(request.SelectionReason) > 500 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "selection_reason must contain 1 to 500 characters"})
+		return
+	}
+	overrides, err := podsreset.ValidateProtectionOverrides(request.OverrideCodes)
+	request.OverrideReason = strings.TrimSpace(request.OverrideReason)
+	if err != nil || len(request.OverrideReason) > 500 || (len(overrides) > 0 && request.OverrideReason == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "choose only supported fresh-start overrides and provide a reason of 1 to 500 characters; live provider effects and incomplete file verification cannot be overridden"})
 		return
 	}
 	ids := make([]uuid.UUID, 0, len(request.ContentIDs))
@@ -1469,10 +1469,17 @@ func CreatePodsResetPlan(c *gin.Context) {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
-	db := c.MustGet("db").(*gorm.DB)
+	db := c.MustGet("db").(*gorm.DB).WithContext(c.Request.Context())
 	schemaFingerprint, err := podsResetSchemaFingerprint(db)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reset schema fingerprint is unavailable"})
+		log.Printf("pods reset schema preflight failed: %v", err)
+		response := gin.H{"error": "reset schema fingerprint is unavailable", "code": "pods_reset_schema_unavailable"}
+		var compatibilityErr podsResetSchemaCompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			response["error"] = "Reset preview is blocked: " + compatibilityErr.Error() + "."
+			response["code"] = "pods_reset_schema_unqualified"
+		}
+		c.JSON(http.StatusServiceUnavailable, response)
 		return
 	}
 	environment, err := podsResetEnvironment(db)
@@ -1485,15 +1492,12 @@ func CreatePodsResetPlan(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	if totalObjects > podsreset.MaxRunObjects || totalBytes > podsreset.MaxRunBytes {
-		for index := range targets {
-			appendPodsResetBlocker(&targets[index].Blockers, "run_budget_exceeded", fmt.Sprintf("The frozen selection exceeds the bounded run budget of %d objects or %s; split it into smaller explicit previews.", podsreset.MaxRunObjects, formatPodsResetBytes(podsreset.MaxRunBytes)))
-		}
-	}
+	applyPodsResetProtectionOverrides(targets, overrides)
 	manifest := gin.H{
 		"policy_version": podsreset.PolicyVersion, "schema_fingerprint": schemaFingerprint, "tenant_id": principal.TenantID, "environment_identity": environment,
 		"relationship_dispositions": podsreset.RelationshipPolicies(),
 		"requested_ids":             ids, "selection_reason": request.SelectionReason, "targets": targets,
+		"protection_override_codes": overrides, "protection_override_reason": request.OverrideReason,
 		"counts":  gin.H{"selected_ids": len(ids), "object_count": totalObjects, "object_bytes": totalBytes},
 		"outcome": "purge_only", "rollback": "unavailable_after_retirement_fence",
 	}
@@ -1516,6 +1520,8 @@ func CreatePodsResetPlan(c *gin.Context) {
 		if err := tx.Create(&run).Error; err != nil {
 			return err
 		}
+		resetItems := make([]models.PodsResetItem, 0, len(targets))
+		resetObjects := make([]models.PodsResetObject, 0, totalObjects)
 		for ordinal, t := range targets {
 			snapshotHash := strings.Repeat("0", 64)
 			if t.Snapshot.PublicID != "" {
@@ -1530,24 +1536,25 @@ func CreatePodsResetPlan(c *gin.Context) {
 			if len(t.Blockers) > 0 {
 				state = "blocked"
 			}
-			resetItem := models.PodsResetItem{RunID: run.PublicID, TenantID: principal.TenantID, ContentItemID: t.ID, Ordinal: ordinal, SnapshotHash: snapshotHash, Decision: datatypes.JSON(decision), State: state, BlockedReasons: datatypes.JSON(blockers)}
-			if err := tx.Create(&resetItem).Error; err != nil {
-				return err
-			}
+			resetItems = append(resetItems, models.PodsResetItem{RunID: run.PublicID, TenantID: principal.TenantID, ContentItemID: t.ID, Ordinal: ordinal, SnapshotHash: snapshotHash, Decision: datatypes.JSON(decision), State: state, BlockedReasons: datatypes.JSON(blockers)})
 			for _, object := range t.Objects {
-				row := models.PodsResetObject{RunID: run.PublicID, ContentItemID: t.ID, StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes, State: "planned"}
-				if err := tx.Create(&row).Error; err != nil {
-					return err
-				}
+				resetObjects = append(resetObjects, models.PodsResetObject{RunID: run.PublicID, ContentItemID: t.ID, StorageTier: object.StorageTier, Bucket: object.Bucket, ObjectKey: object.ObjectKey, ETag: object.ETag, SizeBytes: object.SizeBytes, State: "planned"})
 			}
+		}
+		if err := tx.CreateInBatches(&resetItems, 100).Error; err != nil {
+			return err
+		}
+		if len(resetObjects) > 0 {
+			return tx.CreateInBatches(&resetObjects, 1000).Error
 		}
 		return nil
 	}); err != nil {
+		log.Printf("pods reset preview persistence failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not persist reset preview"})
 		return
 	}
 	retentionAudit(db, principal, "pods_reset.preview", run.PublicID.String(), "success", map[string]interface{}{"manifest_hash": manifestHash, "selected_count": len(ids), "object_count": totalObjects, "object_bytes": totalBytes})
-	c.JSON(http.StatusCreated, gin.H{"data": gin.H{"run": run, "items": targets, "approval_phrase": podsResetApprovalPhrase(run, len(ids)), "counts": gin.H{"selected_ids": len(ids), "object_count": totalObjects, "object_bytes": totalBytes}, "can_approve": allPodsResetTargetsUnblocked(targets)}})
+	c.JSON(http.StatusCreated, gin.H{"data": gin.H{"run": run, "items": targets, "approval_phrase": podsResetApprovalPhrase(run, len(ids)), "counts": gin.H{"selected_ids": len(ids), "object_count": totalObjects, "object_bytes": totalBytes}, "can_approve": allPodsResetTargetsUnblocked(targets), "protection_override_options": podsreset.ProtectionOverrides()}})
 }
 
 func podsResetArtifactOwnershipBlockers(db *gorm.DB, tenant string, id uuid.UUID, objects []podsreset.ObjectIdentity) error {
@@ -1560,6 +1567,7 @@ func podsResetArtifactOwnershipBlockers(db *gorm.DB, tenant string, id uuid.UUID
 		known[podsResetObjectKey(object.StorageTier, object.Bucket, object.ObjectKey)] = true
 	}
 	ownership := make([]podsreset.ArtifactOwnership, 0, len(manifests))
+	checkShared := false
 	for _, manifest := range manifests {
 		identity := podsResetObjectKey(manifest.StorageTier, manifest.Bucket, manifest.ObjectKey)
 		state := manifest.State
@@ -1589,10 +1597,18 @@ func podsResetArtifactOwnershipBlockers(db *gorm.DB, tenant string, id uuid.UUID
 		if manifest.State == "deleted" {
 			continue
 		}
+		checkShared = true
+	}
+	if checkShared {
+		// Inspect all registered identities together instead of one Neon round
+		// trip per file. Keep the same tenant, deletion and other-owner predicates.
 		var shared int64
-		query := db.Model(&models.MediaArtifactManifest{}).
-			Where("tenant_id=? AND storage_tier=? AND bucket=? AND object_key=? AND public_id<>? AND state<>'deleted' AND deleted_at IS NULL", tenant, manifest.StorageTier, manifest.Bucket, manifest.ObjectKey, manifest.PublicID)
-		if err := query.Count(&shared).Error; err != nil {
+		if err := db.Raw(`SELECT COUNT(*) FROM media_artifact_manifests other
+WHERE other.tenant_id=? AND other.state<>'deleted' AND other.deleted_at IS NULL
+AND EXISTS (SELECT 1 FROM media_artifact_manifests owned
+  WHERE owned.tenant_id=? AND (owned.content_item_id=? OR (owned.content_item_id IS NULL AND owned.parent_content_item_id=?))
+    AND owned.state<>'deleted' AND owned.public_id<>other.public_id
+    AND (owned.storage_tier,owned.bucket,owned.object_key)=(other.storage_tier,other.bucket,other.object_key))`, tenant, tenant, id, id).Scan(&shared).Error; err != nil {
 			return err
 		}
 		if shared > 0 {
@@ -1682,7 +1698,7 @@ func GetPodsResetPlan(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not verify pre-effect cancellation safety"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"run": run, "items": items, "objects": objects, "actions": actions, "can_cancel": canCancel, "rollback": "unavailable_after_retirement_fence"}})
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"run": run, "items": items, "objects": objects, "actions": actions, "can_cancel": canCancel, "rollback": "unavailable_after_retirement_fence", "protection_override_options": podsreset.ProtectionOverrides()}})
 }
 
 func ListPodsResetRuns(c *gin.Context) {
@@ -1930,6 +1946,14 @@ func ExecutePodsResetRun(c *gin.Context) {
 	if !ok {
 		return
 	}
+	var req struct {
+		ManifestHash       string `json:"manifest_hash"`
+		ConfirmedItemCount *int   `json:"confirmed_item_count"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "execution item count confirmation required"})
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
 	run, err := loadPodsResetRun(db, principal.TenantID, c.Param("id"))
 	if err != nil {
@@ -1938,6 +1962,13 @@ func ExecutePodsResetRun(c *gin.Context) {
 	}
 	if run.ContentResetCampaignID != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "campaign-delegated Pods reset runs execute through the Content Reset coordinator", "code": "CAMPAIGN_DELEGATED"})
+		return
+	}
+	var manifest struct {
+		RequestedIDs []uuid.UUID `json:"requested_ids"`
+	}
+	if json.Unmarshal(run.Manifest, &manifest) != nil || len(manifest.RequestedIDs) == 0 || req.ConfirmedItemCount == nil || *req.ConfirmedItemCount != len(manifest.RequestedIDs) || req.ManifestHash == "" || req.ManifestHash != run.ManifestHash {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "execution confirmation must match this manifest and its exact item deletion count"})
 		return
 	}
 	outcome, err := executePodsResetRunInProcess(db, principal, run)
@@ -1981,36 +2012,11 @@ func podsResetAcquireExecutionClaim(db *gorm.DB, tenant string, runID uuid.UUID)
 		if run.PauseRequested {
 			return fmt.Errorf("reset is paused; explicitly resume it before execution")
 		}
-		// The delegating campaign is the authority for a delegated run. Its
-		// execution row is locked in the same transaction as the executor
-		// claim so a pause or terminal transition committed before admission
-		// cannot be overtaken by the pass.
 		if run.ContentResetCampaignID != nil {
-			var campaign models.ContentResetCampaign
-			if err := tx.Where("tenant_id=? AND id=?", tenant, *run.ContentResetCampaignID).First(&campaign).Error; err != nil {
-				return fmt.Errorf("delegating Content Reset campaign is unavailable")
-			}
-			switch campaign.State {
-			case "executing", "published", "cleanup_pending", "partial":
-			default:
-				return fmt.Errorf("delegating Content Reset campaign is not active")
-			}
-			var execution models.ContentResetExecution
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND campaign_id=?", tenant, campaign.ID).First(&execution).Error; err != nil {
-				return fmt.Errorf("delegating Content Reset campaign has no durable execution")
-			}
-			if execution.PauseRequested {
-				return fmt.Errorf("delegating Content Reset campaign is paused")
-			}
-			if execution.CompletedAt != nil || execution.RolledBackAt != nil {
-				return fmt.Errorf("delegating Content Reset campaign is terminal")
-			}
+			return fmt.Errorf("campaign-delegated Pods reset is discontinued")
 		}
 		if run.State != "approved" && run.State != "executing" && run.State != "partial" {
 			return fmt.Errorf("run is not approved or resumable")
-		}
-		if run.State == "approved" && run.ContentResetCampaignID == nil && now.After(run.ExpiresAt) {
-			return fmt.Errorf("approval expired; create a fresh preview")
 		}
 		var targets []models.PodsResetItem
 		if err := tx.Where("tenant_id = ? AND run_id = ?", tenant, run.PublicID).
@@ -2166,11 +2172,8 @@ func podsResetFenceItem(db *gorm.DB, run models.PodsResetRun, resetItem *models.
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND state='executing' AND execution_token=? AND fencing_token=? AND execution_lease_until>?", run.TenantID, run.PublicID, run.ExecutionToken, run.FencingToken, time.Now().UTC()).First(&activeRun).Error; err != nil {
 			return fmt.Errorf("reset executor fence is no longer active: %w", err)
 		}
-		// A delegated run's admission fence includes the live parent campaign
-		// pause/authority, checked under the campaign execution row lock so a
-		// pause acknowledged before this effect cannot be overtaken.
-		if err := delegatedPodsCampaignAdmissionLocked(tx, run); err != nil {
-			return err
+		if run.ContentResetCampaignID != nil {
+			return fmt.Errorf("campaign-delegated Pods reset is discontinued")
 		}
 		if err := podsResetSetWriteFence(tx, run); err != nil {
 			return err
@@ -2194,6 +2197,10 @@ func podsResetFenceItem(db *gorm.DB, run models.PodsResetRun, resetItem *models.
 		if checkErr != nil {
 			return checkErr
 		}
+		blockers, checkErr = podsResetRevalidateProtectionOverrides(run, locked.PublicID, blockers)
+		if checkErr != nil {
+			return checkErr
+		}
 		if len(blockers) > 0 {
 			return fmt.Errorf("dependencies changed before retirement fence: %s", blockers[0].Code)
 		}
@@ -2201,7 +2208,7 @@ func podsResetFenceItem(db *gorm.DB, run models.PodsResetRun, resetItem *models.
 		if approvedTarget == nil {
 			return fmt.Errorf("approved target storage ownership is missing")
 		}
-		if err := podsResetArtifactOwnershipBlockers(tx, locked.TenantID, locked.PublicID, approvedTarget.Objects); err != nil {
+		if err := podsResetRevalidateArtifactOwnership(tx, run, locked.PublicID, approvedTarget.Objects); err != nil {
 			return fmt.Errorf("artifact ownership changed before retirement fence: %w", err)
 		}
 		var current models.PodsResetItem
@@ -2219,6 +2226,9 @@ func podsResetFenceItem(db *gorm.DB, run models.PodsResetRun, resetItem *models.
 			return err
 		} else if retirement.RunPublicID != run.PublicID || retirement.FencingToken != *run.FencingToken || retirement.ManifestHash != run.ManifestHash || retirement.IdentityHash != identityHash {
 			return fmt.Errorf("content identity has a different retirement fence")
+		}
+		if err := podsResetDiscardApprovedWork(tx, run, locked.PublicID); err != nil {
+			return fmt.Errorf("could not discard the approved selected work: %w", err)
 		}
 		locked.Status = models.ContentStatusArchived
 		locked.FeedVisibility = "hidden"
@@ -2254,19 +2264,22 @@ func podsResetFinalizeItem(db *gorm.DB, run models.PodsResetRun, resetItem *mode
 		return fmt.Errorf("two distinct origin-absence probes are required before database finalization")
 	}
 	var approvedManifest struct {
-		Targets []struct {
-			ID             uuid.UUID                     `json:"content_item_id"`
-			Decisions      []podsreset.DataClassDecision `json:"data_decisions"`
-			MetadataCounts map[string]int64              `json:"metadata_counts"`
+		OverrideReason string `json:"protection_override_reason"`
+		Targets        []struct {
+			ID                 uuid.UUID                     `json:"content_item_id"`
+			Decisions          []podsreset.DataClassDecision `json:"data_decisions"`
+			MetadataCounts     map[string]int64              `json:"metadata_counts"`
+			OverriddenBlockers []podsResetBlocker            `json:"overridden_blockers"`
 		} `json:"targets"`
 	}
 	if err := json.Unmarshal(run.Manifest, &approvedManifest); err != nil {
 		return fmt.Errorf("approved metadata decision manifest is invalid: %w", err)
 	}
 	var approvedTarget *struct {
-		ID             uuid.UUID                     `json:"content_item_id"`
-		Decisions      []podsreset.DataClassDecision `json:"data_decisions"`
-		MetadataCounts map[string]int64              `json:"metadata_counts"`
+		ID                 uuid.UUID                     `json:"content_item_id"`
+		Decisions          []podsreset.DataClassDecision `json:"data_decisions"`
+		MetadataCounts     map[string]int64              `json:"metadata_counts"`
+		OverriddenBlockers []podsResetBlocker            `json:"overridden_blockers"`
 	}
 	for index := range approvedManifest.Targets {
 		if approvedManifest.Targets[index].ID == resetItem.ContentItemID {
@@ -2332,8 +2345,7 @@ func podsResetFinalizeItem(db *gorm.DB, run models.PodsResetRun, resetItem *mode
 			"title": nil, "body_text": nil, "excerpt": nil, "content_language": nil,
 			"original_url": nil, "source_feed_url": nil, "author": nil, "source_name": nil, "duration_sec": nil, "topic_tags": "{}", "story_id": nil,
 			"embedding": nil, "embedding_model": nil, "embedding_space_id": nil, "embedding_producer_id": nil,
-			"embedding_sparse": nil,
-			"image_embedding":  nil, "image_embedding_model": nil, "image_embedding_space_id": nil, "image_embedding_producer_id": nil,
+			"image_embedding": nil, "image_embedding_model": nil, "image_embedding_space_id": nil, "image_embedding_producer_id": nil,
 			"metadata": nil, "transcript_id": nil, "caption_state": nil, "transcript_source": nil,
 			"chapter_index": nil, "chapter_start_ms": nil, "chapter_end_ms": nil, "chapter_confidence": nil,
 			"chaptering_status": nil, "duration_bucket": nil, "source_episode_id": nil,
@@ -2344,6 +2356,11 @@ func podsResetFinalizeItem(db *gorm.DB, run models.PodsResetRun, resetItem *mode
 			"retired_payload_at": now, "file_size_bytes": 0, "storage_deleted_at": now,
 			"storage_state": models.StorageStateUnrecoverable, "storage_state_reason": "Pods reset removed origin objects; no independent restore copy is represented by this run",
 			"storage_recovery_status": models.StorageRecoveryUnrecoverable,
+		}
+		// Fresh canonical databases omit this retired BGE-era column. Clear its
+		// payload only on older installations that still retain it.
+		if tx.Migrator().HasColumn(&models.ContentItem{}, "embedding_sparse") {
+			updates["embedding_sparse"] = nil
 		}
 		// Keep stable identity, type/source, lineage, and processing ledgers; clear item-owned content and derived vectors.
 		contentResult := tx.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=?", run.TenantID, item.PublicID).Updates(updates)
@@ -2465,6 +2482,8 @@ func podsResetFinalizeItem(db *gorm.DB, run models.PodsResetRun, resetItem *mode
 			"metadata_counts_before": approvedTarget.MetadataCounts, "metadata_decisions": approvedTarget.Decisions,
 			"metadata_effects":             metadataEffects,
 			"shared_transcripts_preserved": len(sharedTranscriptIDs),
+			"protection_overrides":         approvedTarget.OverriddenBlockers,
+			"protection_override_reason":   approvedManifest.OverrideReason,
 			"rollback":                     "unavailable", "manifest_hash": run.ManifestHash,
 		})
 		if err != nil {
@@ -2583,6 +2602,14 @@ func InternalAuthorizePodsResetObjectDeletion(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "reset item is not fenced"})
 		return
 	}
+	if ready, err := podsResetSelectionFenced(db, run); err != nil || !ready {
+		c.JSON(http.StatusConflict, gin.H{"error": "every selected content identity must be fenced before deleting shared family files"})
+		return
+	}
+	if err := podsResetRevalidateArtifactOwnership(db, run, itemID, approvedObjects); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "file references changed after approval; deletion is blocked"})
+		return
+	}
 	var stored []models.PodsResetObject
 	if err := db.Where("run_id=? AND content_item_id=?", runID, itemID).Order("storage_tier,bucket,object_key").Find(&stored).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not validate frozen object set"})
@@ -2605,4 +2632,21 @@ func InternalAuthorizePodsResetObjectDeletion(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"authorized": true}})
+}
+
+// Exact installed references keep unknown old work blocked. No prefix exemption.
+func podsResetHasCampaignReference(db *gorm.DB, tenant string, itemID uuid.UUID) (bool, error) {
+	for _, table := range []string{"content_reset_targets", "content_reset_replay_reuses"} {
+		if !db.Migrator().HasTable(table) {
+			continue
+		}
+		var count int64
+		if err := db.Table(table).Where("tenant_id=? AND content_item_id=?", tenant, itemID).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }

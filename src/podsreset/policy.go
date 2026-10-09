@@ -13,11 +13,9 @@ import (
 )
 
 const (
-	PolicyVersion             = 2
-	MaxItems                  = 30
+	PolicyVersion             = 6
 	MaxObjects                = 1000
-	MaxRunObjects             = 1000
-	MaxRunBytes               = int64(25 * 1024 * 1024 * 1024)
+	MaxItemBytes              = int64(25 * 1024 * 1024 * 1024)
 	MaxBatchItems             = 3
 	PlanTTL                   = 30 * time.Minute
 	VerificationProbeInterval = time.Minute
@@ -219,6 +217,7 @@ func ValidateObjectSet(contentID string, objects []ObjectIdentity) error {
 		return fmt.Errorf("object_count_exceeds_limit")
 	}
 	seen := make(map[string]struct{}, len(objects))
+	var totalBytes int64
 	for _, object := range objects {
 		if object.StorageTier != "primary" && object.StorageTier != "cold" {
 			return fmt.Errorf("unknown_storage_tier")
@@ -226,6 +225,10 @@ func ValidateObjectSet(contentID string, objects []ObjectIdentity) error {
 		if strings.TrimSpace(object.Bucket) == "" || strings.TrimSpace(object.ETag) == "" || object.SizeBytes < 0 {
 			return fmt.Errorf("incomplete_object_identity")
 		}
+		if object.SizeBytes > MaxItemBytes-totalBytes {
+			return fmt.Errorf("item_bytes_exceed_limit")
+		}
+		totalBytes += object.SizeBytes
 		prefix := "content/" + contentID + "/"
 		if !strings.HasPrefix(object.ObjectKey, prefix) || len(object.ObjectKey) == len(prefix) {
 			return fmt.Errorf("object_outside_content_prefix")

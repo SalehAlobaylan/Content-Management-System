@@ -78,11 +78,7 @@ func AttachReadyNewsStory(tx *gorm.DB, item models.ContentItem) error {
 				return err
 			}
 		}
-		if generation.Purpose == "content_reset" {
-			if err := RebuildNewsStoryProjection(tx, item.TenantID, generation.PublicID, *item.StoryID); err != nil {
-				return err
-			}
-		}
+
 	}
 	return nil
 }
@@ -118,26 +114,9 @@ func ReconcileNewsMembership(db *gorm.DB, tenant string) (int64, error) {
 			query := tx.Model(&models.ContentItem{}).Select("public_id,story_id").Where("tenant_id=? AND type='NEWS' AND status='READY' AND story_id IS NOT NULL", tenant).
 				Where("COALESCE(news_retention_state,'full')='full' OR news_feed_role IN ('lead','representative')")
 			if registered {
-				query = query.Where(`NOT EXISTS (
-      SELECT 1 FROM source_item_instances instance LEFT JOIN content_reset_campaigns campaign
-        ON campaign.tenant_id=instance.tenant_id AND campaign.id=instance.campaign_id
-      WHERE instance.tenant_id=content_items.tenant_id AND instance.content_item_id=content_items.public_id
-        AND (instance.state IN ('staged','retired') OR (instance.campaign_id IS NOT NULL AND NOT (
-          (?='content_reset' AND instance.campaign_id=?) OR campaign.state IN ('published','cleanup_pending','complete')
-        )))
-    )`, generation.Purpose, generation.ContentResetCampaignID)
-			}
-			if generation.Purpose == "content_reset" {
-				if generation.ContentResetCampaignID == nil {
-					return errors.New("reset generation has no campaign")
-				}
-				query = query.Where(`NOT EXISTS (
-      SELECT 1 FROM content_reset_targets target
-      JOIN content_reset_revisions revision ON revision.tenant_id=target.tenant_id AND revision.id=target.revision_id
-      JOIN content_reset_campaigns campaign ON campaign.tenant_id=revision.tenant_id AND campaign.id=revision.campaign_id AND campaign.current_revision=revision.revision
-      WHERE campaign.tenant_id=content_items.tenant_id AND campaign.id=?
-        AND target.content_item_id=content_items.public_id AND target.disposition='selected' AND NOT target.protected
-    )`, *generation.ContentResetCampaignID)
+				query = query.Where(`NOT EXISTS (SELECT 1 FROM source_item_instances instance
+     WHERE instance.tenant_id=content_items.tenant_id AND instance.content_item_id=content_items.public_id
+       AND (instance.state IN ('staged','retired') OR instance.campaign_id IS NOT NULL))`)
 			}
 			result := tx.Exec(`INSERT INTO feed_generation_memberships (generation_id,member_type,member_id,attached_at)
      SELECT DISTINCT ?, 'story', story_id, NOW() FROM (?) AS candidates ON CONFLICT DO NOTHING`, generation.PublicID, query)
@@ -261,51 +240,17 @@ func generationAcceptsMediaItem(tx *gorm.DB, generation models.FeedGeneration, i
 }
 
 func generationAcceptsCampaignInstance(tx *gorm.DB, generation models.FeedGeneration, itemID uuid.UUID) (bool, error) {
-	if !tx.Migrator().HasTable(&models.SourceItemInstance{}) {
-		return generation.Purpose != "content_reset", nil
+	if generation.Purpose == "content_reset" || generation.ContentResetCampaignID != nil {
+		return false, nil
 	}
 	instance, err := CampaignInstanceForItem(tx, generation.TenantID, itemID)
 	if err != nil {
 		return false, err
 	}
-	if instance == nil || instance.CampaignID == nil {
-		if generation.Purpose == "content_reset" {
-			return generationAllowsUnreplacedMediaItem(tx, generation, itemID)
-		}
+	if instance == nil {
 		return true, nil
 	}
-	// Children inherit the parent's staging boundary. An atomized chapter has
-	// no provider identity of its own, so a closed-partial campaign still keeps
-	// its promoted children serving until an owner explicitly retires them.
-	if instance.State == "staged" {
-		return generation.State == "candidate" && generation.Purpose == "content_reset" &&
-			generation.ContentResetCampaignID != nil && *generation.ContentResetCampaignID == *instance.CampaignID, nil
-	}
-	if instance.ContentItemID == itemID && instance.State == "retired" {
-		return false, nil
-	}
-	var campaign models.ContentResetCampaign
-	if err := tx.Where("tenant_id = ? AND id = ?", generation.TenantID, *instance.CampaignID).First(&campaign).Error; err != nil {
-		return false, err
-	}
-	if generation.ContentResetCampaignID == nil || *generation.ContentResetCampaignID != *instance.CampaignID {
-		// A closed-partial campaign keeps its promoted replacements serving;
-		// residual cleanup obligations are reported separately and never
-		// silently withdraw published content.
-		if campaign.State != "published" && campaign.State != "cleanup_pending" && campaign.State != "complete" && campaign.State != "closed_partial" {
-			return false, nil
-		}
-	}
-	if generation.Purpose == "content_reset" {
-		if generation.ContentResetCampaignID != nil && *generation.ContentResetCampaignID == *instance.CampaignID {
-			return true, nil
-		}
-		return generationAllowsUnreplacedMediaItem(tx, generation, itemID)
-	}
-	if (generation.State != "active" && generation.State != "candidate") || !tx.Migrator().HasTable(&models.ContentResetCampaign{}) {
-		return false, nil
-	}
-	return campaign.State == "published" || campaign.State == "cleanup_pending" || campaign.State == "complete", nil
+	return instance.CampaignID == nil && instance.State != "staged" && !(instance.ContentItemID == itemID && instance.State == "retired"), nil
 }
 
 // CampaignInstanceForItem includes canonical media children in their parent's
@@ -333,28 +278,6 @@ func CampaignInstanceForItem(db *gorm.DB, tenant string, itemID uuid.UUID) (*mod
 		return nil, err
 	}
 	return &instance, nil
-}
-
-func generationAllowsUnreplacedMediaItem(tx *gorm.DB, generation models.FeedGeneration, itemID uuid.UUID) (bool, error) {
-	if generation.Purpose != "content_reset" || generation.ContentResetCampaignID == nil {
-		return false, nil
-	}
-	var campaign models.ContentResetCampaign
-	if err := tx.Where("tenant_id = ? AND id = ?", generation.TenantID, *generation.ContentResetCampaignID).First(&campaign).Error; err != nil {
-		return false, err
-	}
-	var revision models.ContentResetRevision
-	if err := tx.Where("tenant_id = ? AND campaign_id = ? AND revision = ?", campaign.TenantID, campaign.ID, campaign.CurrentRevision).First(&revision).Error; err != nil {
-		return false, err
-	}
-	var count int64
-	if err := tx.Model(&models.ContentResetTarget{}).Where(
-		"tenant_id = ? AND revision_id = ? AND content_item_id = ? AND disposition = ? AND protected = FALSE",
-		campaign.TenantID, revision.ID, itemID, "selected",
-	).Count(&count).Error; err != nil {
-		return false, err
-	}
-	return count == 0, nil
 }
 
 func lifecycleSourceID(id *uuid.UUID) string {

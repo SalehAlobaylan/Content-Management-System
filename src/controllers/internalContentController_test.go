@@ -77,9 +77,9 @@ func TestNormalizeContentLanguageAcceptsOnlyVerifiedDeliveryLanguages(t *testing
 	}
 }
 
-func TestContentResetReplayIngestCannotOmitGrantOrObservation(t *testing.T) {
+func TestContentResetReplayIngestIsDiscontinued(t *testing.T) {
 	fixture := internalCreateContentItemRequest{ReconstructionGrant: "opaque", SourceObservationID: uuid.NewString(), SourceUpstreamItemID: "item", SourceRunAttribution: &internalSourceRunAttribution{}}
-	if err := validateContentResetReplayIngest("content_reset_replay", fixture); err != nil {
+	if err := validateContentResetReplayIngest("content_reset_replay", fixture); err == nil {
 		t.Fatal(err)
 	}
 	for _, field := range []string{"grant", "observation", "identity", "unit"} {
@@ -102,6 +102,26 @@ func TestContentResetReplayIngestCannotOmitGrantOrObservation(t *testing.T) {
 	}
 	if err := validateContentResetReplayIngest("baseline", internalCreateContentItemRequest{}); err != nil {
 		t.Fatal("ordinary ingestion now requires reset authority")
+	}
+}
+
+func TestContentResetGrantIngestRejectedBeforeDatabaseAccess(t *testing.T) {
+	db, mock := newMockGorm(t)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Set("db", db)
+	c.Request = httptest.NewRequest(http.MethodPost, "/internal/content-items", bytes.NewBufferString(`{
+  "idempotency_key":"old-replay", "type":"VIDEO", "source":"YOUTUBE", "status":"PENDING",
+  "title":"legacy", "original_url":"https://example.test/legacy", "source_name":"test",
+  "content_reset_reconstruction_grant":"old-authority"
+}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	InternalCreateContentItem(c)
+	if w.Code != http.StatusGone {
+		t.Fatalf("grant payload reached ordinary ingest: %d %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 

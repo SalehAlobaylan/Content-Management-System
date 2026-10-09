@@ -1,8 +1,14 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -11,6 +17,77 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 )
+
+func TestPodsResetDeletionFailureDiagnostics(t *testing.T) {
+	for _, test := range []struct {
+		name, body, expected string
+		status               int
+		err                  error
+	}{
+		{"authorization unavailable", `{"code":"pods_reset_cms_authorization_failed","cms_status":503,"message":"private secret"}`, "CMS reset authorization (HTTP 503); file deletion was not started", 409, nil},
+		{"retired content unavailable", `{"code":"pods_reset_cms_retirement_read_failed"}`, "could not read the retired content", 409, nil},
+		{"storage failed", `{"code":"pods_reset_storage_deletion_failed"}`, "storage deletion or file-absence verification failed", 409, nil},
+		{"older owner", `{"message":"private secret"}`, "HTTP 409", 409, nil},
+		{"timeout", "", "timed out; the result is unknown", 0, &url.Error{Op: "Post", URL: "https://private:secret@example.test", Err: context.DeadlineExceeded}},
+		{"offline", "", "could not contact Aggregation", 0, errors.New("private secret")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := podsResetDeletionFailureMessage(test.status, []byte(test.body), test.err)
+			if !strings.Contains(message, test.expected) || strings.Contains(message, "private") || strings.Contains(message, "secret") {
+				t.Fatalf("incorrect or unredacted reset failure: %q", message)
+			}
+		})
+	}
+}
+
+func TestPodsResetDeletionTransportWaitsForOwnerWithinItsDeadline(t *testing.T) {
+	owner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/pods-reset/delete-media-item" || r.Header.Get("Authorization") != "Bearer test-only" {
+			t.Error("reset owner request lost its route or service authentication")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case <-time.After(80 * time.Millisecond):
+			w.Write([]byte(`{"data":{"objectsAbsent":true}}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer owner.Close()
+	t.Setenv("AGGREGATION_BASE_URL", owner.URL)
+	t.Setenv("AGGREGATION_CMS_SERVICE_TOKEN", "test-only")
+	if _, _, err := callAggregationInternalWithTimeout(http.MethodPost, "/internal/pods-reset/delete-media-item", map[string]string{"run_id": "fixture"}, 20*time.Millisecond); err == nil {
+		t.Fatal("transport ignored its bounded deadline")
+	}
+	if body, status, err := callAggregationInternalWithTimeout(http.MethodPost, "/internal/pods-reset/delete-media-item", map[string]string{"run_id": "fixture"}, 300*time.Millisecond); err != nil || status != http.StatusOK || !strings.Contains(string(body), `"objectsAbsent":true`) {
+		t.Fatalf("slow owner result was discarded before its deadline: status=%d error=%v", status, err)
+	}
+}
+
+func TestPodsResetInventoryFailureDiagnostics(t *testing.T) {
+	for _, test := range []struct {
+		name, expected string
+		status         int
+		err            error
+	}{
+		{"owner offline", "Aggregation is not reachable", 0, &url.Error{Op: "Post", URL: "https://private:secret@example.test", Err: syscall.ECONNREFUSED}},
+		{"transport failure", "CMS could not contact Aggregation", 0, errors.New("private secret")},
+		{"unauthorized", "rejected the service credentials", 401, nil},
+		{"forbidden", "rejected the service credentials", 403, nil},
+		{"missing endpoint", "required file inventory endpoint", 404, nil},
+		{"owner failure", "HTTP 503", 503, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := podsResetInventoryFailureMessage(test.status, test.err)
+			if !strings.Contains(message, test.expected) || !strings.Contains(message, "create a new preview") {
+				t.Fatalf("missing actionable diagnostic: %q", message)
+			}
+			if strings.Contains(message, "private") || strings.Contains(message, "secret") {
+				t.Fatalf("transport details exposed: %q", message)
+			}
+		})
+	}
+}
 
 func TestPodsResetInventoryDriftFailsClosedButAllowsPreviouslyAbsentKeys(t *testing.T) {
 	expected := []podsreset.ObjectIdentity{
@@ -117,6 +194,14 @@ func TestPodsResetSchemaFingerprintRequiresCorrectActiveFenceTriggers(t *testing
 	valid := `CREATE TRIGGER reset_guard BEFORE INSERT OR UPDATE ON content_flags FOR EACH ROW EXECUTE FUNCTION public.enforce_pods_reset_retirement_fence('content_item_id')`
 	if !podsResetTriggerDefinitionUsable("O", valid, "enforce_pods_reset_retirement_fence", "BEFORE INSERT OR UPDATE") {
 		t.Fatal("correct origin-mode write fence should count as enabled")
+	}
+	ordered := `CREATE TRIGGER reset_guard BEFORE INSERT OR DELETE OR UPDATE ON content_items FOR EACH ROW EXECUTE FUNCTION enforce_pods_reset_retirement_fence()`
+	if !podsResetTriggerDefinitionUsable("O", ordered, "enforce_pods_reset_retirement_fence", "BEFORE INSERT OR UPDATE OR DELETE") {
+		t.Fatal("PostgreSQL event ordering rejected")
+	}
+	narrow := `CREATE TRIGGER reset_guard BEFORE INSERT OR UPDATE OF title ON content_items FOR EACH ROW EXECUTE FUNCTION enforce_pods_reset_retirement_fence()`
+	if podsResetTriggerDefinitionUsable("O", narrow, "enforce_pods_reset_retirement_fence", "BEFORE INSERT OR UPDATE") {
+		t.Fatal("column-limited generic producer fence accepted")
 	}
 	for name, tc := range map[string]struct {
 		enabled    string

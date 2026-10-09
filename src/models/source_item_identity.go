@@ -41,38 +41,3 @@ type SourceItemInstance struct {
 }
 
 func (SourceItemInstance) TableName() string { return "source_item_instances" }
-
-// ContentResetReconstructionGrant authorizes one exact replacement instance.
-// Only a hash of the one-time opaque grant is persisted.
-type ContentResetReconstructionGrant struct {
-	ID                            uint       `gorm:"primaryKey" json:"-"`
-	PublicID                      uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID                      string     `gorm:"type:varchar(64);not null" json:"tenant_id"`
-	CampaignID                    uint       `gorm:"not null" json:"-"`
-	RevisionID                    uint       `gorm:"not null" json:"-"`
-	IdentityID                    uint       `gorm:"not null" json:"-"`
-	GrantKind                     string     `gorm:"type:varchar(24);not null" json:"grant_kind"`
-	TargetContentItemID           *uuid.UUID `gorm:"type:uuid" json:"target_content_item_id,omitempty"`
-	SourceRunRequestID            uuid.UUID  `gorm:"type:uuid;not null" json:"-"`
-	SourceRunAttemptID            uuid.UUID  `gorm:"type:uuid;not null" json:"-"`
-	ExecutionUnitID               uuid.UUID  `gorm:"type:uuid;not null" json:"-"`
-	ExecutionFenceToken           uuid.UUID  `gorm:"type:uuid;not null" json:"-"`
-	PageID                        string     `gorm:"type:varchar(128);not null" json:"-"`
-	BatchID                       string     `gorm:"type:varchar(128);not null" json:"-"`
-	SourceObservationID           uuid.UUID  `gorm:"type:uuid;not null" json:"source_observation_id"`
-	ReplacementInstanceGeneration int        `gorm:"not null" json:"replacement_instance_generation"`
-	BaseInstanceGeneration        int        `gorm:"not null" json:"base_instance_generation"`
-	ExpectedFingerprint           string     `gorm:"type:char(64);not null" json:"expected_fingerprint"`
-	ProviderVersion               string     `gorm:"type:varchar(64);not null" json:"provider_version"`
-	GrantTokenHash                string     `gorm:"type:char(64);not null" json:"-"`
-	State                         string     `gorm:"type:varchar(16);not null" json:"state"`
-	ExpiresAt                     time.Time  `json:"expires_at"`
-	ConsumedAt                    *time.Time `json:"consumed_at,omitempty"`
-	ReplacementContentItemID      *uuid.UUID `gorm:"type:uuid" json:"replacement_content_item_id,omitempty"`
-	CreatedBy                     string     `gorm:"type:varchar(255);not null" json:"created_by"`
-	CreatedAt                     time.Time  `json:"created_at"`
-}
-
-func (ContentResetReconstructionGrant) TableName() string {
-	return "content_reset_reconstruction_grants"
-}

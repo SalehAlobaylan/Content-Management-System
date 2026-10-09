@@ -77,10 +77,8 @@ func ClaimNextDispatchableRequest(db *gorm.DB, owner string, dispatcherLease, ex
 
 			var lease AttemptLease
 			if candidate.Purpose == "content_reset_replay" {
-				if _, err := ValidateContentResetReplayRequest(tx, candidate); err != nil {
-					skipCandidate = true
-					return nil
-				}
+				skipCandidate = true
+				return nil
 			}
 			if candidate.State == string(RequestRequested) {
 				var err error
