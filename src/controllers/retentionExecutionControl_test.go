@@ -32,12 +32,14 @@ func TestRetentionCapabilityMapsOnlyItsOwnGate(t *testing.T) {
 	for _, capability := range []string{
 		retentionCapabilityCanonicalCompaction,
 		retentionCapabilityHistorical,
-		retentionCapabilityOwnerRuns,
 		retentionCapabilityRecoveryRotate,
 	} {
 		if !retentionCapabilityEnabled(control, capability) {
 			t.Fatalf("capability %q was not enabled", capability)
 		}
+	}
+	if retentionCapabilityEnabled(control, retentionCapabilityOwnerRuns) {
+		t.Fatal("retired owner bridge cannot be armed by historical controls")
 	}
 	if retentionCapabilityEnabled(control, "unknown") {
 		t.Fatal("unknown capability must fail closed")

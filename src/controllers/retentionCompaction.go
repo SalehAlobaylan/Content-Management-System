@@ -53,8 +53,9 @@ type retentionStoryCursor struct {
 }
 
 type retentionStoryCandidate struct {
-	StoryID      uuid.UUID `gorm:"column:story_id"`
-	LastMemberAt time.Time `gorm:"column:last_member_at"`
+	StoryID          uuid.UUID `gorm:"column:story_id"`
+	LastMemberAt     time.Time `gorm:"column:last_member_at"`
+	ReadyMemberCount int       `gorm:"column:ready_member_count"`
 }
 
 func encodeRetentionStoryCursor(candidate retentionStoryCandidate) string {
@@ -164,7 +165,9 @@ func retentionEligibleStoryPage(db *gorm.DB, tenant, timezone, cursor string, li
 		return nil, false, err
 	}
 	querySQL := `
-		SELECT s.public_id AS story_id, s.last_member_at
+		SELECT s.public_id AS story_id, s.last_member_at,
+		       (SELECT COUNT(*) FROM content_items i WHERE i.tenant_id = s.tenant_id AND i.story_id = s.public_id
+		        AND i.type = 'NEWS' AND i.status = 'READY' AND COALESCE(i.news_retention_state, 'full') = 'full') AS ready_member_count
 		FROM stories s
 		WHERE s.tenant_id = ?
 		  AND (s.news_retention_state = 'full' OR s.news_retention_state IS NULL)
@@ -392,9 +395,7 @@ func PrepareRetentionCompaction(c *gin.Context) {
 			return
 		}
 	}
-	// A preparation has a fresh pressure sample/run and produces immutable
-	// evidence. It cannot execute the plan it prepares.
-	run, err := runRetention(db, principal.TenantID, "manual", principal.Email)
+	run, err := beginRetentionRun(db, principal.TenantID, "manual", principal.Email)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, errRetentionBusy) {
@@ -403,6 +404,16 @@ func PrepareRetentionCompaction(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
+	run.AfterEvidence = retentionActionEvidence(map[string]interface{}{"operation": "Compaction preparation"})
+	defer func() {
+		if run.Status == models.RetentionRunRunning {
+			if err == nil {
+				err = errors.New("manifest preparation failed")
+			}
+			_ = finishRetentionRun(db, &run, err)
+		}
+	}()
+	var actionID uuid.UUID
 	policy := loadRetentionPolicy(db, principal.TenantID)
 	policy.NewsTimezone = retentionNewsTimezone(db, principal.TenantID)
 	candidates, hasMore, err := retentionEligibleStoryPage(db, principal.TenantID, policy.NewsTimezone, request.Cursor, 1000)
@@ -411,7 +422,8 @@ func PrepareRetentionCompaction(c *gin.Context) {
 		return
 	}
 	if len(candidates) == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "no dormant current-month stories are eligible for compaction"})
+		err = errors.New("no dormant current-month stories are eligible for compaction")
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -426,6 +438,11 @@ func PrepareRetentionCompaction(c *gin.Context) {
 		for _, candidate := range candidates {
 			priorCursor := scannedCursor
 			scannedCursor = encodeRetentionStoryCursor(candidate)
+			// A lead and three representatives retain every member of a small story.
+			if candidate.ReadyMemberCount <= 4 {
+				blockedStories[candidate.StoryID.String()] = "no_redundant_members"
+				continue
+			}
 			var story models.Story
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id = ? AND public_id = ?", principal.TenantID, candidate.StoryID).First(&story).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -546,6 +563,7 @@ func PrepareRetentionCompaction(c *gin.Context) {
 		if err := tx.Create(&action).Error; err != nil {
 			return err
 		}
+		actionID = action.PublicID
 		manifest.ActionID = &action.ID
 		return tx.Model(&manifest).Update("action_id", action.ID).Error
 	})
@@ -561,6 +579,15 @@ func PrepareRetentionCompaction(c *gin.Context) {
 		c.JSON(status, response)
 		return
 	}
+	run.AfterEvidence = retentionActionEvidence(map[string]interface{}{"operation": "Compaction preparation", "manifest_id": manifest.PublicID, "manifest_hash": manifest.ManifestHash, "action_id": actionID})
+	if err = finishRetentionRun(db, &run, nil); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "manifest saved but preparation evidence could not be finished"})
+		return
+	}
 	retentionAudit(db, principal, "retention.compaction.prepare", manifest.PublicID.String(), "success", map[string]interface{}{"manifest_hash": manifest.ManifestHash, "retire_count": manifest.RetireCount})
-	c.JSON(http.StatusCreated, gin.H{"data": manifest})
+	c.JSON(http.StatusCreated, gin.H{"data": struct {
+		models.RetentionCompactionManifest
+		RunID    uuid.UUID `json:"run_id"`
+		ActionID uuid.UUID `json:"action_id"`
+	}{manifest, run.PublicID, actionID}})
 }

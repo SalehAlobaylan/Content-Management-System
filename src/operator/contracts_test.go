@@ -85,7 +85,7 @@ func TestRetentionOperatorMatrixKeepsCustodyAndOwnerExecutionOutOfTools(t *testi
 			t.Fatalf("%s must remain outside the Operator mutation catalog", key)
 		}
 	}
-	if RetentionOperatorToolForbidden("retention.refresh_news_snapshots") {
-		t.Fatal("the bounded derived snapshot candidate must remain available for later dedicated tool admission")
+	if !RetentionOperatorToolForbidden("retention.refresh_news_snapshots") {
+		t.Fatal("retired snapshot refresh must remain unavailable to tools")
 	}
 }

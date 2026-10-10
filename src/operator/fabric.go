@@ -769,7 +769,7 @@ func (fabric *ContextFabric) BuildRetentionStatePacket(ctx context.Context, visi
 
 	var controls models.RetentionExecutionControl
 	if err := fabric.db.WithContext(ctx).Where("tenant_id=?", access.TenantID).First(&controls).Error; err == nil {
-		appendRetentionFact("retention.execution_controls", "retention_execution_control", access.TenantID, controls.UpdatedAt, map[string]any{"updated_at": controls.UpdatedAt}, map[string]any{"canonical_compaction_enabled": controls.CanonicalCompactionEnabled, "historical_enabled": controls.HistoricalEnabled, "owner_runs_enabled": controls.OwnerRunsEnabled, "feed_recovery_rotate_enabled": controls.FeedRecoveryRotateEnabled, "feed_recovery_purge_enabled": controls.FeedRecoveryPurgeEnabled, "operator_cannot_arm_destructive_controls": true})
+		appendRetentionFact("retention.execution_controls", "retention_execution_control", access.TenantID, controls.UpdatedAt, map[string]any{"updated_at": controls.UpdatedAt}, map[string]any{"canonical_compaction_enabled": controls.CanonicalCompactionEnabled, "historical_enabled": controls.HistoricalEnabled, "owner_runs_enabled": false, "feed_recovery_rotate_enabled": controls.FeedRecoveryRotateEnabled, "feed_recovery_purge_enabled": controls.FeedRecoveryPurgeEnabled, "operator_cannot_arm_destructive_controls": true})
 	} else if err == gorm.ErrRecordNotFound {
 		unknowns = append(unknowns, "No Retention execution-control row exists; destructive execution is fail-closed.")
 	} else {
@@ -780,19 +780,19 @@ func (fabric *ContextFabric) BuildRetentionStatePacket(ctx context.Context, visi
 	if err := fabric.db.WithContext(ctx).Where("tenant_id=?", access.TenantID).Order("updated_at DESC").Limit(descriptor.MaxRows).Find(&actions).Error; err != nil {
 		return DecisionPacket{}, err
 	}
-	byClass, byOutcome, breakerCandidates := map[string]int{}, map[string]int{}, map[string]int{}
+	byClass, byOutcome, failures := map[string]int{}, map[string]int{}, map[string]int{}
 	actionsObservedAt := time.Time{}
 	for _, action := range actions {
 		byClass[action.ActionClass]++
 		byOutcome[action.Outcome]++
 		if action.Outcome == models.RetentionActionToolFailed || action.Outcome == models.RetentionActionVerifyFailed {
-			breakerCandidates[action.ActionClass]++
+			failures[action.ActionClass]++
 		}
 		if action.UpdatedAt.After(actionsObservedAt) {
 			actionsObservedAt = action.UpdatedAt
 		}
 	}
-	appendRetentionFact("retention.actions_trust", "retention_action_collection", access.TenantID, actionsObservedAt, map[string]any{"sampled_count": len(actions)}, map[string]any{"sampled_count": len(actions), "max_rows": descriptor.MaxRows, "by_class": byClass, "by_outcome": byOutcome, "failure_counts_for_breaker_review": breakerCandidates, "operator_cannot_reset_or_arm_breakers": true})
+	appendRetentionFact("retention.actions", "retention_action_collection", access.TenantID, actionsObservedAt, map[string]any{"sampled_count": len(actions)}, map[string]any{"sampled_count": len(actions), "max_rows": descriptor.MaxRows, "by_class": byClass, "by_outcome": byOutcome, "failure_counts": failures, "snapshot_automation_retired": true})
 
 	var holds []models.RetentionHold
 	if err := fabric.db.WithContext(ctx).Where("tenant_id=? AND released_at IS NULL", access.TenantID).Order("updated_at DESC").Limit(descriptor.MaxRows).Find(&holds).Error; err != nil {

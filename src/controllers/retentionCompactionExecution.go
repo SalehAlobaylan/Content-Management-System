@@ -94,7 +94,7 @@ func loadApprovedCompaction(tx *gorm.DB, tenant string, actionID uuid.UUID) (mod
 	return action, manifest, payload, err
 }
 
-func retentionActionEvidence(payload map[string]interface{}) datatypes.JSON {
+func retentionActionEvidence(payload interface{}) datatypes.JSON {
 	raw, _ := json.Marshal(payload)
 	return datatypes.JSON(raw)
 }
@@ -503,6 +503,7 @@ func runApprovedCompactionMutation(db *gorm.DB, tenant string, actionID uuid.UUI
 			ActionID: action.ID, ManifestID: manifest.ID, TenantID: tenant, BatchIndex: 0, State: "running",
 			TargetHash: retentionBatchTargetHash(retireIDs), TargetIDs: idsJSON(retireIDs), TargetCount: len(retireIDs),
 			EstimatedBytes: manifest.EstimatedBytes, StartedAt: &now,
+			AfterEvidence:  retentionActionEvidence(map[string]interface{}{}),
 			BeforeEvidence: retentionActionEvidence(map[string]interface{}{"manifest_hash": manifest.ManifestHash, "target_count": len(retireIDs)}),
 		}
 		if err := tx.Create(&batch).Error; err != nil {
@@ -656,7 +657,7 @@ func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.Retent
 		return nil, fmt.Errorf("load correlated retention run: %w", err)
 	}
 	feedRun, err := runFeedIntegrity(db, tenant, feedIntegrityRunOptions{
-		Trigger:   "retention:" + retentionRun.CorrelationID.String(),
+		Trigger: "retention", CorrelationID: &retentionRun.CorrelationID,
 		CreatedBy: "retention-autopilot",
 		Tier:      models.FeedIntegrityTierDeep,
 	})
@@ -682,6 +683,8 @@ func verifyCompactionReadback(db *gorm.DB, tenant string, manifest models.Retent
 	return retentionActionEvidence(result), nil
 }
 
+var compactionReadback = verifyCompactionReadback
+
 func finalizeCompactionVerification(db *gorm.DB, tenant string, action models.RetentionAction, manifest models.RetentionCompactionManifest, payload retentionManifestPayload) (models.RetentionAction, error) {
 	now := time.Now().UTC()
 	if err := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifying, "started_at": now}).Error; err != nil {
@@ -690,7 +693,7 @@ func finalizeCompactionVerification(db *gorm.DB, tenant string, action models.Re
 	if err := db.Model(&models.RetentionCompactionBatch{}).Where("action_id = ? AND tenant_id = ? AND batch_index = 0", action.ID, tenant).Update("state", "verifying").Error; err != nil {
 		return action, fmt.Errorf("record compaction batch verification start: %w", err)
 	}
-	verification, err := verifyCompactionReadback(db, tenant, manifest, payload)
+	verification, err := compactionReadback(db, tenant, manifest, payload)
 	if err != nil {
 		if persistErr := db.Model(&models.RetentionAction{}).Where("id = ?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "finished_at": time.Now().UTC(), "verification": retentionActionEvidence(map[string]interface{}{"phase": "readback", "error": err.Error()})}).Error; persistErr != nil {
 			return action, errors.Join(err, fmt.Errorf("record readback failure: %w", persistErr))
@@ -758,20 +761,8 @@ func ExecuteRetentionCompaction(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "retention action not found"})
 		return
 	}
-	if existing.ActionClass == models.RetentionActionRefreshNewsSnapshots {
-		if existing.Outcome != models.RetentionActionApproved && existing.Outcome != models.RetentionActionReady {
-			c.JSON(http.StatusConflict, gin.H{"error": "snapshot refresh action is not approved or ready"})
-			return
-		}
-		updated, refreshErr := executeRetentionSnapshotRefresh(db, existing, principal.Email)
-		if refreshErr != nil {
-			c.JSON(http.StatusConflict, gin.H{"error": refreshErr.Error(), "data": updated})
-			return
-		}
-		retentionAudit(db, principal, "retention.snapshot_refresh.execute", existing.PublicID.String(), "success", map[string]interface{}{"canonical_rows_deleted": false})
-		var result models.RetentionAction
-		_ = db.Where("id=?", existing.ID).First(&result).Error
-		c.JSON(http.StatusOK, gin.H{"data": result})
+	if retentionActionRetired(existing.ActionClass) {
+		RetentionCapabilityRetired(c)
 		return
 	}
 	if err := requireRetentionCapability(db, principal.TenantID, retentionCapabilityCanonicalCompaction); err != nil {

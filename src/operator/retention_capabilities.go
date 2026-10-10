@@ -20,7 +20,7 @@ func RetentionOperatorCapabilityMatrix() []RetentionOperatorCapability {
 		{Key: "retention.prepare_compaction", ToolEligible: true, Reason: "exact manifest preparation only after dedicated admission"},
 		{Key: "retention.monthly_review", ToolEligible: true, Reason: "derived Month in Review build/verification after dedicated admission"},
 		{Key: "retention.hold", ToolEligible: true, Reason: "additive protection hold/override after dedicated admission"},
-		{Key: "retention.refresh_news_snapshots", ToolEligible: true, Reason: "bounded noncanonical derived snapshot refresh after dedicated admission"},
+		{Key: "retention.refresh_news_snapshots", Reason: "retired; native News owns snapshot rebuilding"},
 		{Key: "retention.compaction", Reason: "canonical mutation stays native/manual"},
 		{Key: "retention.historical_retirement", Reason: "old-month deletion stays native/manual"},
 		{Key: "retention.physical_rewrite", Reason: "database rewrite stays native/manual"},

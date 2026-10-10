@@ -303,11 +303,21 @@ func PrepareHistoricalRetention(c *gin.Context) {
 	}
 	policy := loadRetentionPolicy(db, principal.TenantID)
 	timezone := retentionNewsTimezone(db, principal.TenantID)
-	run, err := runRetention(db, principal.TenantID, "manual", principal.Email)
+	run, err := beginRetentionRun(db, principal.TenantID, "manual", principal.Email)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	run.AfterEvidence = retentionActionEvidence(map[string]interface{}{"operation": "Historical preparation"})
+	defer func() {
+		if run.Status == models.RetentionRunRunning {
+			if err == nil {
+				err = errors.New("manifest preparation failed")
+			}
+			_ = finishRetentionRun(db, &run, err)
+		}
+	}()
+	var actionID uuid.UUID
 	items, stories, estimated, nextCursor, hasMore, err := historicalCandidates(db, principal.TenantID, timezone, request.Cursor, policy.MaxRowsPerRun, policy.MaxBytesPerRun)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -315,7 +325,8 @@ func PrepareHistoricalRetention(c *gin.Context) {
 	}
 	ids := extractPublicIDs(items)
 	if len(ids) == 0 {
-		response := gin.H{"error": "no archive-gated, unprotected historical News is eligible"}
+		err = errors.New("no archive-gated, unprotected historical News is eligible")
+		response := gin.H{"error": err.Error()}
 		if hasMore && nextCursor != "" {
 			response["next_cursor"] = nextCursor
 		}
@@ -325,7 +336,8 @@ func PrepareHistoricalRetention(c *gin.Context) {
 	// historicalCandidates already returns a deterministic bounded prefix. A
 	// second assertion protects against future callers widening that helper.
 	if len(ids) > policy.MaxRowsPerRun || estimated > policy.MaxBytesPerRun {
-		c.JSON(409, gin.H{"error": "historical batch exceeds policy cap"})
+		err = errors.New("historical batch exceeds policy cap")
+		c.JSON(409, gin.H{"error": err.Error()})
 		return
 	}
 	issues, err := historicalDependencyPreflight(db, principal.TenantID, ids)
@@ -333,7 +345,7 @@ func PrepareHistoricalRetention(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	if err := retentionDependencyError(issues); err != nil {
+	if err = retentionDependencyError(issues); err != nil {
 		c.JSON(409, gin.H{"error": err.Error()})
 		return
 	}
@@ -348,6 +360,7 @@ func PrepareHistoricalRetention(c *gin.Context) {
 		if err := tx.Create(&action).Error; err != nil {
 			return err
 		}
+		actionID = action.PublicID
 		manifest.ActionID = &action.ID
 		return tx.Model(&manifest).Update("action_id", action.ID).Error
 	})
@@ -355,8 +368,17 @@ func PrepareHistoricalRetention(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
+	run.AfterEvidence = retentionActionEvidence(map[string]interface{}{"operation": "Historical preparation", "manifest_id": manifest.PublicID, "manifest_hash": manifest.ManifestHash, "action_id": actionID})
+	if err = finishRetentionRun(db, &run, nil); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "manifest saved but preparation evidence could not be finished"})
+		return
+	}
 	retentionAudit(db, principal, "retention.historical.prepare", manifest.PublicID.String(), "success", nil)
-	c.JSON(201, gin.H{"data": manifest})
+	c.JSON(201, gin.H{"data": struct {
+		models.RetentionHistoricalManifest
+		RunID    uuid.UUID `json:"run_id"`
+		ActionID uuid.UUID `json:"action_id"`
+	}{manifest, run.PublicID, actionID}})
 }
 
 func createHistoricalTombstones(tx *gorm.DB, tenant string, action models.RetentionAction, manifest models.RetentionHistoricalManifest, items []models.ContentItem) error {
@@ -521,13 +543,22 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadRetentionPolicy(db, principal.TenantID)
-	if !policy.Enabled || policy.Mode != models.RetentionModeAssist {
-		c.JSON(409, gin.H{"error": "historical purge requires enabled Assist mode"})
+	var existing models.RetentionAction
+	if db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&existing).Error != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "retention action not found"})
 		return
 	}
 	if err := requireRetentionCapability(db, principal.TenantID, retentionCapabilityHistorical); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if existing.ActionClass == models.RetentionActionExecuteHistoricalPurge {
+		finalizeHistoricalVerification(c, db, existing)
+		return
+	}
+	policy := loadRetentionPolicy(db, principal.TenantID)
+	if !policy.Enabled || policy.Mode != models.RetentionModeAssist {
+		c.JSON(409, gin.H{"error": "historical purge requires enabled Assist mode"})
 		return
 	}
 	now := time.Now().UTC()
@@ -541,11 +572,17 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		if action.ActionClass != models.RetentionActionPrepareHistoricalPurge || action.Outcome != models.RetentionActionApproved {
 			return errors.New("approved historical manifest action is required")
 		}
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("action_id=? AND state=?", action.ID, "approved").First(&manifest).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND action_id=? AND state=?", principal.TenantID, action.ID, "approved").First(&manifest).Error; err != nil {
 			return err
+		}
+		if err := validateHistoricalManifest(manifest); err != nil || manifest.RunID != action.RunID || action.ManifestHash == nil || *action.ManifestHash != manifest.ManifestHash {
+			return errors.New("historical manifest evidence is inconsistent")
 		}
 		if now.After(manifest.ExpiresAt) {
 			return errors.New("historical manifest expired")
+		}
+		if manifest.ContentCount > policy.MaxRowsPerRun || manifest.EstimatedBytes > policy.MaxBytesPerRun {
+			return errors.New("historical manifest exceeds current cleanup limits; prepare a new manifest")
 		}
 		contentIDs, err := historicalIDs(manifest.ContentIDs)
 		if err != nil {
@@ -639,10 +676,55 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		c.JSON(409, gin.H{"error": err.Error()})
 		return
 	}
+	if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&action).Error; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "cleanup committed; reload this action to verify"})
+		return
+	}
+	finalizeHistoricalVerification(c, db, action)
+}
+
+// Verification consumes only the durable, original committed effect proof.
+func historicalVerificationProof(action models.RetentionAction, manifest models.RetentionHistoricalManifest, artifact models.RetentionHistoricalRecoveryArtifact) error {
+	if action.ActionClass != models.RetentionActionExecuteHistoricalPurge || (action.Outcome != models.RetentionActionToolSucceeded && action.Outcome != models.RetentionActionVerifying && action.Outcome != models.RetentionActionVerifyFailed && action.Outcome != models.RetentionActionVerified) || manifest.State != "executed" || manifest.ActionID == nil || *manifest.ActionID != action.ID || manifest.RunID != action.RunID || manifest.TenantID != action.TenantID || action.ManifestHash == nil || *action.ManifestHash != manifest.ManifestHash {
+		return errors.New("committed cleanup evidence is inconsistent; manual reconciliation required")
+	}
+	if err := validateHistoricalManifest(manifest); err != nil {
+		return err
+	}
+	hash, err := hex.DecodeString(artifact.SHA256)
+	if err != nil || len(hash) != sha256.Size || artifact.VerifiedAt == nil || artifact.TenantID != action.TenantID || artifact.ActionID != action.ID || artifact.ManifestID != manifest.ID || artifact.ArtifactKey == "" || action.RecoveryRef != artifact.ArtifactKey {
+		return errors.New("original verified recovery receipt is unavailable; manual reconciliation required")
+	}
+	return nil
+}
+
+// Keep native readbacks at their owner boundary for focused continuation tests.
+var historicalReadbacks = struct {
+	snapshot  func(*gorm.DB, string, string) (int, error)
+	integrity func(*gorm.DB, string, feedIntegrityRunOptions) (models.FeedIntegrityRun, error)
+	health    func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly)
+	sample    func(*gorm.DB, string) (models.RetentionDBSample, error)
+}{buildNewsSnapshot, runFeedIntegrity, collectSystemHealthSnapshot, collectRetentionDBSample}
+
+func finalizeHistoricalVerification(c *gin.Context, db *gorm.DB, action models.RetentionAction) {
+	principal, ok := requireRetentionTenant(c)
+	if !ok {
+		return
+	}
+	var manifest models.RetentionHistoricalManifest
+	var artifact models.RetentionHistoricalRecoveryArtifact
+	if db.Where("tenant_id=? AND action_id=?", principal.TenantID, action.ID).First(&manifest).Error != nil || db.Where("tenant_id=? AND action_id=?", principal.TenantID, action.ID).First(&artifact).Error != nil || historicalVerificationProof(action, manifest, artifact) != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "committed cleanup proof is unavailable; manual reconciliation required"})
+		return
+	}
+	if action.Outcome == models.RetentionActionVerified {
+		c.JSON(http.StatusOK, gin.H{"data": action})
+		return
+	}
 	evictLocalNewsSnapshots(principal.TenantID)
-	verification := map[string]interface{}{"phase": "historical_readback", "manifest_hash": manifest.ManifestHash, "recovery_artifact": externalArtifactKey}
+	verification := map[string]interface{}{"phase": "historical_readback", "manifest_hash": manifest.ManifestHash, "recovery_artifact": artifact.ArtifactKey}
 	for _, window := range []string{models.NewsWindowToday, models.NewsWindowWeek, models.NewsWindowMonth} {
-		if _, err := buildNewsSnapshot(db, principal.TenantID, window); err != nil {
+		if _, err := historicalReadbacks.snapshot(db, principal.TenantID, window); err != nil {
 			verification["snapshot_error"] = err.Error()
 			_ = db.Model(&models.RetentionAction{}).Where("id=?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerifyFailed, "verification": retentionActionEvidence(verification), "finished_at": time.Now().UTC()}).Error
 			c.JSON(http.StatusConflict, gin.H{"error": "historical purge needs snapshot readback: " + err.Error()})
@@ -660,14 +742,14 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "historical purge readback did not match manifest"})
 		return
 	}
-	integrity, integrityErr := runFeedIntegrity(db, principal.TenantID, feedIntegrityRunOptions{Tier: models.FeedIntegrityTierDeep, Trigger: "retention_historical", CreatedBy: principal.Email})
+	integrity, integrityErr := historicalReadbacks.integrity(db, principal.TenantID, feedIntegrityRunOptions{Tier: models.FeedIntegrityTierDeep, Trigger: "retention_historical", CreatedBy: principal.Email})
 	if integrityErr != nil {
 		verification["feed_integrity_error"] = integrityErr.Error()
 	} else {
 		verification["feed_integrity_run_id"] = integrity.PublicID.String()
 		verification["feed_integrity_status"] = integrity.Status
 	}
-	health, _ := collectSystemHealthSnapshot(db)
+	health, _ := historicalReadbacks.health(db)
 	verification["system_health"] = health.Overall
 	if err := db.Exec("VACUUM (ANALYZE) content_items").Error; err != nil {
 		verification["maintenance_error"] = err.Error()
@@ -675,7 +757,7 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "historical purge needs maintenance verification: " + err.Error()})
 		return
 	}
-	sample, sampleErr := collectRetentionDBSample(db, principal.TenantID)
+	sample, sampleErr := historicalReadbacks.sample(db, principal.TenantID)
 	if sampleErr != nil {
 		verification["measurement_error"] = sampleErr.Error()
 	} else {
@@ -686,9 +768,15 @@ func ExecuteHistoricalRetention(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "historical purge completed but post-deploy safety verification failed"})
 		return
 	}
-	_ = db.Model(&models.RetentionAction{}).Where("id=?", action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerified, "after_bytes": sample.DatabaseBytes, "verification": retentionActionEvidence(verification), "finished_at": time.Now().UTC()}).Error
-	_ = db.Where("id=?", action.ID).First(&action).Error
-	retentionAudit(db, principal, "retention.historical.execute", id.String(), "success", nil)
+	if err := db.Model(&models.RetentionAction{}).Where("tenant_id=? AND id=?", principal.TenantID, action.ID).Updates(map[string]interface{}{"outcome": models.RetentionActionVerified, "after_bytes": sample.DatabaseBytes, "verification": retentionActionEvidence(verification), "finished_at": time.Now().UTC()}).Error; err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "verification receipt could not be saved; retry this action"})
+		return
+	}
+	if db.Where("tenant_id=? AND id=?", principal.TenantID, action.ID).First(&action).Error != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "reload verified action"})
+		return
+	}
+	retentionAudit(db, principal, "retention.historical.verify", action.PublicID.String(), "success", nil)
 	c.JSON(http.StatusOK, gin.H{"data": action})
 }
 

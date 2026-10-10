@@ -8,9 +8,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// StartRetentionHeartbeat polls persisted policy state. Scheduled work may
-// execute only the Slice 10 trusted derived-state snapshot refresh; canonical
-// content, sources, objects, and physical storage remain human/operator-owned.
+// StartRetentionHeartbeat records scheduled pressure observations and expires
+// ledgered recovery objects. Canonical cleanup is always native/manual.
 func StartRetentionHeartbeat(db *gorm.DB) {
 	go func() {
 		ticker := time.NewTicker(time.Minute)

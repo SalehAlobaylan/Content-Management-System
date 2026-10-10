@@ -303,6 +303,7 @@ func ApplyPublicItemGenerationMembership(db *gorm.DB, query *gorm.DB) *gorm.DB {
 }
 
 func legacyNewsItemMembershipJoin(memberColumn string) string {
+	alias := "active_generation_member_" + strings.ReplaceAll(memberColumn, ".", "_")
 	return `JOIN (
         SELECT legacy_content.public_id AS member_id
         FROM feed_generation_heads legacy_head
@@ -315,10 +316,11 @@ func legacyNewsItemMembershipJoin(memberColumn string) string {
           AND legacy_content.type = 'NEWS'
         WHERE legacy_head.tenant_id = ?
           AND legacy_head.lane = ?
-    ) active_generation_member ON active_generation_member.member_id = ` + memberColumn
+    ) ` + alias + ` ON ` + alias + `.member_id = ` + memberColumn
 }
 
 func activeGenerationMembershipJoin(memberColumn string) string {
+	alias := "active_generation_member_" + strings.ReplaceAll(memberColumn, ".", "_")
 	return `JOIN (
         SELECT generation_membership.member_id
         FROM feed_generation_heads generation_head
@@ -327,7 +329,7 @@ func activeGenerationMembershipJoin(memberColumn string) string {
         WHERE generation_head.tenant_id = ?
           AND generation_head.lane = ?
           AND generation_membership.member_type = ?
-    ) active_generation_member ON active_generation_member.member_id = ` + memberColumn
+    ) ` + alias + ` ON ` + alias + `.member_id = ` + memberColumn
 }
 
 // ActiveGeneration separates the pre-schema compatibility window from a

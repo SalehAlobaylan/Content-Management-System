@@ -2,49 +2,36 @@ package controllers
 
 import (
 	"content-management-system/src/models"
-	"testing"
-
 	"gorm.io/datatypes"
+	"testing"
 )
 
-func TestRetentionTrustPromotionOnlyAllowsDerivedSnapshotRefresh(t *testing.T) {
-	if !retentionActionAutoEligible(models.RetentionActionRefreshNewsSnapshots) {
-		t.Fatal("snapshot refresh should be the only Safe Auto eligible class")
+func TestRetentionLegacySafeAutoIsReadOnly(t *testing.T) {
+	policy := models.DefaultRetentionPolicy("default")
+	policy.Mode = models.RetentionModeSafeAuto
+	policy.ActionModes = datatypes.JSON([]byte(`{"news_database.refresh_snapshots":"safe_auto"}`))
+	if normalizeRetentionPolicy(policy).Mode != models.RetentionModeSafeAuto {
+		t.Fatal("saved policy evidence lost")
 	}
-	for _, class := range []string{models.RetentionActionExecuteHistoricalPurge, "news_database.compact_story", models.RetentionActionRequestStorageRun, models.RetentionActionRequestMediaRun} {
-		if retentionActionAutoEligible(class) {
-			t.Fatalf("human-only class became Safe Auto eligible: %s", class)
+	if effectiveRetentionMode(policy.Mode) != models.RetentionModeObserve {
+		t.Fatal("legacy policy acquired effect authority")
+	}
+	if retentionPolicyValid(policy) == nil {
+		t.Fatal("new Safe Auto write accepted")
+	}
+	policy.Mode = models.RetentionModeAssist
+	if retentionPolicyValid(policy) != nil || effectiveRetentionMode(policy.Mode) != models.RetentionModeAssist {
+		t.Fatal("explicit manual Assist rejected")
+	}
+}
+
+func TestRetentionRetiredClassesCannotExecute(t *testing.T) {
+	for _, class := range []string{models.RetentionActionRefreshNewsSnapshots, models.RetentionActionRequestStorageRun, models.RetentionActionRequestMediaRun} {
+		if !retentionActionRetired(class) {
+			t.Fatalf("retired class admitted: %s", class)
 		}
 	}
-}
-
-func TestRetentionActionModeCannotWidenAnOverride(t *testing.T) {
-	policy := models.DefaultRetentionPolicy("default")
-	policy.Mode = models.RetentionModeSafeAuto
-	policy.ActionModes = datatypes.JSON([]byte(`{"news_database.refresh_snapshots":"assist"}`))
-	if got := retentionActionMode(policy, models.RetentionActionRefreshNewsSnapshots); got != models.RetentionModeAssist {
-		t.Fatalf("effective action mode = %q, want assist override", got)
-	}
-}
-
-func TestRetentionSnapshotActionFailsClosedUntilTrust(t *testing.T) {
-	run := models.RetentionRun{TenantID: "default"}
-	policy := models.DefaultRetentionPolicy("default")
-	policy.Mode = models.RetentionModeSafeAuto
-	action := buildRetentionSnapshotRefreshAction(run, policy, retentionPreview{CandidateRows: 3}, []string{models.NewsWindowToday}, false)
-	if action.Mode != models.RetentionModeAssist || action.Outcome != models.RetentionActionApprovalRequired || action.Guardrail != "trust_gate" {
-		t.Fatalf("untrusted promotion should fall back to Assist approval: %+v", action)
-	}
-	trusted := buildRetentionSnapshotRefreshAction(run, policy, retentionPreview{}, []string{models.NewsWindowWeek}, true)
-	if trusted.Mode != models.RetentionModeSafeAuto || trusted.Outcome != models.RetentionActionReady {
-		t.Fatalf("trusted promotion should create a ready Safe Auto action: %+v", trusted)
-	}
-}
-
-func TestRetentionPolicyRejectsSafeAutoForHumanOnlyClass(t *testing.T) {
-	policy := models.DefaultRetentionPolicy("default")
-	policy.ActionModes = datatypes.JSON([]byte(`{"news_database.compact_story":"safe_auto"}`))
-	if err := retentionPolicyValid(policy); err == nil {
-		t.Fatal("canonical compaction must remain human-only")
+	if retentionActionRetired(retentionActionPrepareNewsCompaction) {
+		t.Fatal("manual compaction was retired")
 	}
 }

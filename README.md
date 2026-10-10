@@ -128,6 +128,7 @@ Grouped capabilities (see the full route list in [`../docs/content-management-sy
 - **Media Studio, transcription, atomization** — per-item transcript/chapter editor, transcription config + jobs/batches, Media Atomization overview/pipeline/parents/chapters/runs/review/repair, quality.
 - **Enrichment** — stats, missing, trigger (single/batch/all), bulk-status, health.
 - **Storage** — stats, candidates, purge, restore, policy + overrides, sweep runs/preview, reconcile, operations.
+- **Retention** — `/admin/retention/*` owns capacity observations, settings, exact News cleanup plans, approval and verification. Cleanup is manual, with private backup verification before deletion. See the [Retention guide](../plans/implemented-systems/retention-and-fresh-start-systems.md/retention-autopilot.md).
 - **Quality** — profiles CRUD, resolve, probe-item.
 - **Audit & ops** — audit log read/write, `restart`.
 

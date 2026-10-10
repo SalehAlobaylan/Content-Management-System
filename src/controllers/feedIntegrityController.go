@@ -175,17 +175,25 @@ func withFeedIntegrityLock(ctx context.Context, db *gorm.DB, tenant string) (fun
 	if err != nil {
 		return func() {}, false
 	}
+	// Keep the guard transaction alive until the entire owner run finishes.
+	// Transaction pooling cannot safely retain a session advisory lock.
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		conn.Close()
+		return func() {}, false
+	}
 	key := int64(0)
 	for _, b := range []byte("wahb:feed-integrity:" + tenant) {
 		key = key*31 + int64(b)
 	}
 	var acquired bool
-	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&acquired); err != nil || !acquired {
+	if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", key).Scan(&acquired); err != nil || !acquired {
+		_ = tx.Rollback()
 		conn.Close()
 		return func() {}, false
 	}
 	return func() {
-		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
+		_ = tx.Rollback()
 		_ = conn.Close()
 	}, true
 }

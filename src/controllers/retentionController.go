@@ -1,13 +1,10 @@
 package controllers
 
-// Retention Autopilot is a deterministic, ledgered supervisor. Destructive
-// canonical-content and physical-storage actions remain human-only; Slice 10
-// can promote only the verified derived-state snapshot refresh action.
+// Retention records capacity observations and exact, human-owned News cleanup.
+// Snapshot rebuilding and media operations stay with their native owners.
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,8 +37,8 @@ var (
 const (
 	// The preview is advisory evidence used by the cockpit. It must never be
 	// allowed to hold the status endpoint open while a busy provider is
-	// scanning content_items. Preparation/run paths still execute a fresh
-	// preview and therefore retain their fail-closed behavior.
+	// scanning content_items. Observations use a fresh preview; preparation
+	// uses only its exact candidate checks and fails closed on uncertainty.
 	retentionPreviewReadTimeout = 5 * time.Second
 	retentionPreviewCacheTTL    = 15 * time.Second
 )
@@ -74,14 +71,13 @@ type retentionStatus struct {
 	LatestRun    *models.RetentionRun               `json:"latest_run,omitempty"`
 	Forecast     retentionForecast                  `json:"forecast"`
 	Verdict      string                             `json:"verdict"`
+	Pressure     string                             `json:"capacity_verdict"`
 	Preview      retentionPreview                   `json:"preview"`
 	Historical   map[string]interface{}             `json:"historical"`
 	Maintenance  *models.RetentionMaintenanceReport `json:"latest_maintenance,omitempty"`
 	Execution    models.RetentionExecutionControl   `json:"execution_controls"`
 	Paused       bool                               `json:"paused"`
 	ObserveOnly  bool                               `json:"observe_only"`
-	Promotion    retentionPromotionStatus           `json:"promotion"`
-	Trust        []retentionTrustStat               `json:"trust"`
 	Satellite    retentionSatelliteStatus           `json:"satellite_evaluation"`
 	Guarantees   map[string]interface{}             `json:"guarantees"`
 }
@@ -101,7 +97,7 @@ func retentionCapabilityEnabled(control models.RetentionExecutionControl, capabi
 	case retentionCapabilityHistorical:
 		return control.HistoricalEnabled
 	case retentionCapabilityOwnerRuns:
-		return control.OwnerRunsEnabled
+		return false // Retention-mediated owner execution is retired.
 	case retentionCapabilityRecoveryRotate:
 		return control.FeedRecoveryRotateEnabled
 	case retentionCapabilityRecoveryPurge:
@@ -127,6 +123,7 @@ func requireRetentionCapability(db *gorm.DB, tenant, capability string) error {
 func retentionExecutionControlFor(db *gorm.DB, tenant string) models.RetentionExecutionControl {
 	var control models.RetentionExecutionControl
 	_ = db.Where("tenant_id = ?", tenant).First(&control).Error
+	control.OwnerRunsEnabled = false
 	return control
 }
 
@@ -191,18 +188,16 @@ func normalizeRetentionPolicy(policy models.RetentionPolicy) models.RetentionPol
 }
 
 func retentionPolicyValid(policy models.RetentionPolicy) error {
-	if policy.Mode != models.RetentionModeObserve &&
-		policy.Mode != models.RetentionModeAssist &&
-		policy.Mode != models.RetentionModeSafeAuto {
-		return errors.New("mode must be observe, assist, or safe_auto")
+	if policy.Mode != models.RetentionModeObserve && policy.Mode != models.RetentionModeAssist {
+		return errors.New("mode must be observe or assist; Safe Auto is retired")
 	}
 	if policy.ScheduleIntervalMinutes < 15 || policy.ScheduleIntervalMinutes > 10080 {
 		return errors.New("schedule_interval_minutes must be between 15 and 10080")
 	}
-	if !(policy.DatabaseTargetBytes <= policy.DatabaseWarningBytes &&
+	if !(policy.DatabaseTargetBytes > 0 && policy.DatabaseTargetBytes <= policy.DatabaseWarningBytes &&
 		policy.DatabaseWarningBytes < policy.DatabaseActionBytes &&
 		policy.DatabaseActionBytes < policy.DatabaseCriticalBytes) {
-		return errors.New("database thresholds must be ordered target <= warning < action < critical")
+		return errors.New("database thresholds must be positive and ordered target <= warning < action < critical")
 	}
 	if policy.WarningForecastDays < 1 || policy.WarningForecastDays > 90 ||
 		policy.ActionForecastDays < 1 || policy.ActionForecastDays > 90 ||
@@ -212,23 +207,6 @@ func retentionPolicyValid(policy models.RetentionPolicy) error {
 	if policy.MaxRowsPerRun < 1 || policy.MaxRowsPerRun > 10000 ||
 		policy.MaxBytesPerRun < 1 || policy.MaxActionsPerRun < 1 || policy.MaxActionsPerRun > 50 {
 		return errors.New("run caps are outside supported bounds")
-	}
-	if policy.TrustMinDecisions < 1 || policy.TrustMinDecisions > 10000 || policy.TrustMinAgreementPct < 50 || policy.TrustMinAgreementPct > 100 {
-		return errors.New("trust thresholds are outside supported bounds")
-	}
-	if len(policy.ActionModes) > 0 {
-		var modes map[string]string
-		if err := json.Unmarshal(policy.ActionModes, &modes); err != nil {
-			return errors.New("action_modes must be valid JSON")
-		}
-		for actionClass, mode := range modes {
-			if mode != models.RetentionModeObserve && mode != models.RetentionModeAssist && mode != models.RetentionModeSafeAuto {
-				return fmt.Errorf("invalid mode for action class %s", actionClass)
-			}
-			if mode == models.RetentionModeSafeAuto && !retentionActionAutoEligible(actionClass) {
-				return fmt.Errorf("action class %s is human-only", actionClass)
-			}
-		}
 	}
 	return nil
 }
@@ -274,7 +252,7 @@ func retentionOperationalVerdict(policy models.RetentionPolicy, sample *models.R
 }
 
 func retentionHistoricalSignal(db *gorm.DB, tenant, timezone string, policy models.RetentionPolicy) (string, map[string]interface{}) {
-	_, err := time.LoadLocation(timezone)
+	location, err := time.LoadLocation(timezone)
 	if err != nil {
 		return models.RetentionVerdictInconclusive, map[string]interface{}{"error": "invalid_news_timezone"}
 	}
@@ -287,7 +265,7 @@ func retentionHistoricalSignal(db *gorm.DB, tenant, timezone string, policy mode
 	if err := db.Model(&models.NewsMonthArchive{}).Where("tenant_id=? AND month_start < ? AND finalized_at IS NOT NULL", tenant, monthStart.UTC()).Count(&finalized).Error; err != nil {
 		return models.RetentionVerdictInconclusive, map[string]interface{}{"error": "archive_inventory_unavailable"}
 	}
-	evidence := map[string]interface{}{"month_start": monthStart.Format("2006-01-02"), "old_news_rows": oldRows, "finalized_archives": finalized}
+	evidence := map[string]interface{}{"month_start": monthStart.In(location).Format("2006-01-02"), "old_news_rows": oldRows, "finalized_archives": finalized}
 	if oldRows == 0 {
 		return "", evidence
 	}
@@ -469,8 +447,8 @@ func previewRetentionNews(db *gorm.DB, tenant, timezone string) (retentionPrevie
 // contention. A preview is observation evidence, not an authorization to
 // mutate content, so a short-lived successful cache is safe. A timeout turns a
 // slow provider into an explicit inconclusive status instead of making the
-// entire Retention page hang; run/preparation paths still call the uncached
-// preview above and fail closed on errors.
+// entire Retention page hang; observations call the uncached preview above,
+// while preparation uses its own exact candidate queries.
 func previewRetentionNewsForStatus(db *gorm.DB, tenant, timezone string) (retentionPreview, error) {
 	key := tenant + "\x00" + timezone
 	now := time.Now()
@@ -516,7 +494,6 @@ func retentionStatusFor(db *gorm.DB, tenant string) retentionStatus {
 	var activeRecovery int64
 	activeRecoveryErr := db.Table("feed_availability_states").Where("tenant_id = ? AND state <> 'normal'", tenant).Count(&activeRecovery).Error
 	now := time.Now().UTC()
-	promotion := retentionPromotionFor(db, tenant, policy)
 	satellite := retentionSatelliteEvaluation(db, tenant, policy, sample, forecast)
 	verdict := retentionOperationalVerdict(policy, sample, forecast, preview, activeRecovery > 0)
 	historicalVerdict, historicalEvidence := retentionHistoricalSignal(db, tenant, policy.NewsTimezone, policy)
@@ -553,11 +530,10 @@ func retentionStatusFor(db *gorm.DB, tenant string) retentionStatus {
 	return retentionStatus{
 		Policy: policy, LatestSample: sample, LatestRun: run, Forecast: forecast,
 		Verdict: verdict, Preview: preview, Historical: historicalEvidence, Maintenance: maintenance,
+		Pressure:    retentionVerdict(policy, sample, forecast),
 		Execution:   retentionExecutionControlFor(db, tenant),
 		Paused:      policy.PausedUntil != nil && policy.PausedUntil.After(now),
-		ObserveOnly: policy.Mode == models.RetentionModeObserve,
-		Promotion:   promotion,
-		Trust:       promotion.Trust,
+		ObserveOnly: effectiveRetentionMode(policy.Mode) == models.RetentionModeObserve,
 		Satellite:   satellite,
 		Guarantees: map[string]interface{}{
 			"full_fidelity_days":     7,
@@ -631,6 +607,10 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "a reason of at least 10 characters is required"})
 		return
 	}
+	if patch.OwnerRunsEnabled != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Retention owner execution is retired; use the native owner dashboard", "code": "retention_capability_retired"})
+		return
+	}
 	if patch.FeedRecoveryPurgeEnabled != nil && *patch.FeedRecoveryPurgeEnabled {
 		c.JSON(http.StatusConflict, gin.H{"error": "legacy Purge & Reseed cannot be enabled; use manual Pods Reset"})
 		return
@@ -653,9 +633,6 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		if patch.HistoricalEnabled != nil {
 			control.HistoricalEnabled = *patch.HistoricalEnabled
 		}
-		if patch.OwnerRunsEnabled != nil {
-			control.OwnerRunsEnabled = *patch.OwnerRunsEnabled
-		}
 		if patch.FeedRecoveryRotateEnabled != nil {
 			control.FeedRecoveryRotateEnabled = *patch.FeedRecoveryRotateEnabled
 		}
@@ -665,7 +642,6 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		return tx.Model(&control).Updates(map[string]interface{}{
 			"canonical_compaction_enabled": control.CanonicalCompactionEnabled,
 			"historical_enabled":           control.HistoricalEnabled,
-			"owner_runs_enabled":           control.OwnerRunsEnabled,
 			"feed_recovery_rotate_enabled": control.FeedRecoveryRotateEnabled,
 			"feed_recovery_purge_enabled":  control.FeedRecoveryPurgeEnabled,
 			"updated_by":                   control.UpdatedBy,
@@ -676,6 +652,7 @@ func UpdateRetentionExecutionControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not persist execution control"})
 		return
 	}
+	control.OwnerRunsEnabled = false
 	retentionAudit(db, principal, "retention.execution_control.update", principal.TenantID, "success", map[string]interface{}{"reason": patch.Reason, "control": control})
 	c.JSON(http.StatusOK, gin.H{"data": control})
 }
@@ -707,6 +684,10 @@ func UpdateRetentionPolicy(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&patch); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy payload"})
+		return
+	}
+	if patch.ActionModes != nil || patch.TrustMinDecisions != nil || patch.TrustMinAgreementPct != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "action overrides and trust settings are retired; choose Observe or Assist"})
 		return
 	}
 	if patch.Enabled != nil {
@@ -748,25 +729,11 @@ func UpdateRetentionPolicy(c *gin.Context) {
 	if patch.MaxActionsPerRun != nil {
 		policy.MaxActionsPerRun = *patch.MaxActionsPerRun
 	}
-	if patch.ActionModes != nil {
-		raw, _ := json.Marshal(patch.ActionModes)
-		policy.ActionModes = datatypes.JSON(raw)
-	}
-	if patch.TrustMinDecisions != nil {
-		policy.TrustMinDecisions = *patch.TrustMinDecisions
-	}
-	if patch.TrustMinAgreementPct != nil {
-		policy.TrustMinAgreementPct = *patch.TrustMinAgreementPct
-	}
 	policy.NewsTimezone = retentionNewsTimezone(db, principal.TenantID)
 	policy.PolicyVersion++
 	policy.UpdatedBy = principal.Email
 	if err := retentionPolicyValid(policy); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if policy.Mode == models.RetentionModeSafeAuto && !retentionSafeAutoPromotionReady(db, principal.TenantID, policy) {
-		c.JSON(http.StatusConflict, gin.H{"error": "Safe Auto promotion requires trusted, breaker-closed Assist agreement for every eligible action class"})
 		return
 	}
 	if err := db.Clauses(clause.OnConflict{
@@ -776,8 +743,7 @@ func UpdateRetentionPolicy(c *gin.Context) {
 			"news_timezone", "database_target_bytes", "database_warning_bytes",
 			"database_action_bytes", "database_critical_bytes", "warning_forecast_days",
 			"action_forecast_days", "critical_forecast_hours", "max_rows_per_run",
-			"max_bytes_per_run", "max_actions_per_run", "action_modes", "trust_min_decisions",
-			"trust_min_agreement_pct", "updated_by", "updated_at",
+			"max_bytes_per_run", "max_actions_per_run", "updated_by", "updated_at",
 		}),
 	}).Create(&policy).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save retention policy"})
@@ -787,20 +753,16 @@ func UpdateRetentionPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": policy})
 }
 
-func runRetention(db *gorm.DB, tenant, trigger, createdBy string) (models.RetentionRun, error) {
-	retentionRunMu.Lock()
-	if retentionRunTenants[tenant] {
-		retentionRunMu.Unlock()
-		return models.RetentionRun{}, errRetentionBusy
+func effectiveRetentionMode(mode string) string {
+	if mode == models.RetentionModeAssist {
+		return mode
 	}
-	retentionRunTenants[tenant] = true
-	retentionRunMu.Unlock()
-	defer func() {
-		retentionRunMu.Lock()
-		delete(retentionRunTenants, tenant)
-		retentionRunMu.Unlock()
-	}()
+	return models.RetentionModeObserve
+}
 
+// beginRetentionRun samples required pressure evidence without selecting work.
+// The canonical one-active-lane index also serializes manual preparation.
+func beginRetentionRun(db *gorm.DB, tenant, trigger, createdBy string) (models.RetentionRun, error) {
 	policy := loadRetentionPolicy(db, tenant)
 	policy.NewsTimezone = retentionNewsTimezone(db, tenant)
 	now := time.Now().UTC()
@@ -817,7 +779,7 @@ func runRetention(db *gorm.DB, tenant, trigger, createdBy string) (models.Retent
 			"finished_at": now,
 		}).Error
 	run := models.RetentionRun{
-		TenantID: tenant, Lane: "database", Trigger: trigger, Mode: policy.Mode,
+		TenantID: tenant, Lane: "database", Trigger: trigger, Mode: effectiveRetentionMode(policy.Mode),
 		Status: models.RetentionRunRunning, Verdict: models.RetentionVerdictInconclusive,
 		PolicyVersion: policy.PolicyVersion, CorrelationID: uuid.New(),
 		CreatedBy: createdBy, StartedAt: now, HeartbeatAt: now,
@@ -831,107 +793,74 @@ func runRetention(db *gorm.DB, tenant, trigger, createdBy string) (models.Retent
 	}
 	_ = ensureCurrentRetentionMonth(db, tenant, policy.NewsTimezone, now)
 
-	finishFailure := func(class string, err error) (models.RetentionRun, error) {
-		finished := time.Now().UTC()
-		run.Status, run.ErrorClass, run.Error, run.FinishedAt = models.RetentionRunFailed, class, err.Error(), &finished
-		_ = db.Model(&run).Updates(map[string]interface{}{
-			"status": run.Status, "error_class": class, "error": run.Error,
-			"finished_at": finished, "heartbeat_at": finished,
-		}).Error
-		return run, err
-	}
-
 	sample, err := collectRetentionDBSample(db, tenant)
 	if err != nil {
-		return finishFailure("sample_failed", err)
-	}
-	samples := retentionSamples(db, tenant, 200)
-	forecast := calculateRetentionForecast(samples, policy)
-	preview, err := previewRetentionNews(db, tenant, policy.NewsTimezone)
-	if err != nil {
-		return finishFailure("preview_failed", err)
-	}
-	run.Verdict = retentionVerdict(policy, &sample, forecast)
-	beforeRaw, _ := json.Marshal(map[string]interface{}{
-		"sample_id": sample.PublicID, "database_bytes": sample.DatabaseBytes,
-		"provider_bytes": sample.ProviderBytes, "provider_source": sample.ProviderSource,
-	})
-	forecastRaw, _ := json.Marshal(forecast)
-	countsRaw, _ := json.Marshal(preview)
-	run.BeforeEvidence = datatypes.JSON(beforeRaw)
-	run.ForecastEvidence = datatypes.JSON(forecastRaw)
-	run.Counts = datatypes.JSON(countsRaw)
-	var safeAutoAction *models.RetentionAction
-
-	if preview.EligibleStories > 0 {
-		evidence := map[string]interface{}{
-			"preview": preview, "timezone": policy.NewsTimezone,
-			"dormancy_days": 7, "destructive_execution_enabled": false,
-			"required_preflight": []string{
-				"protected-reference scan", "dependency scan", "snapshot invalidation",
-				"manifest readback", "post-action feed integrity", "post-action system health",
-			},
-		}
-		evidenceRaw, _ := json.Marshal(evidence)
-		sum := sha256.Sum256(evidenceRaw)
-		fingerprint := hex.EncodeToString(sum[:])
-		action := models.RetentionAction{
-			RunID: run.ID, TenantID: tenant, ActionClass: models.RetentionActionPreviewNewsCompaction,
-			OwnerSystem: "news_database", TargetScope: "dormant_current_month_stories",
-			Mode: policy.Mode, Decision: "shadow_preview", Outcome: models.RetentionActionWouldExecute,
-			IdempotencyKey:      run.CorrelationID.String() + ":news-preview",
-			EvidenceFingerprint: fingerprint, TargetCount: preview.CandidateRows,
-			ProtectedCount: preview.ProtectedRows, EstimatedBytes: preview.EstimatedBytes,
-			Guardrail: "observe_only_no_content_mutation", Evidence: datatypes.JSON(evidenceRaw),
-			BeforeBytes: &sample.DatabaseBytes,
-		}
-		forecastAfter := sample.DatabaseBytes - minInt64(preview.EstimatedBytes, policy.MaxBytesPerRun)
-		if forecastAfter < 0 {
-			forecastAfter = 0
-		}
-		action.ForecastAfterBytes = &forecastAfter
-		if err := db.Create(&action).Error; err != nil {
-			return finishFailure("action_ledger_failed", err)
-		}
-	}
-
-	// Slice 10's only promotable action is a bounded derived-state News
-	// snapshot refresh. Observe writes the shadow decision, Assist asks for a
-	// human decision, and Safe Auto can create a ready action only after the
-	// same class has earned trust with a closed breaker. No canonical row,
-	// source, object, or physical rewrite is eligible here.
-	refreshWindows := retentionSnapshotRefreshWindows(db, tenant)
-	if len(refreshWindows) > 0 {
-		trusted := retentionSafeAutoPromotionReady(db, tenant, policy)
-		action := buildRetentionSnapshotRefreshAction(run, policy, preview, refreshWindows, trusted)
-		if err := db.Create(&action).Error; err != nil {
-			return finishFailure("action_ledger_failed", err)
-		}
-		if action.Outcome == models.RetentionActionReady {
-			safeAutoAction = &action
-		}
-	}
-
-	finished := time.Now().UTC()
-	run.Status, run.FinishedAt, run.HeartbeatAt = models.RetentionRunCompleted, &finished, finished
-	if err := db.Model(&run).Updates(map[string]interface{}{
-		"status": run.Status, "verdict": run.Verdict, "before_evidence": run.BeforeEvidence,
-		"forecast_evidence": run.ForecastEvidence, "counts": run.Counts,
-		"finished_at": finished, "heartbeat_at": finished,
-	}).Error; err != nil {
+		_ = finishRetentionRun(db, &run, err)
 		return run, err
 	}
-	if safeAutoAction != nil {
-		if _, refreshErr := executeRetentionSnapshotRefresh(db, *safeAutoAction, "retention-autopilot"); refreshErr != nil {
-			run.Status = models.RetentionRunPartial
-			run.ErrorClass = "safe_auto_action_failed"
-			run.Error = refreshErr.Error()
-			_ = db.Model(&run).Updates(map[string]interface{}{"status": run.Status, "error_class": run.ErrorClass, "error": run.Error, "updated_at": time.Now().UTC()}).Error
-		}
-	}
-	_ = db.Model(&models.RetentionPolicy{}).Where("tenant_id = ?", tenant).
-		Update("last_run_at", finished).Error
+	forecast := calculateRetentionForecast(retentionSamples(db, tenant, 200), policy)
+	run.Verdict = retentionVerdict(policy, &sample, forecast)
+	run.BeforeEvidence = retentionActionEvidence(map[string]interface{}{"sample_id": sample.PublicID, "database_bytes": sample.DatabaseBytes, "provider_bytes": sample.ProviderBytes, "provider_source": sample.ProviderSource})
+	run.ForecastEvidence = retentionActionEvidence(forecast)
 	return run, nil
+}
+
+func finishRetentionRun(db *gorm.DB, run *models.RetentionRun, runErr error) error {
+	finished, status, errorClass, message := time.Now().UTC(), models.RetentionRunCompleted, "none", ""
+	if runErr != nil {
+		status, errorClass, message = models.RetentionRunFailed, "run_failed", runErr.Error()
+		run.Verdict = models.RetentionVerdictInconclusive
+	}
+	if err := db.Model(run).Updates(map[string]interface{}{
+		"status": status, "verdict": run.Verdict, "before_evidence": run.BeforeEvidence,
+		"forecast_evidence": run.ForecastEvidence, "counts": run.Counts, "after_evidence": run.AfterEvidence,
+		"error_class": errorClass, "error": message, "finished_at": finished, "heartbeat_at": finished,
+	}).Error; err != nil {
+		return err
+	}
+	run.Status, run.FinishedAt, run.HeartbeatAt = status, &finished, finished
+	return nil
+}
+
+func runRetention(db *gorm.DB, tenant, trigger, createdBy string) (models.RetentionRun, error) {
+	retentionRunMu.Lock()
+	if retentionRunTenants[tenant] {
+		retentionRunMu.Unlock()
+		return models.RetentionRun{}, errRetentionBusy
+	}
+	retentionRunTenants[tenant] = true
+	retentionRunMu.Unlock()
+	defer func() {
+		retentionRunMu.Lock()
+		delete(retentionRunTenants, tenant)
+		retentionRunMu.Unlock()
+	}()
+
+	run, err := beginRetentionRun(db, tenant, trigger, createdBy)
+	if err != nil {
+		return run, err
+	}
+	preview, previewErr := previewRetentionNews(db, tenant, retentionNewsTimezone(db, tenant))
+	run.Counts = retentionActionEvidence(preview)
+	if err := finishRetentionRun(db, &run, previewErr); err != nil {
+		return run, err
+	}
+	if previewErr != nil {
+		return run, previewErr
+	}
+	_ = db.Model(&models.RetentionPolicy{}).Where("tenant_id = ?", tenant).Update("last_run_at", run.FinishedAt).Error
+	return run, nil
+}
+
+// RetentionCapabilityRetired keeps old authenticated routes fail-closed.
+func RetentionCapabilityRetired(c *gin.Context) {
+	if _, ok := requireRetentionTenant(c); ok {
+		c.JSON(http.StatusGone, gin.H{"code": "retention_capability_retired", "error": "This Retention capability is retired; use native News or media maintenance"})
+	}
+}
+
+func retentionActionRetired(class string) bool {
+	return class == models.RetentionActionRefreshNewsSnapshots || class == models.RetentionActionRequestStorageRun || class == models.RetentionActionRequestMediaRun
 }
 
 func ensureCurrentRetentionMonth(db *gorm.DB, tenant, timezone string, now time.Time) error {
@@ -1081,8 +1010,11 @@ func ApproveRetentionAction(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "retention action not found"})
 		return
 	}
-	// The harness intentionally has no canonical-row executor. Approval cannot
-	// turn an observe-only preview into an implicit mutation.
+	if action.ActionClass != retentionActionPrepareNewsCompaction && action.ActionClass != models.RetentionActionPrepareHistoricalPurge {
+		RetentionCapabilityRetired(c)
+		return
+	}
+	// Historical shadow previews carry no approval authority.
 	if action.Outcome == models.RetentionActionWouldExecute || action.ActionClass == models.RetentionActionPreviewNewsCompaction {
 		c.JSON(http.StatusConflict, gin.H{"error": "shadow previews cannot be approved; destructive execution is not installed"})
 		return
@@ -1094,7 +1026,7 @@ func ApproveRetentionAction(c *gin.Context) {
 			Where("tenant_id = ? AND public_id = ?", principal.TenantID, id).First(&locked).Error; err != nil {
 			return err
 		}
-		if locked.Outcome != models.RetentionActionApprovalRequired {
+		if locked.ActionClass != action.ActionClass || locked.Outcome != models.RetentionActionApprovalRequired {
 			return fmt.Errorf("action is no longer awaiting approval")
 		}
 		result := tx.Model(&locked).Where("id = ? AND tenant_id = ? AND outcome = ?", locked.ID, principal.TenantID, models.RetentionActionApprovalRequired).
@@ -1121,10 +1053,6 @@ func ApproveRetentionAction(c *gin.Context) {
 		}
 		if result := tx.Model(&models.RetentionHistoricalManifest{}).Where("action_id = ? AND state = 'prepared'", locked.ID).
 			Updates(map[string]interface{}{"state": "approved", "approved_at": now, "approved_by": principal.Email}); result.Error != nil {
-			return result.Error
-		}
-		if result := tx.Model(&models.RetentionOwnerRequest{}).Where("action_id = ? AND status = ?", locked.ID, "approval_required").
-			Update("status", "approved"); result.Error != nil {
 			return result.Error
 		}
 		action = locked
