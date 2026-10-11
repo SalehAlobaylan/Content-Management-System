@@ -455,18 +455,21 @@ func recordPodsServe(db *gorm.DB, tenantID string, items []models.ContentItem, r
 // GetNewsFeed returns the News feed with cursor-based pagination
 // GET /api/v1/feed/news?window=today|week|month&cursor=xxx&limit=10
 func GetNewsFeed(c *gin.Context) {
-	db := c.MustGet("db").(*gorm.DB)
+	db := feedcontract.WithReadSchema(c.MustGet("db").(*gorm.DB).WithContext(c.Request.Context()))
+	if db.Error != nil {
+		c.JSON(503, gin.H{"error": "Feed schema is unavailable"})
+		return
+	}
 	tenantID, tenantErr := trustedPublicFeedTenant(c)
 	if tenantErr != nil {
 		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Public feed tenant is unavailable"})
 		return
 	}
-	newsGenerationID, generationSupported, generationActive := feedcontract.ActiveGeneration(db, tenantID, "news")
+	newsGenerationID, generationSupported, generationActive, availability := publicFeedBoundary(db, tenantID, "news")
 	if generationSupported && !generationActive {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "News serving generation is unavailable", "code": "FEED_VIEW_UNAVAILABLE"})
 		return
 	}
-	availability := currentFeedAvailability(db, tenantID, "news")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
 	}
@@ -671,6 +674,11 @@ func applyDurationPreference(query *gorm.DB, targetMinutes int) *gorm.DB {
 	if targetMinutes <= 0 {
 		return query
 	}
+	minSec, maxSec := podsDurationBounds(targetMinutes)
+	return query.Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", minSec, maxSec)
+}
+
+func podsDurationBounds(targetMinutes int) (int, int) {
 	targetSec := targetMinutes * 60
 	minSec := int(float64(targetSec) * 0.6)
 	maxSec := int(float64(targetSec) * 1.6)
@@ -680,7 +688,7 @@ func applyDurationPreference(query *gorm.DB, targetMinutes int) *gorm.DB {
 	if maxSec > podsHardMaxDurationSec {
 		maxSec = podsHardMaxDurationSec
 	}
-	return query.Where("duration_sec IS NOT NULL AND duration_sec BETWEEN ? AND ?", minSec, maxSec)
+	return minSec, maxSec
 }
 
 func supportsAtomizedPodsSchema(db *gorm.DB) bool {

@@ -119,13 +119,13 @@ func ReconcileNewsMembership(db *gorm.DB, tenant string) (int64, error) {
        AND (instance.state IN ('staged','retired') OR instance.campaign_id IS NOT NULL))`)
 			}
 			result := tx.Exec(`INSERT INTO feed_generation_memberships (generation_id,member_type,member_id,attached_at)
-     SELECT DISTINCT ?, 'story', story_id, NOW() FROM (?) AS candidates ON CONFLICT DO NOTHING`, generation.PublicID, query)
+     SELECT DISTINCT ?::uuid, 'story', story_id, NOW() FROM (?) AS candidates ON CONFLICT DO NOTHING`, generation.PublicID, query)
 			if result.Error != nil {
 				return result.Error
 			}
 			attached += result.RowsAffected
 			result = tx.Exec(`INSERT INTO feed_generation_memberships (generation_id,member_type,member_id,attached_at)
-     SELECT ?, 'news_item', public_id, NOW() FROM (?) AS candidates ON CONFLICT DO NOTHING`, generation.PublicID, query)
+     SELECT ?::uuid, 'news_item', public_id, NOW() FROM (?) AS candidates ON CONFLICT DO NOTHING`, generation.PublicID, query)
 			if result.Error != nil {
 				return result.Error
 			}

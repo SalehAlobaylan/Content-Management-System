@@ -15,8 +15,8 @@ func TestFeedIntegrityLockHoldsTransactionUntilOwnerFinishes(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT pg_try_advisory_xact_lock($1)")).
 		WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"acquired"}).AddRow(true))
 	ctx, cancel := context.WithCancel(context.Background())
-	release, ok := withFeedIntegrityLock(ctx, db, "default")
-	if !ok {
+	release, ok, err := withFeedIntegrityLock(ctx, db, "default")
+	if !ok || err != nil {
 		t.Fatal("could not acquire owner guard")
 	}
 	// Expiry of the probe context must not release the guard while inventory
@@ -44,9 +44,12 @@ func TestFeedIntegrityLockRollsBackDeniedOrFailedAcquisition(t *testing.T) {
 				query.WillReturnRows(sqlmock.NewRows([]string{"acquired"}).AddRow(false))
 			}
 			mock.ExpectRollback()
-			release, ok := withFeedIntegrityLock(context.Background(), db, "default")
+			release, ok, err := withFeedIntegrityLock(context.Background(), db, "default")
 			if ok {
 				t.Fatal("failed owner guard granted execution")
+			}
+			if (err != nil) != failed {
+				t.Fatal("database failure was conflated with contention", err)
 			}
 			release()
 			if err := mock.ExpectationsWereMet(); err != nil {
@@ -59,8 +62,8 @@ func TestFeedIntegrityLockRollsBackDeniedOrFailedAcquisition(t *testing.T) {
 func TestFeedIntegrityLockHandlesBeginFailure(t *testing.T) {
 	db, mock := newMockGorm(t)
 	mock.ExpectBegin().WillReturnError(errors.New("begin failed"))
-	release, ok := withFeedIntegrityLock(context.Background(), db, "default")
-	if ok {
+	release, ok, err := withFeedIntegrityLock(context.Background(), db, "default")
+	if ok || err == nil {
 		t.Fatal("begin failure granted execution")
 	}
 	release()

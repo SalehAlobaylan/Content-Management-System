@@ -427,6 +427,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/feed-integrity/autopilot/actions/:id", perm("feed", "read"), controllers.GetFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/approve", perm("feed", "manage"), controllers.ApproveFeedIntegrityAutopilotAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/:id/reject", perm("feed", "manage"), controllers.RejectFeedIntegrityAutopilotAction)
+	adminGroup.POST("/feed-integrity/autopilot/actions/:id/review-unknown", perm("feed", "manage"), controllers.ReviewFeedIntegrityUnknownAction)
 	adminGroup.POST("/feed-integrity/autopilot/actions/breakers/:class/reset", perm("feed", "manage"), controllers.ResetFeedIntegrityAutopilotBreaker)
 
 	// Retention Autopilot — database pressure, compact-News preview, and the

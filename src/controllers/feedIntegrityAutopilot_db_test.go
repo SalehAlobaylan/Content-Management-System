@@ -2,6 +2,10 @@ package controllers
 
 import (
 	"encoding/json"
+	"gorm.io/driver/postgres"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,8 +20,20 @@ import (
 func feedIntegrityTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t)
-	if err := db.AutoMigrate(&models.FeedIntegrityPolicy{}, &models.FeedIntegrityRun{}, &models.FeedIntegrityFinding{}, &models.FeedIntegrityEpisode{}, &models.FeedIntegritySuppression{}, &models.FeedIntegrityAction{}, &models.NewsSnapshot{}, &models.AuditLog{}); err != nil {
-		t.Fatalf("migrate feed integrity test schema: %v", err)
+	dsn := db.Dialector.(*postgres.Dialector).Config.DSN
+	cmd := exec.Command("go", "run", "./cmd/migrate", "--all", "--allow-destructive", "--bootstrap-empty")
+	cmd.Dir = "../.."
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "DATABASE_URL=") && !strings.HasPrefix(value, "CMS_RUNTIME_DATABASE_URL=") && !strings.HasPrefix(value, "CMS_MIGRATION_BOOTSTRAP_DISPOSABLE=") {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "DATABASE_URL="+dsn, "CMS_MIGRATION_BOOTSTRAP_DISPOSABLE=I_UNDERSTAND_THIS_DATABASE_IS_DISPOSABLE")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if len(output) > 6000 {
+			output = output[len(output)-6000:]
+		}
+		t.Fatalf("canonical integrity fixture: %v\n%s", err, output)
 	}
 	clear := func() {
 		_ = db.Exec("DELETE FROM feed_integrity_actions").Error
@@ -30,6 +46,10 @@ func feedIntegrityTestDB(t *testing.T) *gorm.DB {
 		_ = db.Exec("DELETE FROM audit_logs").Error
 	}
 	clear()
+	now := time.Now().UTC()
+	if err := db.Create(&models.SystemAutopilotRun{Trigger: "test", Mode: "observe", Status: "completed", Headline: "healthy", StartedAt: now, FinishedAt: &now, ProbeResults: integrityJSON(map[string]interface{}{"run_snapshot": map[string]interface{}{"overall": "healthy"}})}).Error; err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(clear)
 	return db
 }
@@ -42,7 +62,7 @@ func seedFeedIntegrityAction(t *testing.T, db *gorm.DB, tenant string, outcome s
 	if err := db.Create(&policy).Error; err != nil {
 		t.Fatalf("create policy: %v", err)
 	}
-	run := models.FeedIntegrityRun{TenantID: tenant, Trigger: "test", Tier: models.FeedIntegrityTierLight, Status: models.FeedIntegrityRunCompleted, Headline: "all_clear", StartedAt: now.Add(-time.Minute), FinishedAt: &now, ErrorClass: "none", AutopilotErrorClass: "none"}
+	run := models.FeedIntegrityRun{LaneResults: integrityRepairTestLanes(now), TenantID: tenant, Trigger: "test", Tier: models.FeedIntegrityTierLight, Status: models.FeedIntegrityRunCompleted, Headline: "all_clear", StartedAt: now.Add(-time.Minute), FinishedAt: &now, ErrorClass: "none", AutopilotErrorClass: "none"}
 	if err := db.Create(&run).Error; err != nil {
 		t.Fatalf("create run: %v", err)
 	}
@@ -50,7 +70,11 @@ func seedFeedIntegrityAction(t *testing.T, db *gorm.DB, tenant string, outcome s
 	if err := db.Create(&episode).Error; err != nil {
 		t.Fatalf("create episode: %v", err)
 	}
-	action := models.FeedIntegrityAction{TenantID: tenant, RunID: run.ID, EpisodeID: episode.ID, ActionClass: models.FeedIntegrityActionRefreshWindow, OwnerSystem: "news-circulation", TargetScope: "today", Mode: models.FeedIntegrityAutopilotModeAssist, Outcome: outcome, Decision: models.FeedIntegrityDecisionReady, IdempotencyKey: tenant + "-claim-" + outcome, EvidenceFingerprint: "fingerprint-" + tenant, RegistryVersion: feedIntegrityRegistryVersion}
+	snapshot := models.NewsSnapshot{TenantID: tenant, Window: "today", BuiltAt: now.Add(-2 * time.Minute).Truncate(time.Microsecond), Dirty: true}
+	if err := db.Create(&snapshot).Error; err != nil {
+		t.Fatal(err)
+	}
+	action := models.FeedIntegrityAction{ApprovedAt: &now, Input: integrityJSON(map[string]interface{}{"evidence": map[string]interface{}{"built_at": snapshot.BuiltAt, "generation": snapshot.Generation}}), TenantID: tenant, RunID: run.ID, EpisodeID: episode.ID, ActionClass: models.FeedIntegrityActionRefreshWindow, OwnerSystem: "news-circulation", TargetScope: "today", Mode: models.FeedIntegrityAutopilotModeAssist, Outcome: outcome, Decision: models.FeedIntegrityDecisionReady, IdempotencyKey: tenant + "-claim-" + outcome, EvidenceFingerprint: "fingerprint-" + tenant, RegistryVersion: feedIntegrityRegistryVersion}
 	if err := db.Create(&action).Error; err != nil {
 		t.Fatalf("create action: %v", err)
 	}
@@ -119,7 +143,7 @@ func TestFeedIntegrityDBExpiredClaimRecoversForOneLaterWorker(t *testing.T) {
 	if err := db.First(&recovered, action.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if recovered.Outcome != models.FeedIntegrityActionReady || recovered.ClaimToken != "" || recovered.ClaimExpiresAt != nil || recovered.Guardrail != "stale_claim_recovered" {
+	if recovered.Outcome != models.FeedIntegrityActionApproved || recovered.ClaimToken != "" || recovered.ClaimExpiresAt != nil || recovered.Guardrail != "stale_claim_recovered" {
 		t.Fatalf("expired claim was not safely recovered: %+v", recovered)
 	}
 	if _, err := claimFeedIntegrityAction(db, "tenant-a", action.ID); err != nil {
@@ -138,7 +162,7 @@ func TestFeedIntegrityDBDualEvidenceAndObserveEvaluationDoNotMutateSnapshot(t *t
 	if err := db.Create(&policy).Error; err != nil {
 		t.Fatal(err)
 	}
-	run := models.FeedIntegrityRun{TenantID: "tenant-a", Trigger: "test", Tier: models.FeedIntegrityTierLight, Status: models.FeedIntegrityRunCompleted, Headline: "watching", StartedAt: now.Add(-time.Minute), FinishedAt: &now, ErrorClass: "none", AutopilotErrorClass: "none"}
+	run := models.FeedIntegrityRun{LaneResults: integrityRepairTestLanes(now), TenantID: "tenant-a", Trigger: "test", Tier: models.FeedIntegrityTierLight, Status: models.FeedIntegrityRunCompleted, Headline: "watching", StartedAt: now.Add(-time.Minute), FinishedAt: &now, ErrorClass: "none", AutopilotErrorClass: "none"}
 	if err := db.Create(&run).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +222,17 @@ func TestFeedIntegrityDBOverflowCreatesAggregateBacklogEpisode(t *testing.T) {
 	if err := db.Create(&findings).Error; err != nil {
 		t.Fatal(err)
 	}
-	updateFeedIntegrityEpisodes(db, "tenant-a", policy, run, findings)
+	c := newIntegrityCollector(run, nil, nil)
+	for _, f := range findings {
+		c.add(f.CheckKey, f.Lane, f.Feed, f.Variant, f.Axis, f.Severity, f.Status, f.TargetType, f.TargetRef, 1, nil)
+	}
+	run.LaneResults = integrityJSON(c.lanes())
+	if err := db.Model(&run).Update("lane_results", run.LaneResults).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := updateFeedIntegrityEpisodes(db, "tenant-a", policy, run, findings); err != nil {
+		t.Fatal(err)
+	}
 	var regular int64
 	db.Model(&models.FeedIntegrityEpisode{}).Where("tenant_id=? AND check_key=? AND scope NOT LIKE ?", "tenant-a", "edge_pods_bounds_served", "aggregate:%").Count(&regular)
 	if regular != 20 {
@@ -218,4 +252,13 @@ func TestFeedIntegrityDBOverflowCreatesAggregateBacklogEpisode(t *testing.T) {
 	if !evidence.Overflow || evidence.AffectedCount != 5 {
 		t.Fatalf("unexpected overflow evidence: %+v", evidence)
 	}
+}
+
+func integrityRepairTestLanes(now time.Time) []byte {
+	obs := []integrityObservation{
+		{Version: 1, CheckKey: "inv_news_cache_rebuild_debt", Feed: "news", Variant: "today", Outcome: "violation", Coverage: "exhaustive", CandidateCount: 1, SampleCount: 1, AffectedCount: 1, ObservedAt: now, Targets: []integrityTargetOutcome{{Scope: "today", Outcome: "violation"}}},
+		{Version: 1, CheckKey: "edge_news_cache_stale", Feed: "news", Variant: "window:today", Outcome: "pass", Coverage: "sampled", CandidateCount: 1, SampleCount: 1, ObservedAt: now},
+		{Version: 1, CheckKey: "edge_news_http", Feed: "news", Variant: "window:today", Outcome: "pass", Coverage: "sampled", CandidateCount: 1, SampleCount: 1, ObservedAt: now},
+	}
+	return integrityJSON(map[string]integrityLane{"inventory": {Executed: 1, Observations: obs[:1]}, "edge": {Executed: 1, Observations: obs[1:]}})
 }

@@ -96,7 +96,7 @@ type FeedIntegrityPolicy struct {
 	AutopilotEnabled               bool           `gorm:"column:autopilot_enabled;not null;default:false" json:"autopilot_enabled"`
 	AutopilotMode                  string         `gorm:"column:autopilot_mode;type:varchar(24);not null;default:'observe'" json:"autopilot_mode"`
 	AutopilotPausedUntil           *time.Time     `gorm:"column:autopilot_paused_until;type:timestamp" json:"autopilot_paused_until,omitempty"`
-	AutopilotActionModes           datatypes.JSON `gorm:"column:autopilot_action_modes;type:jsonb" json:"autopilot_action_modes,omitempty"`
+	AutopilotActionModes           datatypes.JSON `gorm:"column:autopilot_action_modes;type:jsonb;not null;default:'{}'" json:"autopilot_action_modes,omitempty"`
 	AutopilotActionHourlyCap       int            `gorm:"column:autopilot_action_hourly_cap;not null;default:2" json:"autopilot_action_hourly_cap"`
 	AutopilotDiagnosticHourlyCap   int            `gorm:"column:autopilot_diagnostic_hourly_cap;not null;default:4" json:"autopilot_diagnostic_hourly_cap"`
 	AutopilotCooldownMinutes       int            `gorm:"column:autopilot_cooldown_minutes;not null;default:60" json:"autopilot_cooldown_minutes"`

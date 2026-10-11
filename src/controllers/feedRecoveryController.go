@@ -962,6 +962,11 @@ type recoveryInventoryProof struct {
 }
 
 func feedIntegrityPageCount(db *gorm.DB, run models.FeedIntegrityRun, checkKey, feed, variant string) (int64, error) {
+	key := "edge_" + feed + "_http"
+	obs, ok := integrityObservationFor(run, key, feed, variant)
+	if run.Status != "completed" || !ok || obs.Outcome != "pass" {
+		return 0, errors.New("complete versioned page evidence required")
+	}
 	var count int64
 	if err := db.Model(&models.FeedIntegrityFinding{}).
 		Where("run_id=? AND check_key=? AND feed=? AND variant=? AND status=?", run.ID, checkKey, feed, variant, "ok").
@@ -1032,24 +1037,29 @@ func systemHealthRunHealthy(run models.SystemAutopilotRun) bool {
 }
 
 func feedIntegrityLatencyClean(db *gorm.DB, run models.FeedIntegrityRun) bool {
-	var findings []models.FeedIntegrityFinding
-	if db.Where("run_id = ?", run.ID).Find(&findings).Error != nil {
+	if run.Status != "completed" {
 		return false
 	}
-	for _, finding := range findings {
-		if strings.Contains(finding.CheckKey, "latency") && finding.Status != "ok" {
+	for _, feed := range []string{"pods", "news"} {
+		variant := "default"
+		if feed == "news" {
+			variant = "window:today"
+		}
+		o, ok := integrityObservationFor(run, "edge_"+feed+"_latency", feed, variant)
+		if !ok || o.Outcome != "pass" {
 			return false
 		}
 	}
 	return true
 }
-
 func feedIntegritySuccessfulPlaybackProbes(db *gorm.DB, run models.FeedIntegrityRun) (int64, error) {
-	var count int64
-	if err := db.Model(&models.FeedIntegrityFinding{}).Where("run_id=? AND check_key=? AND feed=? AND status=?", run.ID, "probe_url_success", "pods", "ok").Count(&count).Error; err != nil {
-		return 0, err
+	o, ok := integrityObservationFor(run, "probe_url_dead", "pods", "default")
+	if run.Status != "completed" || run.Tier != "deep" || !ok || o.Outcome != "pass" {
+		return 0, errors.New("complete versioned primary probe evidence required")
 	}
-	return count, nil
+	var count int64
+	err := db.Model(&models.FeedIntegrityFinding{}).Where("run_id=? AND tenant_id=? AND check_key='probe_url_success' AND feed='pods' AND status='ok' AND evidence->>'role'='primary' AND evidence->>'complete'='true'", run.ID, run.TenantID).Select("COUNT(DISTINCT target_ref)").Scan(&count).Error
+	return count, err
 }
 
 // recoveryCandidateMembershipProof verifies the private generation that will
@@ -2231,6 +2241,15 @@ type feedAvailabilityMeta struct {
 	Availability      string `json:"availability"`
 	MessageKey        string `json:"message_key,omitempty"`
 	RetryAfterSeconds *int   `json:"retry_after_seconds,omitempty"`
+}
+
+// The active serving head and availability notice are independent reads.
+// Overlap them instead of paying two sequential database round trips.
+func publicFeedBoundary(db *gorm.DB, tenant, lane string) (uuid.UUID, bool, bool, *feedAvailabilityMeta) {
+	notice := make(chan *feedAvailabilityMeta, 1)
+	go func() { notice <- currentFeedAvailability(db, tenant, lane) }()
+	generation, supported, active := feedcontract.ActiveGeneration(db, tenant, lane)
+	return generation, supported, active, <-notice
 }
 
 func currentFeedAvailability(db *gorm.DB, tenant, lane string) *feedAvailabilityMeta {

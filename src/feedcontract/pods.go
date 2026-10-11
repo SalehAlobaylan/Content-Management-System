@@ -151,12 +151,18 @@ func ValidateServingView(view ServingView) error {
 }
 
 func SupportsAtomizedPodsSchema(db *gorm.DB) bool {
+	if schema, ok := requestSchema(db); ok {
+		return schema.Atomized
+	}
 	return db != nil && db.Migrator().HasColumn(&models.ContentItem{}, "is_feed_unit") &&
 		db.Migrator().HasColumn(&models.ContentItem{}, "feed_visibility") &&
 		db.Migrator().HasColumn(&models.ContentItem{}, "playback_url")
 }
 
 func SupportsStorageStateSchema(db *gorm.DB) bool {
+	if schema, ok := requestSchema(db); ok {
+		return schema.Storage
+	}
 	// Query-shape tests use a DryRun sqlmock without a real information_schema.
 	// Runtime reads still check the column before adding the filter.
 	return !isDryRun(db) && db != nil && db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
@@ -203,7 +209,7 @@ func PodsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema boo
 	}
 	// Atomization candidates are not serving generations. This also fences
 	// previously marked-visible candidates while completion is reconciled.
-	if db.Migrator().HasTable(&models.AtomizationGeneration{}) {
+	if hasAtomizationGenerations(db) {
 		q = q.Where(`(parent_content_item_id IS NULL OR COALESCE(metadata->>'atomization_generation_id','')='' OR EXISTS (
 			SELECT 1 FROM atomization_generations ag WHERE ag.tenant_id=content_items.tenant_id
 			AND ag.parent_content_item_id=content_items.parent_content_item_id
@@ -219,7 +225,11 @@ func ApplyActiveGenerationMembership(db *gorm.DB, query *gorm.DB, tenant, lane, 
 	if db == nil || query == nil || isDryRun(db) {
 		return query
 	}
-	_, supported, active := ActiveGeneration(db, tenant, lane)
+	schema, scoped := requestSchema(db)
+	supported, active := schema.Generations, true
+	if !scoped {
+		_, supported, active = ActiveGeneration(db, tenant, lane)
+	}
 	if !supported {
 		return query
 	}
@@ -335,7 +345,7 @@ func activeGenerationMembershipJoin(memberColumn string) string {
 // ActiveGeneration separates the pre-schema compatibility window from a
 // missing authority row after generation membership becomes operational.
 func ActiveGeneration(db *gorm.DB, tenant, lane string) (uuid.UUID, bool, bool) {
-	if db == nil || isDryRun(db) || !db.Migrator().HasTable(&models.FeedGenerationHead{}) || !db.Migrator().HasTable(&models.FeedGenerationMembership{}) {
+	if db == nil || isDryRun(db) || !hasGenerationTables(db) {
 		return uuid.Nil, false, false
 	}
 	var head models.FeedGenerationHead
@@ -350,6 +360,9 @@ func isDryRun(db *gorm.DB) bool {
 }
 
 func supportsNewsItemMembershipSchema(db *gorm.DB) (bool, bool) {
+	if schema, ok := requestSchema(db); ok {
+		return schema.ExactItems, schema.ConstraintFound
+	}
 	if db == nil || isDryRun(db) {
 		return false, false
 	}

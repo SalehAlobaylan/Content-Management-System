@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
@@ -225,24 +227,6 @@ func assembleStoryNewsFeed(
 	now := circ.Window.Now
 	// 1. Pull a recent pool of classified NEWS members and score them with the
 	//    existing ranking engine (freshness/engagement/velocity/trending).
-	// Topic metadata is independent of the member pool — overlap the two WAN
-	// round-trips (each is the better part of a second against a remote DB).
-	type topicsResult struct {
-		byID map[uuid.UUID]models.Story
-		err  error
-	}
-	topicsCh := make(chan topicsResult, 1)
-	go func() {
-		var topics []models.Story
-		topicsQuery := feedstate.ActiveNewsStoryQuery(db, tenantID).Select(topicMetaColumns)
-		topicsQuery = applyActiveGenerationMembership(db, topicsQuery, tenantID, "news", "story", "stories.public_id")
-		result := topicsQuery.Find(&topics)
-		byID := make(map[uuid.UUID]models.Story, len(topics))
-		for _, t := range topics {
-			byID[t.PublicID] = t
-		}
-		topicsCh <- topicsResult{byID: byID, err: result.Error}
-	}()
 
 	windowStart := circ.Window.QueryStart
 	var members []models.ContentItem
@@ -262,18 +246,39 @@ func assembleStoryNewsFeed(
 	if len(members) == 0 {
 		return []StorySlide{}, nil, nil
 	}
-	// Retention state is part of the story read contract. Fetch it before any
-	// window/seen filtering so compact stories use their frozen lead identity
-	// and original last-member cursor, not the newest retained row.
-	topics := <-topicsCh
-	if topics.err != nil {
-		return nil, nil, topics.err
+	// Only the scored stories need metadata. Loading the whole corpus forces
+	// PostgreSQL to hydrate thousands of unrelated projections on every read.
+	storyIDs := make([]uuid.UUID, 0, len(members))
+	for _, member := range members {
+		if member.StoryID != nil {
+			storyIDs = append(storyIDs, *member.StoryID)
+		}
 	}
-	topicByID := topics.byID
-
+	activeStories := feedstate.ActiveNewsStoryQuery(db, tenantID)
+	topicByID := make(map[uuid.UUID]models.Story)
+	var topics []models.Story
+	var topicErr error
+	var flagMap map[uuid.UUID]models.ContentFlag
+	var velocityData VelocityData
 	contentIDs := extractPublicIDs(members)
-	flagMap := LoadContentFlags(db, tenantID, contentIDs)
-	velocityData := LoadVelocityData(db, contentIDs, config.VelocityWindowHours, now)
+	var scoringReads sync.WaitGroup
+	scoringReads.Add(3)
+	go func() {
+		defer scoringReads.Done()
+		topicErr = activeStories.Session(&gorm.Session{}).Select(topicMetaColumns).Where("public_id IN ?", storyIDs).Find(&topics).Error
+	}()
+	go func() { defer scoringReads.Done(); flagMap = LoadContentFlags(db, tenantID, contentIDs) }()
+	go func() {
+		defer scoringReads.Done()
+		velocityData = LoadVelocityData(db, contentIDs, config.VelocityWindowHours, now)
+	}()
+	scoringReads.Wait()
+	if topicErr != nil {
+		return nil, nil, topicErr
+	}
+	for _, topic := range topics {
+		topicByID[topic.PublicID] = topic
+	}
 	scored := ScoreItems(members, config, flagMap, velocityData, now)
 
 	// 2. Aggregate scored members into stories. Story momentum = max member
@@ -513,26 +518,53 @@ func assembleStoryNewsFeed(
 	}
 	sourceImageByFeedURL := loadSourceImagesByFeedURL(db, tenantID, pageMembers)
 
+	// Resolve related IDs and hydrate every related lead in one batch. A cache
+	// rebuild can contain 60 slides; per-slide hydration multiplied WAN trips.
+	relatedIDs, err := relatedCandidatesForPage(db, activeStories, pageStoryIDs, topicByID)
+	if err != nil {
+		return nil, nil, err
+	}
+	allRelated := make([]uuid.UUID, 0)
+	relatedSet := make(map[uuid.UUID]bool)
+	for _, ids := range relatedIDs {
+		for _, id := range ids {
+			if !pageIDs[id] && !relatedSet[id] {
+				allRelated = append(allRelated, id)
+				relatedSet[id] = true
+			}
+		}
+	}
+	if len(allRelated) > 0 {
+		var relatedTopics []models.Story
+		if err := activeStories.Session(&gorm.Session{}).Select(topicMetaColumns).Where("public_id IN ?", allRelated).Find(&relatedTopics).Error; err != nil {
+			return nil, nil, err
+		}
+		for _, topic := range relatedTopics {
+			topicByID[topic.PublicID] = topic
+		}
+	}
+	leads := leadSummariesByStory(db, tenantID, allRelated, topicByID, circ)
 	slides := make([]StorySlide, len(page))
 	relCandidates := make([][]StorySummary, len(page))
-	var wg sync.WaitGroup
-	for i, a := range page {
-		wg.Add(1)
-		go func(idx int, ag *storyAgg) {
-			defer wg.Done()
-			topic := topicByID[ag.storyID]
-			storyMembers := membersByStory[ag.storyID]
-			if len(storyMembers) == 0 {
-				// Defensive — page stories always have pool members; slim rows
-				// at worst render text-light rather than dropping the slide.
-				storyMembers = ag.members
+	for i, ag := range page {
+		topic := topicByID[ag.storyID]
+		storyMembers := membersByStory[ag.storyID]
+		if len(storyMembers) == 0 {
+			storyMembers = ag.members
+		}
+		slides[i] = StorySlide{SlideID: uuid.New(), Featured: buildStoryFeatured(topic, ag, storyMembers, sourceImageByFeedURL)}
+		for _, id := range relatedIDs[ag.storyID] {
+			if pageIDs[id] {
+				continue
 			}
-			featured := buildStoryFeatured(topic, ag, storyMembers, sourceImageByFeedURL)
-			slides[idx] = StorySlide{SlideID: uuid.New(), Featured: featured}
-			relCandidates[idx] = buildRelatedStories(db, tenantID, topic, ag.storyID, topicByID, pageIDs, circ)
-		}(i, a)
+			if _, active := topicByID[id]; !active {
+				continue
+			}
+			if summary, ok := leads[id]; ok && summary.LeadID != uuid.Nil {
+				relCandidates[i] = append(relCandidates[i], summary)
+			}
+		}
 	}
-	wg.Wait()
 
 	// Cross-slide dedup: a related story appears on at most one slide. Walk
 	// slides in page order, picking each slide's first still-unused candidates
@@ -964,6 +996,39 @@ func relatedCandidateIDs(db *gorm.DB, tenantID string, topic models.Story, story
 	return relatedKNNIDs(db, tenantID, storyID, storyRelatedPoolLimit)
 }
 
+// relatedCandidatesForPage keeps stored write-time ordering, including an
+// explicit empty list. Only missing plans use the existing cosine fallback.
+func relatedCandidatesForPage(db, activeStories *gorm.DB, storyIDs []uuid.UUID, topics map[uuid.UUID]models.Story) (map[uuid.UUID][]uuid.UUID, error) {
+	out := make(map[uuid.UUID][]uuid.UUID, len(storyIDs))
+	var missing []uuid.UUID
+	for _, id := range storyIDs {
+		if ids, computed := storedRelatedIDs(topics[id]); computed {
+			out[id] = ids
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	anchors := activeStories.Session(&gorm.Session{}).Select("public_id, embedding, embedding_space_id").Where("public_id IN ? AND embedding IS NOT NULL AND embedding_space_id IS NOT NULL", missing)
+	neighbors := activeStories.Session(&gorm.Session{}).Select("public_id, embedding, embedding_space_id, article_count, last_member_at")
+	var pairs []struct{ AnchorID, RelatedID uuid.UUID }
+	err := db.Raw(`SELECT anchor.public_id AS anchor_id, neighbor.public_id AS related_id
+	 FROM (?) anchor JOIN LATERAL (
+	  SELECT candidate.public_id FROM (?) candidate
+	  WHERE candidate.public_id<>anchor.public_id AND candidate.embedding IS NOT NULL
+	    AND candidate.embedding_space_id=anchor.embedding_space_id AND candidate.article_count>0
+	    AND (candidate.last_member_at IS NULL OR candidate.last_member_at>?)
+	    AND candidate.embedding <=> anchor.embedding <= ?
+	  ORDER BY candidate.embedding <=> anchor.embedding, candidate.public_id LIMIT ?
+	 ) neighbor ON TRUE`, anchors, neighbors, time.Now().AddDate(0, 0, -storyRelatedWindowDays), 1-storyRelatedMinSimilarity, storyRelatedPoolLimit).Scan(&pairs).Error
+	for _, pair := range pairs {
+		out[pair.AnchorID] = append(out[pair.AnchorID], pair.RelatedID)
+	}
+	return out, err
+}
+
 // relatedKNNIDs is the raw centroid-cosine neighbor query: active stories with
 // members, nearest first — FLOORED at storyRelatedMinSimilarity. Without the
 // floor, kNN dutifully returns the 3 "nearest" stories even when nearest means
@@ -1023,7 +1088,10 @@ func leadSummariesByStory(
 			continue
 		}
 		sid := *top.StoryID
-		t := topicByID[sid]
+		t, active := topicByID[sid]
+		if !active {
+			continue
+		}
 		memberCount := t.ArticleCount
 		lastMemberAt := itemTime(top)
 		if t.LastMemberAt != nil {
@@ -1100,22 +1168,29 @@ func buildRelatedStories(
 // background refresh, the admin Refresh endpoint, the classification backfill,
 // and lazily when the cache is empty.
 func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error) {
+	snap, err := buildNewsSnapshotResult(db, tenantID, window)
+	return snap.SlideCount, err
+}
+
+func buildNewsSnapshotResult(db *gorm.DB, tenantID string, window string) (models.NewsSnapshot, error) {
+	db = feedcontract.WithReadSchema(db)
+	started := time.Now().Truncate(time.Microsecond)
 	config := loadTenantConfig(db, tenantID)
 	circ := circulationContextFor(db, tenantID, window, time.Now())
 	generation, err := ensureNewsSnapshotGeneration(db, tenantID, circ.Window.Name)
 	if err != nil {
-		return 0, err
+		return models.NewsSnapshot{}, err
 	}
 	slides, _, err := assembleStoryNewsFeed(db, tenantID, config, circ, time.Time{}, uuid.Nil, newsSnapshotSlideCount, nil, "", false)
 	if err != nil {
-		return 0, err
+		return models.NewsSnapshot{}, err
 	}
 	if slides == nil {
 		slides = []StorySlide{}
 	}
 	data, err := json.Marshal(slides)
 	if err != nil {
-		return 0, err
+		return models.NewsSnapshot{}, err
 	}
 	// Atomic upsert on tenant + window avoids the SELECT-then-INSERT race
 	// (lazy build on read vs admin Refresh) that a FirstOrCreate would hit.
@@ -1128,19 +1203,19 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error)
 		SlideCount: len(slides),
 		Dirty:      false,
 		Generation: generation,
-		BuiltAt:    time.Now().Truncate(time.Microsecond),
+		BuiltAt:    started,
 	}
 	err = db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "tenant_id"}, {Name: "window"}},
 		DoUpdates: clause.AssignmentColumns([]string{"slides", "slide_count", "dirty", "generation", "built_at"}),
 	}).Create(&snap).Error
 	if err != nil {
-		return 0, err
+		return models.NewsSnapshot{}, err
 	}
 	// Seed process memory directly — the next read serves without re-pulling
 	// the JSON it just wrote.
 	newsSnapshotMem.Store(snapshotMemKey(tenantID, circ.Window.Name), &memCachedSnapshot{tenantID: tenantID, window: circ.Window.Name, slides: slides, builtAt: snap.BuiltAt, generation: generation})
-	return len(slides), nil
+	return snap, nil
 }
 
 // newsSnapshotTTL is the freshness SLO of the News-feed cache: a cached page
@@ -1150,11 +1225,9 @@ func buildNewsSnapshot(db *gorm.DB, tenantID string, window string) (int, error)
 // in the background.
 const newsSnapshotTTL = 60 * time.Second
 
-// newsSnapshotMaxStale is the hard ceiling for serve-stale-while-revalidate:
-// a user request is NEVER blocked on inline assembly while a cache younger
-// than this exists — it serves instantly and the rebuild runs behind it.
-// Inline assembly only happens truly cold (no cache, or idle longer than
-// this). Bounded staleness, flat latency.
+// newsSnapshotMaxStale is the degraded cache-only diagnostic ceiling:
+// Live mode uses the 60-second freshness SLO above. Cached-only policy may
+// deliberately serve stale data while rebuilding; the checker reports its age.
 const newsSnapshotMaxStale = 15 * time.Minute
 
 // memCachedSnapshot is the in-process copy of the news cache. The DB row stays
@@ -1279,8 +1352,12 @@ func startSnapshotRebuild(db *gorm.DB, tenantID string, window string) {
 	if _, loaded := snapshotRebuildRunning.LoadOrStore(key, true); loaded {
 		return
 	}
+	backgroundDB := db.WithContext(context.WithoutCancel(db.Statement.Context))
 	go func() {
 		defer snapshotRebuildRunning.Delete(key)
+		ctx, cancel := context.WithTimeout(backgroundDB.Statement.Context, 2*time.Minute)
+		defer cancel()
+		db := feedcontract.WithReadSchema(backgroundDB.WithContext(ctx))
 		if _, err := buildNewsSnapshot(db, tenantID, window); err != nil {
 			log.Printf("[news-snapshot] background rebuild failed: %v", err)
 		}
@@ -1409,11 +1486,12 @@ func serveStoryNewsFeed(
 ) ([]StorySlide, *string, newsServeMeta, error) {
 	if config.NewsFeedMode == "cached_only" {
 		slides, cursor := serveNewsSnapshot(db, tenantID, circ, lastTimestamp, lastID, slideLimit, waitSeen())
-		_, builtAt, _, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
+		_, builtAt, dirty, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name)
 		meta := newsServeMeta{Source: "cache", Window: circ.Window.Name}
 		if ok {
 			meta.SnapshotAge = time.Since(builtAt)
 			meta.SnapshotBuiltAt = builtAt
+			meta.SnapshotDirty = dirty
 		}
 		return slides, cursor, meta, nil
 	}
@@ -1428,25 +1506,11 @@ func serveStoryNewsFeed(
 		return slides, nextCursor, newsServeMeta{Source: "live", Window: circ.Window.Name}, nil
 	}
 
-	// Live mode (default; legacy "precompute"/"on_demand" values fold in here).
-	// Serve-stale-while-revalidate: a request is never blocked on inline
-	// assembly while ANY cache younger than newsSnapshotMaxStale exists — it
-	// serves instantly; dirty/expired only decide whether a background rebuild
-	// is kicked. Freshness stays bounded (rebuild lands within seconds of a
-	// news event), latency stays flat. The seen query (kicked by the caller)
-	// runs concurrently with the cache lookup.
-	//
-	// The cache can only answer requests it actually COVERS: its cursor must
-	// be one of its own slides, and the page it produces must be non-empty.
-	// Deep scrolls past the cached slides — or a session that has already
-	// seen all of them — fall through to live assembly over the full corpus
-	// instead of dead-ending the feed with an empty page.
+	// Live reads use only a clean cache inside the product freshness SLO.
+	// Cursor coverage and seen filtering still determine whether it can answer.
 	if all, builtAt, dirty, ok := loadCachedSnapshot(db, tenantID, circ.Window.Name); ok {
 		age := time.Since(builtAt)
-		if age <= newsSnapshotMaxStale {
-			if dirty || age > newsSnapshotTTL {
-				startSnapshotRebuild(db, tenantID, circ.Window.Name)
-			}
+		if newsSnapshotFreshForLive(builtAt, dirty, time.Now()) {
 			cursorCovered := lastID == uuid.Nil
 			if !cursorCovered {
 				for _, s := range all {
@@ -1758,4 +1822,9 @@ func rerankStorySummaries(query string, summaries []StorySummary) []StorySummary
 		out[i] = summaries[j]
 	}
 	return out
+}
+
+func newsSnapshotFreshForLive(builtAt time.Time, dirty bool, now time.Time) bool {
+	age := now.Sub(builtAt)
+	return !dirty && age >= 0 && age <= newsSnapshotTTL
 }

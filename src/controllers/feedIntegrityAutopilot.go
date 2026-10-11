@@ -1,16 +1,17 @@
 package controllers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"content-management-system/src/models"
@@ -23,13 +24,16 @@ import (
 )
 
 const (
-	feedIntegrityRegistryVersion     = "fi-registry-v1"
+	feedIntegrityRegistryVersion     = "fi-registry-v2"
 	feedIntegrityVerificationV1      = "fi-verify-v1"
 	feedIntegritySnapshotToolVersion = "news-snapshot-v1"
 	feedIntegrityClaimLease          = 2 * time.Minute
 )
 
-var feedIntegrityRetention = struct{ Last time.Time }{}
+var feedIntegrityRetention = struct {
+	sync.Mutex
+	Last time.Time
+}{}
 
 type feedIntegrityActionSpec struct {
 	Owner        string
@@ -45,7 +49,7 @@ func feedIntegrityActionSpecFor(f models.FeedIntegrityFinding) feedIntegrityActi
 	case "edge_news_cache_stale":
 		spec.Owner, spec.ActionClass, spec.DeepLink, spec.AutoEligible = "news-circulation", models.FeedIntegrityActionRefreshWindow, "/platform/news/circulation", true
 	case "inv_news_cache_rebuild_debt":
-		spec.Owner, spec.ActionClass, spec.DeepLink = "news-circulation", "news_snapshot.inspect", "/platform/news/circulation"
+		spec.Owner, spec.ActionClass, spec.DeepLink, spec.AutoEligible = "news-circulation", models.FeedIntegrityActionRefreshWindow, "/platform/news/circulation", true
 	case "inv_news_unlabeled_stale":
 		spec.Owner, spec.ActionClass, spec.DeepLink = "enrichment", "enrichment.review", "/platform/enrichment"
 	case "inv_pods_bounds", "inv_pods_parent_leak", "inv_pods_bucket_mismatch":
@@ -77,8 +81,11 @@ func feedIntegrityScope(f models.FeedIntegrityFinding) string {
 	if f.CheckKey == "inv_news_cache_rebuild_debt" || f.CheckKey == "edge_news_cache_stale" {
 		return strings.TrimPrefix(f.Variant, "window:")
 	}
+	if f.TargetType == "probe" || f.TargetType == "checker" {
+		return f.TargetRef
+	}
 	switch f.TargetType {
-	case "content_item", "story", "snapshot":
+	case "content_item", "story", "snapshot", "page", "predicate", "generation":
 		if strings.TrimSpace(f.TargetRef) != "" {
 			return f.TargetType + ":" + strings.TrimSpace(f.TargetRef)
 		}
@@ -97,7 +104,9 @@ func feedIntegrityAutopilotSchemaReady(db *gorm.DB) bool {
 }
 
 func sanitizeFeedIntegrityAutopilotPolicy(p *models.FeedIntegrityPolicy) {
-	if p.AutopilotMode != models.FeedIntegrityAutopilotModeAssist && p.AutopilotMode != models.FeedIntegrityAutopilotModeSafeAuto {
+	// Legacy Safe Auto settings are read as Observe. Report the same reduced
+	// capability that admission enforces, without rewriting stored policy.
+	if p.AutopilotMode != models.FeedIntegrityAutopilotModeAssist {
 		p.AutopilotMode = models.FeedIntegrityAutopilotModeObserve
 	}
 	if p.AutopilotActionHourlyCap < 1 || p.AutopilotActionHourlyCap > 20 {
@@ -180,34 +189,53 @@ func feedIntegrityModeRank(mode string) int {
 }
 
 func feedIntegritySystemIncidentOpen(db *gorm.DB) bool {
-	if !db.Migrator().HasTable(&models.SystemIncidentEpisode{}) {
-		return false
-	}
 	var n int64
-	db.Model(&models.SystemIncidentEpisode{}).Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).Count(&n)
-	return n > 0
+	if err := db.Model(&models.SystemIncidentEpisode{}).Where("status IN ?", []string{"open", "recovering"}).Count(&n).Error; err != nil || n > 0 {
+		return true
+	}
+	var health models.SystemAutopilotRun
+	if err := db.Order("started_at DESC").First(&health).Error; err != nil {
+		return true
+	}
+	return health.FinishedAt == nil || health.FinishedAt.After(time.Now().UTC().Add(time.Second)) || time.Since(*health.FinishedAt) > 10*time.Minute || !systemHealthRunHealthy(health)
 }
 
 func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 	if !feedIntegrityAutopilotSchemaReady(db) {
 		return nil
 	}
+	var hint models.FeedIntegrityRun
+	if err := db.First(&hint, runID).Error; err != nil {
+		return err
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		var locked models.FeedIntegrityPolicy
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=?", hint.TenantID).First(&locked).Error; err != nil {
+			return err
+		}
 		var run models.FeedIntegrityRun
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&run, runID).Error; err != nil {
 			return err
 		}
-		if run.AutopilotEvaluatedAt != nil || (run.Status != models.FeedIntegrityRunCompleted && run.Status != models.FeedIntegrityRunPartial) {
+		if run.AutopilotEvaluatedAt != nil || (run.Status != models.FeedIntegrityRunCompleted) {
 			return nil
 		}
-		policy := loadFeedIntegrityPolicy(tx, run.TenantID)
+		policy, policyErr := readFeedIntegrityPolicy(tx, run.TenantID)
+		if policyErr != nil {
+			return policyErr
+		}
+		if len(integrityRunObservations(run)) == 0 {
+			return fmt.Errorf("versioned completed observations required")
+		}
 		sanitizeFeedIntegrityAutopilotPolicy(&policy)
 		now := time.Now().UTC()
 		decision := models.FeedIntegrityDecisionNoAction
 		counts := map[string]int{"considered": 0, "proposed": 0, "blocked": 0}
 
 		var findings []models.FeedIntegrityFinding
-		tx.Where("run_id=? AND status='violation'", run.ID).Order("created_at ASC").Find(&findings)
+		if err := tx.Where("run_id=? AND status='violation'", run.ID).Order("created_at ASC").Find(&findings).Error; err != nil {
+			return err
+		}
 		sort.SliceStable(findings, func(i, j int) bool {
 			left, right := feedIntegrityPriority(findings[i]), feedIntegrityPriority(findings[j])
 			if left != right {
@@ -216,7 +244,6 @@ func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 			return findings[i].PublicID.String() < findings[j].PublicID.String()
 		})
 		seenEpisodes := map[uint]bool{}
-		readyCreated := false
 		for _, finding := range findings {
 			scope := feedIntegrityScope(finding)
 			var ep models.FeedIntegrityEpisode
@@ -229,7 +256,15 @@ func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 			fingerprint := feedIntegrityFingerprint(finding)
 			idempotency := fmt.Sprintf("fi:%d:%d:%s:%s", run.ID, ep.ID, spec.ActionClass, fingerprint[:16])
 			action := models.FeedIntegrityAction{TenantID: run.TenantID, RunID: run.ID, EpisodeID: ep.ID, ActionClass: spec.ActionClass, OwnerSystem: spec.Owner, TargetScope: scope, Mode: models.FeedIntegrityAutopilotModeObserve, Decision: models.FeedIntegrityDecisionAttention, Outcome: models.FeedIntegrityActionWouldExecute, Reason: "Observe mode: recommendation recorded without execution", IdempotencyKey: idempotency, EvidenceFingerprint: fingerprint, RegistryVersion: feedIntegrityRegistryVersion, VerificationContractVersion: feedIntegrityVerificationV1, Actor: "automation"}
-			input, _ := json.Marshal(gin.H{"check_key": finding.CheckKey, "feed": finding.Feed, "variant": finding.Variant, "scope": scope, "deep_link": spec.DeepLink, "evidence": json.RawMessage(finding.Evidence)})
+			evidence := finding.Evidence
+			if spec.ActionClass == models.FeedIntegrityActionRefreshWindow {
+				var precondition models.FeedIntegrityFinding
+				window := strings.TrimPrefix(finding.Variant, "window:")
+				if err := tx.Where("run_id=? AND check_key='inv_news_cache_rebuild_debt' AND variant=? AND status='violation'", run.ID, window).First(&precondition).Error; err == nil {
+					evidence = precondition.Evidence
+				}
+			}
+			input, _ := json.Marshal(gin.H{"check_key": finding.CheckKey, "feed": finding.Feed, "variant": finding.Variant, "scope": scope, "axis": finding.Axis, "deep_link": spec.DeepLink, "evidence": json.RawMessage(evidence)})
 			action.Input = datatypes.JSON(input)
 
 			blocked := ""
@@ -239,10 +274,14 @@ func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 				blocked = "autopilot_disabled"
 			} else if policy.AutopilotPausedUntil != nil && policy.AutopilotPausedUntil.After(now) {
 				blocked = "autopilot_paused"
-			} else if !policy.ScheduledEnabled {
-				blocked = "detection_disabled"
+			} else if policy.AutopilotMode == "safe_auto" || mode == "safe_auto" {
+				blocked = "safe_auto_deferred"
 			} else if run.FinishedAt == nil || now.Sub(*run.FinishedAt) > time.Duration(policy.AutopilotEvidenceMaxAgeMinutes)*time.Minute {
 				blocked = "stale_evidence"
+			} else if isFeedIntegritySuppressed(tx, run.TenantID, finding, now) {
+				blocked = "suppressed"
+			} else if feedIntegrityActionExecutable(spec.ActionClass) && !feedIntegritySnapshotDualEvidence(tx, run.ID, finding.Variant) {
+				blocked = "repair_evidence_missing"
 			} else if feedIntegritySystemIncidentOpen(tx) {
 				blocked = "system_incident_open"
 			}
@@ -262,26 +301,15 @@ func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 				decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionAttention)
 			} else if mode == models.FeedIntegrityAutopilotModeAssist {
 				action.Outcome, action.Decision, action.Reason = models.FeedIntegrityActionApprovalRequired, models.FeedIntegrityDecisionApprovalRequired, "Registered repair requires human approval"
+				if finding.Axis == "readiness" {
+					action.Reason = "Readiness maintenance: healthy delivery still has snapshot rebuild debt; human approval required"
+				}
 				decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionApprovalRequired)
 				counts["proposed"]++
 			} else {
-				trust := feedIntegrityTrust(tx, run.TenantID, spec.ActionClass, policy)
-				if spec.ActionClass == models.FeedIntegrityActionRefreshWindow && !feedIntegritySnapshotDualEvidence(tx, run.ID, finding.Variant) {
-					action.Outcome, action.Decision, action.Guardrail, action.Reason = models.FeedIntegrityActionApprovalRequired, models.FeedIntegrityDecisionApprovalRequired, "dual_evidence_missing", "Safe Auto requires stale inventory and stale-served-cache evidence in the same run"
-					decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionApprovalRequired)
-				} else if trust.State != "trusted" || trust.BreakerOpen {
-					action.Outcome, action.Decision, action.Guardrail, action.Reason = models.FeedIntegrityActionApprovalRequired, models.FeedIntegrityDecisionApprovalRequired, "trust_gate", "Safe Auto held in Assist until this action class earns trust"
-					decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionApprovalRequired)
-				} else if readyCreated {
-					action.Outcome, action.Decision, action.Guardrail, action.Reason = models.FeedIntegrityActionSkipped, models.FeedIntegrityDecisionBlocked, "run_action_cap", "A higher-priority repair already owns this run's action slot"
-					decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionBlocked)
-				} else {
-					action.Outcome, action.Decision, action.Reason = models.FeedIntegrityActionReady, models.FeedIntegrityDecisionReady, "Trusted registered action is ready for execution"
-					decision = promoteFeedIntegrityDecision(decision, models.FeedIntegrityDecisionReady)
-					readyCreated = true
-				}
-				counts["proposed"]++
+				action.Outcome, action.Decision, action.Guardrail = "skipped", "blocked", "safe_auto_deferred"
 			}
+
 			created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&action)
 			if created.Error != nil {
 				return created.Error
@@ -289,8 +317,7 @@ func evaluateFeedIntegrityAutopilot(db *gorm.DB, runID uint) error {
 			if created.RowsAffected == 0 {
 				continue
 			}
-			attr, _ := json.Marshal(gin.H{"owner": spec.Owner, "action_class": spec.ActionClass, "deep_link": spec.DeepLink, "registry_version": feedIntegrityRegistryVersion})
-			if err := tx.Model(&models.FeedIntegrityEpisode{}).Where("id=? AND tenant_id=?", ep.ID, run.TenantID).Updates(map[string]interface{}{"attribution": datatypes.JSON(attr), "attribution_version": feedIntegrityRegistryVersion, "recommended_action": spec.ActionClass, "latest_action_id": action.ID, "updated_at": now}).Error; err != nil {
+			if err := tx.Model(&models.FeedIntegrityEpisode{}).Where("id=? AND tenant_id=?", ep.ID, run.TenantID).Updates(map[string]interface{}{"attribution_version": feedIntegrityRegistryVersion, "recommended_action": spec.ActionClass, "latest_action_id": action.ID, "updated_at": now}).Error; err != nil {
 				return err
 			}
 		}
@@ -326,11 +353,15 @@ func promoteFeedIntegrityDecision(current, candidate string) string {
 }
 
 func feedIntegritySnapshotDualEvidence(db *gorm.DB, runID uint, variant string) bool {
+	var run models.FeedIntegrityRun
+	if db.First(&run, runID).Error != nil || run.Status != "completed" {
+		return false
+	}
 	window := strings.TrimPrefix(variant, "window:")
-	var inventory, edge int64
-	db.Model(&models.FeedIntegrityFinding{}).Where("run_id=? AND check_key=? AND status='violation' AND (variant=? OR target_ref=?)", runID, "inv_news_cache_rebuild_debt", variant, window).Count(&inventory)
-	db.Model(&models.FeedIntegrityFinding{}).Where("run_id=? AND check_key=? AND status='violation' AND variant=?", runID, "edge_news_cache_stale", "window:"+window).Count(&edge)
-	return inventory > 0 && edge > 0
+	inventory, ok := integrityObservationFor(run, "inv_news_cache_rebuild_debt", "news", window)
+	edge, edgeOK := integrityObservationFor(run, "edge_news_cache_stale", "news", "window:"+window)
+	httpProof, httpOK := integrityObservationFor(run, "edge_news_http", "news", "window:"+window)
+	return ok && edgeOK && httpOK && inventory.Outcome == "violation" && (edge.Outcome == "pass" || edge.Outcome == "violation") && httpProof.Outcome == "pass"
 }
 
 func evaluatePendingFeedIntegrityRuns(db *gorm.DB) {
@@ -347,88 +378,27 @@ func evaluatePendingFeedIntegrityRuns(db *gorm.DB) {
 }
 
 func claimFeedIntegrityAction(db *gorm.DB, tenant string, actionID uint) (models.FeedIntegrityAction, error) {
-	now := time.Now().UTC()
-	var pending models.FeedIntegrityAction
-	if err := db.Where("id=? AND tenant_id=?", actionID, tenant).First(&pending).Error; err != nil {
-		return pending, err
-	}
-	policy := loadFeedIntegrityPolicy(db, tenant)
-	sanitizeFeedIntegrityAutopilotPolicy(&policy)
-	if !policy.AutopilotEnabled || !policy.ScheduledEnabled || policy.AutopilotPausedUntil != nil && policy.AutopilotPausedUntil.After(now) {
-		return pending, fmt.Errorf("autopilot is disabled or paused")
-	}
-	if feedIntegritySystemIncidentOpen(db) {
-		return pending, fmt.Errorf("system incident is open")
-	}
-	var run models.FeedIntegrityRun
-	if db.Where("id=? AND tenant_id=?", pending.RunID, tenant).First(&run).Error != nil || run.FinishedAt == nil || now.Sub(*run.FinishedAt) > time.Duration(policy.AutopilotEvidenceMaxAgeMinutes)*time.Minute {
-		finished := now
-		_ = db.Model(&pending).Where("outcome IN ?", []string{models.FeedIntegrityActionReady, models.FeedIntegrityActionApproved, models.FeedIntegrityActionApprovalRequired}).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionExpired, "guardrail": "stale_evidence", "reason": "Action evidence expired before execution", "finished_at": finished, "updated_at": finished}).Error
-		return pending, fmt.Errorf("action evidence is stale")
-	}
-	var runActions int64
-	db.Model(&models.FeedIntegrityAction{}).Where("tenant_id=? AND run_id=? AND executed_at IS NOT NULL", tenant, pending.RunID).Count(&runActions)
-	if runActions > 0 {
-		return pending, fmt.Errorf("run action cap reached")
-	}
-	var hourly int64
-	db.Model(&models.FeedIntegrityAction{}).Where("tenant_id=? AND executed_at > ?", tenant, now.Add(-time.Hour)).Count(&hourly)
-	if hourly >= int64(policy.AutopilotActionHourlyCap) {
-		return pending, fmt.Errorf("hourly action cap reached")
-	}
-	var cooldown int64
-	db.Model(&models.FeedIntegrityAction{}).Where("tenant_id=? AND episode_id=? AND action_class=? AND executed_at > ?", tenant, pending.EpisodeID, pending.ActionClass, now.Add(-time.Duration(policy.AutopilotCooldownMinutes)*time.Minute)).Count(&cooldown)
-	if cooldown > 0 {
-		return pending, fmt.Errorf("action cooldown is active")
-	}
-	if pending.Mode == models.FeedIntegrityAutopilotModeSafeAuto {
-		trust := feedIntegrityTrust(db, tenant, pending.ActionClass, policy)
-		if trust.State != "trusted" || trust.BreakerOpen {
-			return pending, fmt.Errorf("action trust gate is not earned")
-		}
-	}
-	token := uuid.NewString()
-	expires := now.Add(feedIntegrityClaimLease)
-	result := db.Model(&models.FeedIntegrityAction{}).Where("id=? AND tenant_id=? AND outcome IN ?", actionID, tenant, []string{models.FeedIntegrityActionReady, models.FeedIntegrityActionApproved}).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionClaimed, "claim_token": token, "claimed_at": now, "claim_expires_at": expires, "updated_at": now})
-	if result.Error != nil || result.RowsAffected != 1 {
-		return models.FeedIntegrityAction{}, fmt.Errorf("action is no longer executable")
-	}
-	var action models.FeedIntegrityAction
-	if err := db.Where("id=? AND claim_token=?", actionID, token).First(&action).Error; err != nil {
-		return action, err
-	}
-	return action, nil
+	return admitIntegrityAction(db, tenant, actionID, "", false)
 }
-
 func executeFeedIntegrityAction(db *gorm.DB, action models.FeedIntegrityAction) error {
-	started := time.Now().UTC()
-	_ = db.Model(&action).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionRunning, "updated_at": started}).Error
-	if !feedIntegrityActionExecutable(action.ActionClass) {
-		finished := time.Now().UTC()
-		return db.Model(&action).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionSkipped, "guardrail": "owner_tool_unregistered", "reason": "No executable owner adapter is registered", "finished_at": finished, "updated_at": finished}).Error
-	}
-	window := normalizeNewsWindow(action.TargetScope)
-	var snap models.NewsSnapshot
-	if err := db.Where("tenant_id=? AND \"window\"=?", action.TenantID, window).First(&snap).Error; err != nil {
-		return finishFeedIntegrityActionFailure(db, action, "precondition_changed", err)
-	}
-	staleFloor := newsSnapshotTTL
-	if action.Mode == models.FeedIntegrityAutopilotModeSafeAuto {
-		staleFloor = newsSnapshotMaxStale
-	}
-	if time.Since(snap.BuiltAt) <= staleFloor && !snap.Dirty {
-		finished := time.Now().UTC()
-		return db.Model(&action).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionSkipped, "guardrail": "precondition_changed", "reason": "Snapshot recovered before execution", "finished_at": finished, "updated_at": finished}).Error
-	}
-	count, err := buildNewsSnapshot(db, action.TenantID, window)
+	admitted, err := admitIntegrityAction(db, action.TenantID, action.ID, action.ClaimToken, true)
 	if err != nil {
-		return finishFeedIntegrityActionFailure(db, action, "tool_failed", err)
-	}
-	executed := time.Now().UTC()
-	output, _ := json.Marshal(gin.H{"window": window, "slide_count": count, "built_at": executed, "tool_version": feedIntegritySnapshotToolVersion})
-	due := executed.Add(5 * time.Second)
-	if err := db.Model(&action).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionVerifying, "output": datatypes.JSON(output), "tool_version": feedIntegritySnapshotToolVersion, "executed_at": executed, "verification_due_at": due, "duration_ms": executed.Sub(started).Milliseconds(), "updated_at": executed}).Error; err != nil {
 		return err
+	}
+	started := time.Now().UTC()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	snapshot, err := buildNewsSnapshotResult(db.WithContext(ctx), admitted.TenantID, admitted.TargetScope)
+	if err != nil {
+		return markIntegrityEffectUnknown(db, admitted, err)
+	}
+	count := snapshot.SlideCount
+	now := time.Now().UTC()
+	due := now.Add(5 * time.Second)
+	output := integrityJSON(gin.H{"window": admitted.TargetScope, "slide_count": count, "built_at": snapshot.BuiltAt, "generation": snapshot.Generation, "tool_version": feedIntegritySnapshotToolVersion, "effect_known": true})
+	update := db.Model(&models.FeedIntegrityAction{}).Where("id=? AND tenant_id=? AND outcome='running' AND claim_token=?", admitted.ID, admitted.TenantID, admitted.ClaimToken).Updates(map[string]interface{}{"outcome": "verifying", "output": output, "tool_version": feedIntegritySnapshotToolVersion, "executed_at": now, "verification_due_at": due, "duration_ms": now.Sub(started).Milliseconds(), "updated_at": now})
+	if update.Error != nil || update.RowsAffected != 1 {
+		return markIntegrityEffectUnknown(db, admitted, fmt.Errorf("effect output was not durably recorded"))
 	}
 	return nil
 }
@@ -440,61 +410,65 @@ func finishFeedIntegrityActionFailure(db *gorm.DB, action models.FeedIntegrityAc
 }
 
 func verifyFeedIntegrityAction(db *gorm.DB, action models.FeedIntegrityAction) {
+	var receipt struct {
+		Known      bool      `json:"effect_known"`
+		BuiltAt    time.Time `json:"built_at"`
+		Generation int64     `json:"generation"`
+	}
+	if json.Unmarshal(action.Output, &receipt) != nil || !receipt.Known || receipt.BuiltAt.IsZero() {
+		_ = markIntegrityEffectUnknown(db, action, fmt.Errorf("missing effect receipt"))
+		return
+	}
+	edgePassed, edgeEvidence := verifyFeedIntegrityNewsEdge(action.TargetScope, receipt.BuiltAt)
+	// Recheck serving authority after the HTTP probe: ingestion or another
+	// builder may invalidate the recorded effect while delivery is inspected.
+	var snap struct {
+		BuiltAt           time.Time
+		Dirty             bool
+		SlideCount        int
+		Generation        int64
+		CurrentGeneration int64
+	}
+	err := db.Table("news_snapshots snapshot").
+		Select("snapshot.built_at, snapshot.dirty, snapshot.slide_count, snapshot.generation, generation.generation AS current_generation").
+		Joins("JOIN news_snapshot_generations generation ON generation.tenant_id=snapshot.tenant_id AND generation.\"window\"=snapshot.\"window\"").
+		Where("snapshot.tenant_id=? AND snapshot.\"window\"=?", action.TenantID, action.TargetScope).Take(&snap).Error
 	now := time.Now().UTC()
-	window := normalizeNewsWindow(action.TargetScope)
-	var snap models.NewsSnapshot
-	err := db.Where("tenant_id=? AND \"window\"=?", action.TenantID, window).First(&snap).Error
-	edgePassed, edgeEvidence := verifyFeedIntegrityNewsEdge(window)
-	passed := err == nil && !snap.Dirty && time.Since(snap.BuiltAt) <= newsSnapshotTTL && snap.SlideCount > 0 && edgePassed
-	outcome := models.FeedIntegrityActionVerificationFailed
-	reason := "Snapshot verification did not meet freshness and fill contract"
-	decision := models.FeedIntegrityDecisionActionFailed
+	attributable := err == nil && snap.BuiltAt.Equal(receipt.BuiltAt) && snap.Generation == receipt.Generation && snap.CurrentGeneration == receipt.Generation
+	passed := attributable && newsSnapshotFreshForLive(snap.BuiltAt, snap.Dirty, now) && snap.SlideCount > 0 && edgePassed
+	outcome, reason := models.FeedIntegrityActionVerificationFailed, "Snapshot effect is known; fresh populated delivery was not verified"
 	if passed {
-		outcome, reason, decision = models.FeedIntegrityActionVerificationPassed, "Fresh snapshot is populated and clean", models.FeedIntegrityDecisionRecovering
+		outcome, reason = models.FeedIntegrityActionVerificationPassed, "Recorded snapshot refresh verified at CMS edge"
 	}
-	verification, _ := json.Marshal(gin.H{"window": window, "passed": passed, "dirty": snap.Dirty, "slide_count": snap.SlideCount, "built_at": snap.BuiltAt, "error": safeIntegrityError(err), "edge": edgeEvidence})
-	_ = db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.FeedIntegrityAction{}).Where("id=? AND tenant_id=? AND outcome=?", action.ID, action.TenantID, models.FeedIntegrityActionVerifying).Updates(map[string]interface{}{"outcome": outcome, "decision": decision, "verification": datatypes.JSON(verification), "reason": reason, "finished_at": now, "updated_at": now}).Error; err != nil {
-			return err
-		}
-		if passed {
-			return tx.Model(&models.FeedIntegrityEpisode{}).Where("id=? AND tenant_id=? AND status=?", action.EpisodeID, action.TenantID, models.FeedIntegrityEpisodeOpen).Updates(map[string]interface{}{"status": models.FeedIntegrityEpisodeRecovering, "recovering_since": now, "clean_streak": 1, "updated_at": now}).Error
-		}
-		return nil
-	})
+	verification := integrityJSON(gin.H{"window": action.TargetScope, "passed": passed, "effect_known": true, "recorded_version_current": attributable, "generation": snap.Generation, "current_generation": snap.CurrentGeneration, "dirty": snap.Dirty, "slide_count": snap.SlideCount, "built_at": snap.BuiltAt, "edge": edgeEvidence, "error": safeIntegrityError(err)})
+	_ = db.Model(&models.FeedIntegrityAction{}).Where("id=? AND tenant_id=? AND outcome='verifying' AND claim_token=?", action.ID, action.TenantID, action.ClaimToken).Updates(map[string]interface{}{"outcome": outcome, "verification": verification, "reason": reason, "finished_at": now, "updated_at": now}).Error
+	// Episode recovery remains owned by consecutive checker observations.
 }
-
-func verifyFeedIntegrityNewsEdge(window string) (bool, gin.H) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, _ := http.NewRequest(http.MethodGet, feedIntegritySelfURL()+"/api/v1/feed/news?limit=10&window="+url.QueryEscape(window), nil)
-	req.Header.Set(feedIntegritySyntheticHdr, feedIntegrityCapability)
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, gin.H{"error": safeIntegrityError(err)}
-	}
-	defer resp.Body.Close()
-	var payload struct {
-		Slides []struct {
-			Featured struct {
-				StoryID string            `json:"story_id"`
-				Members []json.RawMessage `json:"members"`
-			} `json:"featured"`
-			Related []json.RawMessage `json:"related"`
-		} `json:"slides"`
-	}
-	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&payload)
-	valid := resp.StatusCode == http.StatusOK && decodeErr == nil && len(payload.Slides) > 0
-	for _, slide := range payload.Slides {
-		if slide.Featured.StoryID == "" || len(slide.Featured.Members) == 0 || len(slide.Related) > 3 {
+func verifyFeedIntegrityNewsEdge(window string, expectedBuiltAt time.Time) (bool, gin.H) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var page integrityNewsPage
+	headers, status, _, err := integrityReadPage(ctx, &http.Client{Timeout: 5 * time.Second}, "/api/v1/feed/news?limit=10&window="+url.QueryEscape(window), &page)
+	diagnostics, diagErr := integrityNewsDiagnostics(headers, window)
+	valid := err == nil && diagErr == nil && len(page.Slides) > 0
+	seen := map[string]bool{}
+	for _, slide := range page.Slides {
+		_, idErr := uuid.Parse(slide.Featured.StoryID)
+		if idErr != nil || len(slide.Featured.Members) == 0 || len(slide.Related) > 3 || seen[slide.Featured.StoryID] {
 			valid = false
-			break
+		}
+		seen[slide.Featured.StoryID] = true
+		related := map[string]bool{}
+		for _, story := range slide.Related {
+			_, e := uuid.Parse(story.StoryID)
+			if e != nil || story.StoryID == slide.Featured.StoryID || related[story.StoryID] {
+				valid = false
+			}
+			related[story.StoryID] = true
 		}
 	}
-	age, _ := strconv.ParseInt(resp.Header.Get("X-Wahb-Snapshot-Age-Ms"), 10, 64)
-	if resp.Header.Get("X-Wahb-Feed-Source") == "cache" && age > newsSnapshotTTL.Milliseconds() {
-		valid = false
-	}
-	return valid, gin.H{"status": resp.StatusCode, "slides": len(payload.Slides), "source": resp.Header.Get("X-Wahb-Feed-Source"), "snapshot_age_ms": age, "decode_error": safeIntegrityError(decodeErr)}
+	served := diagErr == nil && diagnostics.Source == "cache" && diagnostics.SnapshotBuiltAt.Equal(expectedBuiltAt) && !diagnostics.SnapshotDirty && diagnostics.SnapshotAge <= newsSnapshotTTL
+	return valid && served, gin.H{"status": status, "slides": len(page.Slides), "delivery_valid": valid, "recorded_version_served": served, "source": diagnostics.Source, "snapshot_built_at": diagnostics.SnapshotBuiltAt, "snapshot_age_ms": diagnostics.SnapshotAge.Milliseconds(), "error": safeIntegrityError(err), "diagnostics_error": safeIntegrityError(diagErr)}
 }
 
 func processFeedIntegrityActions(db *gorm.DB) {
@@ -523,22 +497,28 @@ func processFeedIntegrityActions(db *gorm.DB) {
 // verification states cannot be resurrected by the scheduler.
 func recoverExpiredFeedIntegrityClaims(db *gorm.DB, now time.Time) {
 	var stale []models.FeedIntegrityAction
-	db.Where("outcome=? AND claim_expires_at < ?", models.FeedIntegrityActionClaimed, now).Limit(20).Find(&stale)
+	db.Where("outcome IN ? AND claim_expires_at < ?", []string{"claimed", "running", "verifying"}, now).Limit(20).Find(&stale)
 	for _, action := range stale {
-		_ = db.Model(&action).Where("id=? AND outcome=? AND claim_expires_at < ?", action.ID, models.FeedIntegrityActionClaimed, now).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionReady, "claim_token": "", "claimed_at": nil, "claim_expires_at": nil, "guardrail": "stale_claim_recovered", "updated_at": now}).Error
+		if action.Outcome != "claimed" {
+			_ = markIntegrityEffectUnknown(db, action, fmt.Errorf("interrupted effect"))
+			continue
+		}
+		_ = db.Model(&action).Where("id=? AND outcome=? AND claim_expires_at < ?", action.ID, models.FeedIntegrityActionClaimed, now).Updates(map[string]interface{}{"outcome": models.FeedIntegrityActionApproved, "claim_token": "", "claimed_at": nil, "claim_expires_at": nil, "guardrail": "stale_claim_recovered", "updated_at": now}).Error
 	}
 }
 
 func sweepFeedIntegrityRetention(db *gorm.DB) {
+	feedIntegrityRetention.Lock()
+	defer feedIntegrityRetention.Unlock()
 	now := time.Now().UTC()
 	if !feedIntegrityRetention.Last.IsZero() && now.Sub(feedIntegrityRetention.Last) < 24*time.Hour {
 		return
 	}
 	feedIntegrityRetention.Last = now
-	_ = db.Where("created_at < ? AND status NOT IN ?", now.Add(-30*24*time.Hour), []string{"violation", "check_error"}).Delete(&models.FeedIntegrityFinding{}).Error
-	_ = db.Where("created_at < ? AND status IN ?", now.Add(-90*24*time.Hour), []string{"violation", "check_error"}).Delete(&models.FeedIntegrityFinding{}).Error
+	_ = db.Where("created_at < ? AND status <> ?", now.Add(-30*24*time.Hour), "violation").Delete(&models.FeedIntegrityFinding{}).Error
+	_ = db.Where("created_at < ? AND status='violation' AND NOT EXISTS (SELECT 1 FROM feed_integrity_episodes ep WHERE ep.tenant_id=feed_integrity_findings.tenant_id AND ep.check_key=feed_integrity_findings.check_key AND ep.feed=feed_integrity_findings.feed AND ep.variant=feed_integrity_findings.variant AND ep.status IN ('open','recovering'))", now.Add(-90*24*time.Hour)).Delete(&models.FeedIntegrityFinding{}).Error
 	terminal := []string{models.FeedIntegrityActionWouldExecute, models.FeedIntegrityActionRejected, models.FeedIntegrityActionToolFailed, models.FeedIntegrityActionVerificationPassed, models.FeedIntegrityActionVerificationFailed, models.FeedIntegrityActionSkipped, models.FeedIntegrityActionExpired}
-	_ = db.Where("created_at < ? AND outcome IN ?", now.Add(-365*24*time.Hour), terminal).Delete(&models.FeedIntegrityAction{}).Error
+	_ = db.Where("created_at < ? AND outcome IN ? AND NOT (error_class='effect_unknown' AND COALESCE(output->'uncertainty_review'->>'disposition','')<>'allow_fresh_approval')", now.Add(-365*24*time.Hour), terminal).Delete(&models.FeedIntegrityAction{}).Error
 	_ = db.Where("created_at < ? AND NOT EXISTS (SELECT 1 FROM feed_integrity_actions a WHERE a.run_id=feed_integrity_runs.id)", now.Add(-365*24*time.Hour)).Delete(&models.FeedIntegrityRun{}).Error
 }
 
@@ -557,7 +537,10 @@ func feedIntegrityAutopilotStatus(db *gorm.DB, tenant string) gin.H {
 	for _, class := range classes {
 		trust = append(trust, feedIntegrityTrust(db, tenant, class, policy))
 	}
-	self := "healthy"
+	self := "unknown"
+	if latest.ID != 0 {
+		self = "healthy"
+	}
 	if pending > 0 || stuck > 0 || latest.AutopilotErrorClass != "" && latest.AutopilotErrorClass != "none" {
 		self = "degraded"
 	}
@@ -580,6 +563,17 @@ func GetFeedIntegrityAutopilotStatus(c *gin.Context) {
 	if !feedIntegrityAutopilotSchemaReady(db) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "feed integrity autopilot migration is not applied"})
 		return
+	}
+	if _, err := readFeedIntegrityPolicy(db, principal.TenantID); err != nil {
+		integrityReadError(c, err)
+		return
+	}
+	var count int64
+	for _, table := range []string{"feed_integrity_runs", "feed_integrity_actions"} {
+		if err := db.Table(table).Where("tenant_id=?", principal.TenantID).Count(&count).Error; err != nil {
+			integrityReadError(c, err)
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": feedIntegrityAutopilotStatus(db, principal.TenantID)})
 }
@@ -604,42 +598,58 @@ func UpdateFeedIntegrityAutopilotPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid policy"})
 		return
 	}
+	if req.Mode != nil && *req.Mode != "observe" && *req.Mode != "assist" {
+		c.JSON(400, gin.H{"error": "only Observe and Assist are supported; Safe Auto is deferred"})
+		return
+	}
+	for _, mode := range req.ActionModes {
+		if mode != "observe" && mode != "assist" {
+			c.JSON(400, gin.H{"error": "unsupported per-action mode"})
+			return
+		}
+	}
+	if req.TrustMinDecisions != nil || req.TrustMinAgreementPct != nil || req.DiagnosticHourlyCap != nil {
+		c.JSON(400, gin.H{"error": "trust and diagnostic promotion controls are read-only compatibility"})
+		return
+	}
+	if (req.ActionHourlyCap != nil && (*req.ActionHourlyCap < 1 || *req.ActionHourlyCap > 20)) || (req.CooldownMinutes != nil && (*req.CooldownMinutes < 15 || *req.CooldownMinutes > 1440)) || (req.EvidenceMaxAgeMinutes != nil && (*req.EvidenceMaxAgeMinutes < 2 || *req.EvidenceMaxAgeMinutes > 60)) {
+		c.JSON(400, gin.H{"error": "repair limits outside supported bounds"})
+		return
+	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadFeedIntegrityPolicy(db, principal.TenantID)
+	policy, err := readFeedIntegrityPolicy(db, principal.TenantID)
+	if err != nil {
+		integrityReadError(c, err)
+		return
+	}
+	updates := map[string]interface{}{"updated_at": time.Now().UTC()}
 	if req.Enabled != nil {
-		policy.AutopilotEnabled = *req.Enabled
+		updates["autopilot_enabled"] = *req.Enabled
 	}
 	if req.Mode != nil {
-		policy.AutopilotMode = *req.Mode
+		updates["autopilot_mode"] = *req.Mode
 	}
 	if req.ActionModes != nil {
-		raw, _ := json.Marshal(req.ActionModes)
-		policy.AutopilotActionModes = datatypes.JSON(raw)
+		updates["autopilot_action_modes"] = integrityJSON(req.ActionModes)
 	}
 	if req.ActionHourlyCap != nil {
-		policy.AutopilotActionHourlyCap = *req.ActionHourlyCap
-	}
-	if req.DiagnosticHourlyCap != nil {
-		policy.AutopilotDiagnosticHourlyCap = *req.DiagnosticHourlyCap
+		updates["autopilot_action_hourly_cap"] = *req.ActionHourlyCap
 	}
 	if req.CooldownMinutes != nil {
-		policy.AutopilotCooldownMinutes = *req.CooldownMinutes
+		updates["autopilot_cooldown_minutes"] = *req.CooldownMinutes
 	}
 	if req.EvidenceMaxAgeMinutes != nil {
-		policy.AutopilotEvidenceMaxAgeMinutes = *req.EvidenceMaxAgeMinutes
+		updates["autopilot_evidence_max_age_minutes"] = *req.EvidenceMaxAgeMinutes
 	}
-	if req.TrustMinDecisions != nil {
-		policy.AutopilotTrustMinDecisions = *req.TrustMinDecisions
-	}
-	if req.TrustMinAgreementPct != nil {
-		policy.AutopilotTrustMinAgreementPct = *req.TrustMinAgreementPct
-	}
-	sanitizeFeedIntegrityAutopilotPolicy(&policy)
-	if err := db.Save(&policy).Error; err != nil {
+	if err := updateIntegrityPolicyAudited(db, principal, "feed_integrity.autopilot.policy.update", updates); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update policy"})
 		return
 	}
-	feedIntegrityAudit(db, principal, "feed_integrity.autopilot.policy.update", principal.TenantID, "success", map[string]interface{}{"mode": policy.AutopilotMode, "enabled": policy.AutopilotEnabled})
+	policy, err = readFeedIntegrityPolicy(db, principal.TenantID)
+	if err != nil {
+		integrityReadError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": policy})
 }
 
@@ -671,7 +681,10 @@ func PauseFeedIntegrityAutopilot(c *gin.Context) {
 	var req struct {
 		Minutes int `json:"minutes"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if c.ShouldBindJSON(&req) != nil || req.Minutes < 0 || req.Minutes > 10080 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "minutes must be between 0 and 10080"})
+		return
+	}
 	var until *time.Time
 	if req.Minutes > 0 {
 		if req.Minutes > 10080 {
@@ -681,9 +694,15 @@ func PauseFeedIntegrityAutopilot(c *gin.Context) {
 		until = &t
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := loadFeedIntegrityPolicy(db, principal.TenantID)
-	_ = db.Model(&policy).Updates(map[string]interface{}{"autopilot_paused_until": until, "updated_at": time.Now().UTC()}).Error
-	feedIntegrityAudit(db, principal, "feed_integrity.autopilot.pause", principal.TenantID, "success", map[string]interface{}{"minutes": req.Minutes})
+	_, policyErr := readFeedIntegrityPolicy(db, principal.TenantID)
+	if policyErr != nil {
+		integrityReadError(c, policyErr)
+		return
+	}
+	if err := updateIntegrityPolicyAudited(db, principal, "feed_integrity.autopilot.pause", map[string]interface{}{"autopilot_paused_until": until, "updated_at": time.Now().UTC()}); err != nil {
+		integrityReadError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"autopilot_paused_until": until}})
 }
 
@@ -704,7 +723,10 @@ func ListFeedIntegrityAutopilotActions(c *gin.Context) {
 		}
 	}
 	var rows []models.FeedIntegrityAction
-	q.Order("created_at DESC").Limit(limit).Find(&rows)
+	if err := q.Order("created_at DESC").Limit(limit).Find(&rows).Error; err != nil {
+		integrityReadError(c, err)
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": rows}})
 }
 
@@ -736,71 +758,75 @@ func decideFeedIntegrityAction(c *gin.Context, approve bool) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action id"})
+		c.JSON(400, gin.H{"error": "invalid action id"})
 		return
 	}
 	var req struct {
 		Reason string `json:"reason"`
 	}
-	_ = c.ShouldBindJSON(&req)
-	if !approve && strings.TrimSpace(req.Reason) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "reason is required"})
+	if c.ShouldBindJSON(&req) != nil || strings.TrimSpace(req.Reason) == "" || len(req.Reason) > 2000 {
+		c.JSON(400, gin.H{"error": "review note required (up to 2000 characters)"})
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var row models.FeedIntegrityAction
-	if db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&row).Error != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "action not found"})
+	err = db.Transaction(func(tx *gorm.DB) error {
+		var hint models.FeedIntegrityAction
+		if err := tx.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&hint).Error; err != nil {
+			return err
+		}
+		if err := lockIntegrityPolicy(tx, principal.TenantID); err != nil {
+			return err
+		}
+		var ep models.FeedIntegrityEpisode
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND id=?", principal.TenantID, hint.EpisodeID).First(&ep).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND id=?", principal.TenantID, hint.ID).First(&row).Error; err != nil {
+			return err
+		}
+		if row.Outcome != "approval_required" {
+			return fmt.Errorf("action no longer awaits approval")
+		}
+		now := time.Now().UTC()
+		updates := map[string]interface{}{"reason": req.Reason, "actor": principal.Email, "updated_at": now, "outcome": "rejected", "finished_at": now}
+		if approve {
+			updates["outcome"] = "approved"
+			updates["approved_at"] = now
+			updates["finished_at"] = nil
+		}
+		if err := tx.Model(&row).Updates(updates).Error; err != nil {
+			return err
+		}
+		if approve {
+			claimed, e := admitIntegrityAction(tx, principal.TenantID, row.ID, "", false)
+			if e != nil {
+				return e
+			}
+			row = claimed
+		}
+		return tx.Create(&models.AuditLog{TenantID: principal.TenantID, UserID: principal.UserID, UserEmail: principal.Email, Action: map[bool]string{true: "feed_integrity.autopilot.action.approve", false: "feed_integrity.autopilot.action.reject"}[approve], TargetService: "cms", TargetResource: id.String(), Status: "success", Payload: integrityJSON(gin.H{"reason": req.Reason})}).Error
+	})
+	if err != nil {
+		c.JSON(409, gin.H{"error": safeIntegrityError(err)})
 		return
 	}
-	if row.Outcome != models.FeedIntegrityActionApprovalRequired {
-		c.JSON(http.StatusConflict, gin.H{"error": "action is no longer awaiting approval"})
-		return
-	}
-	now := time.Now().UTC()
-	outcome := models.FeedIntegrityActionRejected
-	decision := models.FeedIntegrityDecisionAttention
-	updates := map[string]interface{}{"outcome": outcome, "decision": decision, "reason": req.Reason, "actor": principal.Email, "finished_at": now, "updated_at": now}
 	if approve {
-		updates["outcome"] = models.FeedIntegrityActionApproved
-		updates["decision"] = models.FeedIntegrityDecisionReady
-		updates["approved_at"] = now
-		updates["finished_at"] = nil
-	}
-	if db.Model(&models.FeedIntegrityAction{}).Where("id=? AND outcome=?", row.ID, models.FeedIntegrityActionApprovalRequired).Updates(updates).RowsAffected != 1 {
-		c.JSON(http.StatusConflict, gin.H{"error": "action changed concurrently"})
-		return
-	}
-	feedIntegrityAudit(db, principal, "feed_integrity.autopilot.action."+map[bool]string{true: "approve", false: "reject"}[approve], row.PublicID.String(), "success", map[string]interface{}{"reason": req.Reason})
-	_ = db.Where("id=?", row.ID).First(&row).Error
-	if approve {
-		if claimed, e := claimFeedIntegrityAction(db, row.TenantID, row.ID); e == nil {
-			_ = executeFeedIntegrityAction(db, claimed)
-			_ = db.Where("id=?", row.ID).First(&row).Error
+		if err := executeFeedIntegrityAction(db, row); err != nil {
+			c.JSON(409, gin.H{"error": safeIntegrityError(err)})
+			return
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"data": row})
+	if err := db.First(&row, row.ID).Error; err != nil {
+		integrityReadError(c, err)
+		return
+	}
+	c.JSON(200, gin.H{"data": row})
 }
 
 func ResetFeedIntegrityAutopilotBreaker(c *gin.Context) {
-	principal, ok := requireAdminPrincipal(c)
-	if !ok {
+	if _, ok := requireAdminPrincipal(c); !ok {
 		return
 	}
-	class := strings.TrimSpace(c.Param("class"))
-	if class != models.FeedIntegrityActionRefreshWindow && class != models.FeedIntegrityActionConfirm {
-		c.JSON(http.StatusNotFound, gin.H{"error": "action class not found"})
-		return
-	}
-	var req struct {
-		Reason string `json:"reason"`
-	}
-	_ = c.ShouldBindJSON(&req)
-	if strings.TrimSpace(req.Reason) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "reason is required"})
-		return
-	}
-	db := c.MustGet("db").(*gorm.DB)
-	feedIntegrityAudit(db, principal, "feed_integrity.autopilot.breaker.reset", class, "success", map[string]interface{}{"reason": req.Reason})
-	c.JSON(http.StatusOK, gin.H{"data": feedIntegrityTrust(db, principal.TenantID, class, loadFeedIntegrityPolicy(db, principal.TenantID))})
+	c.JSON(http.StatusGone, gin.H{"error": "Safe Auto promotion and trust controls are deferred"})
 }

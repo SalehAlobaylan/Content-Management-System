@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -20,7 +21,7 @@ type NewsMetadataScope struct {
 // membership change invalidates that work instead of updating another view.
 func CaptureNewsMetadataScope(db *gorm.DB, tenant string, storyID uuid.UUID) (NewsMetadataScope, error) {
 	var scope NewsMetadataScope
-	if !db.Migrator().HasTable(&models.NewsFeedStoryProjection{}) {
+	if !feedcontract.HasNewsStoryProjection(db) {
 		return scope, nil
 	}
 	var head models.FeedGenerationHead
@@ -98,11 +99,10 @@ func WriteNewsMetadata(db *gorm.DB, tenant string, storyID uuid.UUID, scope News
 // PostgreSQL's composite type preserves the Story contract without copying a
 // hand-maintained list of columns into every reader.
 func NewsStoryQuery(db *gorm.DB, tenant string, generationID uuid.UUID) *gorm.DB {
-	if !db.Migrator().HasTable(&models.NewsFeedStoryProjection{}) {
+	if !feedcontract.HasNewsStoryProjection(db) {
 		return db.Model(&models.Story{}).Where("tenant_id=?", tenant)
 	}
-	view := db.Raw(`SELECT (jsonb_populate_record(NULL::stories,
-        to_jsonb(canonical) || COALESCE(projection.projection,'{}'::jsonb))).*
+	view := db.Raw(`SELECT (jsonb_populate_record(canonical, COALESCE(projection.projection,'{}'::jsonb))).*
         FROM stories canonical JOIN feed_generations generation ON generation.public_id=? AND generation.tenant_id=canonical.tenant_id AND generation.lane='news'
         LEFT JOIN news_feed_story_projections projection
         ON projection.tenant_id=canonical.tenant_id AND projection.story_id=canonical.public_id AND projection.generation_id=?
@@ -111,7 +111,7 @@ func NewsStoryQuery(db *gorm.DB, tenant string, generationID uuid.UUID) *gorm.DB
 }
 
 func ActiveNewsStoryQuery(db *gorm.DB, tenant string) *gorm.DB {
-	if !db.Migrator().HasTable(&models.NewsFeedStoryProjection{}) {
+	if !feedcontract.HasNewsStoryProjection(db) {
 		return db.Model(&models.Story{}).Where("tenant_id=?", tenant)
 	}
 	var head models.FeedGenerationHead

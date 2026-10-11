@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"content-management-system/src/feedcontract"
@@ -57,18 +58,21 @@ type podsAssemblyResult struct {
 }
 
 func getPodsFeedCanonical(c *gin.Context) {
-	db := c.MustGet("db").(*gorm.DB)
+	db := feedcontract.WithReadSchema(c.MustGet("db").(*gorm.DB).WithContext(c.Request.Context()))
+	if db.Error != nil {
+		c.JSON(503, gin.H{"error": "Feed schema is unavailable"})
+		return
+	}
 	tenantID, tenantErr := trustedPublicFeedTenant(c)
 	if tenantErr != nil {
 		c.JSON(503, utils.HTTPError{Code: 503, Message: "Public feed tenant is unavailable"})
 		return
 	}
-	servingGenerationID, generationSupported, generationActive := feedcontract.ActiveGeneration(db, tenantID, "media")
+	servingGenerationID, generationSupported, generationActive, availability := publicFeedBoundary(db, tenantID, "media")
 	if generationSupported && !generationActive {
 		c.JSON(503, gin.H{"error": "Pods serving generation is unavailable", "code": "FEED_VIEW_UNAVAILABLE"})
 		return
 	}
-	availability := currentFeedAvailability(db, tenantID, "media")
 	if availability != nil && availability.RetryAfterSeconds != nil {
 		c.Header("Retry-After", strconv.Itoa(*availability.RetryAfterSeconds))
 	}
@@ -282,7 +286,14 @@ func assemblePods(db *gorm.DB, req podsAssemblyRequest) (podsAssemblyResult, err
 	}
 	if req.Mode == podsAssemblyRanked && (config.IsActive || req.RankingConfig != nil) {
 		ids := extractPublicIDs(candidates)
-		result.Final = ScoreItems(candidates, config, LoadContentFlags(db, req.TenantID, ids), LoadVelocityData(db, ids, config.VelocityWindowHours, req.AsOf), req.AsOf)
+		var flags map[uuid.UUID]models.ContentFlag
+		var velocity VelocityData
+		var reads sync.WaitGroup
+		reads.Add(2)
+		go func() { defer reads.Done(); flags = LoadContentFlags(db, req.TenantID, ids) }()
+		go func() { defer reads.Done(); velocity = LoadVelocityData(db, ids, config.VelocityWindowHours, req.AsOf) }()
+		reads.Wait()
+		result.Final = ScoreItems(candidates, config, flags, velocity, req.AsOf)
 		result.Final, result.PreferenceEligible = applyPreferenceFeedHook(db, req.TenantID, req.UserID, result.Final)
 		result.Final = applyIntelligenceFeedHooks(db, req.TenantID, result.Final)
 	} else {

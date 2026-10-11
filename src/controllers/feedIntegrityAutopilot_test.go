@@ -53,6 +53,16 @@ func TestSanitizeFeedIntegrityAutopilotPolicy(t *testing.T) {
 	}
 }
 
+func TestFeedIntegrityLegacySafeAutoReportsObserve(t *testing.T) {
+	p := models.DefaultFeedIntegrityPolicy("default")
+	p.AutopilotEnabled = true
+	p.AutopilotMode = models.FeedIntegrityAutopilotModeSafeAuto
+	sanitizeFeedIntegrityAutopilotPolicy(&p)
+	if p.AutopilotMode != models.FeedIntegrityAutopilotModeObserve || feedIntegrityActionMode(p, models.FeedIntegrityActionRefreshWindow) != models.FeedIntegrityAutopilotModeObserve {
+		t.Fatal("unsupported saved mode advertised executable repairs", p)
+	}
+}
+
 func TestFeedIntegrityActionModeNeverElevates(t *testing.T) {
 	p := models.DefaultFeedIntegrityPolicy("default")
 	p.AutopilotMode = models.FeedIntegrityAutopilotModeAssist
