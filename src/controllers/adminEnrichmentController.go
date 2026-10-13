@@ -569,7 +569,7 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
 			} else if text := buildEmbeddingText(item); text == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no text content available"
-			} else if err := triggerEmbedding(text, id); err != nil {
+			} else if err := triggerEmbedding(text, id, spendContext(item.TenantID, triggerSource, "")); err != nil {
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
 				o.Status = artifactOutcomeTriggered
@@ -582,7 +582,7 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
 			} else if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no thumbnail_url available"
-			} else if err := triggerImageEmbedding(*item.ThumbnailURL, id); err != nil {
+			} else if err := triggerImageEmbedding(*item.ThumbnailURL, id, spendContext(item.TenantID, "admin_enrichment", id)); err != nil {
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
 			} else {
 				o.Status = artifactOutcomeTriggered

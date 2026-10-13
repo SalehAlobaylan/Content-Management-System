@@ -556,6 +556,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/ai-spend/budgets", perm("content", "read"), controllers.ListAISpendBudgets)
 	adminGroup.PUT("/ai-spend/budgets", perm("content", "write"), controllers.UpsertAISpendBudget)
 	adminGroup.POST("/ai-spend/run", perm("content", "write"), controllers.RunAISpendGovernorNow)
+	adminGroup.GET("/ai-spend/runs/:id", perm("content", "read"), controllers.GetAISpendRun)
+	adminGroup.GET("/ai-spend/by-run", perm("content", "read"), controllers.ListAISpendByRun)
+	adminGroup.GET("/ai-spend/by-run/:id", perm("content", "read"), controllers.GetAISpendByRun)
+	adminGroup.GET("/ai-spend/episodes", perm("content", "read"), controllers.ListAISpendEpisodes)
+	adminGroup.POST("/ai-spend/episodes/:id/close", perm("content", "write"), controllers.CloseAISpendEpisode)
+	adminGroup.GET("/ai-spend/override/preview", perm("content", "read"), controllers.PreviewAISpendOverride)
+	adminGroup.POST("/ai-spend/override/confirm", perm("content", "write"), controllers.ConfirmAISpendOverride)
+	adminGroup.GET("/ai-spend/invoices", perm("content", "read"), controllers.ListAISpendInvoices)
+	adminGroup.PUT("/ai-spend/invoices", perm("content", "write"), controllers.UpsertAISpendInvoice)
 
 	// Real User Experience (RUX) — browser-observed reliability cockpit. Reuses
 	// the `feed` permission resource (consumer-edge experience, same family).

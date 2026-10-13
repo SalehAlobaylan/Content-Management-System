@@ -16,7 +16,12 @@ const (
 )
 
 type AISpendEvent struct {
+	OverrideID           *uuid.UUID     `gorm:"type:uuid" json:"override_id,omitempty"`
+	HumanActorID         string         `json:"human_actor_id,omitempty"`
 	ID                   uint           `gorm:"primaryKey" json:"id"`
+	EventCount           int64          `gorm:"not null;default:1" json:"event_count"`
+	FoldedAt             *time.Time     `json:"folded_at,omitempty"`
+	UsageUnavailable     bool           `json:"usage_unavailable"`
 	EventID              uuid.UUID      `gorm:"type:uuid;uniqueIndex;not null" json:"event_id"`
 	OccurredAt           time.Time      `gorm:"not null;index" json:"occurred_at"`
 	SpendClass           string         `gorm:"type:varchar(32);not null;index" json:"spend_class"`
@@ -59,37 +64,46 @@ type AIPriceBook struct {
 func (AIPriceBook) TableName() string { return "ai_price_book" }
 
 type AISpendRollup struct {
-	ID             uint           `gorm:"primaryKey" json:"id"`
-	Day            time.Time      `gorm:"type:date;not null" json:"day"`
-	SpendClass     string         `json:"spend_class"`
-	Operation      string         `json:"operation"`
-	Provider       string         `json:"provider"`
-	Model          string         `json:"model"`
-	TriggerSource  string         `json:"trigger_source"`
-	SystemRunID    string         `json:"system_run_id,omitempty"`
-	Events         int64          `json:"events"`
-	Units          datatypes.JSON `gorm:"type:jsonb" json:"units"`
-	CostUSD        float64        `json:"cost_usd"`
-	AvoidedCostUSD float64        `json:"avoided_cost_usd"`
-	CacheHits      int64          `json:"cache_hits"`
-	Backfilled     bool           `json:"backfilled"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	HumanActorID           string         `json:"human_actor_id"`
+	OverCapHumanEvents     int64          `json:"over_cap_human_events"`
+	TenantID               string         `json:"tenant_id"`
+	EstimatedEvents        int64          `json:"estimated_events"`
+	UnpricedEvents         int64          `json:"unpriced_events"`
+	UnknownEvents          int64          `json:"unknown_events"`
+	UsageUnavailableEvents int64          `json:"usage_unavailable_events"`
+	AvoidedEstimatedUSD    float64        `json:"avoided_estimated_usd"`
+	ID                     uint           `gorm:"primaryKey" json:"id"`
+	Day                    time.Time      `gorm:"type:date;not null" json:"day"`
+	SpendClass             string         `json:"spend_class"`
+	Operation              string         `json:"operation"`
+	Provider               string         `json:"provider"`
+	Model                  string         `json:"model"`
+	TriggerSource          string         `json:"trigger_source"`
+	SystemRunID            string         `json:"system_run_id,omitempty"`
+	Events                 int64          `json:"events"`
+	Units                  datatypes.JSON `gorm:"type:jsonb" json:"units"`
+	CostUSD                float64        `json:"cost_usd"`
+	AvoidedCostUSD         float64        `json:"avoided_cost_usd"`
+	CacheHits              int64          `json:"cache_hits"`
+	Backfilled             bool           `json:"backfilled"`
+	UpdatedAt              time.Time      `json:"updated_at"`
 }
 
 func (AISpendRollup) TableName() string { return "ai_spend_rollups" }
 
 type AISpendPolicy struct {
-	ID                         uint       `gorm:"primaryKey" json:"id"`
-	TenantID                   string     `gorm:"type:varchar(64);not null;uniqueIndex" json:"tenant_id"`
-	Enabled                    bool       `json:"enabled"`
-	AggregationIntervalMinutes int        `json:"aggregation_interval_minutes"`
-	ForecastHorizonDays        int        `json:"forecast_horizon_days"`
-	RetentionDays              int        `json:"retention_days"`
-	SpikeMultiplier            float64    `json:"spike_multiplier"`
-	PausedUntil                *time.Time `json:"paused_until,omitempty"`
-	LastRunAt                  *time.Time `json:"last_run_at,omitempty"`
-	CreatedAt                  time.Time  `json:"created_at"`
-	UpdatedAt                  time.Time  `json:"updated_at"`
+	ComputeWatchLimits         datatypes.JSON `gorm:"type:jsonb;default:'{}'" json:"compute_watch_limits"`
+	ID                         uint           `gorm:"primaryKey" json:"id"`
+	TenantID                   string         `gorm:"type:varchar(64);not null;uniqueIndex" json:"tenant_id"`
+	Enabled                    bool           `json:"enabled"`
+	AggregationIntervalMinutes int            `json:"aggregation_interval_minutes"`
+	ForecastHorizonDays        int            `json:"forecast_horizon_days"`
+	RetentionDays              int            `json:"retention_days"`
+	SpikeMultiplier            float64        `json:"spike_multiplier"`
+	PausedUntil                *time.Time     `json:"paused_until,omitempty"`
+	LastRunAt                  *time.Time     `json:"last_run_at,omitempty"`
+	CreatedAt                  time.Time      `json:"created_at"`
+	UpdatedAt                  time.Time      `json:"updated_at"`
 }
 
 func (AISpendPolicy) TableName() string { return "ai_spend_policies" }
@@ -131,6 +145,12 @@ type AISpendRun struct {
 func (AISpendRun) TableName() string { return "ai_spend_runs" }
 
 type AISpendEpisode struct {
+	ReopenTimes   datatypes.JSON `gorm:"type:jsonb;default:'[]'" json:"reopen_times,omitempty"`
+	ClosedBy      string         `json:"closed_by,omitempty"`
+	ClosedAt      *time.Time     `json:"closed_at,omitempty"`
+	Confirmations int            `json:"confirmations"`
+	HealthyRuns   int            `json:"healthy_runs"`
+	Reopens       int            `json:"reopens"`
 	ID            uint           `gorm:"primaryKey" json:"id"`
 	TenantID      string         `json:"tenant_id"`
 	Kind          string         `json:"kind"`
@@ -147,3 +167,79 @@ type AISpendEpisode struct {
 }
 
 func (AISpendEpisode) TableName() string { return "ai_spend_episodes" }
+
+// Acknowledgements outlive raw retention, so redelivery cannot bill twice.
+type AISpendReceipt struct {
+	EventID   uuid.UUID `gorm:"type:uuid;primaryKey" json:"event_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (AISpendReceipt) TableName() string { return "ai_spend_receipts" }
+
+type AISpendEmitter struct {
+	Closed                 bool       `json:"closed"`
+	GuardUnavailable       int64      `json:"guard_unavailable"`
+	LastLossAt             *time.Time `json:"last_loss_at,omitempty"`
+	LastGuardUnavailableAt *time.Time `json:"last_guard_unavailable_at,omitempty"`
+	ProcessID              string     `gorm:"primaryKey" json:"process_id"`
+	TenantID               string     `gorm:"primaryKey" json:"tenant_id"`
+	SourceService          string     `json:"source_service"`
+	Sequence               int64      `json:"sequence"`
+	Emitted                int64      `json:"emitted"`
+	Accepted               int64      `json:"accepted"`
+	Dropped                int64      `json:"dropped"`
+	Unobservable           int64      `json:"unobservable"`
+	StartedAt              time.Time  `json:"started_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+}
+
+func (AISpendEmitter) TableName() string { return "ai_spend_emitters" }
+
+type AISpendOverride struct {
+	AdmissionSnapshot datatypes.JSON `gorm:"type:jsonb;default:'{}'" json:"admission_snapshot"`
+	ID                uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
+	TenantID          string         `json:"tenant_id"`
+	TriggerSource     string         `json:"trigger_source"`
+	CreatedBy         string         `json:"created_by"`
+	ExpiresAt         time.Time      `json:"expires_at"`
+	CreatedAt         time.Time      `json:"created_at"`
+}
+
+func (AISpendOverride) TableName() string { return "ai_spend_overrides" }
+
+type AISpendInvoice struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	TenantID  string    `json:"tenant_id"`
+	Provider  string    `json:"provider"`
+	Month     time.Time `gorm:"type:date" json:"month"`
+	AmountUSD float64   `json:"amount_usd"`
+	Note      string    `json:"note"`
+	CreatedBy string    `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (AISpendInvoice) TableName() string { return "ai_spend_invoices" }
+
+type AISpendSTTSettlement struct {
+	JobID          uuid.UUID `gorm:"type:uuid;primaryKey" json:"job_id"`
+	TenantID       string    `json:"tenant_id"`
+	CostUSD        float64   `json:"cost_usd"`
+	OwnerUpdatedAt time.Time `json:"owner_updated_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+func (AISpendSTTSettlement) TableName() string { return "ai_spend_stt_settlements" }
+
+// Permanent provenance survives raw retention alongside the event receipt.
+type AISpendOverrideUse struct {
+	EventID       uuid.UUID `gorm:"type:uuid;primaryKey" json:"event_id"`
+	OverrideID    uuid.UUID `gorm:"type:uuid" json:"override_id"`
+	TenantID      string    `json:"tenant_id"`
+	HumanActorID  string    `json:"human_actor_id"`
+	TriggerSource string    `json:"trigger_source"`
+	SystemRunID   string    `json:"system_run_id"`
+	OccurredAt    time.Time `json:"occurred_at"`
+}
+
+func (AISpendOverrideUse) TableName() string { return "ai_spend_override_uses" }

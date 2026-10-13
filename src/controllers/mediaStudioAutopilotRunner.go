@@ -746,7 +746,16 @@ func (r *studioRunner) runProposalPhase() {
 		items = append(items, r.buildProposalItem(pc))
 	}
 
-	proposals, err := generateChapterProposalsViaEnrichment(items)
+	context := spendContext(r.tenantID, "studio_autopilot", r.run.PublicID.String())
+	context = guardedSpendContext(r.db, context, float64(len(items))*.01)
+	proposals, err := generateChapterProposalsViaEnrichment(items, context)
+	if isAISpendCapped(err) {
+		for _, pc := range queue {
+			r.markProposalGuardrail(pc.ActionID, "budget_capped", "Proposal deferred; the chapter remains in review.")
+		}
+		r.record(studioActionInput{UnitType: models.StudioUnitChapterReview, Verdict: "proposal_phase", ToolName: "proposals.generate", Status: models.StudioActionStatusSkipped, Guardrail: "budget_capped", Reason: err.Error()})
+		return
+	}
 	if err != nil {
 		// Degrade: queue appears unranked, nothing blocked (S10).
 		for _, pc := range queue {
@@ -856,7 +865,7 @@ func (r *studioRunner) attachProposal(actionID uint, p studioProposal) {
 	}
 	raw, _ := json.Marshal(p)
 	conf := p.Confidence
-	r.db.Model(&models.MediaStudioAction{}).Where("id = ?", actionID).Updates(map[string]interface{}{
+	r.db.Model(&models.MediaStudioAction{}).Where("id = ? AND tenant_id=?", actionID, r.tenantID).Updates(map[string]interface{}{
 		"verdict":             verdict,
 		"proposal":            datatypes.JSON(raw),
 		"proposal_model":      "enrichment_llm",
@@ -867,10 +876,13 @@ func (r *studioRunner) attachProposal(actionID uint, p studioProposal) {
 // markProposalGuardrail annotates a case row with the proposal-step outcome,
 // preserving the original classification reason (append, don't overwrite).
 func (r *studioRunner) markProposalGuardrail(actionID uint, guardrail, note string) {
-	r.db.Model(&models.MediaStudioAction{}).Where("id = ?", actionID).Updates(map[string]interface{}{
+	result := r.db.Model(&models.MediaStudioAction{}).Where("id = ? AND tenant_id=?", actionID, r.tenantID).Updates(map[string]interface{}{
 		"guardrail": guardrail,
 		"reason":    gorm.Expr("COALESCE(NULLIF(reason, ''), '') || CASE WHEN COALESCE(reason,'') = '' THEN '' ELSE ' · ' END || ?", note),
 	})
+	if result.Error != nil {
+		r.fatalErr = fmt.Errorf("persist Studio proposal deferral: %w", result.Error)
+	}
 }
 
 // ---------------------------------------------------------------

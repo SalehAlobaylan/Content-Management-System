@@ -752,8 +752,13 @@ func classifyCandidates(candidates []models.SourceCandidate) (map[uint]string, m
 		return classMap, methodMap
 	}
 
-	results, err := classifyAccountsViaEnrichment(batch)
+	results, err := classifyAccountsViaEnrichment(batch, spendContext(candidates[0].TenantID, "source_intelligence", ""))
 	if err != nil {
+		if isAISpendCapped(err) {
+			for _, id := range ids {
+				methodMap[id] = "budget_capped"
+			}
+		}
 		log.Printf("source classify: LLM fallback failed (keeping deterministic): %v", err)
 		return classMap, methodMap
 	}
@@ -791,7 +796,7 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 		relevance := 0.0
 		novelty := 1.0
 		if len(titles) > 0 {
-			if vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles); err == nil && len(vecs) > 0 &&
+			if vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles, spendContext(cand.TenantID, "source_intelligence", cand.PublicID.String())); err == nil && len(vecs) > 0 &&
 				profile.EmbeddingSpaceID != nil && sampleSpaceID == *profile.EmbeddingSpaceID {
 				var sum float64
 				n := 0

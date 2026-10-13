@@ -15,6 +15,7 @@ import (
 )
 
 type ReasonRequest struct {
+	SpendOverrideID             string           `json:"spend_override_id,omitempty"`
 	SchemaVersion               string           `json:"schema_version"`
 	InvestigationID             string           `json:"investigation_id"`
 	ThreadID                    string           `json:"thread_id"`

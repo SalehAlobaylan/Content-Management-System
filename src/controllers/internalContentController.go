@@ -215,6 +215,17 @@ func normalizeContentLanguage(raw *string) *string {
 }
 
 func validEnrichmentMetadataField(key string, value interface{}) bool {
+	if key == "ai_spend_tagging_skip" {
+		v, ok := value.(map[string]interface{})
+		if !ok || len(v) != 3 {
+			return false
+		}
+		reason, _ := v["reason"].(string)
+		run, _ := v["system_run_id"].(string)
+		at, _ := v["occurred_at"].(string)
+		_, err := time.Parse(time.RFC3339Nano, at)
+		return reason == "budget_capped" && len(run) <= 96 && err == nil
+	}
 	if key == "summary" {
 		_, ok := value.(string)
 		return ok
@@ -1959,6 +1970,7 @@ type internalBatchTextRequest struct {
 }
 
 type internalBatchTextItem struct {
+	TenantID    string  `json:"tenant_id,omitempty"`
 	ID          string  `json:"id"` // public_id (UUID string)
 	Type        string  `json:"type"`
 	Title       *string `json:"title"`
@@ -2073,6 +2085,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 	}
 
 	type row struct {
+		TenantID    string
 		PublicID    uuid.UUID
 		Type        string
 		Title       *string
@@ -2091,7 +2104,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 		Where("embedding IS NULL OR embedding_model IS NULL").
 		Order("created_at ASC").
 		Limit(limit).
-		Select("public_id, type, title, excerpt, body_text, source_name, published_at").
+		Select("tenant_id, public_id, type, title, excerpt, body_text, source_name, published_at").
 		Scan(&rows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list missing-embedding items"})
 		return
@@ -2105,6 +2118,7 @@ func InternalListMissingEmbedding(c *gin.Context) {
 			publishedAtStr = &s
 		}
 		items = append(items, internalBatchTextItem{
+			TenantID:    r.TenantID,
 			ID:          r.PublicID.String(),
 			Type:        r.Type,
 			Title:       r.Title,

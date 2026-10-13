@@ -730,6 +730,33 @@ func InternalCreateTranscriptionGeneration(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "analysis audio manifest must have an audio content type"})
 		return
 	}
+	if strings.EqualFold(req.Provider, "deepgram") {
+		var owner models.TranscriptionJob
+		ownerErr := gorm.ErrRecordNotFound
+		if jobID != nil {
+			ownerErr = db.Where("public_id=? AND tenant_id=? AND content_item_id=?", *jobID, tenant, contentID).First(&owner).Error
+		}
+		if errors.Is(ownerErr, gorm.ErrRecordNotFound) {
+			admitted, triggered, reason, _, admitErr := createTranscriptionJobForItem(db, &contentItem, models.TranscriptionTriggerIngestAuto, false)
+			if admitErr != nil {
+				c.JSON(500, gin.H{"error": admitErr.Error()})
+				return
+			}
+			if !triggered {
+				c.JSON(409, gin.H{"error": "STT owner declined admission", "reason": reason})
+				return
+			}
+			owner = admitted
+			jobID = &owner.PublicID
+		} else if ownerErr != nil {
+			c.JSON(500, gin.H{"error": ownerErr.Error()})
+			return
+		}
+		if terminalTranscriptionStatus(owner.Status) {
+			c.JSON(409, gin.H{"error": "STT owner job is terminal"})
+			return
+		}
+	}
 	proof := map[string]any{}
 	if req.ContentStage != nil {
 		proof["content_stage"] = req.ContentStage

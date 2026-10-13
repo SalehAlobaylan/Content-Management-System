@@ -594,11 +594,16 @@ func (r *preferenceAutopilotRunner) enrichProposals() []proposalScore {
 		return nil
 	}
 	scorer := newProposalScorer(r.db, r.run.TenantID, r.policy, !r.observe)
+	scorer.spendRunID = r.run.PublicID.String()
 	out := make([]proposalScore, 0, len(pending))
 	for i := range pending {
 		started := time.Now()
 		sc := scorer.score(&pending[i])
 		out = append(out, sc)
+		if sc.BudgetCapped {
+			r.writeAction(models.PreferenceActionProposalEnrich, models.PreferenceSubjectProposal, fmt.Sprintf("%d", pending[i].ID), models.PreferenceActionStatusSkipped, "budget_capped", "Translation deferred by AI spend allowance; proposal remains pending.", started)
+			continue
+		}
 		status := models.PreferenceActionStatusSuccess
 		if r.observe {
 			status = models.PreferenceActionStatusWouldTrigger

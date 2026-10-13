@@ -110,7 +110,7 @@ func rebuildCentroidSurface(db *gorm.DB, c *models.EmbeddingCampaign, s Embeddin
 		case "story_centroid":
 			skip, err = rebuildStoryCentroid(db, id, es)
 		case "topic_centroid":
-			skip, err = refreshTopicCentroid(db, id, es)
+			skip, err = refreshTopicCentroid(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)))
 		default:
 			continue
 		}
@@ -228,12 +228,12 @@ func meanOfVectorRows(rows []struct{ Embedding pgvector.Vector }) []float32 {
 // refreshTopicCentroid re-embeds the topic's approved bilingual label seed (a
 // single embedding, not a running mean), stamps both identities, and marks the
 // topic needs_remap so the Preferences dirty sweep re-maps edges afterward (§6).
-func refreshTopicCentroid(db *gorm.DB, topicPublicID string, es expectedSpace) (skip string, err error) {
+func refreshTopicCentroid(db *gorm.DB, topicPublicID string, es expectedSpace, contexts ...AISpendContext) (skip string, err error) {
 	var topic models.Topic
 	if e := db.Where("public_id = ?", topicPublicID).First(&topic).Error; e != nil {
 		return "", e
 	}
-	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(topic.LabelEN + " " + topic.LabelAR)
+	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(topic.LabelEN+" "+topic.LabelAR, contexts...)
 	if e != nil || len(emb) != 1024 {
 		return "", fmt.Errorf("label embed failed: %v", e)
 	}
@@ -272,9 +272,9 @@ func refreshCacheSurface(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSu
 		var err error
 		switch s.Key {
 		case "topic_proposal":
-			err = refreshTopicProposalVector(db, id, es)
+			err = refreshTopicProposalVector(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)))
 		case "discovery_profile":
-			err = refreshDiscoveryProfileVector(db, id, es)
+			err = refreshDiscoveryProfileVector(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)))
 		default:
 			continue
 		}
@@ -342,13 +342,13 @@ func toolForCache(key string) string {
 	return models.EmbeddingToolDiscovery
 }
 
-func refreshTopicProposalVector(db *gorm.DB, proposalID string, es expectedSpace) error {
+func refreshTopicProposalVector(db *gorm.DB, proposalID string, es expectedSpace, contexts ...AISpendContext) error {
 	var p models.TopicProposal
 	if e := db.Where("id = ?", proposalID).First(&p).Error; e != nil {
 		return e
 	}
 	text := p.SuggestedLabelEN + " " + p.SuggestedLabelAR + " " + p.SuggestedSlug
-	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(text)
+	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(text, contexts...)
 	if e != nil || len(emb) != 1024 {
 		return fmt.Errorf("proposal embed failed: %v", e)
 	}
@@ -366,7 +366,7 @@ func refreshTopicProposalVector(db *gorm.DB, proposalID string, es expectedSpace
 		}).Error
 }
 
-func refreshDiscoveryProfileVector(db *gorm.DB, profilePublicID string, es expectedSpace) error {
+func refreshDiscoveryProfileVector(db *gorm.DB, profilePublicID string, es expectedSpace, contexts ...AISpendContext) error {
 	var profile models.DiscoveryProfile
 	if e := db.Where("public_id = ?", profilePublicID).First(&profile).Error; e != nil {
 		return e
@@ -375,7 +375,7 @@ func refreshDiscoveryProfileVector(db *gorm.DB, profilePublicID string, es expec
 	if text == "" {
 		return fmt.Errorf("profile has no embedding input")
 	}
-	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text)
+	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, contexts...)
 	if err != nil || len(emb) != 1024 {
 		return fmt.Errorf("profile embed failed: %v", err)
 	}

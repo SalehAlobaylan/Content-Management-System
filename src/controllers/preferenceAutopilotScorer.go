@@ -96,15 +96,17 @@ func l2Normalize(v []float32) []float32 {
 }
 
 type proposalScorer struct {
-	db       *gorm.DB
-	tenantID string
-	policy   models.PreferenceAutopilotPolicy
-	topics   []topicVector
-	catVecs  map[string][]float32
-	persist  bool
+	db         *gorm.DB
+	tenantID   string
+	spendRunID string
+	policy     models.PreferenceAutopilotPolicy
+	topics     []topicVector
+	catVecs    map[string][]float32
+	persist    bool
 
 	embedCalls     int
 	translateCalls int
+	budgetCapped   bool
 }
 
 func newProposalScorer(db *gorm.DB, tenantID string, policy models.PreferenceAutopilotPolicy, persist bool) *proposalScorer {
@@ -142,6 +144,7 @@ type proposalScore struct {
 	NeedsLabel      bool    `json:"needs_label"`
 	EmbeddingReady  bool    `json:"embedding_ready"`
 	Reason          string  `json:"reason"`
+	BudgetCapped    bool    `json:"budget_capped"`
 }
 
 // score computes the deterministic confidence + verdict for one proposal and, when
@@ -154,7 +157,16 @@ func (s *proposalScorer) score(p *models.TopicProposal) proposalScore {
 	// Bilingual label prefill (Advisor, bounded). Fills a missing/sluggish AR or EN
 	// from the other language via the Enrichment translate wrapper. Display prefill
 	// only; a still-unresolved label is a blocker flag, not evidence quality.
+	s.budgetCapped = false
 	ar, en, needsLabel := s.fillLabels(p)
+	res.BudgetCapped = s.budgetCapped
+	if res.BudgetCapped {
+		res.NeedsLabel = true
+		res.CategoryUnknown = true
+		res.Verdict = models.PreferenceVerdictReview
+		res.Reason = "Paid translation deferred by AI spend allowance; proposal remains pending."
+		return res
+	}
 
 	// Embedding (cached; bounded per run). Without it, duplicate/category are
 	// unknowable and high-confidence is blocked by construction.
@@ -262,16 +274,20 @@ func (s *proposalScorer) fillLabels(p *models.TopicProposal) (string, string, bo
 	}
 
 	if arSluggish && !enSluggish && s.translateCalls < s.policy.MaxTranslationCalls {
-		if t, err := translateViaEnrichment(en, "ar"); err == nil && hasArabicScript(t) {
+		if t, err := translateViaEnrichment(en, "ar", guardedSpendContext(s.db, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID), .01)); err == nil && hasArabicScript(t) {
 			ar = t
 			arSluggish = false
+		} else if isAISpendCapped(err) {
+			s.budgetCapped = true
 		}
 		s.translateCalls++
 	}
 	if enSluggish && !arSluggish && s.translateCalls < s.policy.MaxTranslationCalls {
-		if t, err := translateViaEnrichment(ar, "en"); err == nil && strings.TrimSpace(t) != "" {
+		if t, err := translateViaEnrichment(ar, "en", guardedSpendContext(s.db, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID), .01)); err == nil && strings.TrimSpace(t) != "" {
 			en = t
 			enSluggish = false
+		} else if isAISpendCapped(err) {
+			s.budgetCapped = true
 		}
 		s.translateCalls++
 	}
@@ -297,7 +313,7 @@ func (s *proposalScorer) ensureEmbedding(p *models.TopicProposal, ar, en string)
 		return nil, false
 	}
 	text := strings.TrimSpace(en + " " + ar + " " + strings.ReplaceAll(p.SuggestedSlug, "-", " "))
-	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text)
+	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID))
 	s.embedCalls++
 	if err != nil || len(emb) != 1024 {
 		return nil, false

@@ -52,7 +52,7 @@ type studioProposalResponse struct {
 // generateChapterProposalsViaEnrichment sends a bounded batch of review cases to
 // Enrichment and returns the proposals keyed by case id. Best-effort: a
 // transport or config failure returns an error the caller degrades on.
-func generateChapterProposalsViaEnrichment(items []studioProposalItem) (map[string]studioProposal, error) {
+func generateChapterProposalsViaEnrichment(items []studioProposalItem, contexts ...AISpendContext) (map[string]studioProposal, error) {
 	if len(items) == 0 {
 		return map[string]studioProposal{}, nil
 	}
@@ -65,7 +65,7 @@ func generateChapterProposalsViaEnrichment(items []studioProposalItem) (map[stri
 		return nil, fmt.Errorf("enrichment service token is not configured")
 	}
 
-	body, err := json.Marshal(map[string]interface{}{"items": items})
+	body, err := json.Marshal(map[string]interface{}{"items": items, "spend_context": firstSpendContext(contexts)})
 	if err != nil {
 		return nil, fmt.Errorf("marshal chapter-proposal request: %w", err)
 	}
@@ -86,6 +86,9 @@ func generateChapterProposalsViaEnrichment(items []studioProposalItem) (map[stri
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if e := enrichmentBudgetError(resp.StatusCode, respBody); e != nil {
+			return nil, e
+		}
 		return nil, fmt.Errorf("enrichment chapter-proposal returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 

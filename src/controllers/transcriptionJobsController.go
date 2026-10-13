@@ -673,6 +673,13 @@ func updateTranscriptionJobFromRequest(db *gorm.DB, job *models.TranscriptionJob
 	}
 	if req.DurationSec != nil && *req.DurationSec > 0 {
 		job.ActualCostUsd = estimateSTTCostForDuration(*req.DurationSec)
+		var usageMetadata map[string]interface{}
+		_ = json.Unmarshal(job.Metadata, &usageMetadata)
+		if usageMetadata == nil {
+			usageMetadata = map[string]interface{}{}
+		}
+		usageMetadata["duration_sec"] = *req.DurationSec
+		job.Metadata = aiSpendJSON(usageMetadata)
 	}
 	if req.ActualCostUsd != nil {
 		job.ActualCostUsd = *req.ActualCostUsd

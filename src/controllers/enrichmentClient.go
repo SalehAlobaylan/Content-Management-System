@@ -245,7 +245,7 @@ func cancelMediaTranscriptionJob(mediaJobID string) error {
 // triggerImageEmbedding sends a CLIP image-embedding request to Media-Service
 // for the item's thumbnail/hero image. Same multipart shape as
 // triggerTranscription; Media writes the 512-dim vector back to CMS.
-func triggerImageEmbedding(imageURL string, contentID string) error {
+func triggerImageEmbedding(imageURL string, contentID string, contexts ...AISpendContext) error {
 	baseURL := mediaBaseURL()
 	if baseURL == "" {
 		return fmt.Errorf("MEDIA_BASE_URL is not configured")
@@ -258,6 +258,8 @@ func triggerImageEmbedding(imageURL string, contentID string) error {
 
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
+	spendJSON, _ := json.Marshal(firstSpendContext(contexts))
+	_ = writer.WriteField("spend_context_json", string(spendJSON))
 	writer.WriteField("url", imageURL)
 	writer.WriteField("content_id", contentID)
 	writer.Close()
@@ -431,7 +433,7 @@ type storyDigestResult struct {
 // source-grounded lede + bullets + one category slug via Enrichment's
 // /v1/stories/digest. Mirrors generateTopicLabelViaEnrichment. Caller treats
 // failure as best-effort.
-func generateStorySummaryViaEnrichment(texts []string) (string, []string, string, error) {
+func generateStorySummaryViaEnrichment(texts []string, contexts ...AISpendContext) (string, []string, string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return "", nil, "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -442,6 +444,7 @@ func generateStorySummaryViaEnrichment(texts []string) (string, []string, string
 	}
 
 	payload := map[string]interface{}{"texts": texts, "max_bullets": 3}
+	payload["spend_context"] = firstSpendContext(contexts)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("marshal story-digest request: %w", err)
@@ -463,6 +466,9 @@ func generateStorySummaryViaEnrichment(texts []string) (string, []string, string
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if budgetErr := enrichmentBudgetError(resp.StatusCode, respBody); budgetErr != nil {
+			return "", nil, "", budgetErr
+		}
 		return "", nil, "", fmt.Errorf("enrichment story-digest returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -482,7 +488,7 @@ type accountToClassify struct {
 // classifyAccountsViaEnrichment sends the ambiguous accounts the deterministic
 // pass couldn't resolve to Enrichment's cached LLM classifier. Returns a
 // handle(lowercased) -> source_class map.
-func classifyAccountsViaEnrichment(accounts []accountToClassify) (map[string]string, error) {
+func classifyAccountsViaEnrichment(accounts []accountToClassify, contexts ...AISpendContext) (map[string]string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return nil, fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -493,6 +499,7 @@ func classifyAccountsViaEnrichment(accounts []accountToClassify) (map[string]str
 	}
 
 	payload := map[string]interface{}{"accounts": accounts}
+	payload["spend_context"] = firstSpendContext(contexts)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal classify request: %w", err)
@@ -514,13 +521,17 @@ func classifyAccountsViaEnrichment(accounts []accountToClassify) (map[string]str
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if budgetErr := enrichmentBudgetError(resp.StatusCode, respBody); budgetErr != nil {
+			return nil, budgetErr
+		}
 		return nil, fmt.Errorf("enrichment classify returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var decoded struct {
 		Results []struct {
-			Handle      string `json:"handle"`
-			SourceClass string `json:"source_class"`
+			Handle       string `json:"handle"`
+			SourceClass  string `json:"source_class"`
+			BudgetCapped bool   `json:"budget_capped"`
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
@@ -528,12 +539,15 @@ func classifyAccountsViaEnrichment(accounts []accountToClassify) (map[string]str
 	}
 	out := make(map[string]string, len(decoded.Results))
 	for _, r := range decoded.Results {
+		if r.BudgetCapped {
+			return nil, &aiBudgetCappedError{Reason: "source classification deferred"}
+		}
 		out[strings.ToLower(strings.TrimSpace(r.Handle))] = r.SourceClass
 	}
 	return out, nil
 }
 
-func generateTopicLabelViaEnrichment(texts []string) (string, error) {
+func generateTopicLabelViaEnrichment(texts []string, contexts ...AISpendContext) (string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -544,6 +558,7 @@ func generateTopicLabelViaEnrichment(texts []string) (string, error) {
 	}
 
 	payload := map[string]interface{}{"texts": texts}
+	payload["spend_context"] = firstSpendContext(contexts)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal topic-label request: %w", err)
@@ -565,6 +580,9 @@ func generateTopicLabelViaEnrichment(texts []string) (string, error) {
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if budgetErr := enrichmentBudgetError(resp.StatusCode, respBody); budgetErr != nil {
+			return "", budgetErr
+		}
 		return "", fmt.Errorf("enrichment topic-label returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -618,6 +636,7 @@ type chaptersGenerateResult struct {
 func generateChaptersViaEnrichment(
 	windows []chapterWindowPayload,
 	opts chaptersGenOpts,
+	contexts ...AISpendContext,
 ) ([]generatedChapter, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
@@ -641,6 +660,7 @@ func generateChaptersViaEnrichment(
 		payload["language"] = opts.Language
 	}
 
+	payload["spend_context"] = firstSpendContext(contexts)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal chapters request: %w", err)
@@ -663,6 +683,9 @@ func generateChaptersViaEnrichment(
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if budgetErr := enrichmentBudgetError(resp.StatusCode, respBody); budgetErr != nil {
+			return nil, budgetErr
+		}
 		return nil, fmt.Errorf("enrichment chapters returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -680,7 +703,7 @@ func generateChaptersViaEnrichment(
 // — never an approval input by itself. The scorer caps calls per run; failure
 // degrades to slug-derived labels flagged needs_label.
 
-func translateViaEnrichment(text, targetLanguage string) (string, error) {
+func translateViaEnrichment(text, targetLanguage string, contexts ...AISpendContext) (string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -696,7 +719,7 @@ func translateViaEnrichment(text, targetLanguage string) (string, error) {
 		targetLanguage = "en"
 	}
 
-	payload, err := json.Marshal(map[string]interface{}{"text": text, "target_language": targetLanguage})
+	payload, err := json.Marshal(map[string]interface{}{"text": text, "target_language": targetLanguage, "spend_context": firstSpendContext(contexts)})
 	if err != nil {
 		return "", err
 	}
@@ -715,6 +738,9 @@ func translateViaEnrichment(text, targetLanguage string) (string, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if budgetErr := enrichmentBudgetError(resp.StatusCode, body); budgetErr != nil {
+			return "", budgetErr
+		}
 		return "", fmt.Errorf("enrichment translate status %d: %s", resp.StatusCode, string(body))
 	}
 	var r struct {
@@ -753,7 +779,7 @@ func embedQueryViaEnrichment(text string) ([]float32, error) {
 // embedQueryViaEnrichmentWithSpace returns the vector and the exact space_id
 // reported by the inference call. Lifecycle owner adapters compare this with
 // their frozen campaign target before stamping, closing a model-swap race.
-func embedQueryViaEnrichmentWithSpace(text string) ([]float32, string, error) {
+func embedQueryViaEnrichmentWithSpace(text string, contexts ...AISpendContext) ([]float32, string, error) {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return nil, "", fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -763,7 +789,7 @@ func embedQueryViaEnrichmentWithSpace(text string) ([]float32, string, error) {
 		return nil, "", fmt.Errorf("enrichment service token is not configured")
 	}
 
-	payload, err := json.Marshal(map[string]interface{}{"text": text})
+	payload, err := json.Marshal(map[string]interface{}{"text": text, "spend_context": firstSpendContext(contexts)})
 	if err != nil {
 		return nil, "", err
 	}
@@ -806,7 +832,7 @@ func embedBatchViaEnrichment(texts []string) ([][]float32, error) {
 	return vectors, err
 }
 
-func embedBatchViaEnrichmentWithSpace(texts []string) ([][]float32, string, error) {
+func embedBatchViaEnrichmentWithSpace(texts []string, contexts ...AISpendContext) ([][]float32, string, error) {
 	if len(texts) == 0 {
 		return nil, "", fmt.Errorf("no texts")
 	}
@@ -815,7 +841,7 @@ func embedBatchViaEnrichmentWithSpace(texts []string) ([][]float32, string, erro
 	if baseURL == "" || token == "" {
 		return nil, "", fmt.Errorf("enrichment not configured")
 	}
-	payload, err := json.Marshal(map[string]interface{}{"texts": texts})
+	payload, err := json.Marshal(map[string]interface{}{"texts": texts, "spend_context": firstSpendContext(contexts)})
 	if err != nil {
 		return nil, "", err
 	}
@@ -851,7 +877,7 @@ func embedBatchViaEnrichmentWithSpace(texts []string) ([][]float32, string, erro
 
 // triggerEmbedding sends an embedding request to the Enrichment-Service.
 // Enrichment writes the embedding back to CMS via /internal endpoints.
-func triggerEmbedding(text string, contentID string) error {
+func triggerEmbedding(text string, contentID string, contexts ...AISpendContext) error {
 	baseURL := enrichmentBaseURL()
 	if baseURL == "" {
 		return fmt.Errorf("ENRICHMENT_BASE_URL is not configured")
@@ -870,6 +896,7 @@ func triggerEmbedding(text string, contentID string) error {
 		"content_ids": []string{contentID},
 	}
 
+	payload["spend_context"] = firstSpendContext(contexts)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal embedding request: %w", err)

@@ -895,7 +895,15 @@ func LabelTopicsBatch(c *gin.Context) {
 			continue
 		}
 
-		label, lerr := generateTopicLabelViaEnrichment(texts)
+		context, admitted := manualAISpendContext(c, principal.TenantID, "manual_story_label", t.PublicID.String())
+		if !admitted {
+			return
+		}
+		label, lerr := generateTopicLabelViaEnrichment(texts, context)
+		if isAISpendCapped(lerr) {
+			c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": lerr.Error()})
+			return
+		}
 		if lerr != nil {
 			// Enrichment/LLM is unreachable — surface it instead of silently
 			// stamping "Cluster N" on every topic. The caller can retry.
@@ -1003,7 +1011,15 @@ func DigestTopicsBatch(c *gin.Context) {
 				Updates(map[string]interface{}{"summary_built_at": now, "category": "general"})
 			continue
 		}
-		summary, bullets, category, derr := generateStorySummaryViaEnrichment(texts)
+		context, admitted := manualAISpendContext(c, principal.TenantID, "manual_story_digest", t.PublicID.String())
+		if !admitted {
+			return
+		}
+		summary, bullets, category, derr := generateStorySummaryViaEnrichment(texts, context)
+		if isAISpendCapped(derr) {
+			c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": derr.Error()})
+			return
+		}
 		if derr != nil {
 			// Surface an Enrichment outage (don't mark attempted) so the caller
 			// can retry — matches LabelTopicsBatch's behaviour.

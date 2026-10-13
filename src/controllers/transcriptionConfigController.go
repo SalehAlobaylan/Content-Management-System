@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"content-management-system/src/utils"
 	"errors"
 	"net/http"
 	"time"
@@ -171,6 +172,9 @@ func InternalRequestSTT(c *gin.Context) {
 		Force bool `json:"force"`
 	}
 	_ = c.ShouldBindJSON(&req) // body optional
+	if principal, ok := c.Get(utils.InternalPrincipalContextKey); ok && principal == utils.MachinePrincipalMedia {
+		req.Force = false
+	}
 
 	job, triggered, reason, _, err := createTranscriptionJobForItem(db, &item, models.TranscriptionTriggerIngestAuto, req.Force)
 	if err != nil {

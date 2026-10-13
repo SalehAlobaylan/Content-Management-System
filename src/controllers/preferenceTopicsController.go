@@ -338,7 +338,7 @@ func AdminCreateTopic(c *gin.Context) {
 		CategorySlug: strings.TrimSpace(req.CategorySlug), Active: active, Featured: featured, CreatedFrom: "manual",
 		NeedsRemap: true,
 	}
-	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en + " " + ar); err == nil && len(emb) == 1024 {
+	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en+" "+ar, spendContext(principal.TenantID, "manual_topic", "")); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
 		topic.Centroid = &vec
 		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
@@ -487,7 +487,7 @@ func AdminApproveTopicProposal(c *gin.Context) {
 		featured = *req.Featured
 	}
 	topic := models.Topic{TenantID: principal.TenantID, Slug: slug, LabelAR: ar, LabelEN: en, CategorySlug: topicFirstNonEmpty(req.CategorySlug, p.SuggestedCategory), Featured: featured, Active: true, CreatedFrom: "mined", NeedsRemap: true}
-	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en + " " + ar); err == nil && len(emb) == 1024 {
+	if emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(en+" "+ar, spendContext(principal.TenantID, "manual_topic", "")); err == nil && len(emb) == 1024 {
 		vec := pgvector.NewVector(emb)
 		topic.Centroid = &vec
 		if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicCentroid, observedSpace); ok {
@@ -763,7 +763,7 @@ func hydrateMissingTopicCentroids(db *gorm.DB, tenantID string) {
 		return
 	}
 	for _, topic := range topics {
-		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN + " " + topic.LabelAR)
+		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN+" "+topic.LabelAR, spendContext(tenantID, "topics_maintenance", topic.PublicID.String()))
 		if err != nil || len(emb) != 1024 {
 			continue
 		}

@@ -1651,7 +1651,7 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		return
 	}
 
-	summary, bullets, category, err := generateStorySummaryViaEnrichment(texts)
+	summary, bullets, category, err := generateStorySummaryViaEnrichment(texts, AISpendContext{TenantID: tenantID, TriggerSource: "serving_news_summary", SystemRunID: storyID.String(), ServingExempt: true})
 	if err != nil || len(bullets) == 0 {
 		return // best-effort — keep the previous digest (or none)
 	}
@@ -1731,7 +1731,7 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 			}
 		}
 		if len(summaries) > 1 && query != "" {
-			reranked := rerankStorySummaries(query, summaries)
+			reranked := rerankStorySummaries(query, summaries, spendContext(tenantID, "story_related", storyID.String()))
 			ids = ids[:0]
 			for _, s := range reranked {
 				ids = append(ids, s.StoryID)
@@ -1759,7 +1759,7 @@ type storyRerankResponse struct {
 // refreshStoryRelated (write time) — never on the read path. On any failure it
 // returns the input unchanged (centroid order); rerank is enrichment, not a
 // hard requirement.
-func rerankStorySummaries(query string, summaries []StorySummary) []StorySummary {
+func rerankStorySummaries(query string, summaries []StorySummary, contexts ...AISpendContext) []StorySummary {
 	baseURL := enrichmentBaseURL()
 	token := enrichmentServiceToken()
 	if baseURL == "" || token == "" || len(summaries) == 0 {
@@ -1784,7 +1784,7 @@ func rerankStorySummaries(query string, summaries []StorySummary) []StorySummary
 		candidates[i] = capText(text)
 	}
 
-	body, err := json.Marshal(map[string]interface{}{"query": query, "candidates": candidates})
+	body, err := json.Marshal(map[string]interface{}{"query": query, "candidates": candidates, "spend_context": firstSpendContext(contexts)})
 	if err != nil {
 		return summaries
 	}

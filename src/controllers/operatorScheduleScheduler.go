@@ -92,7 +92,7 @@ func runOperatorScheduleHeartbeat(db *gorm.DB) {
 		if policy.LLMEnabled {
 			reasoner, _ = operatorpkg.NewHTTPReasonerFromEnv()
 		}
-		coordinator := operatorpkg.NewInvestigationCoordinator(operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()), operatorpkg.NewInvestigationStore(db), reasoner)
+		coordinator := operatorpkg.NewInvestigationCoordinator(operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()), operatorpkg.NewInvestigationStore(db), wrapSpendReasoner(db, reasoner))
 		input := operatorpkg.InvestigationInput{VisibleContext: template.VisibleContext, Intent: template.Request.Intent, Locale: schedule.Locale, Message: template.Request.Message, Tier: template.Request.Tier}
 		result, err := coordinator.Run(ctx, access, policy, input)
 		if err != nil {

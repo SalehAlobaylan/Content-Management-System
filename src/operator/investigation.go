@@ -549,3 +549,17 @@ func appendInvestigationEvent(tx *gorm.DB, investigationID uint, tenantID, event
 	}
 	return tx.Create(&models.OperatorInvestigationEvent{InvestigationID: investigationID, TenantID: tenantID, Sequence: sequence + 1, EventType: eventType, Payload: datatypes.JSON(raw)}).Error
 }
+
+// RecordSpendSkip leaves a durable explanation while the evidence-only answer completes.
+func (store *InvestigationStore) RecordSpendSkip(ctx context.Context, publicID, tenant, reason string) error {
+	return store.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var i models.OperatorInvestigation
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=?", publicID, tenant).First(&i).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&i).Update("error_class", "budget_capped").Error; err != nil {
+			return err
+		}
+		return appendInvestigationEvent(tx, i.ID, tenant, "budget_capped", map[string]any{"reason": reason, "paid_dispatch": false})
+	})
+}

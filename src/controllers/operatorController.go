@@ -265,6 +265,24 @@ func CreateOperatorInvestigation(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Operator investigation request"})
 		return
 	}
+	var spendOverride string
+	allowance := CheckTenantSpendAllowance(db, tenantID, "llm", .02, "operator", "")
+	if allowance["allowed"] == false {
+		if allowance["reason"] != "budget_capped" || body.Tier == "reasoning" {
+			c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": "Operator LLM admission is paused or capped", "allowance": allowance})
+			return
+		}
+		if !body.SpendAcknowledged {
+			c.JSON(409, gin.H{"code": "ai_budget_confirmation_required", "message": "The LLM budget is reached. Confirm a paid interactive answer above the cap.", "allowance": allowance})
+			return
+		}
+		var err error
+		spendOverride, err = confirmedOperatorSpend(db, tenantID, principal.UserID)
+		if err != nil {
+			c.JSON(500, gin.H{"message": "Could not persist spend confirmation"})
+			return
+		}
+	}
 	softSpend, hardSpend := operatorSpendStatus(db, tenantID, persisted.InteractiveSoftSpendLimit, persisted.DeepHardSpendLimit)
 	if body.Tier == "reasoning" && hardSpend {
 		c.JSON(http.StatusTooManyRequests, gin.H{"message": "Deep Operator reasoning is hard-stopped by the current spend policy", "code": "deep_hard_spend_stop"})
@@ -318,8 +336,8 @@ func CreateOperatorInvestigation(c *gin.Context) {
 	if memoryEmbedder, err := operatorpkg.NewHTTPMemoryEmbedder(os.Getenv("ENRICHMENT_BASE_URL"), memoryToken, nil); err == nil {
 		fabric.WithMemoryRetrieval(operatorpkg.NewMemoryStore(db), memoryEmbedder)
 	}
-	coordinator := operatorpkg.NewInvestigationCoordinator(fabric, store, reasoner)
-	input := operatorpkg.InvestigationInput{VisibleContext: body.VisibleContext, Intent: body.Intent, Locale: body.Locale, Message: body.Message, Tier: body.Tier, ThreadID: threadID}
+	coordinator := operatorpkg.NewInvestigationCoordinator(fabric, store, wrapSpendReasoner(db, reasoner))
+	input := operatorpkg.InvestigationInput{SpendOverrideID: spendOverride, VisibleContext: body.VisibleContext, Intent: body.Intent, Locale: body.Locale, Message: body.Message, Tier: body.Tier, ThreadID: threadID}
 	investigation, err := coordinator.Start(c.Request.Context(), access, runtimePolicy, input)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Operator investigation could not be started"})

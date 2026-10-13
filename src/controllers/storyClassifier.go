@@ -103,7 +103,13 @@ func classifyContentTopic(db *gorm.DB, contentID uuid.UUID) {
 	// (Labeled=false, renamed later by /admin/stories/label-batch). Returning
 	// without a topic would silently exclude the item from the News feed.
 	labeled := true
-	label, err := generateTopicLabelViaEnrichment(topicSeedTexts(&item))
+	label, err := generateTopicLabelViaEnrichment(topicSeedTexts(&item), guardedSpendContext(db, spendContext(item.TenantID, "ingest_story_label", item.PublicID.String()), .01))
+	if isAISpendCapped(err) {
+		// Classification can continue with its placeholder; the optional paid
+		// labeling attempt remains visibly deferred on the owner item.
+		skip := aiSpendJSON(map[string]any{"reason": "budget_capped", "system_run_id": item.PublicID.String(), "occurred_at": time.Now().UTC()})
+		_ = db.Model(&models.ContentItem{}).Where("id=? AND tenant_id=?", item.ID, item.TenantID).Update("metadata", gorm.Expr("jsonb_set(COALESCE(metadata,'{}'::jsonb),'{ai_spend_label_skip}',?::jsonb,true)", string(skip))).Error
+	}
 	label = strings.TrimSpace(label)
 	if err != nil || label == "" {
 		labeled = false

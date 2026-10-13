@@ -168,7 +168,7 @@ func createManualArticle(db *gorm.DB, tenantID string, req createAdminContentReq
 		if text := buildEmbeddingText(&item); strings.TrimSpace(text) != "" {
 			id := item.PublicID.String()
 			go func() {
-				_ = triggerEmbedding(text, id)
+				_ = triggerEmbedding(text, id, spendContext(tenantID, "manual_content", id))
 			}()
 		}
 	}

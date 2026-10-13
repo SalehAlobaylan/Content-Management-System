@@ -9,12 +9,13 @@ import (
 )
 
 type InvestigationInput struct {
-	VisibleContext VisibleContext
-	Intent         Intent
-	Locale         string
-	Message        string
-	Tier           string
-	ThreadID       *uint
+	SpendOverrideID string
+	VisibleContext  VisibleContext
+	Intent          Intent
+	Locale          string
+	Message         string
+	Tier            string
+	ThreadID        *uint
 }
 
 type InvestigationResult struct {
@@ -82,6 +83,7 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 	if err != nil {
 		return InvestigationResult{Investigation: investigation}, err
 	}
+	ctx = withMemorySpendContext(ctx, investigation.TenantID, investigation.PublicID.String(), investigation.ActorID)
 	packet, err := coordinator.fabric.BuildPacket(ctx, input.VisibleContext, access)
 	if err != nil {
 		_ = coordinator.store.FailClaim(ctx, investigation.ID, access.TenantID, claimToken, "context_unavailable")
@@ -108,7 +110,7 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 	for _, recommendation := range packet.Recommendations {
 		recommendationIDs = append(recommendationIDs, recommendation.ID)
 	}
-	output, reasonErr := coordinator.reasoner.Reason(ctx, ReasonRequest{SchemaVersion: ContractVersion, InvestigationID: investigation.PublicID.String(), ThreadID: investigation.PublicID.String(), TaskKind: input.Intent, Language: input.Locale, Tier: input.Tier, AdminMessage: input.Message, Packet: packet, AdvertisedRecommendationIDs: recommendationIDs, AdvertisedActions: []AdvertisedTool{}, DataCategories: []string{"operational_state"}})
+	output, reasonErr := coordinator.reasoner.Reason(ctx, ReasonRequest{SpendOverrideID: input.SpendOverrideID, SchemaVersion: ContractVersion, InvestigationID: investigation.PublicID.String(), ThreadID: investigation.PublicID.String(), TaskKind: input.Intent, Language: input.Locale, Tier: input.Tier, AdminMessage: input.Message, Packet: packet, AdvertisedRecommendationIDs: recommendationIDs, AdvertisedActions: []AdvertisedTool{}, DataCategories: []string{"operational_state"}})
 	if reasonErr != nil {
 		blocks := DeterministicDegradedBlocksForLocale(packet, input.Locale, localizedDegradedReason(input.Locale, true))
 		if err := coordinator.store.Complete(ctx, investigation.ID, access.TenantID, claimToken, blocks); err != nil {

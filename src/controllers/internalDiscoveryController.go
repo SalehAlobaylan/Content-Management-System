@@ -199,7 +199,7 @@ func scoreSuggestionRows(db *gorm.DB, tenantID string, profileID *uint, rows []m
 		if len(titles) == 0 {
 			continue
 		}
-		vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles)
+		vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles, spendContext(profile.TenantID, "discovery", profile.PublicID.String()))
 		if err != nil || len(vecs) == 0 || profile.EmbeddingSpaceID == nil || sampleSpaceID != *profile.EmbeddingSpaceID {
 			continue
 		}
@@ -268,7 +268,7 @@ func ensureProfileEmbedding(db *gorm.DB, profile *models.DiscoveryProfile) ([]fl
 	if text == "" {
 		return nil, false
 	}
-	vec, observedSpace, err := embedQueryViaEnrichmentWithSpace(text)
+	vec, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, spendContext(profile.TenantID, "discovery", profile.PublicID.String()))
 	if err != nil || len(vec) == 0 {
 		return nil, false
 	}

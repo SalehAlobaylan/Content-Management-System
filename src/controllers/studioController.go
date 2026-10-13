@@ -482,6 +482,10 @@ func GenerateChapters(c *gin.Context) {
 		lang = *transcript.Language
 	}
 
+	context, admitted := manualAISpendContext(c, principal.TenantID, "manual_chapter_planning", item.PublicID.String())
+	if !admitted {
+		return
+	}
 	generated, err := generateChaptersViaEnrichment(windows, chaptersGenOpts{
 		Mode:              req.Mode,
 		TargetCount:       req.TargetCount,
@@ -490,7 +494,11 @@ func GenerateChapters(c *gin.Context) {
 		MaxSec:            req.MaxSec,
 		WithSummary:       withSummary,
 		Language:          lang,
-	})
+	}, context)
+	if isAISpendCapped(err) {
+		c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": err.Error()})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadGateway, utils.HTTPError{
 			Code: http.StatusBadGateway, Message: "Chapter generation failed: " + err.Error(),
@@ -764,7 +772,7 @@ func SaveTranscript(c *gin.Context) {
 	itemCopy := *item
 	go func() {
 		if text := buildEmbeddingText(&itemCopy); text != "" {
-			_ = triggerEmbedding(text, itemCopy.PublicID.String())
+			_ = triggerEmbedding(text, itemCopy.PublicID.String(), spendContext(itemCopy.TenantID, "manual_transcript_edit", itemCopy.PublicID.String()))
 		}
 	}()
 

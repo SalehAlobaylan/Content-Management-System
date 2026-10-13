@@ -401,7 +401,7 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 	}
 
 	tool := toolForSurface(s)
-	err := invokeItemAdapter(db, s, targetID)
+	err := invokeItemAdapter(db, s, targetID, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)))
 	action.LatencyMS = time.Since(start).Milliseconds()
 	action.Tool = tool
 	if err != nil {
@@ -442,7 +442,7 @@ func toolForSurface(s EmbeddingSurface) string {
 // invokeItemAdapter re-embeds one item through the owner inference path, which
 // stamps the CURRENT service identity on write-back. This is the narrow
 // force-recompute adapter — it does NOT reuse the skip-on-present trigger path.
-func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string) error {
+func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string, contexts ...AISpendContext) error {
 	var item models.ContentItem
 	if err := db.Where("public_id = ?", targetID).First(&item).Error; err != nil {
 		return fmt.Errorf("target not found: %w", err)
@@ -453,12 +453,12 @@ func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string) error {
 		if text == "" {
 			return fmt.Errorf("no text content to embed")
 		}
-		return triggerEmbedding(text, targetID)
+		return triggerEmbedding(text, targetID, contexts...)
 	case "content_image":
 		if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
 			return fmt.Errorf("no thumbnail_url to embed")
 		}
-		return triggerImageEmbedding(*item.ThumbnailURL, targetID)
+		return triggerImageEmbedding(*item.ThumbnailURL, targetID, contexts...)
 	default:
 		return fmt.Errorf("no item adapter for surface %s", s.Key)
 	}

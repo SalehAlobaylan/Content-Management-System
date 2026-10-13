@@ -52,7 +52,7 @@ func (h *HTTPMemoryEmbedder) EmbedQuery(ctx context.Context, text string) ([]flo
 		SpaceID    string    `json:"space_id"`
 		Dimensions int       `json:"dimensions"`
 	}
-	err := h.post(ctx, "/v1/embed/query", map[string]string{"text": text}, &out)
+	err := h.post(ctx, "/v1/embed/query", map[string]any{"text": text, "spend_context": memorySpendContext(ctx)}, &out)
 	if err != nil || len(out.Embedding) != 1024 || out.Dimensions != 1024 || strings.TrimSpace(out.SpaceID) == "" {
 		return nil, "", fmt.Errorf("%w: invalid query embedding", ErrInvalidContract)
 	}
@@ -65,8 +65,20 @@ func (h *HTTPMemoryEmbedder) Rerank(ctx context.Context, query string, candidate
 	if len(candidates) == 0 || len(candidates) > 8 {
 		return nil, fmt.Errorf("%w: invalid rerank batch", ErrInvalidContract)
 	}
-	if err := h.post(ctx, "/v1/rerank", map[string]any{"query": query, "candidates": candidates}, &out); err != nil || len(out.Scores) != len(candidates) {
+	if err := h.post(ctx, "/v1/rerank", map[string]any{"query": query, "candidates": candidates, "spend_context": memorySpendContext(ctx)}, &out); err != nil || len(out.Scores) != len(candidates) {
 		return nil, fmt.Errorf("%w: invalid rerank response", ErrInvalidContract)
 	}
 	return out.Scores, nil
+}
+
+type memorySpendKey struct{}
+
+func withMemorySpendContext(ctx context.Context, tenant, run, actor string) context.Context {
+	return context.WithValue(ctx, memorySpendKey{}, map[string]string{"tenant_id": tenant, "trigger_source": "operator", "system_run_id": run, "human_actor_id": actor})
+}
+func memorySpendContext(ctx context.Context) map[string]string {
+	if value, ok := ctx.Value(memorySpendKey{}).(map[string]string); ok {
+		return value
+	}
+	return map[string]string{"tenant_id": "default", "trigger_source": "unknown"}
 }

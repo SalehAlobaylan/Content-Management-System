@@ -155,6 +155,7 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodPost, "/transcripts", controllers.InternalCreateTranscript)
 	route(http.MethodPost, "/ai-spend/events", controllers.InternalIngestAISpendEvents)
 	route(http.MethodGet, "/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
+	route(http.MethodGet, "/transcription-jobs/:id/spend-context", controllers.InternalGetSTTSpendContext)
 	route(http.MethodPut, "/auth/suspensions/:user_id", controllers.InternalSyncAuthSuspension)
 	route(http.MethodDelete, "/auth/users/:user_id/product-data", controllers.InternalDeleteUserProductData)
 

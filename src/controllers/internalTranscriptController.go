@@ -347,7 +347,7 @@ func InternalCreateTranscript(c *gin.Context) {
 			itemCopy := item
 			go func() {
 				if text := buildEmbeddingText(&itemCopy); text != "" {
-					_ = triggerEmbedding(text, itemCopy.PublicID.String())
+					_ = triggerEmbedding(text, itemCopy.PublicID.String(), spendContext(itemCopy.TenantID, "transcript_writeback", itemCopy.PublicID.String()))
 				}
 			}()
 		}
