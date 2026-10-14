@@ -84,26 +84,22 @@ func TestValidateRuxEvent_BoundsMeasurements(t *testing.T) {
 	badCode := 9
 	neg := -5
 	in.Measurements = &struct {
-		DurationMS      *int    `json:"duration_ms"`
-		MediaErrorCode  *int    `json:"media_error_code"`
-		StallDurationMS *int    `json:"stall_duration_ms"`
-		FailureClass    *string `json:"failure_class"`
-		Visible         *bool   `json:"visible"`
+		DurationMS         *int    `json:"duration_ms"`
+		MediaErrorCode     *int    `json:"media_error_code"`
+		StallDurationMS    *int    `json:"stall_duration_ms"`
+		FailureClass       *string `json:"failure_class"`
+		ObservedPlaybackMS *int    `json:"observed_playback_ms"`
+		StallCount         *int    `json:"stall_count"`
+		PositionDriftMS    *int    `json:"position_drift_ms"`
+		FallbackUsed       *bool   `json:"fallback_used"`
+		BoundaryStarved    *bool   `json:"boundary_starved"`
+		Visible            *bool   `json:"visible"`
 	}{DurationMS: &over, MediaErrorCode: &badCode, StallDurationMS: &neg}
 
-	out, ok := validateAndNormalizeRuxEvent(&in, time.Now())
-	if !ok {
-		t.Fatal("out-of-range measurements should be dropped, not reject the event")
+	if _, ok := validateAndNormalizeRuxEvent(&in, time.Now()); ok {
+		t.Fatal("v2 measurements outside supported range must reject the event")
 	}
-	if out.DurationMS != nil {
-		t.Errorf("over-range duration should be dropped, got %v", *out.DurationMS)
-	}
-	if out.MediaErrorCode != nil {
-		t.Errorf("out-of-range media error code should be dropped, got %v", *out.MediaErrorCode)
-	}
-	if out.StallDurationMS != nil {
-		t.Errorf("negative stall should be dropped, got %v", *out.StallDurationMS)
-	}
+
 }
 
 func TestValidateRuxEvent_AcceptsValidFailureClass(t *testing.T) {
@@ -111,11 +107,16 @@ func TestValidateRuxEvent_AcceptsValidFailureClass(t *testing.T) {
 	in.EventType = "playback_failed"
 	fc := "autoplay_blocked"
 	in.Measurements = &struct {
-		DurationMS      *int    `json:"duration_ms"`
-		MediaErrorCode  *int    `json:"media_error_code"`
-		StallDurationMS *int    `json:"stall_duration_ms"`
-		FailureClass    *string `json:"failure_class"`
-		Visible         *bool   `json:"visible"`
+		DurationMS         *int    `json:"duration_ms"`
+		MediaErrorCode     *int    `json:"media_error_code"`
+		StallDurationMS    *int    `json:"stall_duration_ms"`
+		FailureClass       *string `json:"failure_class"`
+		ObservedPlaybackMS *int    `json:"observed_playback_ms"`
+		StallCount         *int    `json:"stall_count"`
+		PositionDriftMS    *int    `json:"position_drift_ms"`
+		FallbackUsed       *bool   `json:"fallback_used"`
+		BoundaryStarved    *bool   `json:"boundary_starved"`
+		Visible            *bool   `json:"visible"`
 	}{FailureClass: &fc}
 	out, ok := validateAndNormalizeRuxEvent(&in, time.Now())
 	if !ok || out.FailureClass == nil || *out.FailureClass != "autoplay_blocked" {

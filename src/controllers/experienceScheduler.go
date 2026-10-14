@@ -51,6 +51,7 @@ func StartExperienceHeartbeat(db *gorm.DB) {
 func runExperienceDue(db *gorm.DB) {
 	var policies []models.ExperiencePolicy
 	if err := db.Where("evaluation_enabled = ?", true).Find(&policies).Error; err != nil {
+		log.Print("[experience] scheduled policy read unavailable; will retry")
 		return
 	}
 	now := time.Now()

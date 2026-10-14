@@ -20,6 +20,8 @@ type LocalMigrationPolicy struct{ Checksum, WorkScope string }
 // Maintainer policy, not an operator setting. Each entry records review of the
 // exact canonical SQL bytes; it does not approve execution or destructive SQL.
 var localMigrationPolicies = map[string]LocalMigrationPolicy{
+	"20261013020000_real_experience_native.sql":                      {"59a2e665875bf83309d7535ee594e96340badde906f5715fc5f2ad1d675ee79b", PreservesExpiredProcessingHistory},
+	"20261013010000_real_experience_completion.sql":                  {"35d5d5a994bc2371e0af9d14f627fedb97f139a1ea5ea05c32819a12d1cd0cc0", PreservesExpiredProcessingHistory},
 	"20261012030000_ai_spend_review_completion.sql":                  {"72cec9bed2ad708381290d549e668d1f8fe867af57d10921e4a9469a99fa13de", PreservesExpiredProcessingHistory},
 	"20261012020000_ai_spend_human_provenance.sql":                   {"d1a750624f4cbfc17fb7a7258eb4ba23a60b82c729233f969362c9bb03609e22", PreservesExpiredProcessingHistory},
 	"20261012010000_ai_spend_completion.sql":                         {"4c00082a0b32f672ad0938ebcd37afc1a92a19a360b602bedc6e2c1c6d095ec6", PreservesExpiredProcessingHistory},

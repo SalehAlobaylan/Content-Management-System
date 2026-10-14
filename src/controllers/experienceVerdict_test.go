@@ -11,21 +11,21 @@ func spec(metric, dir string, target float64, critical bool, latP75 int) sliSpec
 }
 
 func TestEvaluateSLI_InsufficientBelowFloor(t *testing.T) {
-	st := evaluateSLI(spec(mFeedRenderSuccess, "min", 0.995, true, 0), 40, 40, 0, 0, [7]int64{}, 50)
+	st := evaluateSLI(spec(mFeedRenderSuccess, "min", 0.995, true, 0), 40, 40, 0, 0, [8]int64{}, 50)
 	if st.Status != "insufficient" {
 		t.Fatalf("expected insufficient below sample floor, got %s", st.Status)
 	}
 }
 
 func TestEvaluateSLI_HealthyAboveTarget(t *testing.T) {
-	st := evaluateSLI(spec(mFeedRenderSuccess, "min", 0.995, true, 0), 999, 1000, 999, 1000, [7]int64{}, 50)
+	st := evaluateSLI(spec(mFeedRenderSuccess, "min", 0.995, true, 0), 999, 1000, 999, 1000, [8]int64{}, 50)
 	if st.Status != "ok" {
 		t.Fatalf("expected ok, got %s (value=%v)", st.Status, st.Value)
 	}
 }
 
 func TestEvaluateSLI_BreachBelowTarget(t *testing.T) {
-	st := evaluateSLI(spec(mPlaybackStartSuccess, "min", 0.985, true, 0), 900, 1000, 900, 0, [7]int64{}, 50)
+	st := evaluateSLI(spec(mPlaybackStartSuccess, "min", 0.985, true, 0), 900, 1000, 900, 0, [8]int64{}, 50)
 	if st.Status != "breach" {
 		t.Fatalf("expected breach, got %s", st.Status)
 	}
@@ -33,7 +33,7 @@ func TestEvaluateSLI_BreachBelowTarget(t *testing.T) {
 
 func TestEvaluateSLI_MaxDirectionBreach(t *testing.T) {
 	// fatal-rate style: value must stay <= target.
-	st := evaluateSLI(spec(mPlaybackFatalRate, "max", 0.01, false, 0), 50, 1000, 0, 0, [7]int64{}, 50)
+	st := evaluateSLI(spec(mPlaybackFatalRate, "max", 0.01, false, 0), 50, 1000, 0, 0, [8]int64{}, 50)
 	if st.Status != "breach" {
 		t.Fatalf("expected breach on max-direction overrun, got %s (value=%v)", st.Status, st.Value)
 	}
@@ -41,21 +41,21 @@ func TestEvaluateSLI_MaxDirectionBreach(t *testing.T) {
 
 func TestEvaluateSLI_LatencyBreach(t *testing.T) {
 	// Value passes, but p75 exceeds budget → watching-grade latency breach.
-	buckets := [7]int64{0, 0, 0, 0, 0, 100, 0} // all samples in the 4000-8000 bucket
+	buckets := [8]int64{0, 0, 0, 0, 0, 100, 0} // all samples in the 4000-8000 bucket
 	st := evaluateSLI(spec(mFeedRenderSuccess, "min", 0.995, true, 2500), 1000, 1000, 100, 500000, buckets, 50)
 	if st.Status != "latency_breach" {
 		t.Fatalf("expected latency_breach, got %s (p75=%d)", st.Status, st.P75)
 	}
 }
 
-func TestSurfaceVerdict_CriticalBeatsDegraded(t *testing.T) {
+func TestSurfaceVerdict_NoUnqualifiedCriticalBypass(t *testing.T) {
 	statuses := []sliStatus{
 		{Status: "breach", Critical: false},
 		{Status: "breach", Critical: true},
 		{Status: "ok"},
 	}
-	if v := surfaceVerdict(statuses, true); v != models.RuxVerdictCritical {
-		t.Fatalf("expected critical, got %s", v)
+	if v := surfaceVerdict(statuses, true); v != models.RuxVerdictWatching {
+		t.Fatalf("expected watching pending confirmation, got %s", v)
 	}
 }
 
@@ -84,7 +84,9 @@ func TestSurfaceVerdict_LatencyOnlyIsWatching(t *testing.T) {
 // denominator or the fatal-rate; it is its own rate (plan §8).
 func TestContributions_AutoplayExcludedFromStartAndFatal(t *testing.T) {
 	fc := "autoplay_blocked"
-	ev := &models.ExperienceEvent{EventType: "playback_failed", FailureClass: &fc}
+	fixture := terminalFixture("startup", "autoplay_blocked")
+	fixture.FailureClass = &fc
+	ev := &fixture
 	cons := contributionsFor(ev)
 	for _, con := range cons {
 		if con.metric == mPlaybackStartSuccess {
@@ -108,7 +110,9 @@ func TestContributions_AutoplayExcludedFromStartAndFatal(t *testing.T) {
 
 func TestContributions_FatalPlaybackFailure(t *testing.T) {
 	fc := "media_error"
-	ev := &models.ExperienceEvent{EventType: "playback_failed", FailureClass: &fc}
+	fixture := terminalFixture("startup", "failed")
+	fixture.FailureClass = &fc
+	ev := &fixture
 	cons := contributionsFor(ev)
 	var startDenom, fatalNum int64
 	for _, con := range cons {
@@ -133,7 +137,7 @@ func TestContributions_BackgroundedIsExcluded(t *testing.T) {
 
 func TestP75FromBuckets(t *testing.T) {
 	// 90 samples in <250, 10 in <500 → p75 sits in the first bucket.
-	b := [7]int64{90, 10, 0, 0, 0, 0, 0}
+	b := [8]int64{90, 10, 0, 0, 0, 0, 0}
 	if p := p75FromBuckets(b); p != 250 {
 		t.Fatalf("expected p75=250, got %d", p)
 	}

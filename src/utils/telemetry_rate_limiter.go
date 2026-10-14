@@ -28,8 +28,7 @@ type telemetryWindow struct {
 }
 
 // NewTelemetryRateLimiter starts the background sweeper immediately. maxKeys
-// bounds memory; when exceeded the limiter allows requests instead of tracking
-// new keys until the sweep drains expired windows.
+// bounds memory; saturation rejects new keys until expired windows are swept.
 func NewTelemetryRateLimiter(maxRequests int, window time.Duration, maxKeys int) *TelemetryRateLimiter {
 	if maxKeys <= 0 {
 		maxKeys = 50000
@@ -46,7 +45,7 @@ func NewTelemetryRateLimiter(maxRequests int, window time.Duration, maxKeys int)
 }
 
 // Allow reports whether the key is within its window budget and how many
-// requests remain. An empty key is always allowed (nothing to key on).
+// requests remain. An empty key fails closed.
 func (l *TelemetryRateLimiter) Allow(key string) (bool, int) {
 	return l.AllowN(key, 1)
 }

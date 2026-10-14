@@ -14,13 +14,14 @@ import (
 
 // RuxSchemaVersion is the current event envelope version. The Wahb-Platform
 // TypeScript contract (src/lib/experience/types.ts) mirrors this value.
-const RuxSchemaVersion = 1
+const RuxSchemaVersion = 2
 
 // ── Allowlisted enums (mirror src/lib/experience/types.ts) ───────────────────
 
 var RuxSurfaces = map[string]bool{"pods": true, "news": true}
 
 var RuxEventTypes = map[string]bool{
+	"journey_terminal":      true,
 	"session_started":       true,
 	"feed_requested":        true,
 	"feed_rendered":         true,
@@ -97,23 +98,25 @@ const (
 // ── experience_events (raw, short-lived) ─────────────────────────────────────
 
 type ExperienceEvent struct {
-	ID            uint       `gorm:"primaryKey" json:"-"`
-	EventID       uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex:idx_experience_events_event_id" json:"event_id"`
-	TenantID      string     `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
-	SchemaVersion int        `gorm:"not null;default:1" json:"schema_version"`
-	EventType     string     `gorm:"type:varchar(40);not null" json:"event_type"`
-	Surface       string     `gorm:"type:varchar(16);not null" json:"surface"`
-	OccurredAt    time.Time  `gorm:"not null" json:"occurred_at"`
-	ReceivedAt    time.Time  `gorm:"not null;autoCreateTime" json:"received_at"`
-	SessionID     string     `gorm:"type:varchar(64);not null" json:"session_id"`
-	PageLoadID    uuid.UUID  `gorm:"type:uuid;not null" json:"page_load_id"`
-	Sequence      int        `gorm:"not null;default:0" json:"sequence"`
-	JourneyID     *uuid.UUID `gorm:"type:uuid" json:"journey_id,omitempty"`
-	Release       string     `gorm:"type:varchar(80);not null" json:"release"`
-	ContentID     *uuid.UUID `gorm:"type:uuid" json:"content_id,omitempty"`
-	StoryID       *uuid.UUID `gorm:"type:uuid" json:"story_id,omitempty"`
-	PlaybackType  *string    `gorm:"type:varchar(16)" json:"playback_type,omitempty"`
-	Locale        *string    `gorm:"type:varchar(16)" json:"locale,omitempty"`
+	OSMajor        int        `gorm:"column:os_major;not null;default:0" json:"os_major"`
+	ClientPlatform string     `gorm:"type:varchar(8);not null;default:web" json:"client_platform"`
+	ID             uint       `gorm:"primaryKey" json:"-"`
+	EventID        uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex:idx_experience_events_event_id" json:"event_id"`
+	TenantID       string     `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
+	SchemaVersion  int        `gorm:"not null;default:1" json:"schema_version"`
+	EventType      string     `gorm:"type:varchar(40);not null" json:"event_type"`
+	Surface        string     `gorm:"type:varchar(16);not null" json:"surface"`
+	OccurredAt     time.Time  `gorm:"not null" json:"occurred_at"`
+	ReceivedAt     time.Time  `gorm:"not null;autoCreateTime" json:"received_at"`
+	SessionID      string     `gorm:"type:varchar(64);not null" json:"session_id"`
+	PageLoadID     uuid.UUID  `gorm:"type:uuid;not null" json:"page_load_id"`
+	Sequence       int        `gorm:"not null;default:0" json:"sequence"`
+	JourneyID      *uuid.UUID `gorm:"type:uuid" json:"journey_id,omitempty"`
+	Release        string     `gorm:"type:varchar(80);not null" json:"release"`
+	ContentID      *uuid.UUID `gorm:"type:uuid" json:"content_id,omitempty"`
+	StoryID        *uuid.UUID `gorm:"type:uuid" json:"story_id,omitempty"`
+	PlaybackType   *string    `gorm:"type:varchar(16)" json:"playback_type,omitempty"`
+	Locale         *string    `gorm:"type:varchar(16)" json:"locale,omitempty"`
 
 	BrowserFamily string `gorm:"type:varchar(16);not null;default:other" json:"browser_family"`
 	BrowserMajor  int    `gorm:"not null;default:0" json:"browser_major"`
@@ -127,8 +130,16 @@ type ExperienceEvent struct {
 	FailureClass    *string `gorm:"type:varchar(24)" json:"failure_class,omitempty"`
 	Visible         *bool   `gorm:"column:visible" json:"visible,omitempty"`
 
-	Measurements datatypes.JSON `gorm:"type:jsonb" json:"measurements,omitempty"`
-	CreatedAt    time.Time      `gorm:"autoCreateTime" json:"-"`
+	Phase              string         `gorm:"type:varchar(16)" json:"phase,omitempty"`
+	Outcome            string         `gorm:"type:varchar(24)" json:"outcome,omitempty"`
+	TerminalStatus     string         `gorm:"type:varchar(16)" json:"terminal_status,omitempty"`
+	ObservedPlaybackMS *int           `json:"observed_playback_ms,omitempty"`
+	StallCount         *int           `json:"stall_count,omitempty"`
+	PositionDriftMS    *int           `json:"position_drift_ms,omitempty"`
+	FallbackUsed       *bool          `json:"fallback_used,omitempty"`
+	BoundaryStarved    *bool          `json:"boundary_starved,omitempty"`
+	Measurements       datatypes.JSON `gorm:"type:jsonb" json:"measurements,omitempty"`
+	CreatedAt          time.Time      `gorm:"autoCreateTime" json:"-"`
 }
 
 func (ExperienceEvent) TableName() string { return "experience_events" }
@@ -136,21 +147,27 @@ func (ExperienceEvent) TableName() string { return "experience_events" }
 // ── experience_metric_rollups ────────────────────────────────────────────────
 
 type ExperienceMetricRollup struct {
-	ID             uint           `gorm:"primaryKey" json:"-"`
-	TenantID       string         `gorm:"type:varchar(64);not null;default:default;uniqueIndex:idx_experience_rollups_identity,priority:1" json:"tenant_id"`
-	BucketStart    time.Time      `gorm:"not null;uniqueIndex:idx_experience_rollups_identity,priority:2" json:"bucket_start"`
-	Resolution     string         `gorm:"type:varchar(8);not null;default:hour;uniqueIndex:idx_experience_rollups_identity,priority:3" json:"resolution"`
-	MetricKey      string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_experience_rollups_identity,priority:4" json:"metric_key"`
-	Surface        string         `gorm:"type:varchar(16);not null;uniqueIndex:idx_experience_rollups_identity,priority:5" json:"surface"`
-	CohortDim      string         `gorm:"type:varchar(24);not null;default:global;uniqueIndex:idx_experience_rollups_identity,priority:6" json:"cohort_dim"`
-	CohortVal      string         `gorm:"type:varchar(80);not null;default:all;uniqueIndex:idx_experience_rollups_identity,priority:7" json:"cohort_val"`
-	Numerator      int64          `gorm:"not null;default:0" json:"numerator"`
-	Denominator    int64          `gorm:"not null;default:0" json:"denominator"`
-	SampleCount    int64          `gorm:"not null;default:0" json:"sample_count"`
-	LatencySum     int64          `gorm:"not null;default:0" json:"latency_sum"`
-	LatencyBuckets datatypes.JSON `gorm:"type:jsonb" json:"latency_buckets,omitempty"`
-	CreatedAt      time.Time      `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt      time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
+	ClientPlatform   string         `gorm:"type:varchar(8);not null;default:web;uniqueIndex:idx_experience_rollups_identity,priority:8" json:"client_platform"`
+	ID               uint           `gorm:"primaryKey" json:"-"`
+	TenantID         string         `gorm:"type:varchar(64);not null;default:default;uniqueIndex:idx_experience_rollups_identity,priority:1" json:"tenant_id"`
+	BucketStart      time.Time      `gorm:"not null;uniqueIndex:idx_experience_rollups_identity,priority:2" json:"bucket_start"`
+	Resolution       string         `gorm:"type:varchar(8);not null;default:hour;uniqueIndex:idx_experience_rollups_identity,priority:3" json:"resolution"`
+	MetricKey        string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_experience_rollups_identity,priority:4" json:"metric_key"`
+	Surface          string         `gorm:"type:varchar(16);not null;uniqueIndex:idx_experience_rollups_identity,priority:5" json:"surface"`
+	CohortDim        string         `gorm:"type:varchar(24);not null;default:global;uniqueIndex:idx_experience_rollups_identity,priority:6" json:"cohort_dim"`
+	CohortVal        string         `gorm:"type:varchar(80);not null;default:all;uniqueIndex:idx_experience_rollups_identity,priority:7" json:"cohort_val"`
+	AffectedSessions int64          `gorm:"not null;default:0" json:"affected_sessions"`
+	ActiveSessions   int64          `gorm:"not null;default:0" json:"active_sessions"`
+	Completed        bool           `gorm:"not null;default:false" json:"completed"`
+	HistogramVersion int            `gorm:"not null;default:1" json:"histogram_version"`
+	Numerator        int64          `gorm:"not null;default:0" json:"numerator"`
+	Denominator      int64          `gorm:"not null;default:0" json:"denominator"`
+	OutcomeCount     int64          `gorm:"not null;default:0" json:"outcome_count"`
+	SampleCount      int64          `gorm:"not null;default:0" json:"sample_count"`
+	LatencySum       int64          `gorm:"not null;default:0" json:"latency_sum"`
+	LatencyBuckets   datatypes.JSON `gorm:"type:jsonb" json:"latency_buckets,omitempty"`
+	CreatedAt        time.Time      `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt        time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
 }
 
 func (ExperienceMetricRollup) TableName() string { return "experience_metric_rollups" }
@@ -158,11 +175,14 @@ func (ExperienceMetricRollup) TableName() string { return "experience_metric_rol
 // ── experience_policies (singleton per tenant) ───────────────────────────────
 
 type ExperiencePolicy struct {
+	EnabledClients             string         `gorm:"type:varchar(32);not null;default:web" json:"enabled_clients"`
 	ID                         uint           `gorm:"primaryKey" json:"-"`
 	TenantID                   string         `gorm:"type:varchar(64);not null;uniqueIndex:idx_experience_policies_tenant" json:"tenant_id"`
 	IngestEnabled              bool           `gorm:"not null;default:true" json:"ingest_enabled"`
 	EvaluationEnabled          bool           `gorm:"not null;default:false" json:"evaluation_enabled"`
 	EnabledSurfaces            string         `gorm:"type:varchar(64);not null;default:pods,news" json:"enabled_surfaces"`
+	LatencySampleFloor         int            `gorm:"not null;default:50" json:"latency_sample_floor"`
+	LastMinuteBucket           *time.Time     `json:"last_minute_bucket,omitempty"`
 	MinSampleFloor             int            `gorm:"not null;default:50" json:"min_sample_floor"`
 	ConfirmWindows             int            `gorm:"not null;default:2" json:"confirm_windows"`
 	ResolveWindows             int            `gorm:"not null;default:3" json:"resolve_windows"`
@@ -184,7 +204,7 @@ func (ExperiencePolicy) TableName() string { return "experience_policies" }
 func DefaultExperiencePolicy(tenantID string) ExperiencePolicy {
 	return ExperiencePolicy{
 		TenantID: tenantID, IngestEnabled: true, EvaluationEnabled: false,
-		EnabledSurfaces: "pods,news", MinSampleFloor: 50, ConfirmWindows: 2, ResolveWindows: 3,
+		EnabledClients: "web", EnabledSurfaces: "pods,news", LatencySampleFloor: 50, MinSampleFloor: 50, ConfirmWindows: 2, ResolveWindows: 3,
 		TelemetryFreshnessMinutes: 15, RollupMaxBucketsPerPass: 180, RawRetentionDays: 7,
 		MinuteRollupRetentionHours: 48, HourRollupRetentionDays: 400, MaxReleaseCohorts: 4,
 	}
@@ -216,31 +236,35 @@ func (ExperienceEvaluationRun) TableName() string { return "experience_evaluatio
 // ── experience_incidents ─────────────────────────────────────────────────────
 
 type ExperienceIncident struct {
-	ID               uint           `gorm:"primaryKey" json:"-"`
-	PublicID         uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID         string         `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
-	Fingerprint      string         `gorm:"type:varchar(200);not null" json:"fingerprint"`
-	MetricKey        string         `gorm:"type:varchar(64);not null" json:"metric_key"`
-	Surface          string         `gorm:"type:varchar(16);not null" json:"surface"`
-	CohortDim        string         `gorm:"type:varchar(24);not null;default:global" json:"cohort_dim"`
-	CohortVal        string         `gorm:"type:varchar(80);not null;default:all" json:"cohort_val"`
-	Severity         string         `gorm:"type:varchar(16);not null" json:"severity"`
-	Status           string         `gorm:"type:varchar(24);not null" json:"status"`
-	Summary          string         `gorm:"type:text" json:"summary,omitempty"`
-	Evidence         datatypes.JSON `gorm:"type:jsonb" json:"evidence,omitempty"`
-	Recommendation   string         `gorm:"type:text" json:"recommendation,omitempty"`
-	LikelyOwner      string         `gorm:"type:varchar(48)" json:"likely_owner,omitempty"`
-	ViolationStreak  int            `gorm:"not null;default:0" json:"violation_streak"`
-	CleanStreak      int            `gorm:"not null;default:0" json:"clean_streak"`
-	FirstSeenAt      time.Time      `gorm:"not null" json:"first_seen_at"`
-	LastSeenAt       time.Time      `gorm:"not null" json:"last_seen_at"`
-	RecoveringSince  *time.Time     `gorm:"type:timestamp" json:"recovering_since,omitempty"`
-	ResolvedAt       *time.Time     `gorm:"type:timestamp" json:"resolved_at,omitempty"`
-	ClosedBy         string         `gorm:"type:varchar(255)" json:"closed_by,omitempty"`
-	CloseReasonClass string         `gorm:"type:varchar(32)" json:"close_reason_class,omitempty"`
-	CloseNotes       string         `gorm:"type:text" json:"close_notes,omitempty"`
-	CreatedAt        time.Time      `gorm:"autoCreateTime" json:"created_at"`
-	UpdatedAt        time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
+	ClientPlatform      string         `gorm:"type:varchar(8);not null;default:web" json:"client_platform"`
+	ID                  uint           `gorm:"primaryKey" json:"-"`
+	PublicID            uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID            string         `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
+	Fingerprint         string         `gorm:"type:varchar(200);not null" json:"fingerprint"`
+	MetricKey           string         `gorm:"type:varchar(64);not null" json:"metric_key"`
+	Surface             string         `gorm:"type:varchar(16);not null" json:"surface"`
+	CohortDim           string         `gorm:"type:varchar(24);not null;default:global" json:"cohort_dim"`
+	CohortVal           string         `gorm:"type:varchar(80);not null;default:all" json:"cohort_val"`
+	Severity            string         `gorm:"type:varchar(16);not null" json:"severity"`
+	Status              string         `gorm:"type:varchar(24);not null" json:"status"`
+	Summary             string         `gorm:"type:text" json:"summary,omitempty"`
+	Evidence            datatypes.JSON `gorm:"type:jsonb" json:"evidence,omitempty"`
+	Recommendation      string         `gorm:"type:text" json:"recommendation,omitempty"`
+	LikelyOwner         string         `gorm:"type:varchar(48)" json:"likely_owner,omitempty"`
+	LastEvaluatedBucket *time.Time     `json:"last_evaluated_bucket,omitempty"`
+	ConfirmedAt         *time.Time     `json:"confirmed_at,omitempty"`
+	InvestigationPath   string         `gorm:"type:varchar(200)" json:"investigation_path,omitempty"`
+	ViolationStreak     int            `gorm:"not null;default:0" json:"violation_streak"`
+	CleanStreak         int            `gorm:"not null;default:0" json:"clean_streak"`
+	FirstSeenAt         time.Time      `gorm:"not null" json:"first_seen_at"`
+	LastSeenAt          time.Time      `gorm:"not null" json:"last_seen_at"`
+	RecoveringSince     *time.Time     `gorm:"type:timestamp" json:"recovering_since,omitempty"`
+	ResolvedAt          *time.Time     `gorm:"type:timestamp" json:"resolved_at,omitempty"`
+	ClosedBy            string         `gorm:"type:varchar(255)" json:"closed_by,omitempty"`
+	CloseReasonClass    string         `gorm:"type:varchar(32)" json:"close_reason_class,omitempty"`
+	CloseNotes          string         `gorm:"type:text" json:"close_notes,omitempty"`
+	CreatedAt           time.Time      `gorm:"autoCreateTime" json:"created_at"`
+	UpdatedAt           time.Time      `gorm:"autoUpdateTime" json:"updated_at"`
 }
 
 func (ExperienceIncident) TableName() string { return "experience_incidents" }
@@ -269,20 +293,56 @@ func (ExperienceAction) TableName() string { return "experience_actions" }
 // ── experience_suppressions ──────────────────────────────────────────────────
 
 type ExperienceSuppression struct {
-	ID        uint       `gorm:"primaryKey" json:"-"`
-	PublicID  uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID  string     `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
-	MetricKey string     `gorm:"type:varchar(64)" json:"metric_key,omitempty"`
-	Surface   string     `gorm:"type:varchar(16)" json:"surface,omitempty"`
-	CohortDim string     `gorm:"type:varchar(24)" json:"cohort_dim,omitempty"`
-	CohortVal string     `gorm:"type:varchar(80)" json:"cohort_val,omitempty"`
-	Reason    string     `gorm:"type:text;not null" json:"reason"`
-	StartsAt  time.Time  `gorm:"not null" json:"starts_at"`
-	ExpiresAt time.Time  `gorm:"not null" json:"expires_at"`
-	CreatedBy string     `gorm:"type:varchar(255)" json:"created_by,omitempty"`
-	RevokedAt *time.Time `gorm:"type:timestamp" json:"revoked_at,omitempty"`
-	RevokedBy string     `gorm:"type:varchar(255)" json:"revoked_by,omitempty"`
-	CreatedAt time.Time  `gorm:"autoCreateTime" json:"created_at"`
+	ClientPlatform string     `gorm:"type:varchar(8);not null;default:web" json:"client_platform"`
+	ID             uint       `gorm:"primaryKey" json:"-"`
+	PublicID       uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID       string     `gorm:"type:varchar(64);not null;default:default" json:"tenant_id"`
+	MetricKey      string     `gorm:"type:varchar(64)" json:"metric_key,omitempty"`
+	Surface        string     `gorm:"type:varchar(16)" json:"surface,omitempty"`
+	CohortDim      string     `gorm:"type:varchar(24)" json:"cohort_dim,omitempty"`
+	CohortVal      string     `gorm:"type:varchar(80)" json:"cohort_val,omitempty"`
+	Reason         string     `gorm:"type:text;not null" json:"reason"`
+	StartsAt       time.Time  `gorm:"not null" json:"starts_at"`
+	ExpiresAt      time.Time  `gorm:"not null" json:"expires_at"`
+	CreatedBy      string     `gorm:"type:varchar(255)" json:"created_by,omitempty"`
+	RevokedAt      *time.Time `gorm:"type:timestamp" json:"revoked_at,omitempty"`
+	RevokedBy      string     `gorm:"type:varchar(255)" json:"revoked_by,omitempty"`
+	CreatedAt      time.Time  `gorm:"autoCreateTime" json:"created_at"`
 }
 
 func (ExperienceSuppression) TableName() string { return "experience_suppressions" }
+
+// Receipts retain only opaque terminal hashes after raw privacy retention. They
+// prevent replay with a new event UUID from creating another logical attempt.
+type ExperienceTerminalReceipt struct {
+	Identity  string    `gorm:"type:char(64);primaryKey"`
+	Digest    string    `gorm:"type:char(64);not null"`
+	CreatedAt time.Time `gorm:"not null;autoCreateTime"`
+}
+
+func (ExperienceTerminalReceipt) TableName() string { return "experience_terminal_receipts" }
+
+var RuxPhases = map[string]bool{"feed": true, "pagination": true, "startup": true, "continuation": true, "fallback": true, "handoff": true, "reader": true}
+var RuxOutcomes = map[string]bool{"success": true, "empty": true, "failed": true, "timeout": true, "autoplay_blocked": true, "backgrounded": true, "cancelled": true, "end_of_feed": true}
+
+// A cursor and aggregate rows commit together. Partial buckets never enter
+// decisions; the policy's completed checkpoints are the read authority.
+type ExperienceRollupProgress struct {
+	TenantID        string    `gorm:"type:varchar(64);primaryKey"`
+	Resolution      string    `gorm:"type:varchar(8);primaryKey"`
+	BucketStart     time.Time `gorm:"not null"`
+	Cursor          uint      `gorm:"not null;default:0"`
+	EventsProcessed int64     `gorm:"not null;default:0"`
+	UpdatedAt       time.Time
+}
+
+func (ExperienceRollupProgress) TableName() string { return "experience_rollup_progress" }
+
+var RuxClientPlatforms = map[string]bool{"web": true, "ios": true, "android": true}
+
+func RuxPlatform(value string) string {
+	if value == "ios" || value == "android" {
+		return value
+	}
+	return "web"
+}

@@ -577,6 +577,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/experience/metrics", perm("feed", "read"), controllers.GetExperienceMetrics)
 	adminGroup.GET("/experience/incidents", perm("feed", "read"), controllers.ListExperienceIncidents)
 	adminGroup.POST("/experience/incidents/:id/close", perm("feed", "manage"), controllers.CloseExperienceIncident)
+	adminGroup.GET("/experience/evidence/:kind", perm("feed", "read"), controllers.GetExperienceEvidence)
+	adminGroup.GET("/experience/evidence/:kind/:id", perm("feed", "read"), controllers.GetExperienceEvidence)
 	adminGroup.GET("/experience/actions", perm("feed", "read"), controllers.ListExperienceActions)
 	adminGroup.GET("/experience/suppressions", perm("feed", "read"), controllers.ListExperienceSuppressions)
 	adminGroup.POST("/experience/suppressions", perm("feed", "manage"), controllers.CreateExperienceSuppression)

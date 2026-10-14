@@ -15,11 +15,11 @@ import (
 func experienceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t)
-	if err := db.AutoMigrate(&models.ExperienceEvent{}, &models.ExperienceMetricRollup{}, &models.ExperiencePolicy{},
+	if err := db.AutoMigrate(&models.ExperienceEvent{}, &models.ExperienceTerminalReceipt{}, &models.ExperienceRollupProgress{}, &models.ExperienceMetricRollup{}, &models.ExperiencePolicy{},
 		&models.ExperienceEvaluationRun{}, &models.ExperienceIncident{}, &models.ExperienceAction{}, &models.ExperienceSuppression{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	for _, tbl := range []string{"experience_events", "experience_metric_rollups", "experience_incidents", "experience_actions"} {
+	for _, tbl := range []string{"experience_events", "experience_metric_rollups", "experience_incidents", "experience_actions", "experience_terminal_receipts", "experience_rollup_progress"} {
 		_ = db.Exec("DELETE FROM " + tbl).Error
 	}
 	return db
@@ -28,10 +28,30 @@ func experienceTestDB(t *testing.T) *gorm.DB {
 func insertEvent(t *testing.T, db *gorm.DB, receivedAt time.Time, eventType, surface, release string, failureClass *string, dur *int) {
 	t.Helper()
 	ev := models.ExperienceEvent{
-		EventID: uuid.New(), TenantID: "default", SchemaVersion: 1, EventType: eventType, Surface: surface,
+		EventID: uuid.New(), TenantID: "default", SchemaVersion: 2, EventType: eventType, Surface: surface,
 		OccurredAt: receivedAt, ReceivedAt: receivedAt, SessionID: "s-" + uuid.NewString()[:8],
 		PageLoadID: uuid.New(), Release: release, BrowserFamily: "safari", BrowserMajor: 18,
 		DeviceClass: "mobile", NetworkClass: "unknown", FailureClass: failureClass, DurationMS: dur,
+	}
+	visible := true
+	ev.Visible = &visible
+	ev.TerminalStatus = "accepted"
+	ev.EventType = "journey_terminal"
+	j := uuid.New()
+	ev.JourneyID = &j
+	switch eventType {
+	case "playback_started":
+		ev.Phase = "startup"
+		ev.Outcome = "success"
+	case "playback_failed":
+		ev.Phase = "startup"
+		ev.Outcome = "failed"
+		if failureClass != nil && *failureClass == "autoplay_blocked" {
+			ev.Outcome = "autoplay_blocked"
+		}
+	case "feed_rendered":
+		ev.Phase = "feed"
+		ev.Outcome = "success"
 	}
 	if err := db.Create(&ev).Error; err != nil {
 		t.Fatalf("insert event: %v", err)
