@@ -48,17 +48,18 @@ type AISpendEvent struct {
 func (AISpendEvent) TableName() string { return "ai_spend_events" }
 
 type AIPriceBook struct {
-	ID             uint      `gorm:"primaryKey" json:"id"`
-	SpendClass     string    `gorm:"type:varchar(32);not null" json:"spend_class"`
-	Provider       string    `gorm:"type:varchar(64);not null" json:"provider"`
-	ModelPattern   string    `gorm:"type:varchar(160);not null" json:"model_pattern"`
-	InputUSDPer1M  float64   `gorm:"column:input_usd_per_1m" json:"input_usd_per_1m"`
-	OutputUSDPer1M float64   `gorm:"column:output_usd_per_1m" json:"output_usd_per_1m"`
-	UnitUSD        float64   `gorm:"column:unit_usd" json:"unit_usd"`
-	EffectiveFrom  time.Time `gorm:"not null" json:"effective_from"`
-	Note           string    `json:"note,omitempty"`
-	CreatedBy      string    `json:"created_by,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	CachedInputUSDPer1M *float64  `gorm:"column:cached_input_usd_per_1m" json:"cached_input_usd_per_1m"`
+	ID                  uint      `gorm:"primaryKey" json:"id"`
+	SpendClass          string    `gorm:"type:varchar(32);not null" json:"spend_class"`
+	Provider            string    `gorm:"type:varchar(64);not null" json:"provider"`
+	ModelPattern        string    `gorm:"type:varchar(160);not null" json:"model_pattern"`
+	InputUSDPer1M       float64   `gorm:"column:input_usd_per_1m" json:"input_usd_per_1m"`
+	OutputUSDPer1M      float64   `gorm:"column:output_usd_per_1m" json:"output_usd_per_1m"`
+	UnitUSD             float64   `gorm:"column:unit_usd" json:"unit_usd"`
+	EffectiveFrom       time.Time `gorm:"not null" json:"effective_from"`
+	Note                string    `json:"note,omitempty"`
+	CreatedBy           string    `json:"created_by,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
 }
 
 func (AIPriceBook) TableName() string { return "ai_price_book" }

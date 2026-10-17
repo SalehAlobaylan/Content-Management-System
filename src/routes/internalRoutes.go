@@ -2,6 +2,7 @@ package routes
 
 import (
 	"content-management-system/src/controllers"
+	"content-management-system/src/economics"
 	"content-management-system/src/utils"
 	"net/http"
 
@@ -153,6 +154,8 @@ func SetupInternalRoutes(router *gin.Engine, db *gorm.DB) {
 	route(http.MethodGet, "/content-items/missing-embedding", controllers.InternalListMissingEmbedding)
 	route(http.MethodPost, "/content-items/reconcile-artifact-complete", controllers.InternalReconcileArtifactCompleteStatuses)
 	route(http.MethodPost, "/transcripts", controllers.InternalCreateTranscript)
+	route(http.MethodGet, "/economics/collection", economics.InternalCollection)
+	route(http.MethodPost, "/economics/usage", economics.InternalUsage)
 	route(http.MethodPost, "/ai-spend/events", controllers.InternalIngestAISpendEvents)
 	route(http.MethodGet, "/ai-spend/allowance", controllers.InternalGetAISpendAllowance)
 	route(http.MethodGet, "/transcription-jobs/:id/spend-context", controllers.InternalGetSTTSpendContext)

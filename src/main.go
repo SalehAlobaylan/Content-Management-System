@@ -3,12 +3,18 @@ package main
 import (
 	"content-management-system/src/contentstage"
 	"content-management-system/src/controllers"
+	"content-management-system/src/economics"
 	"content-management-system/src/intelligence"
 	"content-management-system/src/models" // needs it for automigrate
 	"content-management-system/src/pipeline"
 	"content-management-system/src/routes"
 	"content-management-system/src/supply"
 	"content-management-system/src/utils"
+	"context"
+	"errors"
+	"net/http"
+	"os/signal"
+	"syscall"
 
 	"fmt"
 	"log"
@@ -116,6 +122,7 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		c.Next()
 	})
 	router.Use(databaseWriterFenceMiddleware(db))
+	router.Use(economics.DefaultCollector.Middleware())
 
 	v1 := router.Group("/api/v1")
 	routes.SetupPostRoutes(v1, db)
@@ -441,6 +448,7 @@ func main() {
 		// Observation only; disabled by default until an admin enables it.
 		controllers.StartEmbeddingLifecycleHeartbeat(db)
 		controllers.StartAISpendGovernorHeartbeat(db)
+
 		// Wahb Operator — resumes only expired, persisted read investigations after
 		// a fresh IAM access snapshot; no browser session or user bearer is replayed.
 		controllers.StartOperatorInvestigationHeartbeat(db)
@@ -490,11 +498,25 @@ func main() {
 		controllers.StartOperatorShadowHeartbeat(db)
 	}()
 
+	economicsContext, stopEconomics := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopEconomics()
+	go economics.Start(economicsContext, db)
 	serverAddr := cmsServerAddress()
 	log.Printf("Starting server on %s...", serverAddr)
-	if err := router.Run(serverAddr); err != nil {
+	server := &http.Server{Addr: serverAddr, Handler: router, ReadHeaderTimeout: 10 * time.Second}
+	stopped := make(chan struct{})
+	go func() {
+		<-economicsContext.Done()
+		drain, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(drain)
+		_ = economics.DefaultCollector.Close(db.WithContext(drain))
+		close(stopped)
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+	<-stopped
 
 }
 

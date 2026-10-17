@@ -31,9 +31,10 @@ const (
 )
 
 type TranscriptionJob struct {
-	ID       uint      `gorm:"primaryKey" json:"-"`
-	PublicID uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_transcription_jobs_public_id" json:"id"`
-	TenantID string    `gorm:"type:varchar(64);not null;index:idx_transcription_jobs_tenant_id" json:"tenant_id"`
+	EconomicsAttributionRef string    `json:"-"`
+	ID                      uint      `gorm:"primaryKey" json:"-"`
+	PublicID                uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex:idx_transcription_jobs_public_id" json:"id"`
+	TenantID                string    `gorm:"type:varchar(64);not null;index:idx_transcription_jobs_tenant_id" json:"tenant_id"`
 
 	ContentItemID uuid.UUID  `gorm:"type:uuid;not null;index:idx_transcription_jobs_content" json:"content_item_id"`
 	TranscriptID  *uuid.UUID `gorm:"type:uuid;index:idx_transcription_jobs_transcript" json:"transcript_id,omitempty"`

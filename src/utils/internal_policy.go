@@ -192,6 +192,8 @@ func InternalRoutePolicies() []InternalRoutePolicy {
 		{http.MethodPatch, "/content-items/:id/embedding", "embedding.write", enrich, true},
 		{http.MethodPatch, "/content-items/:id/topic-tags", "topic-tags.write", enrich, true},
 		{http.MethodPatch, "/content-items/:id/enrichment-metadata", "enrichment.write", enrich, true},
+		{http.MethodGet, "/economics/collection", "economics.collection.read", []MachinePrincipal{MachinePrincipalIAM, MachinePrincipalAggregation, MachinePrincipalEnrichment, MachinePrincipalMedia}, false},
+		{http.MethodPost, "/economics/usage", "economics.usage.write", []MachinePrincipal{MachinePrincipalIAM, MachinePrincipalAggregation, MachinePrincipalEnrichment, MachinePrincipalMedia}, false},
 		{http.MethodPost, "/ai-spend/events", "ai-spend.write", []MachinePrincipal{MachinePrincipalEnrichment, MachinePrincipalMedia}, true},
 		{http.MethodGet, "/content-items/:id/embeddings", "embedding.read", enrich, true},
 		{http.MethodPost, "/content-items/knn", "embedding.search", enrich, true},

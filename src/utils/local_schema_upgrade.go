@@ -20,6 +20,10 @@ type LocalMigrationPolicy struct{ Checksum, WorkScope string }
 // Maintainer policy, not an operator setting. Each entry records review of the
 // exact canonical SQL bytes; it does not approve execution or destructive SQL.
 var localMigrationPolicies = map[string]LocalMigrationPolicy{
+	"20261017030000_ai_provider_cache_pricing.sql":                   {"812a7e11267e685b4a68d975a5e22c80ccf0a69ec73c882c15f4b97fcdb37ff6", PreservesExpiredProcessingHistory},
+	"20261017020000_economics_resumable_projection.sql":              {"eabb4063cb1481c98545971263a3ede56788eb60839c8abb0f41055d0944c788", PreservesExpiredProcessingHistory},
+	"20261017010000_economics_signed_invoices.sql":                   {"966d4d8983cb4d69d52f53e399376fe5371f9d0223a324392fb67cc2f3101f4c", PreservesExpiredProcessingHistory},
+	"20261016010000_platform_user_economics.sql":                     {"92eaab9cdae375fca0ec3f77fe998a3e5d375abdfd3b08c9d8cd8602d262dcd1", PreservesExpiredProcessingHistory},
 	"20261013020000_real_experience_native.sql":                      {"59a2e665875bf83309d7535ee594e96340badde906f5715fc5f2ad1d675ee79b", PreservesExpiredProcessingHistory},
 	"20261013010000_real_experience_completion.sql":                  {"35d5d5a994bc2371e0af9d14f627fedb97f139a1ea5ea05c32819a12d1cd0cc0", PreservesExpiredProcessingHistory},
 	"20261012030000_ai_spend_review_completion.sql":                  {"72cec9bed2ad708381290d549e668d1f8fe867af57d10921e4a9469a99fa13de", PreservesExpiredProcessingHistory},

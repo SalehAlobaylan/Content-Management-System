@@ -145,12 +145,7 @@ func dailyOpSeries(db *gorm.DB, tenantID string, since time.Time) []opDailyPoint
 		Total   int64
 	}
 	var rows []row
-	db.Model(&models.StorageOpMetric{}).
-		Select("date, op_class, COALESCE(SUM(count), 0) as total").
-		Where("tenant_id = ? AND date >= ?", tenantID, since).
-		Group("date, op_class").
-		Order("date ASC").
-		Scan(&rows)
+	db.Raw(storageObservedCTE+` SELECT date,op_class,sum(count) total FROM observed GROUP BY date,op_class ORDER BY date`, tenantID, since).Scan(&rows)
 
 	// Roll up into one entry per date.
 	byDate := map[string]*opDailyPoint{}
@@ -188,12 +183,7 @@ func opTypeBreakdown(db *gorm.DB, tenantID string, since time.Time, classATotal,
 		Total   int64
 	}
 	var rows []row
-	db.Model(&models.StorageOpMetric{}).
-		Select("op_type, op_class, COALESCE(SUM(count), 0) as total").
-		Where("tenant_id = ? AND date >= ?", tenantID, since).
-		Group("op_type, op_class").
-		Order("total DESC").
-		Scan(&rows)
+	db.Raw(storageObservedCTE+` SELECT op_type,op_class,sum(count) total FROM observed GROUP BY op_type,op_class ORDER BY total DESC`, tenantID, since).Scan(&rows)
 
 	out := make([]opTypeBreakdownEntry, 0, len(rows))
 	for _, r := range rows {

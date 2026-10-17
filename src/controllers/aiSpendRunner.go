@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/economics"
 	"content-management-system/src/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -54,6 +55,9 @@ func importAISpendSTT(tx *gorm.DB, tenant string) (int64, error) {
 				event := models.AISpendEvent{EventID: id, EventCount: 1, OccurredAt: at, TenantID: tenant, SpendClass: "stt_api", Operation: "stt_settlement", Provider: job.Provider, Model: job.Model, Units: aiSpendJSON(units), CostUSD: delta, TriggerSource: job.TriggerSource, SystemRunID: job.PublicID.String(), SourceService: "cms_stt_owner", Backfilled: time.Since(at) > 24*time.Hour}
 				if err := tx.Create(&event).Error; err != nil {
 					return imported, err
+				}
+				if e := economics.LinkReceipt(tx, id, tenant, job.EconomicsAttributionRef); e != nil {
+					return imported, e
 				}
 				imported++
 			}

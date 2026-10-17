@@ -1651,7 +1651,7 @@ func refreshStorySummary(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 		return
 	}
 
-	summary, bullets, category, err := generateStorySummaryViaEnrichment(texts, AISpendContext{TenantID: tenantID, TriggerSource: "serving_news_summary", SystemRunID: storyID.String(), ServingExempt: true})
+	summary, bullets, category, err := generateStorySummaryViaEnrichment(texts, AISpendContext{EconomicsAttributionRef: "story:" + storyID.String(), TenantID: tenantID, TriggerSource: "serving_news_summary", SystemRunID: storyID.String(), ServingExempt: true})
 	if err != nil || len(bullets) == 0 {
 		return // best-effort — keep the previous digest (or none)
 	}

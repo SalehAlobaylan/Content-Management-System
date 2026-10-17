@@ -26,7 +26,7 @@ func aiSpendTestDB(t *testing.T) *gorm.DB {
 		t.Skip("explicit disposable CMS_TEST_ADMIN_URL required")
 	}
 	db := testdb.Open(t)
-	for _, name := range []string{"20260712010000_ai_spend_governor.sql", "20261012010000_ai_spend_completion.sql", "20261012020000_ai_spend_human_provenance.sql", "20261012030000_ai_spend_review_completion.sql"} {
+	for _, name := range []string{"20260712010000_ai_spend_governor.sql", "20261012010000_ai_spend_completion.sql", "20261012020000_ai_spend_human_provenance.sql", "20261012030000_ai_spend_review_completion.sql", "20261017030000_ai_provider_cache_pricing.sql"} {
 		sql, err := os.ReadFile("../../migrations/" + name)
 		if err != nil {
 			t.Fatal(err)
@@ -607,5 +607,45 @@ func TestAISpendEpisodeRepeatedRecoveryBecomesFlapping(t *testing.T) {
 	db.Where("tenant_id='a' AND kind='untrusted_ledger'").First(&ep)
 	if ep.Status != "flapping" || ep.Reopens != 3 {
 		t.Fatalf("flapping lifecycle %+v", ep)
+	}
+}
+
+func TestAISpendProviderCachePriceUsesBoundedSubsetAndHistoricalFallback(t *testing.T) {
+	db := aiSpendTestDB(t)
+	cached := 0.003
+	now := time.Now().UTC()
+	old := models.AIPriceBook{SpendClass: "llm", Provider: "test-cache", ModelPattern: "model", InputUSDPer1M: 0.15, OutputUSDPer1M: 0.6, EffectiveFrom: now.Add(-time.Hour)}
+	if e := db.Create(&old).Error; e != nil {
+		t.Fatal(e)
+	}
+	current := old
+	current.ID = 0
+	current.EffectiveFrom = now
+	current.CachedInputUSDPer1M = &cached
+	if e := db.Create(&current).Error; e != nil {
+		t.Fatal(e)
+	}
+	for _, c := range []struct {
+		name string
+		at   time.Time
+		hits float64
+		want float64
+	}{
+		{"discount", now, 400000, 0.0912}, {"clamp oversized", now, 2000000, 0.003}, {"negative subset", now, -1, 0.15}, {"historical fallback", now.Add(-time.Minute), 400000, 0.15},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, cost, _, e := resolveAISpendPriceChecked(db, aiSpendEventInput{SpendClass: "llm", Provider: "test-cache", Model: "model", OccurredAt: c.at, Units: map[string]any{"input_tokens": 1000000, "input_cache_hit_tokens": c.hits}})
+			if e != nil || math.Abs(cost-c.want) > 1e-12 {
+				t.Fatalf("cost=%v want=%v err=%v", cost, c.want, e)
+			}
+		})
+	}
+}
+
+func TestAIPriceRejectsNegativeProviderCacheRate(t *testing.T) {
+	db := aiSpendTestDB(t)
+	w := aiSpendRequest(t, db, CreateAIPriceBook, "a", `{"spend_class":"llm","provider":"deepseek","cached_input_usd_per_1m":-0.1}`)
+	if w.Code != 400 {
+		t.Fatalf("negative cached rate accepted: %d %s", w.Code, w.Body)
 	}
 }

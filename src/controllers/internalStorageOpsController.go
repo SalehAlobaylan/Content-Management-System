@@ -23,10 +23,13 @@ type opMetricItem struct {
 }
 
 type writeOpMetricsRequest struct {
-	Source   string         `json:"source"`    // internal | cloudflare
-	Date     string         `json:"date"`      // YYYY-MM-DD
-	TenantID string         `json:"tenant_id"` // optional; defaults to "default"
-	Items    []opMetricItem `json:"items"`
+	WindowStart string         `json:"window_start"`
+	WindowEnd   string         `json:"window_end"`
+	WindowKey   string         `json:"window_key"`
+	Source      string         `json:"source"`    // internal | cloudflare
+	Date        string         `json:"date"`      // YYYY-MM-DD
+	TenantID    string         `json:"tenant_id"` // optional; defaults to "default"
+	Items       []opMetricItem `json:"items"`
 }
 
 // InternalWriteOpMetrics handles POST /internal/storage/op-metrics
@@ -38,9 +41,18 @@ type writeOpMetricsRequest struct {
 func InternalWriteOpMetrics(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256*1024)
 	var req writeOpMetricsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	if len(req.Items) > 500 {
+		c.JSON(400, gin.H{"error": "Operation batch exceeds limit"})
+		return
+	}
+	if strings.EqualFold(req.Source, "cloudflare") {
+		writeEconomicsStorageWindow(c, db, req)
 		return
 	}
 	if len(req.Items) == 0 {
@@ -71,7 +83,7 @@ func InternalWriteOpMetrics(c *gin.Context) {
 			tier = "primary"
 		}
 		opClass := strings.ToUpper(strings.TrimSpace(it.OpClass))
-		if opClass != "A" && opClass != "B" {
+		if opClass != "A" && opClass != "B" && opClass != "F" && opClass != "U" {
 			continue // skip silently — telemetry shouldn't 4xx for one bad row
 		}
 		opType := strings.ToUpper(strings.TrimSpace(it.OpType))
@@ -180,7 +192,7 @@ func classifyBudget(used, budget int64, warnPct, capPct int) string {
 	}
 }
 
-// monthToDateOpCounts sums op counts across all sources for the current
+// monthToDateOpCounts keeps overlapping sources separate for the current
 // calendar month, grouped by class. Used by the budget classifier.
 func monthToDateOpCounts(db *gorm.DB, tenantID string) (classA, classB int64) {
 	now := time.Now().UTC()
@@ -191,11 +203,7 @@ func monthToDateOpCounts(db *gorm.DB, tenantID string) (classA, classB int64) {
 		Total   int64
 	}
 	var rows []sumRow
-	db.Model(&models.StorageOpMetric{}).
-		Select("op_class, COALESCE(SUM(count), 0) as total").
-		Where("tenant_id = ? AND date >= ?", tenantID, monthStart).
-		Group("op_class").
-		Scan(&rows)
+	db.Raw(storageObservedCTE+` SELECT op_class,sum(count) total FROM observed GROUP BY op_class`, tenantID, monthStart).Scan(&rows)
 	for _, r := range rows {
 		switch r.OpClass {
 		case "A":
@@ -206,3 +214,7 @@ func monthToDateOpCounts(db *gorm.DB, tenantID string) (classA, classB int64) {
 	}
 	return
 }
+
+// Pick the largest observed source per UTC day/tier/class, preserving its
+// operation mix. Sources overlap; their raw breakdown remains non-additive.
+const storageObservedCTE = `WITH scopes AS(SELECT tenant_id,date,tier,op_class,source,sum(count) total FROM storage_op_metrics WHERE tenant_id=? AND date>=? GROUP BY tenant_id,date,tier,op_class,source),chosen AS(SELECT DISTINCT ON(tenant_id,date,tier,op_class) tenant_id,date,tier,op_class,source FROM scopes ORDER BY tenant_id,date,tier,op_class,total DESC,source),observed AS(SELECT m.* FROM storage_op_metrics m JOIN chosen USING(tenant_id,date,tier,op_class,source))`

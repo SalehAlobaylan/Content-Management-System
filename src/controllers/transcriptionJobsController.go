@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/contentstage"
+	"content-management-system/src/economics"
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
@@ -221,6 +222,12 @@ func createSkippedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigge
 func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, triggerSource string) (models.TranscriptionJob, error) {
 	var job models.TranscriptionJob
 	err := db.Transaction(func(tx *gorm.DB) error {
+		collect := item.EconomicsRequesterID != "" && economics.DefaultCollector.Enabled(item.TenantID)
+		if collect {
+			if e := economics.Lock(tx); e != nil {
+				return e
+			}
+		}
 		// Serialize all job admissions for this content item, not merely Studio's
 		// callers. The active-job recheck closes the evaluate→create race.
 		current, err := lockContentForLifecycleMutation(tx, item.TenantID, item.PublicID)
@@ -255,8 +262,19 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 			EstimatedCostUsd: est,
 			ReservedCostUsd:  est,
 		}
+		if collect {
+			job.EconomicsAttributionRef = uuid.NewString()
+			if e := economics.RegisterAttribution(tx, economics.Attribution{ID: job.EconomicsAttributionRef, TenantID: current.TenantID, Source: "cms", Subject: "account:" + item.EconomicsRequesterID, Feature: "transcription", Benefit: "shared_content", ContentID: current.PublicID.String()}); e != nil {
+				return e
+			}
+		}
 		if err := tx.Create(&job).Error; err != nil {
 			return err
+		}
+		if collect {
+			if e := tx.Exec("UPDATE transcription_jobs SET economics_attribution_ref=? WHERE public_id=?", job.EconomicsAttributionRef, job.PublicID).Error; e != nil {
+				return e
+			}
 		}
 		if est > 0 {
 			if err := tx.Model(&cfg).UpdateColumn("monthly_reserved_usd", gorm.Expr("monthly_reserved_usd + ?", est)).Error; err != nil {

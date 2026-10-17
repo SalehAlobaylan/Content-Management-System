@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"content-management-system/src/economics"
 	"content-management-system/src/models"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -30,6 +31,9 @@ func InternalDeleteUserProductData(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	identityScope := "user:" + userID.String()
 	err = db.Transaction(func(tx *gorm.DB) error {
+		if e := economics.Erase(tx, userID.String()); e != nil {
+			return e
+		}
 		// Remove the account's interactions, but first preserve the rows needed
 		// to keep the denormalized engagement counts and comment-report graph
 		// consistent after the erasure.

@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/economics"
 	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
@@ -1247,7 +1248,14 @@ func DeleteWatchHistory(c *gin.Context) {
 		return
 	}
 
-	if err := query.Delete(&models.UserInteraction{}).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if uid, ok := authedUserID(c); ok {
+			if e := economics.Clear(tx, uid.String(), time.Now().UTC()); e != nil {
+				return e
+			}
+		}
+		return tx.Where(query.Statement.Clauses["WHERE"].Expression).Delete(&models.UserInteraction{}).Error
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}

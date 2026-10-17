@@ -15,13 +15,14 @@ import (
 // Each owning workflow passes provenance explicitly; request-local values never
 // live in mutable package globals. Override IDs are minted by authenticated CMS.
 type AISpendContext struct {
-	HumanActorID  string         `json:"human_actor_id,omitempty"`
-	Admission     map[string]any `json:"admission,omitempty"`
-	TenantID      string         `json:"tenant_id"`
-	TriggerSource string         `json:"trigger_source"`
-	SystemRunID   string         `json:"system_run_id,omitempty"`
-	OverrideID    string         `json:"override_id,omitempty"`
-	ServingExempt bool           `json:"serving_exempt,omitempty"`
+	EconomicsAttributionRef string         `json:"economics_attribution_ref,omitempty"`
+	HumanActorID            string         `json:"human_actor_id,omitempty"`
+	Admission               map[string]any `json:"admission,omitempty"`
+	TenantID                string         `json:"tenant_id"`
+	TriggerSource           string         `json:"trigger_source"`
+	SystemRunID             string         `json:"system_run_id,omitempty"`
+	OverrideID              string         `json:"override_id,omitempty"`
+	ServingExempt           bool           `json:"serving_exempt,omitempty"`
 }
 
 func spendContext(tenant, trigger, run string) AISpendContext {

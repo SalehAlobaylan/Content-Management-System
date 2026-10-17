@@ -1,12 +1,14 @@
 package controllers
 
 import (
+	"content-management-system/src/economics"
 	"content-management-system/src/models"
 	"encoding/json"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -465,15 +467,28 @@ func UpsertAISpendInvoice(c *gin.Context) {
 		return
 	}
 	var r models.AISpendInvoice
-	if c.ShouldBindJSON(&r) != nil || r.Provider == "" || r.Month.IsZero() || r.AmountUSD < 0 {
-		c.JSON(400, gin.H{"error": "provider, month and nonnegative amount required"})
+	if c.ShouldBindJSON(&r) != nil || r.Provider == "" || r.Month.IsZero() || math.IsNaN(r.AmountUSD) || math.IsInf(r.AmountUSD, 0) || math.Abs(r.AmountUSD) >= 1e18 {
+		c.JSON(400, gin.H{"error": "provider, month and finite USD amount required; negative net credits are supported"})
 		return
 	}
 	r.ID = 0
 	r.TenantID = p.TenantID
 	r.CreatedBy = p.UserID
 	r.Month = time.Date(r.Month.Year(), r.Month.Month(), 1, 0, 0, 0, 0, time.UTC)
-	if err := c.MustGet("db").(*gorm.DB).Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "provider"}, {Name: "month"}}, DoUpdates: clause.AssignmentColumns([]string{"amount_usd", "note", "created_by", "updated_at"})}).Create(&r).Error; err != nil {
+	if err := c.MustGet("db").(*gorm.DB).Transaction(func(tx *gorm.DB) error {
+		if economics.Available(tx) {
+			if e := economics.Lock(tx); e != nil {
+				return e
+			}
+		}
+		if e := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "provider"}, {Name: "month"}}, DoUpdates: clause.AssignmentColumns([]string{"amount_usd", "note", "created_by", "updated_at"})}).Create(&r).Error; e != nil {
+			return e
+		}
+		if economics.Available(tx) {
+			return economics.RecordAIInvoice(tx, r)
+		}
+		return nil
+	}); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}

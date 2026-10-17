@@ -2,6 +2,7 @@ package routes
 
 import (
 	"content-management-system/src/controllers"
+	"content-management-system/src/economics"
 	"content-management-system/src/utils"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +21,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup := router.Group("/admin")
 	adminGroup.Use(utils.AdminAuthMiddleware(db))
 	SetupOperatorRoutes(adminGroup, db)
+	economics.RegisterAdmin(adminGroup)
 	// /me only needs a valid principal (any authenticated user may read their own access).
 	adminGroup.GET("/me", controllers.AdminMe)
 

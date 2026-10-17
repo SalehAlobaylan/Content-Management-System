@@ -183,9 +183,10 @@ func RequestTranscription(c *gin.Context) {
 	// Fire-and-forget: trigger transcription asynchronously so we return 202 immediately.
 	// Routed through the guard (force=false) so the budget cap still applies.
 	itemCopy := item
+	itemCopy.EconomicsRequesterID = userIDStr
 	publicID := item.PublicID.String()
 	go func() {
-		if _, err := triggerTranscription(&itemCopy, db, false, ""); err != nil {
+		if _, err := triggerTranscription(&itemCopy, db, false, models.TranscriptionTriggerManual); err != nil {
 			log.Printf("[CMS] transcription trigger failed for %s: %v", publicID, err)
 		}
 	}()

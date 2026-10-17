@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"content-management-system/src/economics"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"github.com/gin-gonic/gin"
@@ -39,26 +40,27 @@ func getTenantAISpendPolicy(db *gorm.DB, tenant string) (*models.AISpendPolicy, 
 }
 
 type aiSpendEventInput struct {
-	HumanActorID         string         `json:"human_actor_id"`
-	EventID              string         `json:"event_id"`
-	OccurredAt           time.Time      `json:"occurred_at"`
-	SpendClass           string         `json:"spend_class"`
-	Operation            string         `json:"operation"`
-	Provider             string         `json:"provider"`
-	Model                string         `json:"model"`
-	Units                map[string]any `json:"units"`
-	EventCount           int64          `json:"event_count"`
-	Cached               bool           `json:"cached"`
-	Estimated            bool           `json:"estimated"`
-	AvoidedCostEstimated bool           `json:"avoided_cost_estimated"`
-	UsageUnavailable     bool           `json:"usage_unavailable"`
-	Backfilled           bool           `json:"backfilled"`
-	OverCapHuman         bool           `json:"over_cap_human"`
-	OverrideID           string         `json:"override_id"`
-	TriggerSource        string         `json:"trigger_source"`
-	SystemRunID          string         `json:"system_run_id"`
-	TenantID             string         `json:"tenant_id"`
-	SourceService        string         `json:"source_service"`
+	EconomicsAttributionRef string         `json:"economics_attribution_ref"`
+	HumanActorID            string         `json:"human_actor_id"`
+	EventID                 string         `json:"event_id"`
+	OccurredAt              time.Time      `json:"occurred_at"`
+	SpendClass              string         `json:"spend_class"`
+	Operation               string         `json:"operation"`
+	Provider                string         `json:"provider"`
+	Model                   string         `json:"model"`
+	Units                   map[string]any `json:"units"`
+	EventCount              int64          `json:"event_count"`
+	Cached                  bool           `json:"cached"`
+	Estimated               bool           `json:"estimated"`
+	AvoidedCostEstimated    bool           `json:"avoided_cost_estimated"`
+	UsageUnavailable        bool           `json:"usage_unavailable"`
+	Backfilled              bool           `json:"backfilled"`
+	OverCapHuman            bool           `json:"over_cap_human"`
+	OverrideID              string         `json:"override_id"`
+	TriggerSource           string         `json:"trigger_source"`
+	SystemRunID             string         `json:"system_run_id"`
+	TenantID                string         `json:"tenant_id"`
+	SourceService           string         `json:"source_service"`
 }
 
 func aiSpendNumber(v any) float64 {
@@ -87,7 +89,13 @@ func resolveAISpendPriceChecked(db *gorm.DB, in aiSpendEventInput) (*models.AIPr
 			continue
 		}
 		// Gemini separates candidate and thought tokens; both are billed output.
-		cost := aiSpendNumber(in.Units["input_tokens"])/1e6*r.InputUSDPer1M + (aiSpendNumber(in.Units["output_tokens"])+aiSpendNumber(in.Units["thoughts_tokens"]))/1e6*r.OutputUSDPer1M
+		input := aiSpendNumber(in.Units["input_tokens"])
+		cached := math.Max(0, math.Min(input, aiSpendNumber(in.Units["input_cache_hit_tokens"])))
+		inputCost := input / 1e6 * r.InputUSDPer1M
+		if r.CachedInputUSDPer1M != nil {
+			inputCost = (input-cached)/1e6*r.InputUSDPer1M + cached/1e6**r.CachedInputUSDPer1M
+		}
+		cost := inputCost + (aiSpendNumber(in.Units["output_tokens"])+aiSpendNumber(in.Units["thoughts_tokens"]))/1e6*r.OutputUSDPer1M
 		cost += (aiSpendNumber(in.Units["audio_sec"]) + aiSpendNumber(in.Units["items"]) + aiSpendNumber(in.Units["pairs"])) * r.UnitUSD
 		return &r, cost, r.Provider == "*", nil
 	}
@@ -195,6 +203,9 @@ func InternalIngestAISpendEvents(c *gin.Context) {
 				}
 			}
 			if e := tx.Create(&event).Error; e != nil {
+				return e
+			}
+			if e := economics.LinkReceipt(tx, id, in.TenantID, in.EconomicsAttributionRef); e != nil {
 				return e
 			}
 			ack["status"] = "inserted"
@@ -605,7 +616,11 @@ func CreateAIPriceBook(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "spend_class and provider required"})
 		return
 	}
-	for _, n := range []float64{r.InputUSDPer1M, r.OutputUSDPer1M, r.UnitUSD} {
+	rates := []float64{r.InputUSDPer1M, r.OutputUSDPer1M, r.UnitUSD}
+	if r.CachedInputUSDPer1M != nil {
+		rates = append(rates, *r.CachedInputUSDPer1M)
+	}
+	for _, n := range rates {
 		if n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
 			c.JSON(400, gin.H{"error": "prices must be finite and nonnegative"})
 			return
