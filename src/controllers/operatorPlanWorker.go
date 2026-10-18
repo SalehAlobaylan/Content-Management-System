@@ -26,6 +26,10 @@ func StartOperatorPlanWorker(db *gorm.DB) {
 }
 
 func runOperatorPlanWorker(db *gorm.DB) {
+	// Observation and terminal convergence require neither new-effect authority nor a signing key.
+	if err := reconcileOperatorSupplyHandoffs(context.Background(), db); err != nil {
+		return
+	}
 	signingKey, err := operatorpkg.PlanSigningKeyFromEnv()
 	if err != nil {
 		return
@@ -74,6 +78,9 @@ func runOperatorPlanWorker(db *gorm.DB) {
 		return
 	}
 	success, before, after, verified := executeRegisteredOperatorPlan(ctx, db, plan.TenantID, descriptor.Key, runningPlan, step, canonical, access)
+	if waiting, _ := after["waiting_for_native_action"].(bool); waiting {
+		return
+	}
 	if err := store.FinishClaimedPlan(ctx, claimed.ID, plan.TenantID, *claimed.ClaimToken, success, before, after, verified); err != nil {
 		return
 	}

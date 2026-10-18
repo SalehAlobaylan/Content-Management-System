@@ -198,6 +198,7 @@ func CreatePodsFeedSession(c *gin.Context) {
 	}
 
 	generation := activeFeedGeneration(db, tenantID, "media")
+	activeGenerationID, _, hasActiveGeneration := feedcontract.ActiveGeneration(db, tenantID, "media")
 	items, err := snapshotCurrentPodsFeed(c, db)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, utils.HTTPError{Code: http.StatusServiceUnavailable, Message: "Unable to create a stable Pods session"})
@@ -221,6 +222,9 @@ func CreatePodsFeedSession(c *gin.Context) {
 		Snapshot:      datatypes.JSON(snapshot),
 		Generation:    generation,
 		ExpiresAt:     now.Add(consumerFeedSessionLifetime),
+	}
+	if hasActiveGeneration {
+		session.ActiveGenerationID = &activeGenerationID
 	}
 	if err := db.Create(&session).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Unable to create a stable Pods session"})

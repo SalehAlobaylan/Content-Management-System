@@ -2,6 +2,7 @@ package supply
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
+
+var errSourceRunBudgetExhausted = errors.New("tenant source-run rolling reservation budget is exhausted")
 
 const (
 	maxTenantReservedProviderCalls       = 64
@@ -103,7 +106,7 @@ func reserveSourceRunBudget(tx *gorm.DB, request *models.SourceRunRequest, budge
 		return err
 	}
 	if totals.ProviderCalls+budget.ProviderCalls > maxTenantReservedProviderCalls || totals.Items+budget.Items > maxTenantReservedItems || totals.Bytes+budget.Bytes > maxTenantReservedBytes || totals.Workload+budget.Workload > maxTenantReservedWorkload {
-		return fmt.Errorf("tenant source-run rolling reservation budget is exhausted")
+		return errSourceRunBudgetExhausted
 	}
 	request.ProviderCallCap, request.ItemCap, request.ByteCap, request.WorkloadCap = budget.ProviderCalls, budget.Items, budget.Bytes, budget.Workload
 	request.ReservedProviderCalls, request.ReservedItems, request.ReservedBytes, request.ReservedWorkload = budget.ProviderCalls, budget.Items, budget.Bytes, budget.Workload

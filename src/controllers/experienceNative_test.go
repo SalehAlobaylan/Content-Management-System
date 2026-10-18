@@ -9,7 +9,7 @@ import (
 
 func TestExperienceNativeTicketExpiryForgeryAndPurpose(t *testing.T) {
 	now := time.Now().UTC()
-	ticket := nativeExperienceTicket{Platform: "ios", Session: uuid.NewString(), Page: uuid.NewString(), Release: "ios-build-1", Expires: now.Add(30 * time.Minute).Unix()}
+	ticket := nativeExperienceTicket{TenantID: "native-tenant", Platform: "ios", Session: uuid.NewString(), Page: uuid.NewString(), Release: "ios-build-1", Expires: now.Add(30 * time.Minute).Unix()}
 	value := issueNativeTicket(ticket, "private-fixture")
 	if got, ok := readNativeTicket(value, "private-fixture", now); !ok || got != ticket {
 		t.Fatal("valid bounded ticket refused")

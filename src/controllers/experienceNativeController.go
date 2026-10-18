@@ -20,6 +20,7 @@ import (
 // A ticket grants only bounded telemetry admission. It is not a user JWT and
 // cannot authorize business APIs or attest an installed binary's provenance.
 type nativeExperienceTicket struct {
+	TenantID string `json:"tenant_id"`
 	Platform string `json:"platform"`
 	Session  string `json:"session_id"`
 	Page     string `json:"page_load_id"`
@@ -69,7 +70,7 @@ func readNativeTicket(value, key string, now time.Time) (nativeExperienceTicket,
 	if err != nil || json.Unmarshal(raw, &ticket) != nil || ticket.Expires <= now.Unix() || ticket.Expires > now.Add(31*time.Minute).Unix() {
 		return ticket, false
 	}
-	if ticket.Platform != "ios" && ticket.Platform != "android" {
+	if strings.TrimSpace(ticket.TenantID) == "" || (ticket.Platform != "ios" && ticket.Platform != "android") {
 		return ticket, false
 	}
 	if _, err := uuid.Parse(ticket.Session); err != nil {
@@ -109,7 +110,13 @@ func CreateNativeExperienceAdmission(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid process epoch"})
 		return
 	}
-	policy, err := loadExperiencePolicy(c.MustGet("db").(*gorm.DB), ruxDefaultTenant)
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(503, gin.H{"error": "Public feed tenant is unavailable"})
+		return
+	}
+	body.TenantID = tenantID
+	policy, err := loadExperiencePolicy(c.MustGet("db").(*gorm.DB), tenantID)
 	if err != nil {
 		c.JSON(503, gin.H{"error": "telemetry policy unavailable"})
 		return

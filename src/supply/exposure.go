@@ -45,27 +45,28 @@ func currentPodsReturnProbe() PodsReturnProbe {
 }
 
 type PodsExposureProof struct {
-	SchemaVersion         string     `json:"schema_version"`
-	GeneratedAt           time.Time  `json:"generated_at"`
-	Verdict               string     `json:"verdict"`
-	EvidenceCompleteness  string     `json:"evidence_completeness"`
-	BaseEligibleCount     int64      `json:"base_eligible_count"`
-	ReachableCount        int64      `json:"reachable_count"`
-	ReturnedCount         int        `json:"returned_count"`
-	DistinctReturnedCount int        `json:"distinct_returned_count"`
-	EligibleReturnedGap   int64      `json:"eligible_returned_gap"`
-	RepeatPressure        float64    `json:"repeat_pressure"`
-	ActiveGenerationID    *uuid.UUID `json:"active_generation_id,omitempty"`
-	ProbeID               uuid.UUID  `json:"probe_id"`
-	NewestEligibleAt      *time.Time `json:"newest_eligible_at,omitempty"`
-	NewestReachableAt     *time.Time `json:"newest_reachable_at,omitempty"`
-	NewestReturnedAt      *time.Time `json:"newest_returned_at,omitempty"`
-	LastFeedRenderedAt    *time.Time `json:"last_feed_rendered_at,omitempty"`
-	LastExactViewAt       *time.Time `json:"last_exact_view_at,omitempty"`
-	ReturnedIDs           []string   `json:"returned_ids"`
-	RenderedIDs           []string   `json:"rendered_ids"`
-	ViewedIDs             []string   `json:"viewed_ids"`
-	Unknowns              []string   `json:"unknowns"`
+	SchemaVersion         string                           `json:"schema_version"`
+	GeneratedAt           time.Time                        `json:"generated_at"`
+	Verdict               string                           `json:"verdict"`
+	EvidenceCompleteness  string                           `json:"evidence_completeness"`
+	BaseEligibleCount     int64                            `json:"base_eligible_count"`
+	ReachableCount        int64                            `json:"reachable_count"`
+	ReturnedCount         int                              `json:"returned_count"`
+	DistinctReturnedCount int                              `json:"distinct_returned_count"`
+	EligibleReturnedGap   int64                            `json:"eligible_returned_gap"`
+	RepeatPressure        float64                          `json:"repeat_pressure"`
+	ActiveGenerationID    *uuid.UUID                       `json:"active_generation_id,omitempty"`
+	ProbeID               uuid.UUID                        `json:"probe_id"`
+	NewestEligibleAt      *time.Time                       `json:"newest_eligible_at,omitempty"`
+	NewestReachableAt     *time.Time                       `json:"newest_reachable_at,omitempty"`
+	NewestReturnedAt      *time.Time                       `json:"newest_returned_at,omitempty"`
+	LastFeedRenderedAt    *time.Time                       `json:"last_feed_rendered_at,omitempty"`
+	LastExactViewAt       *time.Time                       `json:"last_exact_view_at,omitempty"`
+	ReturnedIDs           []string                         `json:"returned_ids"`
+	RenderedIDs           []string                         `json:"rendered_ids"`
+	ViewedIDs             []string                         `json:"viewed_ids"`
+	ConsumerObservations  []models.PodsBoundaryObservation `json:"-"`
+	Unknowns              []string                         `json:"unknowns"`
 }
 
 // BuildPodsExposureProof is a non-perturbing, tenant-scoped internal probe. It
@@ -160,11 +161,12 @@ func BuildPodsExposureProof(db *gorm.DB, tenant string, now time.Time) PodsExpos
 		}
 	}
 	var renderEvents []models.PodsBoundaryObservation
-	renderQuery := db.Where("tenant_id=? AND boundary=? AND verdict=? AND content_item_id IN ?", tenant, "page_render", string(VerdictPresent), returnedIDs)
+	renderQuery := db.Where("tenant_id=? AND boundary=? AND verdict=? AND content_item_id IN ?", tenant, "page_render", string(VerdictPresent), returnedIDs).Where("feed_session_id IS NOT NULL AND observed_at >= ? AND observed_at <= ?", now.Add(-15*time.Minute), now)
 	if proof.ActiveGenerationID != nil {
 		renderQuery = renderQuery.Where("generation_id=?", *proof.ActiveGenerationID)
 	}
 	if len(returnedIDs) > 0 && renderQuery.Order("observed_at DESC").Limit(podsSupplyReturnProbeLimit).Find(&renderEvents).Error == nil && len(renderEvents) > 0 {
+		proof.ConsumerObservations = append(proof.ConsumerObservations, renderEvents...)
 		proof.LastFeedRenderedAt = &renderEvents[0].ObservedAt
 		seenRendered := map[uuid.UUID]bool{}
 		for _, event := range renderEvents {
@@ -177,11 +179,12 @@ func BuildPodsExposureProof(db *gorm.DB, tenant string, now time.Time) PodsExpos
 		proof.Unknowns = append(proof.Unknowns, "No exact returned-item page-render evidence was observed.")
 	}
 	var viewRows []models.PodsBoundaryObservation
-	viewQuery := db.Where("tenant_id=? AND boundary=? AND verdict=? AND content_item_id IN ?", tenant, "exact_view", string(VerdictPresent), returnedIDs)
+	viewQuery := db.Where("tenant_id=? AND boundary=? AND verdict=? AND content_item_id IN ?", tenant, "exact_view", string(VerdictPresent), returnedIDs).Where("feed_session_id IS NOT NULL AND observed_at >= ? AND observed_at <= ?", now.Add(-15*time.Minute), now)
 	if proof.ActiveGenerationID != nil {
 		viewQuery = viewQuery.Where("generation_id=?", *proof.ActiveGenerationID)
 	}
 	if len(returnedIDs) > 0 && viewQuery.Order("observed_at DESC").Limit(podsSupplyReturnProbeLimit).Find(&viewRows).Error == nil && len(viewRows) > 0 {
+		proof.ConsumerObservations = append(proof.ConsumerObservations, viewRows...)
 		proof.LastExactViewAt = &viewRows[0].ObservedAt
 		seenViewed := map[uuid.UUID]bool{}
 		for _, row := range viewRows {

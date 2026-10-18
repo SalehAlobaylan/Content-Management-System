@@ -199,17 +199,19 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 		return fmt.Errorf("source-run receipt source does not match its request")
 	}
 	contentResetReplay := request.Purpose == "content_reset_replay"
+	// A delayed start receipt is still actual attempt evidence after the unit
+	// terminalizes. It may advance this checkpoint without reopening lifecycle.
+	if receipt.EventType == string(ReceiptEventProviderRequestStarted) && !contentResetReplay {
+		if err := tx.Model(&models.ContentSource{}).Where("public_id = ? AND tenant_id = ?", receipt.ContentSourceID, receipt.TenantID).Updates(map[string]any{"last_attempted_at": gorm.Expr("GREATEST(last_attempted_at, ?)", receipt.ProducedAt.UTC())}).Error; err != nil {
+			return err
+		}
+	}
 	if IsTerminalUnit(ExecutionUnitState(unit.State)) {
 		return nil
 	}
 	now := receipt.ObservedAt.UTC()
 	if !contentResetReplay {
 		if err := applySourceYieldReceipt(tx, receipt, now); err != nil {
-			return err
-		}
-	}
-	if receipt.EventType == string(ReceiptEventProviderRequestStarted) && !contentResetReplay {
-		if err := tx.Model(&models.ContentSource{}).Where("public_id = ? AND tenant_id = ?", receipt.ContentSourceID, receipt.TenantID).Updates(map[string]any{"last_attempted_at": now}).Error; err != nil {
 			return err
 		}
 	}
@@ -227,7 +229,7 @@ func applyReceiptProjection(tx *gorm.DB, receipt models.SourceRunReceipt) error 
 		return reconcileAttemptAndRequest(tx, receipt.TenantID, unit.SourceRunAttemptID, unit.SourceRunRequestID)
 	}
 	updates := map[string]any{"state": string(terminal), "terminal_outcome": receipt.Outcome, "finished_at": now, "verification_required": false}
-	if terminal == UnitSucceeded && (receipt.EventType == string(ReceiptEventProviderTerminal) || receipt.EventType == string(ReceiptEventFinalization)) {
+	if (terminal == UnitSucceeded || receipt.Outcome == string(OutcomePartial)) && (receipt.EventType == string(ReceiptEventProviderTerminal) || receipt.EventType == string(ReceiptEventFinalization)) {
 		updates["terminal_outcome"] = receipt.Outcome
 		// A Fresh Start replay has an independent campaign boundary. Updating
 		// ContentSource's regular due time or success health here can postpone
@@ -375,7 +377,7 @@ func terminalUnitState(event ReceiptEvent, outcome SourceRunOutcome) ExecutionUn
 		switch outcome {
 		case OutcomeUnknown:
 			return UnitVerificationRequired
-		case OutcomeProviderFailed, OutcomeDeadLettered:
+		case OutcomeProviderFailed, OutcomeDeadLettered, OutcomePartial, OutcomeObservationBlockedByIntake, OutcomeConfigurationBlocked:
 			return UnitFailed
 		case OutcomeCancelled:
 			return UnitCancelled
@@ -388,6 +390,10 @@ func terminalUnitState(event ReceiptEvent, outcome SourceRunOutcome) ExecutionUn
 }
 
 func applySourceCheckpoint(tx *gorm.DB, receipt models.SourceRunReceipt) error {
+	category, ok := TerminalCategoryForOutcome(SourceRunOutcome(receipt.Outcome))
+	if !ok || (category != RequestSucceeded && category != RequestPartial) {
+		return nil
+	}
 	observedAt := receipt.ProducedAt.UTC()
 	var source models.ContentSource
 	if err := tx.Where("public_id = ? AND tenant_id = ?", receipt.ContentSourceID, receipt.TenantID).First(&source).Error; err != nil {

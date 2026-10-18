@@ -213,6 +213,8 @@ type MediaSupplyActionRequest struct {
 	TenantID                string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
 	PreviewID               uuid.UUID      `gorm:"type:uuid;not null;index" json:"preview_id"`
 	EpisodeID               *uuid.UUID     `gorm:"type:uuid;index" json:"episode_id,omitempty"`
+	OperatorPlanID          *uuid.UUID     `gorm:"type:uuid" json:"operator_plan_id,omitempty"`
+	OperatorStepID          *uuid.UUID     `gorm:"type:uuid" json:"operator_step_id,omitempty"`
 	ActionKey               string         `gorm:"type:varchar(128);not null;index" json:"action_key"`
 	ActionVersion           string         `gorm:"type:varchar(32);not null" json:"action_version"`
 	TargetType              string         `gorm:"type:varchar(64);not null" json:"target_type"`

@@ -59,14 +59,12 @@ func runSupplyActionWorkerOnce(db *gorm.DB) {
 		return
 	} else if verified {
 		supplyActionWorkerLastHeartbeat.Store(time.Now().UTC().UnixNano())
-		return
 	}
 	if verified, err := verifyOneAggregationOwnedSupplyAction(db); err != nil {
 		log.Printf("media supply aggregation action verification failed: %v", err)
 		return
 	} else if verified {
 		supplyActionWorkerLastHeartbeat.Store(time.Now().UTC().UnixNano())
-		return
 	}
 	lease, found, err := claimNextCMSOwnedSupplyAction(db, "cms-media-supply-action-worker")
 	if err != nil {
@@ -140,7 +138,7 @@ func claimNextCMSOwnedSupplyAction(db *gorm.DB, owner string) (SupplyActionLease
 		// actions. Lock a bounded ordered window and claim the first one whose
 		// current subtractive controls still permit recovery.
 		var queued []models.MediaSupplyActionRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ? AND execution_owner = ?", string(SupplyActionQueued), "cms").Order("created_at ASC").Limit(16).Find(&queued).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ? AND execution_owner = ?", string(SupplyActionQueued), "cms").Order("updated_at ASC, created_at ASC, public_id ASC").Limit(16).Find(&queued).Error; err != nil {
 			return err
 		}
 		if len(queued) == 0 {
@@ -148,6 +146,11 @@ func claimNextCMSOwnedSupplyAction(db *gorm.DB, owner string) (SupplyActionLease
 		}
 		var request models.MediaSupplyActionRequest
 		for _, candidate := range queued {
+			// Rotate this bounded review window even when a subtractive control or
+			// transient dependency prevents a claim. Other tenants must still progress.
+			if err := tx.Model(&candidate).UpdateColumn("updated_at", now).Error; err != nil {
+				return err
+			}
 			candidateDescriptor, descriptorErr := RequireSupplyActionDescriptor(candidate.ActionKey, candidate.TargetType)
 			if descriptorErr != nil || candidateDescriptor.ExecutionOwner != "cms" {
 				return fmt.Errorf("CMS supply action is not statically admitted")

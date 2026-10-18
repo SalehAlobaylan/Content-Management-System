@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"content-management-system/src/models"
@@ -9,8 +10,59 @@ import (
 	"content-management-system/src/supply"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// Cases are immutable owner/Observe evidence. Administrators can compare a
+// prediction with its terminal proof; this endpoint grants no execution power.
+func ListMediaSupplyQualificationCases(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	key := strings.TrimSpace(c.Query("action_key"))
+	if _, ok := supply.QualificationVersions(key); !ok {
+		c.JSON(400, gin.H{"message": "Registered action_key is required"})
+		return
+	}
+	limit := 25
+	if raw := c.Query("limit"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > 100 {
+			c.JSON(400, gin.H{"message": "Invalid limit"})
+			return
+		}
+		limit = value
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	query := db.Where("tenant_id=? AND action_key=?", principal.TenantID, key)
+	if raw := c.Query("after"); raw != "" {
+		after, err := uuid.Parse(raw)
+		if err != nil {
+			c.JSON(400, gin.H{"message": "Invalid cursor"})
+			return
+		}
+		var anchor models.MediaSupplyQualificationCase
+		if db.Where("tenant_id=? AND action_key=? AND public_id=?", principal.TenantID, key, after).First(&anchor).Error != nil {
+			c.JSON(400, gin.H{"message": "Invalid cursor"})
+			return
+		}
+		query = query.Where("(created_at,public_id)<(?,?)", anchor.CreatedAt, anchor.PublicID)
+	}
+	var cases []models.MediaSupplyQualificationCase
+	if query.Order("created_at DESC,public_id DESC").Limit(limit+1).Find(&cases).Error != nil {
+		c.JSON(503, gin.H{"message": "Qualification cases are unavailable"})
+		return
+	}
+	var cursor *string
+	if len(cases) > limit {
+		cases = cases[:limit]
+		value := cases[len(cases)-1].PublicID.String()
+		cursor = &value
+	}
+	c.JSON(200, gin.H{"schema_version": supply.MediaSupplyQualificationRubricVersion, "items": cases, "next_cursor": cursor})
+}
 
 func freshSupplyQualificationAdmin(c *gin.Context) (string, string, bool) {
 	principal, ok := requireAdminPrincipal(c)

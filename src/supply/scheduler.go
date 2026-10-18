@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -63,6 +64,15 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 		FROM content_sources
 		WHERE tenant_id <> '' AND is_active = TRUE AND next_due_at IS NOT NULL AND next_due_at <= ?
 		  AND (intake_circuit_until IS NULL OR intake_circuit_until <= ?)
+          AND NOT EXISTS (SELECT 1 FROM source_run_requests r
+            WHERE r.tenant_id=content_sources.tenant_id AND r.content_source_id=content_sources.public_id
+              AND r.state IN ('requested','accepted','running','verification_required'))
+          AND NOT EXISTS (SELECT 1 FROM media_supply_controls c
+            WHERE c.tenant_id=content_sources.tenant_id AND c.control_key='normal_intake_scheduling'
+              AND c.scope_type='tenant' AND c.scope_id='all')
+          AND EXISTS (SELECT 1 FROM source_run_admission_cutovers c
+            WHERE c.tenant_id=content_sources.tenant_id AND c.lane=content_sources.category
+              AND c.mode='durable' AND c.protocol='source-run/v1')
 	) ranked WHERE ranked.tenant_rank <= 2
 	ORDER BY ranked.tenant_rank ASC, ranked.next_due_at ASC, ranked.tenant_id ASC, ranked.public_id ASC LIMIT ?`, now, now, limit).Scan(&sources).Error; err != nil {
 		return nil, err
@@ -119,7 +129,7 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 			return err
 		})
 		if err != nil {
-			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) || errors.Is(err, errSourceRunBudgetExhausted) {
 				continue
 			}
 			return admitted, err
@@ -148,6 +158,15 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 		  ON d.tenant_id=o.tenant_id AND d.observation_id=o.public_id
 		WHERE o.replay_until IS NOT NULL AND o.replay_until > ?
 		  AND COALESCE(d.disposition, 'deferred') IN ('observed','deferred','replay_expiring')
+          AND EXISTS (SELECT 1 FROM content_sources s JOIN source_run_admission_cutovers c
+            ON c.tenant_id=s.tenant_id AND c.lane=s.category AND c.mode='durable' AND c.protocol='source-run/v1'
+            WHERE s.tenant_id=o.tenant_id AND s.public_id=o.content_source_id AND s.is_active=TRUE
+              AND (s.intake_circuit_until IS NULL OR s.intake_circuit_until<=?))
+          AND NOT EXISTS (SELECT 1 FROM source_run_requests r
+            WHERE r.tenant_id=o.tenant_id AND r.content_source_id=o.content_source_id
+              AND r.state IN ('requested','accepted','running','verification_required'))
+          AND NOT EXISTS (SELECT 1 FROM media_supply_controls c
+            WHERE c.tenant_id=o.tenant_id AND c.control_key='normal_intake_scheduling' AND c.scope_type='tenant' AND c.scope_id='all')
 		  AND NOT EXISTS (
 			SELECT 1 FROM source_upstream_observation_events e
 			WHERE e.tenant_id=o.tenant_id AND e.observation_id=o.public_id
@@ -159,7 +178,7 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 			  AND terminal_event.event_type IN ('materialized','filtered','unrecoverable','authorized_abandonment')
 		  )
 	) ranked WHERE ranked.tenant_rank <= 2
-	ORDER BY ranked.tenant_rank ASC, ranked.replay_until ASC, ranked.observed_at ASC, ranked.tenant_id ASC LIMIT ?`, now, limit).Scan(&observations).Error; err != nil {
+	ORDER BY ranked.tenant_rank ASC, ranked.replay_until ASC, ranked.observed_at ASC, ranked.tenant_id ASC LIMIT ?`, now, now, limit).Scan(&observations).Error; err != nil {
 		return nil, err
 	}
 	admitted := make([]models.SourceRunRequest, 0, len(observations))
@@ -239,7 +258,7 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 			return tx.Create(&models.SourceRunProjectionWork{PublicID: uuid.New(), TenantID: observation.TenantID, EvidenceKind: "upstream_observation_event", EvidenceID: event.PublicID, ReducerVersion: "source-run-upstream-observation/v1", State: "queued"}).Error
 		})
 		if err != nil {
-			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) {
+			if lifecycle.IsConflict(err) || lifecycle.IsIntakePaused(err) || errors.Is(err, errSourceRunBudgetExhausted) {
 				continue
 			}
 			return admitted, err

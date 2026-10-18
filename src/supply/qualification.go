@@ -102,7 +102,7 @@ func QualificationVersions(actionKey string) (QualificationVersionSet, bool) {
 	versions := QualificationVersionSet{ActionVersion: "v1", AdapterVersion: "cms-supply-action/v1", VerifierVersion: "cms-supply-verifier/v1", SchemaVersion: "media-supply-actions/v1", PolicyVersion: "media-supply-policy/v1"}
 	switch {
 	case strings.HasPrefix(actionKey, "source_run."):
-		versions.AdapterVersion, versions.VerifierVersion, versions.SchemaVersion = "source-run-adapter/v1", "source-run-verifier/v1", ContractVersion
+		versions.AdapterVersion, versions.VerifierVersion, versions.SchemaVersion = "source-run-adapter/v2", "source-run-verifier/v2", ContractVersion
 	case actionKey == SupplyActionPipelineResumeExactStage:
 		versions.AdapterVersion, versions.VerifierVersion, versions.SchemaVersion = "pipeline-repair/v1", "pipeline-stage-proof/v1", "pipeline-repair/v1"
 	case strings.HasPrefix(actionKey, "artifact."):
@@ -306,7 +306,7 @@ func RecordQualificationHumanDecision(ctx context.Context, db *gorm.DB, tenant, 
 		if err := tx.Where("public_id=? AND tenant_id=?", publicID, tenant).First(&qualificationCase).Error; err != nil {
 			return err
 		}
-		if qualificationCase.Cohort != "human_decision" {
+		if qualificationCase.Cohort != "human_decision" && qualificationCase.Cohort != "terminal" && qualificationCase.Cohort != "tri_state" {
 			return fmt.Errorf("qualification case does not require a human decision")
 		}
 		created = models.MediaSupplyQualificationHumanDecision{PublicID: uuid.New(), CaseID: qualificationCase.ID, Decision: decision, ActorID: actorID, AccessVersion: accessVersion, DecidedAt: time.Now().UTC()}
@@ -372,7 +372,7 @@ func validateQualificationReportPayload(payload QualificationReportPayload) erro
 		if item.TenantID != payload.TenantID {
 			return fmt.Errorf("qualification report contains a cross-tenant case")
 		}
-		if item.ID == "" || item.CaseKey == "" || ids[item.ID] || len(item.PayloadDigest) != 64 || len(item.Violations) != 0 || ((item.Cohort == "terminal" || item.Cohort == "fault") && !item.IndependentVerifier) {
+		if item.ID == "" || item.CaseKey == "" || ids[item.ID] || len(item.PayloadDigest) != 64 || len(item.Violations) != 0 || ((item.Cohort == "terminal" || item.Cohort == "human_decision" || item.Cohort == "fault") && !item.IndependentVerifier) {
 			return fmt.Errorf("qualification case provenance or violation gate failed")
 		}
 		ids[item.ID] = true
@@ -392,7 +392,7 @@ func validateQualificationReportPayload(payload QualificationReportPayload) erro
 		if item.ReversalOrConflict {
 			conflicts++
 		}
-		if item.Cohort == "human_decision" {
+		if item.Cohort == "human_decision" || item.HumanDecision == "agreed" || item.HumanDecision == "disagreed" {
 			human++
 			if item.HumanDecision == "agreed" {
 				agreement++
@@ -421,12 +421,29 @@ func AddQualificationSignoff(ctx context.Context, db *gorm.DB, tenant, reportID,
 	if !qualificationContains(mediaSupplyQualificationSignoffRoles, role) || actorID == "" || accessVersion == "" {
 		return models.MediaSupplyQualificationSignoff{}, fmt.Errorf("qualification signoff is invalid")
 	}
-	var report models.MediaSupplyQualificationReport
-	if err := db.WithContext(ctx).Where("public_id=? AND tenant_id=? AND state=?", reportID, tenant, "draft").First(&report).Error; err != nil {
-		return models.MediaSupplyQualificationSignoff{}, err
-	}
-	signoff := models.MediaSupplyQualificationSignoff{PublicID: uuid.New(), ReportID: report.ID, Role: role, ActorID: actorID, AccessVersion: accessVersion, ReportDigest: report.ReportDigest, SignedAt: time.Now().UTC()}
-	return signoff, db.WithContext(ctx).Create(&signoff).Error
+	var signoff models.MediaSupplyQualificationSignoff
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var report models.MediaSupplyQualificationReport
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id=? AND tenant_id=? AND state=?", reportID, tenant, "draft").First(&report).Error; err != nil {
+			return err
+		}
+		var prior []models.MediaSupplyQualificationSignoff
+		if err := tx.Where("report_id=?", report.ID).Find(&prior).Error; err != nil {
+			return err
+		}
+		for _, existing := range prior {
+			if existing.Role == role && existing.ActorID == actorID && existing.AccessVersion == accessVersion {
+				signoff = existing
+				return nil
+			}
+			if existing.Role == role || existing.ActorID == actorID {
+				return fmt.Errorf("qualification requires independent role signoffs")
+			}
+		}
+		signoff = models.MediaSupplyQualificationSignoff{PublicID: uuid.New(), ReportID: report.ID, Role: role, ActorID: actorID, AccessVersion: accessVersion, ReportDigest: report.ReportDigest, SignedAt: time.Now().UTC()}
+		return tx.Create(&signoff).Error
+	})
+	return signoff, err
 }
 
 func SealQualificationReport(ctx context.Context, db *gorm.DB, tenant, reportID string, signingKey []byte) (models.MediaSupplyQualificationReport, error) {
@@ -455,11 +472,13 @@ func SealQualificationReport(ctx context.Context, db *gorm.DB, tenant, reportID 
 		if err := tx.Where("report_id=?", report.ID).Find(&signoffs).Error; err != nil {
 			return err
 		}
+		signers := map[string]bool{}
 		for _, role := range mediaSupplyQualificationSignoffRoles {
 			valid := false
 			for _, s := range signoffs {
-				if s.Role == role && s.ActorID != "" && s.AccessVersion != "" && s.ReportDigest == report.ReportDigest {
+				if s.Role == role && s.ActorID != "" && s.AccessVersion != "" && s.ReportDigest == report.ReportDigest && !signers[s.ActorID] {
 					valid = true
+					signers[s.ActorID] = true
 				}
 			}
 			if !valid {
@@ -502,7 +521,12 @@ func PromoteQualifiedSupplyAction(ctx context.Context, db *gorm.DB, tenant, repo
 		if err := validateQualificationReportPayload(payload); err != nil {
 			return err
 		}
-		allowed, _, err := MayExecuteSupplyAction(tx, tenant, report.ActionKey)
+		versions, registered := QualificationVersions(report.ActionKey)
+		environment, build := qualificationRuntimeIdentity()
+		if !registered || report.ActionVersion != versions.ActionVersion || report.AdapterVersion != versions.AdapterVersion || report.VerifierVersion != versions.VerifierVersion || report.SchemaVersion != versions.SchemaVersion || report.PolicyVersion != versions.PolicyVersion || report.EnvironmentIdentity != environment || report.BuildIdentity != build {
+			return fmt.Errorf("qualification report no longer matches the current action/runtime version set")
+		}
+		allowed, _, err := MayExecuteAutonomousSupplyAction(tx, tenant, report.ActionKey)
 		if err != nil || !allowed {
 			return fmt.Errorf("supply action is disabled")
 		}
@@ -552,7 +576,7 @@ func RecheckSupplyActionExecutionAuthority(db *gorm.DB, request models.MediaSupp
 }
 
 func RequireActiveSupplyPromotion(db *gorm.DB, tenant, actionKey, actionVersion, adapterVersion, verifierVersion, schemaVersion, policyVersion string) (models.MediaSupplyActionPromotion, error) {
-	allowed, disabledControl, err := MayExecuteSupplyAction(db, tenant, actionKey)
+	allowed, disabledControl, err := MayExecuteAutonomousSupplyAction(db, tenant, actionKey)
 	if err != nil || !allowed {
 		if err == nil && !allowed {
 			_ = DemoteSupplyActionPromotion(context.Background(), db, tenant, actionKey, "cms:qualification-control-guard", "control_disabled:"+disabledControl, true)

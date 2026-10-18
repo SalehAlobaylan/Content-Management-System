@@ -2,9 +2,7 @@ package controllers
 
 import (
 	"content-management-system/src/economics"
-	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
-	"content-management-system/src/supply"
 	"content-management-system/src/utils"
 	"crypto/sha256"
 	"encoding/json"
@@ -454,20 +452,8 @@ func CreateInteraction(c *gin.Context) {
 				return err
 			}
 		}
-		if created && (saved.Type == models.InteractionTypeMeaningful || saved.Type == models.InteractionTypeComplete) {
-			generationID, _, active := feedcontract.ActiveGeneration(tx, contentItem.TenantID, "media")
-			var generation *uuid.UUID
-			if active {
-				generation = &generationID
-			}
-			probeKind := "anonymous"
-			if saved.UserID != nil {
-				probeKind = "authenticated"
-			}
-			// Consumer interaction remains authoritative even if the independent
-			// Supply observation path is unavailable. Supply then reports unknown
-			// exact-view evidence instead of breaking or fabricating user state.
-			_ = supply.RecordPodsBoundaryObservation(tx, models.PodsBoundaryObservation{TenantID: contentItem.TenantID, ContentItemID: contentItem.PublicID, GenerationID: generation, Boundary: "exact_view", ProbeKind: probeKind, ProbeID: saved.PublicID.String(), SourceRunRequestID: contentItem.SourceRunRequestID, Verdict: string(supply.VerdictPresent), ObservedAt: saved.CreatedAt.UTC()})
+		if created {
+			recordPodsViewBoundary(tx, contentItem, saved)
 		}
 		return nil
 	})

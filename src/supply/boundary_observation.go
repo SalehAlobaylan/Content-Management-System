@@ -33,7 +33,7 @@ func RecordPodsBoundaryObservations(db *gorm.DB, rows []models.PodsBoundaryObser
 		return nil
 	}
 	values := make([]string, 0, len(rows))
-	args := make([]any, 0, len(rows)*11)
+	args := make([]any, 0, len(rows)*12)
 	for _, row := range rows {
 		if strings.TrimSpace(row.TenantID) == "" || row.ContentItemID == uuid.Nil ||
 			!validPodsBoundaries[row.Boundary] || !validPodsProbeKinds[row.ProbeKind] ||
@@ -51,23 +51,23 @@ func RecordPodsBoundaryObservations(db *gorm.DB, rows []models.PodsBoundaryObser
 		if row.PublicID == uuid.Nil {
 			row.PublicID = uuid.New()
 		}
-		values = append(values, "(?,?,?,?,?,?,?,?,?,?,?)")
-		args = append(args, row.PublicID, row.TenantID, row.ContentItemID, row.GenerationID, row.Boundary, row.ProbeKind,
+		values = append(values, "(?,?,?,?,?,?,?,?,?,?,?,?)")
+		args = append(args, row.PublicID, row.TenantID, row.ContentItemID, row.GenerationID, row.FeedSessionID, row.Boundary, row.ProbeKind,
 			row.ProbeID, row.SourceRunRequestID, row.Verdict, row.ProvenanceDigest, row.ObservedAt.UTC())
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		inserted := []models.PodsBoundaryObservation{}
 		if err := tx.Raw(`INSERT INTO pods_boundary_observations
-   (public_id,tenant_id,content_item_id,generation_id,boundary,probe_kind,probe_id,source_run_request_row_id,verdict,provenance_digest,observed_at)
+   (public_id,tenant_id,content_item_id,generation_id,feed_session_id,boundary,probe_kind,probe_id,source_run_request_row_id,verdict,provenance_digest,observed_at)
    VALUES `+strings.Join(values, ",")+`
    ON CONFLICT (tenant_id,boundary,probe_kind,probe_id,content_item_id) DO NOTHING
-   RETURNING tenant_id,content_item_id,boundary,verdict,observed_at`, args...).Scan(&inserted).Error; err != nil {
+   RETURNING tenant_id,content_item_id,boundary,probe_kind,verdict,observed_at`, args...).Scan(&inserted).Error; err != nil {
 			return err
 		}
 		presentIDs := []uuid.UUID{}
 		tenants := []string{}
 		for _, row := range inserted {
-			if row.Verdict == string(VerdictPresent) && (row.Boundary == "feed_return" || row.Boundary == "page_render") {
+			if row.ProbeKind != "direct_probe" && row.Verdict == string(VerdictPresent) && (row.Boundary == "feed_return" || row.Boundary == "page_render") {
 				presentIDs = append(presentIDs, row.ContentItemID)
 				tenants = append(tenants, row.TenantID)
 			}
@@ -92,7 +92,7 @@ func RecordPodsBoundaryObservations(db *gorm.DB, rows []models.PodsBoundaryObser
 		}
 		deltas := map[string]*delta{}
 		for _, row := range inserted {
-			if row.Verdict != string(VerdictPresent) || (row.Boundary != "feed_return" && row.Boundary != "page_render") {
+			if row.ProbeKind == "direct_probe" || row.Verdict != string(VerdictPresent) || (row.Boundary != "feed_return" && row.Boundary != "page_render") {
 				continue
 			}
 			source, ok := sources[row.TenantID+":"+row.ContentItemID.String()]

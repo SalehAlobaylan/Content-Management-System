@@ -115,7 +115,7 @@ func pipelineAggregationStub(t *testing.T) *pipelineAggregationTestStub {
 	return stub
 }
 
-func TestPipelineAutopilotDB_QueueDepthBlocksOnlySaturatedTarget(t *testing.T) {
+func TestPipelineAutopilotDB_LegacySafeAutoKeepsQueueGuardsDiagnostic(t *testing.T) {
 	db := pipelineAutopilotTestDB(t)
 	stub := pipelineAggregationStub(t)
 	stub.setQueues([]autopilotQueueStat{{Queue: "media-queue"}, {Queue: "ai-queue", Waiting: 500}, {Queue: "aggregation-dlq"}})
@@ -142,8 +142,8 @@ func TestPipelineAutopilotDB_QueueDepthBlocksOnlySaturatedTarget(t *testing.T) {
 		t.Fatalf("run queue-depth autopilot: %v", err)
 	}
 	retries := stub.snapshotRetries()
-	if len(retries) != 1 || len(retries[0].IDs) != 1 || retries[0].IDs[0] != videoID.String() {
-		t.Fatalf("only shallow media target may dispatch, got %+v", retries)
+	if len(retries) != 0 {
+		t.Fatalf("diagnostic Pipeline must never dispatch broad retries, got %+v", retries)
 	}
 	found := false
 	for _, action := range actions {
@@ -182,7 +182,7 @@ func TestPipelineAutopilotDB_ObserveRunPersistsWithoutRetry(t *testing.T) {
 	}
 }
 
-func TestPipelineAutopilotDB_SafeAutoRetriesOnlyExplicitIDs(t *testing.T) {
+func TestPipelineAutopilotDB_LegacySafeAutoNeverResetsOrRetriesItems(t *testing.T) {
 	db := pipelineAutopilotTestDB(t)
 	stub := pipelineAggregationStub(t)
 	policy := models.DefaultPipelineAutopilotPolicy("default")
@@ -207,19 +207,14 @@ func TestPipelineAutopilotDB_SafeAutoRetriesOnlyExplicitIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run safe-auto pipeline autopilot: %v", err)
 	}
-	retries := stub.snapshotRetries()
-	if len(retries) != 1 || len(retries[0].IDs) != len(ids) || retries[0].Limit != len(ids) {
-		t.Fatalf("expected one explicit retry request for seeded ids, got %+v", retries)
+	if retries := stub.snapshotRetries(); len(retries) != 0 {
+		t.Fatalf("retired safe_auto dispatched broad retry: %+v", retries)
 	}
-	want := map[string]bool{ids[0].String(): true, ids[1].String(): true}
-	for _, id := range retries[0].IDs {
-		if !want[id] {
-			t.Fatalf("retry included unseeded id %q", id)
+	for _, id := range ids {
+		var item models.ContentItem
+		if err := db.Where("public_id=?", id).First(&item).Error; err != nil || item.Status != models.ContentStatusFailed {
+			t.Fatalf("diagnostic run reset item lifecycle: %+v %v", item, err)
 		}
-		delete(want, id)
-	}
-	if len(want) != 0 {
-		t.Fatalf("retry omitted seeded ids: %+v", want)
 	}
 }
 
@@ -362,8 +357,8 @@ func TestPipelineAutopilotDB_ObserveDoesNotConsumeRetryMemory(t *testing.T) {
 		t.Fatalf("run safe-auto pipeline autopilot: %v", err)
 	}
 	retries := stub.snapshotRetries()
-	if len(retries) != 1 || len(retries[0].IDs) != 1 || retries[0].IDs[0] != id.String() {
-		t.Fatalf("safe-auto run must retain eligibility after observe, got %+v", retries)
+	if len(retries) != 0 {
+		t.Fatalf("legacy safe_auto must remain diagnostic after Observe, got %+v", retries)
 	}
 }
 
@@ -495,8 +490,8 @@ func TestPipelineAutopilotDB_SourceCeilingBlocksOnlyCappedSource(t *testing.T) {
 		t.Fatalf("run source-ceiling autopilot: %v", err)
 	}
 	retries := stub.snapshotRetries()
-	if len(retries) != 1 || len(retries[0].IDs) != 1 || retries[0].IDs[0] != openID.String() {
-		t.Fatalf("only uncapped source may retry, got %+v", retries)
+	if len(retries) != 0 {
+		t.Fatalf("source ceilings are diagnostic and cannot authorize broad retry, got %+v", retries)
 	}
 	found := false
 	for _, action := range actions {
@@ -552,7 +547,7 @@ func TestPipelineAutopilotDB_RecoveryCooldownBlocksRetryAfterHealthFailure(t *te
 	}
 }
 
-func TestPipelineAutopilotDB_PartialBatchFailureIsolatedPerID(t *testing.T) {
+func TestPipelineAutopilotDB_LegacyRetryResponseCannotManufactureOwnerSuccess(t *testing.T) {
 	db := pipelineAutopilotTestDB(t)
 	stub := pipelineAggregationStub(t)
 	policy := models.DefaultPipelineAutopilotPolicy("default")
@@ -576,8 +571,8 @@ func TestPipelineAutopilotDB_PartialBatchFailureIsolatedPerID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run partial batch: %v", err)
 	}
-	if run.Status != models.PipelineAutopilotRunStatusPartial {
-		t.Fatalf("partial per-id failure must make run partial: %+v", run)
+	if run.Status != models.PipelineAutopilotRunStatusCompleted || run.Mode != models.PipelineAutopilotModeObserve || len(stub.snapshotRetries()) != 0 {
+		t.Fatalf("diagnostic run invoked an owner or manufactured an owner result: %+v", run)
 	}
 	states := map[uuid.UUID]string{}
 	for _, action := range actions {
@@ -585,7 +580,7 @@ func TestPipelineAutopilotDB_PartialBatchFailureIsolatedPerID(t *testing.T) {
 			states[*action.ContentItemID] = action.Status
 		}
 	}
-	if states[failingID] != models.PipelineAutopilotActionStatusError || states[succeedingID] != models.PipelineAutopilotActionStatusSuccess {
-		t.Fatalf("per-id response must isolate error and success: %+v", states)
+	if states[failingID] != models.PipelineAutopilotActionStatusWouldExecute || states[succeedingID] != models.PipelineAutopilotActionStatusWouldExecute {
+		t.Fatalf("diagnostic candidates must remain would-execute, never owner success/failure: %+v", states)
 	}
 }

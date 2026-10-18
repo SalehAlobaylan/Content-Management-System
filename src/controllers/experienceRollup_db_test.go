@@ -14,6 +14,7 @@ import (
 // PostgreSQL integration tests for the RUX rollup + retention path.
 func experienceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	t.Setenv("DEFAULT_TENANT_ID", "default")
 	db := testdb.Open(t)
 	if err := db.AutoMigrate(&models.ExperienceEvent{}, &models.ExperienceTerminalReceipt{}, &models.ExperienceRollupProgress{}, &models.ExperienceMetricRollup{}, &models.ExperiencePolicy{},
 		&models.ExperienceEvaluationRun{}, &models.ExperienceIncident{}, &models.ExperienceAction{}, &models.ExperienceSuppression{}); err != nil {

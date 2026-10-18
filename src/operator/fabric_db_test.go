@@ -276,7 +276,7 @@ func TestMediaCirculationFabricUsesBoundedPersistedCMSFacts(t *testing.T) {
 	if err := packet.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if len(packet.Facts) != 8 || len(packet.Evidence) != 8 || packet.Completeness != "complete" {
+	if len(packet.Facts) != 9 || len(packet.Evidence) != 9 || packet.Completeness != "complete" {
 		t.Fatalf("unexpected circulation packet: %+v", packet)
 	}
 	if len(packet.Recommendations) != 1 || packet.Recommendations[0].ManualOnly {
@@ -315,7 +315,7 @@ func TestMediaCirculationFabricIncludesBoundedSourceContinuityEvidence(t *testin
 	if err := db.Create(&task).Error; err != nil {
 		t.Fatal(err)
 	}
-	event := models.SourceRunReconciliationEvent{TenantID: "tenant-a", EventKey: "pods-present", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", Verdict: string(supply.VerdictPresent), EvidenceSnapshot: "snapshot", VerifierSchemaVersion: "v1", VerificationTaskID: task.PublicID, CausationID: "consumer_pods_delivery:test", ProvenanceDigest: "digest", ObservedAt: now}
+	event := models.SourceRunReconciliationEvent{TenantID: "tenant-a", EventKey: "pods-present", SourceRunRequestID: request.PublicID, ContentSourceID: source.PublicID, EffectIdentity: "pods", ScopeType: "source_run", ScopeID: request.PublicID.String(), Stage: "delivery", Verdict: string(supply.VerdictPresent), EvidenceSnapshot: "snapshot", VerifierSchemaVersion: "v1", VerificationTaskID: task.PublicID, CausationID: "consumer_pods_delivery:test", ProvenanceDigest: "digest", Payload: datatypes.JSON([]byte(`{}`)), ObservedAt: now}
 	if err := db.Create(&event).Error; err != nil {
 		t.Fatal(err)
 	}

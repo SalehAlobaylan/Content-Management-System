@@ -125,12 +125,11 @@ func observeVerificationTask(db *gorm.DB, tenantID, taskID, owner, claimToken st
 			return VerificationObservation{}, err
 		}
 	} else if unit.UnitType == "normalize_batch" {
-		// The normalizer stamps the exact execution-unit ID into CMS content
-		// metadata before upsert. This is a consumer-side fact, not a queue
-		// acknowledgement or a worker's in-memory counter.
-		if err := db.Model(&models.ContentItem{}).Where("tenant_id = ? AND content_source_id = ? AND metadata ->> ? = ?", tenantID, unit.ContentSourceID, "source_run_execution_unit_id", unit.PublicID.String()).Count(&observedContentCount).Error; err != nil {
+		expectedContentCount, observedContentCount, evidenceComplete, err = observeNormalizeBatch(db, unit)
+		if err != nil {
 			return VerificationObservation{}, err
 		}
+
 	}
 	if !isPodsDeliveryTask(task) && unit.UnitType == "coordinator" {
 		expectedContentCount, observedContentCount, evidenceComplete, err = observeCoordinatorDelivery(db, tenantID, task.SourceRunRequestID, unit.ContentSourceID)
@@ -172,7 +171,15 @@ func observeCoordinatorDelivery(db *gorm.DB, tenantID string, requestID, sourceI
 			return 0, 0, false, err
 		}
 		if len(receipts) != 1 {
-			return 0, 0, false, nil
+			_, materialized, complete, observationErr := observeNormalizeBatch(db, normalizedUnit)
+			if observationErr != nil {
+				return 0, 0, false, observationErr
+			}
+			if !complete {
+				return 0, 0, false, nil
+			}
+			expectedContentCount += materialized
+			continue
 		}
 		var terminalPayload struct {
 			CMSUpserted *int64 `json:"cms_upserted"`
@@ -267,8 +274,11 @@ func podsDeliveryIngestEventID(causationID string) (uuid.UUID, bool) {
 }
 
 func observationVerdict(unitType string, observedContentCount, expectedContentCount int64, evidenceComplete bool) (VerificationVerdict, SourceRunOutcome) {
-	if unitType == "normalize_batch" && observedContentCount > 0 {
-		return VerdictPresent, OutcomeNewItems
+	if unitType == "normalize_batch" && evidenceComplete && expectedContentCount > 0 {
+		if observedContentCount > 0 {
+			return VerdictPresent, OutcomeNewItems
+		}
+		return VerdictPresent, OutcomeNoChange
 	}
 	if (unitType == "coordinator" || unitType == "pods_delivery") && evidenceComplete && observedContentCount == expectedContentCount {
 		if expectedContentCount == 0 {
@@ -280,8 +290,8 @@ func observationVerdict(unitType string, observedContentCount, expectedContentCo
 }
 
 func observationReason(unitType string, observedContentCount, expectedContentCount int64, evidenceComplete bool, terminalReceiptCount int64) string {
-	if unitType == "normalize_batch" && observedContentCount > 0 {
-		return "CMS has consumer-side content linked to this exact normalization unit"
+	if unitType == "normalize_batch" && evidenceComplete && expectedContentCount > 0 {
+		return "CMS has terminal dispositions for every frozen normalization input"
 	}
 	if (unitType == "coordinator" || unitType == "pods_delivery") && !evidenceComplete {
 		return "CMS cannot establish the expected downstream count from the immutable normalization evidence"

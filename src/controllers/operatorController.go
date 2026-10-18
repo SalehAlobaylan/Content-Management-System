@@ -1705,13 +1705,15 @@ func executeRegisteredOperatorPlan(ctx context.Context, db *gorm.DB, tenantID st
 			return false, nil, map[string]any{"error_class": "invalid_supply_episode"}, nil
 		}
 		before := map[string]any{"schema_version": "operator-supply-handoff/v1", "episode_id": episodeID, "action_key": toolKey, "native_action_queued": false}
-		request, err := queueOperatorMediaSupplyRecovery(db, tenantID, access.UserID, access, toolKey, episodeID)
+		request, err := queueOperatorMediaSupplyRecovery(db, tenantID, access.UserID, access, toolKey, episodeID, plan, step)
 		if err != nil {
 			return false, before, map[string]any{"error_class": "native_supply_handoff_failed"}, nil
 		}
 		after := map[string]any{"schema_version": "operator-supply-handoff/v1", "episode_id": episodeID, "action_key": toolKey, "native_action_id": request.PublicID, "native_action_state": request.State}
-		verified := map[string]any{"signed_native_action_queued": request.State == models.MediaSupplyActionRequestQueued, "native_action_id": request.PublicID, "affected_domains": request.AffectedDomains, "affected_subjects": request.AffectedSubjects, "deep_links": request.DeepLinks}
-		return request.State == models.MediaSupplyActionRequestQueued, before, after, verified
+		after["waiting_for_native_action"] = true
+		// Handoff acceptance is progress, not terminal repair proof. The exact
+		// native action monitor completes the signed plan after owner verification.
+		return false, before, after, nil
 	case "feed_integrity.pause.24h", "real_experience.pause.24h", "retention.pause.24h", "ai_economics.pause.24h", "news_circulation.pause.24h", "media_circulation.pause.24h", "redundancy.pause.24h", "pipeline.pause.24h", "enrichment.pause.24h", "embeddings.pause_campaigns.24h", "topics_preferences.pause.24h", "media_library.pause.24h":
 		return executeOperatorDomainPausePlan(ctx, db, tenantID, toolKey, canonical)
 	case "sources.pause", "sources.resume", "media_sources.pause", "media_sources.resume":

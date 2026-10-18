@@ -13,6 +13,7 @@ type PodsBoundaryObservation struct {
 	TenantID           string     `gorm:"column:tenant_id;type:varchar(64);not null;index" json:"tenant_id"`
 	ContentItemID      uuid.UUID  `gorm:"column:content_item_id;type:uuid;not null;index" json:"content_item_id"`
 	GenerationID       *uuid.UUID `gorm:"column:generation_id;type:uuid;index" json:"generation_id,omitempty"`
+	FeedSessionID      *uuid.UUID `gorm:"column:feed_session_id;type:uuid" json:"feed_session_id,omitempty"`
 	Boundary           string     `gorm:"column:boundary;type:varchar(24);not null;index" json:"boundary"`
 	ProbeKind          string     `gorm:"column:probe_kind;type:varchar(24);not null" json:"probe_kind"`
 	ProbeID            string     `gorm:"column:probe_id;type:varchar(160);not null" json:"probe_id"`

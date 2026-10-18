@@ -48,19 +48,20 @@ func InternalAuthorizeSourceRunUnit(c *gin.Context) {
 		return
 	}
 	var body struct {
-		TenantID     string `json:"tenant_id"`
-		ParentUnitID string `json:"parent_unit_id"`
-		UnitType     string `json:"unit_type"`
-		UnitKey      string `json:"unit_key"`
-		PageID       string `json:"page_id"`
-		BatchID      string `json:"batch_id"`
+		TenantID        string                  `json:"tenant_id"`
+		ParentUnitID    string                  `json:"parent_unit_id"`
+		UnitType        string                  `json:"unit_type"`
+		UnitKey         string                  `json:"unit_key"`
+		PageID          string                  `json:"page_id"`
+		BatchID         string                  `json:"batch_id"`
+		NormalizeInputs []supply.NormalizeInput `json:"normalization_inputs"`
 	}
 	if err := decodeStrictJSON(c, &body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid source-run unit authorization"})
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	unit, created, err := supply.AuthorizeChildUnit(db, supply.ChildUnitInput{TenantID: strings.TrimSpace(body.TenantID), RequestID: c.Param("request"), AttemptID: c.Param("attempt"), ParentUnitID: strings.TrimSpace(body.ParentUnitID), UnitType: strings.TrimSpace(body.UnitType), UnitKey: strings.TrimSpace(body.UnitKey), PageID: strings.TrimSpace(body.PageID), BatchID: strings.TrimSpace(body.BatchID)})
+	unit, created, err := supply.AuthorizeChildUnit(db, supply.ChildUnitInput{TenantID: strings.TrimSpace(body.TenantID), RequestID: c.Param("request"), AttemptID: c.Param("attempt"), ParentUnitID: strings.TrimSpace(body.ParentUnitID), UnitType: strings.TrimSpace(body.UnitType), UnitKey: strings.TrimSpace(body.UnitKey), PageID: strings.TrimSpace(body.PageID), BatchID: strings.TrimSpace(body.BatchID), NormalizeInputs: body.NormalizeInputs})
 	if err != nil {
 		writeSourceRunContractError(c, err)
 		return

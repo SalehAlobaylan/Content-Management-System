@@ -252,6 +252,22 @@ func RecordUpstreamObservationDisposition(db *gorm.DB, input MaterializeUpstream
 		if observation.UpstreamItemID != input.UpstreamItemID {
 			return fmt.Errorf("upstream observation does not match the normalized item")
 		}
+		if unit.NormalizeInputDigest != "" {
+			var expected []NormalizeInput
+			if err := json.Unmarshal(unit.NormalizeInputs, &expected); err != nil {
+				return err
+			}
+			matched := false
+			for _, candidate := range expected {
+				if candidate.ObservationID == observation.PublicID.String() && candidate.UpstreamItemID == observation.UpstreamItemID && candidate.Fingerprint == observation.UpstreamFingerprint {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("upstream disposition is outside the frozen normalization cohort")
+			}
+		}
 		if request.Purpose == "deferred_drain" {
 			var reservations int64
 			if err := tx.Model(&models.SourceUpstreamObservationEvent{}).

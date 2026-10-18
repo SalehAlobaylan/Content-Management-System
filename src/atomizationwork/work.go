@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -26,6 +27,8 @@ const (
 	maxAttempts          = 2
 )
 
+var errCandidateChanged = errors.New("atomization candidate changed")
+
 type Claim struct {
 	Request models.AtomizationWorkRequest `json:"request"`
 	Attempt models.AtomizationWorkAttempt `json:"attempt"`
@@ -38,7 +41,7 @@ func Candidate(db *gorm.DB, tenant string, parentID uuid.UUID) (models.ContentIt
 		return parent, models.Transcript{}, models.MediaAtomizationPolicy{}, "", err
 	}
 	if parent.DurationSec == nil || *parent.DurationSec <= 2400 || parent.TranscriptID == nil || parent.Status == models.ContentStatusArchived {
-		return parent, models.Transcript{}, models.MediaAtomizationPolicy{}, "", fmt.Errorf("parent is not atomization eligible")
+		return parent, models.Transcript{}, models.MediaAtomizationPolicy{}, "", fmt.Errorf("parent is not atomization eligible: %w", errCandidateChanged)
 	}
 	var transcript models.Transcript
 	if err := db.Where("public_id = ? AND content_item_id = ?", *parent.TranscriptID, parent.PublicID).First(&transcript).Error; err != nil {
@@ -46,10 +49,10 @@ func Candidate(db *gorm.DB, tenant string, parentID uuid.UUID) (models.ContentIt
 	}
 	var policy models.MediaAtomizationPolicy
 	if err := db.Where("tenant_id = ?", tenant).First(&policy).Error; err != nil {
-		return parent, transcript, policy, "", fmt.Errorf("atomization policy is unavailable")
+		return parent, transcript, policy, "", fmt.Errorf("atomization policy is unavailable: %w", err)
 	}
 	if !policy.ChapteringEnabled {
-		return parent, transcript, policy, "", fmt.Errorf("atomization is disabled by tenant policy")
+		return parent, transcript, policy, "", fmt.Errorf("atomization is disabled by tenant policy: %w", errCandidateChanged)
 	}
 	policyBytes, _ := json.Marshal(policy)
 	transcriptHash := digest("transcript/v1", transcript.PublicID.String(), transcript.FullText, transcript.CreatedAt.UTC().Format(time.RFC3339Nano))
@@ -88,10 +91,15 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	var claim Claim
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var candidates []models.AtomizationWorkRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ? AND (not_before_at IS NULL OR not_before_at <= ?)", "queued", now).Order("created_at").Limit(16).Find(&candidates).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ? AND (not_before_at IS NULL OR not_before_at <= ?)", "queued", now).Order("updated_at ASC, created_at ASC, public_id ASC").Limit(16).Find(&candidates).Error; err != nil {
 			return err
 		}
 		for _, request := range candidates {
+			// Rotate this bounded review window even when a subtractive control or
+			// transient dependency prevents a claim. Other tenants must still progress.
+			if err := tx.Model(&request).UpdateColumn("updated_at", now).Error; err != nil {
+				return err
+			}
 			allowed, _, err := supply.MayExecuteSupplyAction(tx, request.TenantID, supply.SupplyActionAtomizationExecuteExactParent)
 			if err != nil {
 				return err
@@ -100,6 +108,22 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 				continue
 			}
 			parent, transcript, _, fingerprint, err := Candidate(tx, request.TenantID, request.ParentContentItemID)
+			if err != nil || fingerprint != request.InputFingerprint || transcript.PublicID != request.TranscriptID || !parent.UpdatedAt.Equal(request.ParentUpdatedAt) {
+				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && !errors.Is(err, errCandidateChanged) {
+					return err
+				}
+				proof := jsonValue(map[string]any{"verified": "preflight_changed", "reason": "atomization_input_changed"})
+				if updateErr := tx.Model(&request).Updates(map[string]any{"state": "failed", "terminal_proof": proof, "finished_at": now}).Error; updateErr != nil {
+					return updateErr
+				}
+				if updateErr := failAction(tx, request, proof, "atomization_input_changed", now); updateErr != nil {
+					return updateErr
+				}
+				if updateErr := event(tx, request, "preflight_changed", map[string]any{"reason": "atomization_input_changed"}); updateErr != nil {
+					return updateErr
+				}
+				continue
+			}
 			if err == nil {
 				if lifecycleErr := checkAtomizationLifecycle(tx, parent); lifecycleErr != nil {
 					if lifecycle.IsConflict(lifecycleErr) || lifecycle.IsIntakePaused(lifecycleErr) {
@@ -114,9 +138,6 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 				if !admitted {
 					continue
 				}
-			}
-			if err != nil || fingerprint != request.InputFingerprint || transcript.PublicID != request.TranscriptID || !parent.UpdatedAt.Equal(request.ParentUpdatedAt) {
-				continue
 			}
 			var attempts int64
 			// Capacity deferrals happen before a new media effect and therefore

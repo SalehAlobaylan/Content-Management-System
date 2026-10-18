@@ -28,6 +28,7 @@ const (
 type ChildUnitInput struct {
 	TenantID, RequestID, AttemptID, ParentUnitID string
 	UnitType, UnitKey, PageID, BatchID           string
+	NormalizeInputs                              []NormalizeInput
 }
 
 func (input ChildUnitInput) validate() error {
@@ -45,6 +46,9 @@ func (input ChildUnitInput) validate() error {
 			return fmt.Errorf("fetch-page unit requires only a page ID")
 		}
 	case "normalize_batch":
+		if _, _, err := canonicalNormalizeInputs(input.NormalizeInputs); err != nil {
+			return err
+		}
 		if strings.TrimSpace(input.PageID) == "" || strings.TrimSpace(input.BatchID) == "" {
 			return fmt.Errorf("normalize-batch unit requires page and batch IDs")
 		}
@@ -76,6 +80,14 @@ func AuthorizeChildUnit(db *gorm.DB, input ChildUnitInput) (models.SourceRunExec
 	if err != nil {
 		return models.SourceRunExecutionUnit{}, false, fmt.Errorf("source-run parent execution-unit ID is invalid")
 	}
+	cohort := datatypes.JSON([]byte(`[]`))
+	var cohortDigest string
+	if input.UnitType == "normalize_batch" {
+		cohort, cohortDigest, err = canonicalNormalizeInputs(input.NormalizeInputs)
+		if err != nil {
+			return models.SourceRunExecutionUnit{}, false, err
+		}
+	}
 	var unit models.SourceRunExecutionUnit
 	created := false
 	err = db.Transaction(func(tx *gorm.DB) error {
@@ -104,12 +116,30 @@ func AuthorizeChildUnit(db *gorm.DB, input ChildUnitInput) (models.SourceRunExec
 			return fmt.Errorf("source-run manifest edge %s -> %s is not admitted", parent.UnitType, input.UnitType)
 		}
 		if err := tx.Where("tenant_id = ? AND source_run_attempt_id = ? AND unit_key = ?", input.TenantID, attemptID, input.UnitKey).First(&unit).Error; err == nil {
-			if unit.ParentUnitID == nil || *unit.ParentUnitID != parentID || unit.UnitType != input.UnitType || unit.PageID != input.PageID || unit.BatchID != input.BatchID {
+			if unit.ParentUnitID == nil || *unit.ParentUnitID != parentID || unit.UnitType != input.UnitType || unit.PageID != input.PageID || unit.BatchID != input.BatchID || unit.NormalizeInputDigest != cohortDigest {
 				return fmt.Errorf("source-run child unit idempotency key conflicts with its immutable identity")
 			}
 			return nil
 		} else if err != gorm.ErrRecordNotFound {
 			return err
+		}
+		if input.UnitType == "normalize_batch" {
+			for _, expected := range input.NormalizeInputs {
+				if expected.ObservationID == "" {
+					continue
+				} // legacy/unsupported observation stays unverifiable
+				var observation models.SourceUpstreamObservation
+				if err := tx.Where("tenant_id=? AND public_id=? AND content_source_id=? AND upstream_item_id=? AND upstream_fingerprint=?", input.TenantID, expected.ObservationID, request.ContentSourceID, expected.UpstreamItemID, expected.Fingerprint).First(&observation).Error; err != nil {
+					return fmt.Errorf("normalization input observation does not match its frozen source identity: %w", err)
+				}
+				if request.Purpose == "deferred_drain" {
+					if !requestMetadataContainsObservation(request.Metadata, expected.ObservationID) {
+						return fmt.Errorf("normalization input is not reserved by this replay request")
+					}
+				} else if observation.SourceRunRequestID == nil || *observation.SourceRunRequestID != requestID || observation.ProviderPageID != input.PageID {
+					return fmt.Errorf("normalization input does not belong to the authorized provider page")
+				}
+			}
 		}
 		unitID := uuid.New()
 		jobID, err := DeterministicUnitJobID(input.TenantID, requestID.String(), attemptID.String(), unitID.String(), attempt.FenceToken.String())
@@ -119,7 +149,7 @@ func AuthorizeChildUnit(db *gorm.DB, input ChildUnitInput) (models.SourceRunExec
 		unit = models.SourceRunExecutionUnit{
 			PublicID: unitID, TenantID: input.TenantID, SourceRunRequestID: requestID, SourceRunAttemptID: attemptID,
 			ContentSourceID: request.ContentSourceID, ParentUnitID: &parentID, UnitType: input.UnitType, UnitKey: input.UnitKey,
-			PageID: input.PageID, BatchID: input.BatchID, JobID: jobID, AttemptFenceToken: attempt.FenceToken, State: string(UnitAuthorized),
+			PageID: input.PageID, BatchID: input.BatchID, NormalizeInputs: cohort, NormalizeInputDigest: cohortDigest, JobID: jobID, AttemptFenceToken: attempt.FenceToken, State: string(UnitAuthorized),
 		}
 		if err := tx.Create(&unit).Error; err != nil {
 			return err
@@ -891,6 +921,10 @@ func finalizeSealedCoordinator(db *gorm.DB, tenantID string, requestID uuid.UUID
 			state, outcome = UnitFailed, OutcomeProviderFailed
 		case RequestCancelled:
 			state, outcome = UnitCancelled, OutcomeCancelled
+		case RequestExpired:
+			state, outcome = UnitExpired, OutcomeUnknown
+		case RequestBlocked:
+			state, outcome = UnitFailed, OutcomeConfigurationBlocked
 		case RequestPartial:
 			// Unit states deliberately have no synthetic "partial" value. A
 			// failed coordinator plus its successful children produces the
@@ -948,37 +982,49 @@ func aggregateUnitStates(units []models.SourceRunExecutionUnit) (AttemptState, R
 	if len(units) == 0 {
 		return AttemptVerificationRequired, RequestVerificationRequired, false
 	}
-	var succeeded, failed, cancelled, pending int
+	counts := map[RequestState]int{}
+	pending := false
 	for _, unit := range units {
-		switch ExecutionUnitState(unit.State) {
-		case UnitSucceeded:
-			succeeded++
-		case UnitFailed, UnitExpired:
-			failed++
-		case UnitCancelled:
-			cancelled++
-		case UnitVerificationRequired:
+		if ExecutionUnitState(unit.State) == UnitVerificationRequired {
 			return AttemptVerificationRequired, RequestVerificationRequired, false
-		default:
-			pending++
 		}
+		if !IsTerminalUnit(ExecutionUnitState(unit.State)) {
+			pending = true
+			continue
+		}
+		category, known := TerminalCategoryForOutcome(SourceRunOutcome(unit.TerminalOutcome))
+		// Expiry and cancellation carry lifecycle proof independently of a producer receipt.
+		if unit.State == string(UnitExpired) {
+			category, known = RequestExpired, true
+		}
+		if unit.State == string(UnitCancelled) {
+			category, known = RequestCancelled, true
+		}
+		if !known || category == RequestVerificationRequired {
+			return AttemptVerificationRequired, RequestVerificationRequired, false
+		}
+		counts[category]++
 	}
-	if pending > 0 {
+	if pending {
 		return AttemptRunning, RequestRunning, false
 	}
-	if failed > 0 && succeeded > 0 {
-		return AttemptPartial, RequestPartial, true
+	category := RequestSucceeded
+	if counts[RequestPartial] > 0 {
+		category = RequestPartial
+	} else if counts[RequestFailed]+counts[RequestCancelled]+counts[RequestExpired]+counts[RequestBlocked] > 0 {
+		if counts[RequestSucceeded] > 0 {
+			category = RequestPartial
+		} else if counts[RequestFailed] > 0 {
+			category = RequestFailed
+		} else if counts[RequestBlocked] > 0 {
+			category = RequestBlocked
+		} else if counts[RequestExpired] > 0 {
+			category = RequestExpired
+		} else {
+			category = RequestCancelled
+		}
 	}
-	if failed > 0 {
-		return AttemptFailed, RequestFailed, true
-	}
-	if cancelled > 0 && succeeded == 0 {
-		return AttemptCancelled, RequestCancelled, true
-	}
-	if cancelled > 0 {
-		return AttemptPartial, RequestPartial, true
-	}
-	return AttemptSucceeded, RequestSucceeded, true
+	return AttemptState(category), category, true
 }
 
 func validateCurrentUnitLease(unit models.SourceRunExecutionUnit, owner string, token uuid.UUID, now time.Time) error {

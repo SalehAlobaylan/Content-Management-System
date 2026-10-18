@@ -201,10 +201,15 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	var claim Claim
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var queued []models.ArtifactCoverageRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("owner=? AND state=?", owner, "queued").Order("created_at").Limit(16).Find(&queued).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("owner=? AND state=?", owner, "queued").Order("updated_at ASC, created_at ASC, public_id ASC").Limit(16).Find(&queued).Error; err != nil {
 			return err
 		}
 		for _, r := range queued {
+			// Rotate this bounded review window even when a subtractive control or
+			// transient dependency prevents a claim. Other tenants must still progress.
+			if err := tx.Model(&r).UpdateColumn("updated_at", now).Error; err != nil {
+				return err
+			}
 			d, ok := DescriptorForArtifact(r.Artifact)
 			if !ok || d.Owner != owner {
 				continue
@@ -225,6 +230,12 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			}
 			var item models.ContentItem
 			if e = tx.Where("public_id=? AND tenant_id=? AND updated_at=?", r.ContentItemID, r.TenantID, r.ItemUpdatedAt).First(&item).Error; e != nil {
+				if e != gorm.ErrRecordNotFound {
+					return e
+				}
+				if e = failStaleQueuedArtifact(tx, r, "artifact_input_changed", now); e != nil {
+					return e
+				}
 				continue
 			}
 			if e = checkArtifactLifecycle(tx, item); e != nil {
@@ -235,6 +246,11 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 			}
 			missing, e := Missing(item, r.Artifact)
 			if e != nil || !missing {
+				if e == nil {
+					if e = failStaleQueuedArtifact(tx, r, "artifact_already_present", now); e != nil {
+						return e
+					}
+				}
 				continue
 			}
 			var count int64
@@ -918,3 +934,18 @@ func digest(values ...string) string {
 	return hex.EncodeToString(h[:])
 }
 func jsonValue(v any) datatypes.JSON { b, _ := json.Marshal(v); return datatypes.JSON(b) }
+
+// Stale unstarted input is a terminal preflight result, never an owner failure.
+func failStaleQueuedArtifact(tx *gorm.DB, request models.ArtifactCoverageRequest, reason string, now time.Time) error {
+	proof := jsonValue(map[string]any{"evidence": "preflight_changed", "reason": reason, "verified_at": now.Format(time.RFC3339Nano)})
+	if err := tx.Model(&request).Updates(map[string]any{"state": "failed", "failure_class": reason, "terminal_proof": proof, "finished_at": now}).Error; err != nil {
+		return err
+	}
+	if err := settleArtifactBudget(tx, request, "released"); err != nil {
+		return err
+	}
+	if err := terminalizeLinkedAction(tx, request, false, proof, reason); err != nil {
+		return err
+	}
+	return appendEvent(tx, request, nil, "preflight_changed", map[string]any{"reason": reason})
+}

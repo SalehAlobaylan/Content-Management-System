@@ -158,7 +158,7 @@ func TestSourceRunDBInvalidSealedEmptyManifestConvergesTerminally(t *testing.T) 
 	if err := db.Where("public_id=?", lease.RootExecutionUnit.PublicID).First(&observedUnit).Error; err != nil {
 		t.Fatal(err)
 	}
-	if observedRequest.State != string(RequestFailed) || observedUnit.State != string(UnitExpired) {
+	if observedRequest.State != string(RequestExpired) || observedUnit.State != string(UnitExpired) {
 		t.Fatalf("invalid sealed manifest did not converge: request=%s unit=%s", observedRequest.State, observedUnit.State)
 	}
 }

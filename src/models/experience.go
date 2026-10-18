@@ -114,6 +114,7 @@ type ExperienceEvent struct {
 	JourneyID      *uuid.UUID `gorm:"type:uuid" json:"journey_id,omitempty"`
 	Release        string     `gorm:"type:varchar(80);not null" json:"release"`
 	ContentID      *uuid.UUID `gorm:"type:uuid" json:"content_id,omitempty"`
+	FeedSessionID  *uuid.UUID `gorm:"type:uuid" json:"feed_session_id,omitempty"`
 	StoryID        *uuid.UUID `gorm:"type:uuid" json:"story_id,omitempty"`
 	PlaybackType   *string    `gorm:"type:varchar(16)" json:"playback_type,omitempty"`
 	Locale         *string    `gorm:"type:varchar(16)" json:"locale,omitempty"`

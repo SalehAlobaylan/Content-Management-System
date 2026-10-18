@@ -69,7 +69,6 @@ func runStudioClearanceWorker(db *gorm.DB) {
 		return
 	} else if verified {
 		studioClearanceHeartbeat.Store(time.Now().UTC().UnixNano())
-		return
 	}
 	claim, found, err := claimOneStudioClearance(db)
 	studioClearanceHeartbeat.Store(time.Now().UTC().UnixNano())
@@ -90,10 +89,15 @@ func claimOneStudioClearance(db *gorm.DB) (studioClearanceClaim, bool, error) {
 	now := time.Now().UTC()
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var rows []models.StudioClearanceRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state=?", "queued").Order("created_at").Limit(16).Find(&rows).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state=?", "queued").Order("updated_at ASC, created_at ASC, public_id ASC").Limit(16).Find(&rows).Error; err != nil {
 			return err
 		}
 		for _, request := range rows {
+			// Rotate this bounded review window even when a subtractive control or
+			// transient dependency prevents a claim. Other tenants must still progress.
+			if err := tx.Model(&request).UpdateColumn("updated_at", now).Error; err != nil {
+				return err
+			}
 			allowed, _, err := supply.MayExecuteSupplyAction(tx, request.TenantID, supply.SupplyActionStudioClearExactChildren)
 			if err != nil {
 				return err
@@ -108,8 +112,8 @@ func claimOneStudioClearance(db *gorm.DB) (studioClearanceClaim, bool, error) {
 			if studioChildSetDigest(ids) != request.ChildSetDigest {
 				continue
 			}
-			var childItems []models.ContentItem
-			if err := tx.Where("tenant_id=? AND public_id IN ?", request.TenantID, ids).Find(&childItems).Error; err != nil {
+			childItems, err := loadStudioChildItems(tx, request.TenantID, ids)
+			if err != nil {
 				return err
 			}
 			if len(childItems) != len(ids) {
@@ -308,7 +312,7 @@ func clearExactStudioChild(db *gorm.DB, tenant string, childID uuid.UUID, policy
 
 func exactStudioChildIDs(db *gorm.DB, request models.StudioClearanceRequest) ([]uuid.UUID, error) {
 	var raw []string
-	if err := json.Unmarshal(request.ChildIDs, &raw); err != nil || len(raw) == 0 || len(raw) > 64 {
+	if err := json.Unmarshal(request.ChildIDs, &raw); err != nil || len(raw) == 0 {
 		return nil, fmt.Errorf("studio clearance child set is invalid")
 	}
 	var atomization models.AtomizationWorkRequest
@@ -322,12 +326,21 @@ func exactStudioChildIDs(db *gorm.DB, request models.StudioClearanceRequest) ([]
 		if err != nil || seen[id] {
 			return nil, fmt.Errorf("studio clearance child identity is invalid")
 		}
-		var count int64
-		if err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id=? AND parent_content_item_id=?", request.TenantID, id, atomization.ParentContentItemID).Count(&count).Error; err != nil || count != 1 {
-			return nil, fmt.Errorf("studio clearance child escaped its atomization result")
-		}
 		seen[id] = true
 		ids = append(ids, id)
+	}
+	const pageSize = 100
+	for start := 0; start < len(ids); start += pageSize {
+		end := start + pageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var count int64
+		if err := db.Model(&models.ContentItem{}).Where("tenant_id=? AND public_id IN ? AND parent_content_item_id=?", request.TenantID, ids[start:end], atomization.ParentContentItemID).Count(&count).Error; err != nil {
+			return nil, err
+		} else if count != int64(end-start) {
+			return nil, fmt.Errorf("studio clearance child escaped its atomization result")
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i].String() < ids[j].String() })
 	return ids, nil
@@ -492,4 +505,20 @@ func appendStudioClearanceEvent(tx *gorm.DB, request models.StudioClearanceReque
 	}
 	bytes, _ := json.Marshal(payload)
 	return tx.Create(&models.StudioClearanceEvent{PublicID: uuid.New(), TenantID: request.TenantID, RequestID: request.PublicID, Sequence: sequence + 1, EventType: kind, Payload: datatypes.JSON(bytes), OccurredAt: time.Now().UTC()}).Error
+}
+
+func loadStudioChildItems(db *gorm.DB, tenant string, ids []uuid.UUID) ([]models.ContentItem, error) {
+	items := make([]models.ContentItem, 0, len(ids))
+	for start := 0; start < len(ids); start += 100 {
+		end := start + 100
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var page []models.ContentItem
+		if err := db.Where("tenant_id=? AND public_id IN ?", tenant, ids[start:end]).Find(&page).Error; err != nil {
+			return nil, err
+		}
+		items = append(items, page...)
+	}
+	return items, nil
 }

@@ -20,7 +20,10 @@ type LocalMigrationPolicy struct{ Checksum, WorkScope string }
 // Maintainer policy, not an operator setting. Each entry records review of the
 // exact canonical SQL bytes; it does not approve execution or destructive SQL.
 var localMigrationPolicies = map[string]LocalMigrationPolicy{
+	"20261018020000_supply_owner_recovery.sql":                       {"bbfe3d0612715cd63e7fc872e728877fa6b64c80cfb185ac33e0b90dcd1b94ab", PreservesExpiredProcessingHistory},
+	"20261018030000_supply_consumer_evidence.sql":                    {"7e632a9404f76bc65978906a8684d4c268479f61627cdd6de54f6b6071f47e5f", PreservesExpiredProcessingHistory},
 	"20261017030000_ai_provider_cache_pricing.sql":                   {"812a7e11267e685b4a68d975a5e22c80ccf0a69ec73c882c15f4b97fcdb37ff6", PreservesExpiredProcessingHistory},
+	"20261018010000_source_run_completion_evidence.sql":              {"1c93760e49dec17db07210098c351de4c7283bbc130f368de7f43bf5130b3536", PreservesExpiredProcessingHistory},
 	"20261017020000_economics_resumable_projection.sql":              {"eabb4063cb1481c98545971263a3ede56788eb60839c8abb0f41055d0944c788", PreservesExpiredProcessingHistory},
 	"20261017010000_economics_signed_invoices.sql":                   {"966d4d8983cb4d69d52f53e399376fe5371f9d0223a324392fb67cc2f3101f4c", PreservesExpiredProcessingHistory},
 	"20261016010000_platform_user_economics.sql":                     {"92eaab9cdae375fca0ec3f77fe998a3e5d375abdfd3b08c9d8cd8602d262dcd1", PreservesExpiredProcessingHistory},

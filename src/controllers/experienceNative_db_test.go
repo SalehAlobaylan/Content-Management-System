@@ -104,7 +104,8 @@ func TestExperienceNativeHTTPAdmissionBindsClaimsAndCannotUseWebTrust(t *testing
 	db := experienceTestDB(t)
 	t.Setenv("RUX_INGEST_TOKEN", "private-fixture-key")
 	t.Setenv("WAHB_RUNTIME_ID", "native-fixture-launch")
-	policy := models.DefaultExperiencePolicy(ruxDefaultTenant)
+	t.Setenv("DEFAULT_TENANT_ID", "native-tenant")
+	policy := models.DefaultExperiencePolicy("native-tenant")
 	policy.EnabledClients = "web,ios,android"
 	policy.IngestEnabled = true
 	if err := db.Create(&policy).Error; err != nil {

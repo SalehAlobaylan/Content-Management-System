@@ -535,9 +535,16 @@ func operatorSupplyEligibleCandidate(db *gorm.DB, tenantID string, episodeID uui
 // queueOperatorMediaSupplyRecovery converts one already-approved Operator plan
 // into the same native Supply preview/approval ledger used by the cockpit. The
 // episode is the only plan target; CMS re-derives the native item/run target.
-func queueOperatorMediaSupplyRecovery(db *gorm.DB, tenantID, actorID string, access operatorpkg.AccessSnapshot, actionKey string, episodeID uuid.UUID) (models.MediaSupplyActionRequest, error) {
+func queueOperatorMediaSupplyRecovery(db *gorm.DB, tenantID, actorID string, access operatorpkg.AccessSnapshot, actionKey string, episodeID uuid.UUID, plan models.OperatorActionPlan, step models.OperatorActionStep) (models.MediaSupplyActionRequest, error) {
 	if err := supply.ValidateSupplyActionApprovalSnapshot(access, actorID, tenantID); err != nil {
 		return models.MediaSupplyActionRequest{}, err
+	}
+	// A retry after commit adopts exactly the same native action, including its terminal outcome.
+	var existing models.MediaSupplyActionRequest
+	if err := db.Where("tenant_id=? AND operator_plan_id=? AND operator_step_id=?", tenantID, plan.PublicID, step.PublicID).First(&existing).Error; err == nil {
+		return existing, nil
+	} else if err != gorm.ErrRecordNotFound {
+		return existing, err
 	}
 	accessVersion := access.AccessVersion
 	candidate, targetID, err := operatorSupplyEligibleCandidate(db, tenantID, episodeID, actionKey)
@@ -558,6 +565,14 @@ func queueOperatorMediaSupplyRecovery(db *gorm.DB, tenantID, actorID string, acc
 	}
 	var request models.MediaSupplyActionRequest
 	err = db.Transaction(func(tx *gorm.DB) error {
+		var current models.OperatorActionPlan
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=? AND tenant_id=? AND state=? AND claim_token=? AND claim_expires_at>?", plan.ID, tenantID, "running", plan.ClaimToken, time.Now().UTC()).First(&current).Error; err != nil {
+			return err
+		}
+		var currentStep models.OperatorActionStep
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id=? AND plan_id=? AND tenant_id=? AND state=? AND claim_token=?", step.ID, plan.ID, tenantID, "running", plan.ClaimToken).First(&currentStep).Error; err != nil {
+			return err
+		}
 		var lockedPreview models.MediaSupplyActionPreview
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", preview.PublicID, tenantID).First(&lockedPreview).Error; err != nil {
 			return err
@@ -571,7 +586,14 @@ func queueOperatorMediaSupplyRecovery(db *gorm.DB, tenantID, actorID string, acc
 		if approveErr != nil || !created {
 			return approveErr
 		}
-		return initializeApprovedMediaSupplyAction(tx, request)
+		if err := tx.Model(&request).Updates(map[string]any{"operator_plan_id": plan.PublicID, "operator_step_id": step.PublicID, "episode_id": episodeID}).Error; err != nil {
+			return err
+		}
+		request.OperatorPlanID, request.OperatorStepID, request.EpisodeID = &plan.PublicID, &step.PublicID, &episodeID
+		if err := initializeApprovedMediaSupplyAction(tx, request); err != nil {
+			return err
+		}
+		return waitOperatorSupplyHandoff(tx, current, currentStep, request)
 	})
 	if err != nil {
 		return models.MediaSupplyActionRequest{}, err
@@ -742,4 +764,52 @@ func ListMediaSupplyActionEvents(c *gin.Context) {
 		next = events[len(events)-1].Sequence
 	}
 	c.JSON(http.StatusOK, gin.H{"id": request.PublicID, "state": request.State, "events": events, "next_sequence": next})
+}
+
+// ListMediaSupplyEpisodeActionHistory is a durable tenant-scoped lifecycle
+// read. Older requests are joined through their immutable preview evidence.
+func ListMediaSupplyEpisodeActionHistory(c *gin.Context) {
+	principal, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	episodeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Supply episode"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB)
+	var episode models.MediaSupplyEpisode
+	if err := db.Where("public_id=? AND tenant_id=?", episodeID, principal.TenantID).First(&episode).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"message": "Supply episode not found"})
+		return
+	}
+	limit, err := mediaSupplyPageLimit(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+	query := db.Model(&models.MediaSupplyActionRequest{}).Where("media_supply_action_requests.tenant_id=?", principal.TenantID).Where("episode_id=? OR (episode_id IS NULL AND EXISTS (SELECT 1 FROM media_supply_action_previews p WHERE p.public_id=media_supply_action_requests.preview_id AND p.tenant_id=media_supply_action_requests.tenant_id AND p.preflight_evidence->>'episode_id'=?))", episodeID, episodeID.String())
+	if raw := c.Query("cursor"); raw != "" {
+		cursor, err := decodeMediaSupplyCursor(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Supply action cursor"})
+			return
+		}
+		query = query.Where("(created_at,public_id)<(?,?)", cursor.At, cursor.ID)
+	}
+	rows := make([]models.MediaSupplyActionRequest, 0)
+	if err := query.Order("created_at DESC, public_id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Supply action history is unavailable"})
+		return
+	}
+	next := ""
+	if len(rows) > limit {
+		next = encodeMediaSupplyCursor(rows[limit-1].CreatedAt, rows[limit-1].PublicID)
+		rows = rows[:limit]
+	}
+	for i := range rows {
+		decorateMediaSupplyAction(&rows[i])
+	}
+	c.JSON(http.StatusOK, gin.H{"schema_version": "media-supply-action-history/v1", "episode_id": episodeID, "items": rows, "next_cursor": next})
 }

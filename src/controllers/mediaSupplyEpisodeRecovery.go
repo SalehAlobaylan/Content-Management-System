@@ -25,14 +25,15 @@ const (
 // episode. It contains only CMS-owned identifiers and checkpoints; it never
 // contains provider details, queue state, a repair command, or a model claim.
 type mediaSupplyEpisodeResolutionProof struct {
-	SchemaVersion      string                      `json:"schema_version"`
-	EpisodeID          uuid.UUID                   `json:"episode_id"`
-	EpisodeVerdict     string                      `json:"episode_verdict"`
-	ResolvedAt         time.Time                   `json:"resolved_at"`
-	ResolutionKind     string                      `json:"resolution_kind"`
-	Summary            string                      `json:"summary"`
-	EvaluationDigest   string                      `json:"evaluation_digest,omitempty"`
-	ResolutionEvidence []mediaSupplyResolutionFact `json:"resolution_evidence"`
+	SchemaVersion       string                      `json:"schema_version"`
+	EpisodeID           uuid.UUID                   `json:"episode_id"`
+	EpisodeVerdict      string                      `json:"episode_verdict"`
+	ResolvedAt          time.Time                   `json:"resolved_at"`
+	ResolutionKind      string                      `json:"resolution_kind"`
+	Summary             string                      `json:"summary"`
+	EvaluationDigest    string                      `json:"evaluation_digest,omitempty"`
+	ConsumerEvidenceIDs []string                    `json:"consumer_evidence_ids,omitempty"`
+	ResolutionEvidence  []mediaSupplyResolutionFact `json:"resolution_evidence"`
 }
 
 type mediaSupplyResolutionFact struct {
@@ -53,18 +54,38 @@ func reconcileMediaSupplyEpisodes(db *gorm.DB, tenantID string, status mediaSupp
 		return err
 	}
 	for _, episode := range episodes {
-		resolution, proof, err := assessMediaSupplyEpisodeResolution(db, episode, status)
-		if err != nil || resolution.State != supply.EpisodeResolutionResolved {
-			continue
-		}
-		clean, err := recordMediaSupplyCleanResolutionObservation(db, episode, proof)
-		if err != nil {
-			return err
-		}
-		if !clean {
-			continue
-		}
-		if err := resolveMediaSupplyEpisode(db, episode, proof); err != nil {
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			var current models.MediaSupplyEpisode
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=? AND state IN ?", tenantID, episode.PublicID, []string{models.MediaSupplyEpisodeOpen, models.MediaSupplyEpisodeRecovering}).First(&current).Error; err != nil {
+				if err == gorm.ErrRecordNotFound {
+					return nil
+				}
+				return err
+			}
+			var resolution supply.EpisodeResolution
+			var proof mediaSupplyEpisodeResolutionProof
+			assessmentErr := tx.Transaction(func(readTx *gorm.DB) error {
+				var err error
+				resolution, proof, err = assessMediaSupplyEpisodeResolution(readTx, current, status)
+				return err
+			})
+			if assessmentErr != nil {
+				// Restore the transaction after an unreadable observation, then
+				// persist unknown as a streak break rather than retaining old trust.
+				resolution.State = supply.EpisodeResolutionUnknown
+				proof.ResolvedAt = time.Now().UTC()
+			}
+			if resolution.State != supply.EpisodeResolutionResolved {
+				payload, _ := json.Marshal(map[string]any{"state": resolution.State})
+				digest := fmt.Sprintf("%x", sha256.Sum256([]byte(proof.ResolvedAt.Format(time.RFC3339Nano)+string(payload))))
+				return appendMediaSupplyEpisodeEventPayload(tx, current, "resolution_not_clean", digest, payload, proof.ResolvedAt)
+			}
+			clean, err := recordMediaSupplyCleanResolutionObservation(tx, current, proof)
+			if err != nil || !clean {
+				return err
+			}
+			return resolveMediaSupplyEpisode(tx, current, proof)
+		}); err != nil {
 			return err
 		}
 	}
@@ -99,7 +120,7 @@ func assessMediaSupplyEpisodeResolution(db *gorm.DB, episode models.MediaSupplyE
 		proof.EvaluationDigest = digest
 	case supply.SupplyVerdictNoEligibleInventory, supply.SupplyVerdictGenerationOmission,
 		supply.SupplyVerdictServingOmission, supply.SupplyVerdictPodsInventoryStale:
-		input.ConsumerBoundaryRecovered = mediaSupplyConsumerBoundaryRecovery(status.Exposure)
+		input.ConsumerBoundaryRecovered, proof.ConsumerEvidenceIDs = mediaSupplyConsumerEvidence(status.Exposure, episode.FirstSeenAt, proof.ResolvedAt)
 	}
 
 	resolution := supply.AssessEpisodeResolution(input)
@@ -115,34 +136,63 @@ func assessMediaSupplyEpisodeResolution(db *gorm.DB, episode models.MediaSupplyE
 }
 
 func mediaSupplyConsumerBoundaryRecovery(exposure supply.PodsExposureProof) supply.ResolutionObservation {
-	if exposure.EvidenceCompleteness == "unavailable" || exposure.Verdict == "unknown" {
-		return supply.ResolutionObservationUnknown
-	}
-	if exposure.Verdict != "return_path_observed" || len(exposure.ReturnedIDs) == 0 || len(exposure.RenderedIDs) == 0 || len(exposure.ViewedIDs) == 0 {
-		return supply.ResolutionObservationAbsent
-	}
-	return supply.ResolutionObservationPresent
+	verdict, _ := mediaSupplyConsumerEvidence(exposure, time.Time{}, time.Now().UTC())
+	return verdict
 }
 
-// Two fresh independent observations are required before closure. The first
-// moves no state and is durable evidence; a later clean evaluation supplies
-// the second observation. Owner completion alone can therefore never close a
-// consumer-boundary episode.
+func mediaSupplyConsumerEvidence(exposure supply.PodsExposureProof, since, now time.Time) (supply.ResolutionObservation, []string) {
+	if exposure.EvidenceCompleteness == "unavailable" || exposure.Verdict == "unknown" {
+		return supply.ResolutionObservationUnknown, nil
+	}
+	if exposure.Verdict != "return_path_observed" {
+		return supply.ResolutionObservationAbsent, nil
+	}
+	returned := map[uuid.UUID]bool{}
+	for _, id := range exposure.ReturnedIDs {
+		if parsed, err := uuid.Parse(id); err == nil {
+			returned[parsed] = true
+		}
+	}
+	for _, view := range exposure.ConsumerObservations {
+		if view.Boundary != "exact_view" || !freshConsumerObservation(view, since, now) || !returned[view.ContentItemID] {
+			continue
+		}
+		for _, render := range exposure.ConsumerObservations {
+			if render.Boundary == "page_render" && freshConsumerObservation(render, since, now) && render.ContentItemID == view.ContentItemID && render.FeedSessionID != nil && view.FeedSessionID != nil && *render.FeedSessionID == *view.FeedSessionID && render.GenerationID != nil && view.GenerationID != nil && *render.GenerationID == *view.GenerationID && exposure.ActiveGenerationID != nil && *view.GenerationID == *exposure.ActiveGenerationID {
+				return supply.ResolutionObservationPresent, []string{render.PublicID.String(), view.PublicID.String()}
+			}
+		}
+	}
+	return supply.ResolutionObservationAbsent, nil
+}
+
+func freshConsumerObservation(row models.PodsBoundaryObservation, since, now time.Time) bool {
+	return row.PublicID != uuid.Nil && row.Verdict == string(supply.VerdictPresent) && row.ObservedAt.After(since) && !row.ObservedAt.Before(now.Add(-15*time.Minute)) && !row.ObservedAt.After(now)
+}
+
+// The ledger records every failed/unknown check too. Evidence identity is stable
+// across reevaluations, so rereading the same consumer event cannot earn trust.
 func recordMediaSupplyCleanResolutionObservation(db *gorm.DB, episode models.MediaSupplyEpisode, proof mediaSupplyEpisodeResolutionProof) (bool, error) {
-	bytes, err := json.Marshal(proof)
+	identity, _ := json.Marshal(proof.ConsumerEvidenceIDs)
+	if len(proof.ConsumerEvidenceIDs) == 0 {
+		identity = []byte(proof.EvaluationDigest + proof.ResolvedAt.UTC().Truncate(time.Minute).Format(time.RFC3339))
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(identity))
+	payload, err := json.Marshal(proof)
 	if err != nil {
 		return false, err
 	}
-	hash := sha256.Sum256(bytes)
-	digest := hex.EncodeToString(hash[:])
-	if err := appendMediaSupplyEpisodeEventPayload(db, episode, "resolution_clean", digest, bytes, proof.ResolvedAt); err != nil {
+	var latest []models.MediaSupplyEpisodeEvent
+	if err := db.Where("tenant_id=? AND episode_id=? AND event_type IN ? AND occurred_at>=?", episode.TenantID, episode.PublicID, []string{"resolution_clean", "resolution_not_clean"}, proof.ResolvedAt.Add(-15*time.Minute)).Order("occurred_at DESC, id DESC").Limit(2).Find(&latest).Error; err != nil {
 		return false, err
 	}
-	var count int64
-	err = db.Model(&models.MediaSupplyEpisodeEvent{}).
-		Where("tenant_id=? AND episode_id=? AND event_type=? AND occurred_at>=?", episode.TenantID, episode.PublicID, "resolution_clean", proof.ResolvedAt.Add(-15*time.Minute)).
-		Count(&count).Error
-	return count >= 2, err
+	if len(latest) > 0 && latest[0].EventType == "resolution_clean" && latest[0].EvidenceDigest == digest {
+		return false, nil
+	}
+	if err := appendMediaSupplyEpisodeEventPayload(db, episode, "resolution_clean", digest, payload, proof.ResolvedAt); err != nil {
+		return false, err
+	}
+	return len(latest) > 0 && latest[0].EventType == "resolution_clean" && latest[0].EvidenceDigest != digest && !latest[0].OccurredAt.After(proof.ResolvedAt.Add(-time.Minute)) && !latest[0].OccurredAt.Before(proof.ResolvedAt.Add(-2*mediaSupplyEvaluationInterval)), nil
 }
 
 func mediaSupplyEpisodeSourceIDs(episode models.MediaSupplyEpisode) ([]uuid.UUID, error) {

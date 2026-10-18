@@ -3,7 +3,7 @@ package supply
 import "testing"
 
 func TestObservationReasonPreservesUnknownRatherThanInventingAbsence(t *testing.T) {
-	if got := observationReason("normalize_batch", 1, 0, true, 0); got != "CMS has consumer-side content linked to this exact normalization unit" {
+	if got := observationReason("normalize_batch", 1, 2, true, 0); got != "CMS has terminal dispositions for every frozen normalization input" {
 		t.Fatalf("present observation reason = %q", got)
 	}
 	if got := observationReason("normalize_batch", 0, 0, true, 0); got != "CMS cannot independently establish the effect from current evidence" {

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
 	"content-management-system/src/utils"
@@ -33,7 +32,6 @@ import (
 // or a spoofable forwarding header.
 
 const (
-	ruxDefaultTenant     = "default"
 	ruxMaxBatchEvents    = 50
 	ruxRateWindow        = time.Minute
 	ruxRatePerWindow     = 600 // events/min per rate-key; batches of ~20 → ~30 flushes/min
@@ -82,6 +80,7 @@ type incomingRuxEvent struct {
 	Outcome       string  `json:"outcome"`
 	JourneyID     *string `json:"journey_id"`
 	ContentID     *string `json:"content_id"`
+	FeedSessionID *string `json:"feed_session_id"`
 	StoryID       *string `json:"story_id"`
 	PlaybackType  *string `json:"playback_type"`
 	Locale        *string `json:"locale"`
@@ -120,7 +119,16 @@ func IngestExperienceEvents(c *gin.Context) {
 
 	// Kill-switch: checked before any parsing so an abuse flood or bad client
 	// release can be shut off from the Console instantly.
-	policy, policyErr := loadExperiencePolicy(db, ruxDefaultTenant)
+	tenantID, tenantErr := trustedPublicFeedTenant(c)
+	if tenantErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Public feed tenant is unavailable"})
+		return
+	}
+	if native, ok := c.Get("rux_native_ticket"); ok && native.(nativeExperienceTicket).TenantID != tenantID {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "telemetry tenant changed; renew admission"})
+		return
+	}
+	policy, policyErr := loadExperiencePolicy(db, tenantID)
 	if policyErr != nil {
 		c.JSON(503, gin.H{"error": "telemetry policy unavailable"})
 		return
@@ -211,7 +219,7 @@ func IngestExperienceEvents(c *gin.Context) {
 			rejected++
 			continue
 		}
-		row.TenantID = ruxDefaultTenant
+		row.TenantID = tenantID
 		row.ReceivedAt = now
 		rows = append(rows, row)
 	}
@@ -339,6 +347,13 @@ func validateAndNormalizeRuxEvent(in *incomingRuxEvent, now time.Time) (models.E
 		} else if in.SchemaVersion >= 2 {
 			return out, false
 		}
+	}
+	if in.FeedSessionID != nil {
+		id, err := uuid.Parse(strings.TrimSpace(*in.FeedSessionID))
+		if err != nil || id == uuid.Nil {
+			return out, false
+		}
+		out.FeedSessionID = &id
 	}
 	if in.StoryID != nil {
 		if sid, e := uuid.Parse(strings.TrimSpace(*in.StoryID)); e == nil {
@@ -492,6 +507,11 @@ func terminalReceipt(ev *models.ExperienceEvent) models.ExperienceTerminalReceip
 	if models.RuxPlatform(ev.ClientPlatform) != "web" {
 		dimensions = append(dimensions, ev.OSMajor)
 	}
+	// Old retained envelopes without feed correlation must keep their digest.
+	// A correlated envelope includes the session in its immutable comparison.
+	if ev.FeedSessionID != nil {
+		dimensions = append(dimensions, ev.FeedSessionID)
+	}
 	payload, _ := json.Marshal(dimensions)
 	return models.ExperienceTerminalReceipt{Identity: fmt.Sprintf("%x", sha256.Sum256([]byte(identity))), Digest: fmt.Sprintf("%x", sha256.Sum256(payload))}
 }
@@ -511,7 +531,11 @@ func experienceContentScope(db *gorm.DB, events []models.ExperienceEvent) (map[u
 		return items, nil
 	}
 	var rows []models.ContentItem
-	if err := db.Select("public_id", "tenant_id", "source_run_request_id").Where("tenant_id = ? AND public_id IN ?", ruxDefaultTenant, ids).Find(&rows).Error; err != nil {
+	tenant, err := utils.GetConfiguredPublicTenantID()
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Select("public_id", "tenant_id", "source_run_request_id").Where("tenant_id = ? AND public_id IN ?", tenant, ids).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
@@ -524,19 +548,19 @@ func recordExperienceRenderBoundaries(db *gorm.DB, events []models.ExperienceEve
 	if len(events) == 0 {
 		return
 	}
-	generationID, _, active := feedcontract.ActiveGeneration(db, ruxDefaultTenant, "media")
-	var generation *uuid.UUID
-	if active {
-		generation = &generationID
-	}
 	observations := make([]models.PodsBoundaryObservation, 0, len(events))
 	for _, event := range events {
-		item := items[*event.ContentID]
-		observations = append(observations, models.PodsBoundaryObservation{
-			TenantID: ruxDefaultTenant, ContentItemID: item.PublicID, GenerationID: generation,
-			Boundary: "page_render", ProbeKind: "frozen_session", ProbeID: event.PageLoadID.String(),
-			SourceRunRequestID: item.SourceRunRequestID, Verdict: string(supply.VerdictPresent), ObservedAt: event.OccurredAt.UTC(),
-		})
+		if event.ContentID == nil || event.FeedSessionID == nil {
+			continue
+		}
+		item, ok := items[*event.ContentID]
+		if !ok {
+			continue
+		}
+		observation, valid := podsSessionBoundary(db, item, *event.FeedSessionID, "", "page_render", event.EventID.String(), event.OccurredAt.UTC())
+		if valid {
+			observations = append(observations, observation)
+		}
 	}
 	// Supply validates/proves and writes its own observations and yield effects
 	// atomically in one bounded batch. RUX does not gain ledger authority.
@@ -545,7 +569,7 @@ func recordExperienceRenderBoundaries(db *gorm.DB, events []models.ExperienceEve
 
 // The fixed list carries validated envelope columns only. The numeric ID stays
 // database-owned and created_at is stamped by the server, never by client JSON.
-const experienceEventInsertColumns = `event_id,tenant_id,schema_version,event_type,surface,client_platform,os_major,occurred_at,received_at,session_id,page_load_id,sequence,journey_id,release,content_id,story_id,playback_type,locale,browser_family,browser_major,device_class,network_class,installed_pwa,duration_ms,media_error_code,stall_duration_ms,failure_class,visible,phase,outcome,terminal_status,observed_playback_ms,stall_count,position_drift_ms,fallback_used,boundary_starved,measurements`
+const experienceEventInsertColumns = `event_id,tenant_id,schema_version,event_type,surface,client_platform,os_major,occurred_at,received_at,session_id,page_load_id,sequence,journey_id,release,content_id,feed_session_id,story_id,playback_type,locale,browser_family,browser_major,device_class,network_class,installed_pwa,duration_ms,media_error_code,stall_duration_ms,failure_class,visible,phase,outcome,terminal_status,observed_playback_ms,stall_count,position_drift_ms,fallback_used,boundary_starved,measurements`
 
 type experienceEventInsertResult struct {
 	ID      uint

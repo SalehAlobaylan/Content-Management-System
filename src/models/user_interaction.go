@@ -78,14 +78,15 @@ func (ConsumerRequestIdempotency) TableName() string {
 // The snapshot is intentionally a CMS concern; mobile stores a local recovery
 // ledger but must not invent ranking continuity by itself.
 type ConsumerFeedSession struct {
-	ID            uuid.UUID      `gorm:"column:id;type:uuid;primaryKey"`
-	TenantID      string         `gorm:"column:tenant_id;type:varchar(64);not null;index"`
-	IdentityScope string         `gorm:"column:identity_scope;type:varchar(320);not null;index"`
-	FeedType      string         `gorm:"column:feed_type;type:varchar(24);not null"`
-	Snapshot      datatypes.JSON `gorm:"column:snapshot_json;type:jsonb;not null"`
-	Generation    int64          `gorm:"column:generation;not null;default:1" json:"generation"`
-	ExpiresAt     time.Time      `gorm:"column:expires_at;not null;index"`
-	CreatedAt     time.Time      `gorm:"column:created_at;autoCreateTime"`
+	ID                 uuid.UUID      `gorm:"column:id;type:uuid;primaryKey"`
+	TenantID           string         `gorm:"column:tenant_id;type:varchar(64);not null;index"`
+	IdentityScope      string         `gorm:"column:identity_scope;type:varchar(320);not null;index"`
+	FeedType           string         `gorm:"column:feed_type;type:varchar(24);not null"`
+	Snapshot           datatypes.JSON `gorm:"column:snapshot_json;type:jsonb;not null"`
+	Generation         int64          `gorm:"column:generation;not null;default:1" json:"generation"`
+	ActiveGenerationID *uuid.UUID     `gorm:"column:active_generation_id;type:uuid"`
+	ExpiresAt          time.Time      `gorm:"column:expires_at;not null;index"`
+	CreatedAt          time.Time      `gorm:"column:created_at;autoCreateTime"`
 }
 
 func (ConsumerFeedSession) TableName() string {

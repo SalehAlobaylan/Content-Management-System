@@ -2,11 +2,35 @@ package controllers
 
 import (
 	"content-management-system/src/models"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"github.com/google/uuid"
 	"testing"
 	"time"
 )
+
+func TestTerminalReceiptPreservesLegacyDigestAndBindsFrozenSession(t *testing.T) {
+	for _, platform := range []string{"web", "ios"} {
+		ev := terminalFixture("feed", "success")
+		ev.ClientPlatform = platform
+		ev.OSMajor = 26
+		legacy := `["pods","feed","success","r2","safari",18,"mobile","unknown",false,null,null,null,null,null]`
+		if platform == "ios" {
+			legacy = legacy[:len(legacy)-1] + `,26]`
+		}
+		before := terminalReceipt(&ev)
+		if before.Digest != fmt.Sprintf("%x", sha256.Sum256([]byte(legacy))) {
+			t.Fatalf("%s legacy replay digest changed", platform)
+		}
+		id := uuid.New()
+		ev.FeedSessionID = &id
+		after := terminalReceipt(&ev)
+		if after.Identity != before.Identity || after.Digest == before.Digest {
+			t.Fatal("session correlation must affect comparison without changing terminal identity")
+		}
+	}
+}
 
 func terminalFixture(phase, outcome string) models.ExperienceEvent {
 	visible := true

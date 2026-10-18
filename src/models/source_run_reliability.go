@@ -68,35 +68,37 @@ func (SourceRunAttempt) TableName() string { return "source_run_attempts" }
 // identity. A worker must hold its current lease token before it can begin an
 // effect or emit a receipt for the unit.
 type SourceRunExecutionUnit struct {
-	ID                      uint       `gorm:"primaryKey" json:"-"`
-	PublicID                uuid.UUID  `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
-	TenantID                string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	SourceRunRequestID      uuid.UUID  `gorm:"type:uuid;not null;index" json:"source_run_request_id"`
-	SourceRunAttemptID      uuid.UUID  `gorm:"type:uuid;not null;index" json:"source_run_attempt_id"`
-	ContentSourceID         uuid.UUID  `gorm:"type:uuid;not null;index" json:"content_source_id"`
-	ParentUnitID            *uuid.UUID `gorm:"type:uuid;index" json:"parent_unit_id,omitempty"`
-	UnitType                string     `gorm:"type:varchar(32);not null" json:"unit_type"`
-	UnitKey                 string     `gorm:"type:varchar(255);not null" json:"unit_key"`
-	PageID                  string     `gorm:"type:varchar(128)" json:"page_id,omitempty"`
-	BatchID                 string     `gorm:"type:varchar(128)" json:"batch_id,omitempty"`
-	JobID                   string     `gorm:"type:varchar(255);not null" json:"job_id"`
-	AttemptFenceToken       uuid.UUID  `gorm:"type:uuid;not null" json:"attempt_fence_token"`
-	State                   string     `gorm:"type:varchar(32);not null" json:"state"`
-	ExecutionOwner          string     `gorm:"type:varchar(128)" json:"execution_owner,omitempty"`
-	ExecutionLeaseToken     *uuid.UUID `gorm:"type:uuid" json:"-"`
-	ExecutionLeaseEpoch     int64      `gorm:"not null;default:0" json:"execution_lease_epoch"`
-	ExecutionLeaseExpiresAt *time.Time `gorm:"type:timestamptz;index" json:"execution_lease_expires_at,omitempty"`
-	HeartbeatAt             *time.Time `gorm:"type:timestamptz" json:"heartbeat_at,omitempty"`
-	EffectStartedAt         *time.Time `gorm:"type:timestamptz" json:"effect_started_at,omitempty"`
-	CancellationRequestedAt *time.Time `gorm:"type:timestamptz" json:"cancellation_requested_at,omitempty"`
-	VerificationRequired    bool       `gorm:"not null;default:false" json:"verification_required"`
-	DeclaredChildCount      int        `gorm:"not null;default:0" json:"declared_child_count"`
-	DeclaredChildDigest     string     `gorm:"type:varchar(128)" json:"declared_child_digest,omitempty"`
-	TerminalOutcome         string     `gorm:"type:varchar(48)" json:"terminal_outcome,omitempty"`
-	StartedAt               *time.Time `gorm:"type:timestamptz" json:"started_at,omitempty"`
-	FinishedAt              *time.Time `gorm:"type:timestamptz" json:"finished_at,omitempty"`
-	CreatedAt               time.Time  `json:"created_at"`
-	UpdatedAt               time.Time  `json:"updated_at"`
+	ID                      uint           `gorm:"primaryKey" json:"-"`
+	PublicID                uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();uniqueIndex" json:"id"`
+	TenantID                string         `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
+	SourceRunRequestID      uuid.UUID      `gorm:"type:uuid;not null;index" json:"source_run_request_id"`
+	SourceRunAttemptID      uuid.UUID      `gorm:"type:uuid;not null;index" json:"source_run_attempt_id"`
+	ContentSourceID         uuid.UUID      `gorm:"type:uuid;not null;index" json:"content_source_id"`
+	ParentUnitID            *uuid.UUID     `gorm:"type:uuid;index" json:"parent_unit_id,omitempty"`
+	UnitType                string         `gorm:"type:varchar(32);not null" json:"unit_type"`
+	UnitKey                 string         `gorm:"type:varchar(255);not null" json:"unit_key"`
+	PageID                  string         `gorm:"type:varchar(128)" json:"page_id,omitempty"`
+	BatchID                 string         `gorm:"type:varchar(128)" json:"batch_id,omitempty"`
+	JobID                   string         `gorm:"type:varchar(255);not null" json:"job_id"`
+	AttemptFenceToken       uuid.UUID      `gorm:"type:uuid;not null" json:"attempt_fence_token"`
+	State                   string         `gorm:"type:varchar(32);not null" json:"state"`
+	ExecutionOwner          string         `gorm:"type:varchar(128)" json:"execution_owner,omitempty"`
+	ExecutionLeaseToken     *uuid.UUID     `gorm:"type:uuid" json:"-"`
+	ExecutionLeaseEpoch     int64          `gorm:"not null;default:0" json:"execution_lease_epoch"`
+	ExecutionLeaseExpiresAt *time.Time     `gorm:"type:timestamptz;index" json:"execution_lease_expires_at,omitempty"`
+	HeartbeatAt             *time.Time     `gorm:"type:timestamptz" json:"heartbeat_at,omitempty"`
+	EffectStartedAt         *time.Time     `gorm:"type:timestamptz" json:"effect_started_at,omitempty"`
+	CancellationRequestedAt *time.Time     `gorm:"type:timestamptz" json:"cancellation_requested_at,omitempty"`
+	VerificationRequired    bool           `gorm:"not null;default:false" json:"verification_required"`
+	DeclaredChildCount      int            `gorm:"not null;default:0" json:"declared_child_count"`
+	DeclaredChildDigest     string         `gorm:"type:varchar(128)" json:"declared_child_digest,omitempty"`
+	NormalizeInputs         datatypes.JSON `gorm:"column:normalization_inputs;type:jsonb;not null;default:'[]'" json:"normalization_inputs"`
+	NormalizeInputDigest    string         `gorm:"column:normalization_input_digest;type:varchar(64);not null;default:''" json:"normalization_input_digest"`
+	TerminalOutcome         string         `gorm:"type:varchar(48)" json:"terminal_outcome,omitempty"`
+	StartedAt               *time.Time     `gorm:"type:timestamptz" json:"started_at,omitempty"`
+	FinishedAt              *time.Time     `gorm:"type:timestamptz" json:"finished_at,omitempty"`
+	CreatedAt               time.Time      `json:"created_at"`
+	UpdatedAt               time.Time      `json:"updated_at"`
 }
 
 func (SourceRunExecutionUnit) TableName() string { return "source_run_execution_units" }

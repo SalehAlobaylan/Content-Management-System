@@ -28,7 +28,7 @@ func TestPodsBoundaryBatchCountsOnlyNewTenantScopedEvidence(t *testing.T) {
 	// Keep the fixture deliberately narrow; no owner or app runtime uses it.
 	for _, sql := range []string{
 		`CREATE TABLE content_items (tenant_id text, public_id uuid, content_source_id uuid)`,
-		`CREATE TABLE pods_boundary_observations (public_id uuid PRIMARY KEY,tenant_id text,content_item_id uuid,generation_id uuid,boundary text,probe_kind text,probe_id text,source_run_request_row_id bigint,verdict text,provenance_digest text,observed_at timestamp,created_at timestamp DEFAULT now(), UNIQUE(tenant_id,boundary,probe_kind,probe_id,content_item_id))`,
+		`CREATE TABLE pods_boundary_observations (public_id uuid PRIMARY KEY,tenant_id text,content_item_id uuid,generation_id uuid,feed_session_id uuid,boundary text,probe_kind text,probe_id text,source_run_request_row_id bigint,verdict text,provenance_digest text,observed_at timestamp,created_at timestamp DEFAULT now(), UNIQUE(tenant_id,boundary,probe_kind,probe_id,content_item_id))`,
 		`CREATE TABLE media_source_yield_daily (tenant_id text,content_source_id uuid,yield_date date,public_returns bigint DEFAULT 0,first_page_returns bigint DEFAULT 0,updated_at timestamp,PRIMARY KEY(tenant_id,content_source_id,yield_date))`,
 	} {
 		if err := db.Exec(sql).Error; err != nil {

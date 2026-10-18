@@ -42,6 +42,18 @@ func TestOperatorSourceRunCreatesDurableCMSAdmissionAndPersistsCorrelation(t *te
 	if err := db.Create(&step).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := db.AutoMigrate(&models.SourceRunAdmissionProtocol{}, &models.SourceRunAdmissionCutover{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.SourceRunAdmissionProtocol{ProtocolKey: "source-run/v1", Epoch: "durable_required", Build: "source-run/v1"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.SourceRunAdmissionCutover{TenantID: source.TenantID, Lane: source.Category, Protocol: "source-run/v1", Mode: "durable"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`CREATE UNIQUE INDEX fixture_durable_request ON source_run_requests(tenant_id,idempotency_key)`).Error; err != nil {
+		t.Fatal(err)
+	}
 	canonical := operatorpkg.CanonicalPlan{TargetIDs: []string{source.PublicID.String()}}
 	result, before, err := runOperatorSourceOnce(db, "tenant-a", "sources.run_once", plan, step, canonical)
 	if err != nil {

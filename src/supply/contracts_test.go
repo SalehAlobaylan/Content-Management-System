@@ -163,7 +163,7 @@ func TestAggregateUnitStatesDoesNotHideUnknownOrMixedOutcomes(t *testing.T) {
 	if terminal || attempt != AttemptVerificationRequired || request != RequestVerificationRequired {
 		t.Fatalf("unknown unit must remain verification required: %s %s %v", attempt, request, terminal)
 	}
-	attempt, request, terminal = aggregateUnitStates([]models.SourceRunExecutionUnit{{State: string(UnitSucceeded)}, {State: string(UnitFailed)}})
+	attempt, request, terminal = aggregateUnitStates([]models.SourceRunExecutionUnit{{State: string(UnitSucceeded), TerminalOutcome: string(OutcomeNewItems)}, {State: string(UnitFailed), TerminalOutcome: string(OutcomeProviderFailed)}})
 	if !terminal || attempt != AttemptPartial || request != RequestPartial {
 		t.Fatalf("mixed terminal units must be partial: %s %s %v", attempt, request, terminal)
 	}

@@ -57,13 +57,6 @@ func SupplyActionControlKey(actionKey string) (string, error) {
 // admission/effect boundary. It deliberately does not govern cancellation,
 // receipt retention, reconciliation, verification, or terminalization.
 func MayExecuteSupplyAction(db *gorm.DB, tenantID, actionKey string) (bool, string, error) {
-	recoveryDisabled, err := MediaSupplyControlDisabled(db, tenantID, models.MediaSupplyControlExceptionalRecovery)
-	if err != nil {
-		return false, "", err
-	}
-	if recoveryDisabled {
-		return false, models.MediaSupplyControlExceptionalRecovery, nil
-	}
 	controlKey, err := SupplyActionControlKey(actionKey)
 	if err != nil {
 		return false, "", err
@@ -76,4 +69,17 @@ func MayExecuteSupplyAction(db *gorm.DB, tenantID, actionKey string) (bool, stri
 		return false, controlKey, nil
 	}
 	return true, "", nil
+}
+
+// MayExecuteAutonomousSupplyAction adds the autonomous-only containment stop.
+// Explicit native approvals keep their independent, exact action controls.
+func MayExecuteAutonomousSupplyAction(db *gorm.DB, tenantID, actionKey string) (bool, string, error) {
+	disabled, err := MediaSupplyControlDisabled(db, tenantID, models.MediaSupplyControlExceptionalRecovery)
+	if err != nil {
+		return false, "", err
+	}
+	if disabled {
+		return false, models.MediaSupplyControlExceptionalRecovery, nil
+	}
+	return MayExecuteSupplyAction(db, tenantID, actionKey)
 }

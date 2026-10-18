@@ -31,6 +31,7 @@ func openSupplyFixtureDB(t *testing.T) *gorm.DB {
 		&models.SourceRunReceipt{}, &models.SourceRunRetainedReceipt{}, &models.SourceRunReconciliationEvent{},
 		&models.SourceRunVerificationTask{}, &models.SourceRunProjectionWork{},
 		&models.SourceRunAdmissionProtocol{}, &models.SourceRunAdmissionCutover{},
+		&models.SourceUpstreamObservation{}, &models.SourceUpstreamObservationEvent{}, &models.SourceUpstreamObservationDisposition{},
 		&models.MediaSupplyControl{},
 	); err != nil {
 		t.Fatalf("migrate supply fixture schema: %v", err)
