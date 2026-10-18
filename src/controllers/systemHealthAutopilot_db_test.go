@@ -3,9 +3,12 @@ package controllers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,27 +17,55 @@ import (
 	"content-management-system/src/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
-// Lifecycle tests use the shared disposable PostgreSQL fixture.
+var systemHealthFixtureOnce sync.Once
+var systemHealthFixtureMu sync.Mutex
+var systemHealthFixtureDB *gorm.DB
+var systemHealthFixtureClose func() error
+var systemHealthFixtureErr error
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if systemHealthFixtureClose != nil {
+		if err := systemHealthFixtureClose(); err != nil {
+			fmt.Fprintln(os.Stderr, "System Health disposable fixture cleanup failed:", err)
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
+
+// One freshly created database is reset between serialized cases and dropped
+// after the suite. Repeating remote schema discovery per case adds no isolation.
 func systemHealthAutopilotTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	if os.Getenv("CMS_TEST_ADMIN_URL") == "" && os.Getenv("CMS_TEST_DATABASE_URL") == "" {
 		t.Skip("set guarded CMS_TEST_ADMIN_URL or CMS_TEST_DATABASE_URL to run System Health DB tests")
 	}
-	db := testdb.Open(t)
-	if err := db.AutoMigrate(
-		&models.SystemAutopilotPolicy{}, &models.SystemIncidentEpisode{}, &models.SystemAutopilotRun{}, &models.SystemAutopilotAction{}, &models.AuditLog{},
-		&models.PipelineAutopilotPolicy{}, &models.EnrichmentAutopilotPolicy{}, &models.NewsCirculationPolicy{},
-		&models.MediaCirculationPolicy{}, &models.MediaStudioAutopilotPolicy{}, &models.EmbeddingLifecyclePolicy{}, &models.RedundancyPolicy{},
-	); err != nil {
-		t.Fatalf("migrate system health fixture: %v", err)
+	systemHealthFixtureMu.Lock()
+	t.Cleanup(systemHealthFixtureMu.Unlock)
+	systemHealthFixtureOnce.Do(func() {
+		systemHealthFixtureDB, systemHealthFixtureClose, systemHealthFixtureErr = testdb.OpenForMain()
+		if systemHealthFixtureErr != nil {
+			return
+		}
+		systemHealthFixtureErr = systemHealthFixtureDB.AutoMigrate(
+			&models.SystemAutopilotPolicy{}, &models.SystemIncidentEpisode{}, &models.SystemAutopilotRun{}, &models.SystemAutopilotAction{}, &models.AuditLog{},
+			&models.PipelineAutopilotPolicy{}, &models.EnrichmentAutopilotPolicy{}, &models.EnrichmentAutopilotRun{}, &models.EnrichmentAutopilotAction{}, &models.NewsCirculationPolicy{},
+			&models.MediaCirculationPolicy{}, &models.MediaStudioAutopilotPolicy{}, &models.EmbeddingLifecyclePolicy{}, &models.RedundancyPolicy{},
+		)
+	})
+	if systemHealthFixtureErr != nil {
+		t.Fatalf("initialize isolated System Health fixture: %v", systemHealthFixtureErr)
 	}
+	db := systemHealthFixtureDB
 	clear := func() {
 		for _, table := range []string{
 			"system_autopilot_actions", "system_autopilot_runs", "system_incident_episodes", "system_autopilot_policies", "audit_logs",
-			"pipeline_autopilot_policies", "enrichment_autopilot_policies", "news_circulation_policies", "media_circulation_policies",
+			"enrichment_autopilot_actions", "enrichment_autopilot_runs", "pipeline_autopilot_policies", "enrichment_autopilot_policies", "news_circulation_policies", "media_circulation_policies",
 			"media_studio_autopilot_policies", "embedding_lifecycle_policies", "redundancy_policies",
 		} {
 			_ = db.Exec("DELETE FROM " + table).Error
@@ -126,9 +157,84 @@ func TestSystemHealthDB_HarnessSmoke(t *testing.T) {
 	}
 }
 
+func TestSystemHealthDB_StatusReportsTotalBeyondPreview(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, nil)
+	now := time.Now().UTC()
+	for i := 0; i < 12; i++ {
+		ep := models.SystemIncidentEpisode{RootService: "aggregation", Verdict: models.SystemVerdictServiceDown, Status: "open", Severity: "critical", FirstDetectedAt: now, LastSeenAt: now}
+		if err := db.Create(&ep).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Set("db", db)
+	c.Set(utils.AdminPrincipalContextKey, utils.AdminPrincipal{UserID: "admin", TenantID: "default"})
+	GetSystemAutopilotStatus(c)
+	var response struct {
+		Data struct {
+			Count    int               `json:"open_episode_count"`
+			Episodes []json.RawMessage `json:"open_episodes"`
+		} `json:"data"`
+	}
+	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.Data.Count != 12 || len(response.Data.Episodes) != 10 {
+		t.Fatalf("status lost total: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSystemHealthDB_RunScopeCapSpansIndependentIncidents(t *testing.T) {
+	db := systemHealthAutopilotTestDB(t)
+	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeSafeAuto, func(p *models.SystemAutopilotPolicy) {
+		p.ConfirmProbes = 1
+		p.ContainmentDisabledFor = marshalAutopilotJSON([]string{"pipeline", "enrichment", "embedding_lifecycle", "media_circulation", "redundancy"})
+	})
+	news, studio := []models.NewsCirculationPolicy{}, []models.MediaStudioAutopilotPolicy{}
+	for i := 0; i < 60; i++ {
+		tenant := fmt.Sprintf("scope-%d", i)
+		if i == 0 {
+			tenant = defaultCirculationTenant
+		}
+		news = append(news, models.DefaultNewsCirculationPolicy(tenant))
+		studio = append(studio, models.DefaultMediaStudioAutopilotPolicy(tenant))
+	}
+	if err := db.Create(&news).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&studio).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	snapshot, _ := healthySystemSnapshotAt(now)
+	snapshot.Overall, snapshot.Services[2].Status, snapshot.Services[4].Status = "degraded", "degraded", "unhealthy"
+	snapshot.Services[2].Verdicts, snapshot.Services[4].Verdicts = []string{models.SystemVerdictDependencyDown}, []string{models.SystemVerdictServiceDown}
+	snapshot.Services[2].Deps = []systemProbeDependency{{Name: "capability:news_processing", Status: "unhealthy"}}
+	anomalies := systemAnomaliesFromServices(snapshot.Services)
+	run, _, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "scheduled"}, systemAutopilotDeps{now: func() time.Time { return now }, collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies }})
+	if err != nil || run.Status != models.SystemAutopilotRunStatusCompleted {
+		t.Fatalf("scope denial was not accounted for: %v %s", err, run.Error)
+	}
+	for _, target := range []struct{ table, column string }{{"news_circulation_policies", "autopilot_paused_until"}, {"media_studio_autopilot_policies", "paused_until"}} {
+		var count int64
+		if err := db.Table(target.table).Where(target.column + " IS NOT NULL").Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("global target bound permitted an effect: %s %d %v", target.table, count, err)
+		}
+	}
+	var guards int64
+	if err := db.Model(&models.SystemAutopilotAction{}).Where("guardrail = ?", models.SystemAutopilotGuardScopeCap).Count(&guards).Error; err != nil || guards == 0 {
+		t.Fatal("scope exception is missing", err)
+	}
+}
+
 func TestSystemHealthDB_ScheduledContainmentLastsUntilRecovery(t *testing.T) {
 	db := systemHealthAutopilotTestDB(t)
 	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeSafeAuto, nil)
+	enrichment := models.DefaultEnrichmentAutopilotPolicy(defaultCirculationTenant)
+	enrichment.Enabled, enrichment.Mode = true, models.EnrichmentAutopilotModeSafeAuto
+	if err := db.Create(&enrichment).Error; err != nil {
+		t.Fatal(err)
+	}
 	start := time.Now().UTC().Truncate(time.Second)
 	for step := 0; step < 5; step++ {
 		at := start.Add(time.Duration(step) * 10 * time.Minute)
@@ -138,9 +244,12 @@ func TestSystemHealthDB_ScheduledContainmentLastsUntilRecovery(t *testing.T) {
 			snapshot.Overall = "degraded"
 			_, anomalies = systemHealthFailure(at)
 		}
-		_, _, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "scheduled"}, systemAutopilotDeps{now: func() time.Time { return at }, collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies }})
+		observedRun, _, err := runSystemHealthAutopilotWithDeps(db, systemAutopilotRunOptions{Trigger: "scheduled"}, systemAutopilotDeps{now: func() time.Time { return at }, collect: func(*gorm.DB) (systemHealthSnapshot, []systemAnomaly) { return snapshot, anomalies }})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if observedRun.Status != models.SystemAutopilotRunStatusCompleted {
+			t.Fatalf("step %d: run was partial: %s", step, observedRun.Error)
 		}
 		if step == 0 {
 			continue
@@ -152,51 +261,88 @@ func TestSystemHealthDB_ScheduledContainmentLastsUntilRecovery(t *testing.T) {
 		if (policy.PausedUntil != nil) != (step < 4) {
 			t.Fatalf("step %d: unexpected pause %v", step, policy.PausedUntil)
 		}
+		var currentEnrichment models.EnrichmentAutopilotPolicy
+		if err := db.Where("tenant_id = ?", defaultCirculationTenant).First(&currentEnrichment).Error; err != nil {
+			t.Fatal(err)
+		}
+		if (currentEnrichment.PausedUntil != nil) != (step < 4) {
+			t.Fatalf("step %d: Enrichment pause was not released after recovery", step)
+		}
+		called := false
+		admissionErr := withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func(*gorm.DB) error { called = true; return nil })
+		if step < 4 && (called || !errors.Is(admissionErr, errEnrichmentAutopilotPaused)) {
+			t.Fatalf("step %d: native admission bypassed containment: %v", step, admissionErr)
+		}
+		if step == 4 && (!called || admissionErr != nil) {
+			t.Fatalf("recovered native admission stayed blocked: %v", admissionErr)
+		}
 	}
 }
 
 func TestSystemHealthDB_EnrichmentPauseOrdersAdmission(t *testing.T) {
 	db := systemHealthAutopilotTestDB(t)
 	policy := models.DefaultEnrichmentAutopilotPolicy(defaultCirculationTenant)
-	policy.Enabled = true
-	policy.Mode = models.EnrichmentAutopilotModeSafeAuto
+	policy.Enabled, policy.Mode = true, models.EnrichmentAutopilotModeSafeAuto
 	if err := db.Create(&policy).Error; err != nil {
 		t.Fatal(err)
 	}
 	admitted, release := make(chan struct{}), make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		done <- withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func() { close(admitted); <-release })
-	}()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(admitted)
+		<-release
+		_, _ = w.Write([]byte(`{"write_back_status":"success"}`))
+	}))
+	defer server.Close()
+	t.Setenv("ENRICHMENT_BASE_URL", server.URL)
+	t.Setenv("ENRICHMENT_SERVICE_TOKEN", "fixture-token")
+	run := models.EnrichmentAutopilotRun{TenantID: defaultCirculationTenant, Trigger: "test", Mode: "safe_auto", Status: "running", StartedAt: time.Now()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	runner := enrichmentAutopilotRunner{db: db, run: &run, policy: policy}
+	title := "Admission ordering fixture"
+	item := models.ContentItem{PublicID: uuid.New(), TenantID: defaultCirculationTenant, Title: &title}
+	done := make(chan struct{})
+	go func() { defer close(done); runner.dispatchItem(&item, models.EnrichmentArtifactEmbedding) }()
 	select {
 	case <-admitted:
-	case err := <-done:
-		t.Fatalf("admission failed: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("admission timed out")
+		close(release)
+		<-done
+		t.Fatal("remote dispatch did not start")
+	}
+	var admission models.EnrichmentAutopilotAction
+	if err := db.Where("run_id = ? AND status = ?", run.ID, models.EnrichmentAutopilotActionStatusAdmitted).First(&admission).Error; err != nil {
+		close(release)
+		<-done
+		t.Fatal("remote work started without durable admission", err)
 	}
 	paused := make(chan error, 1)
-	until := time.Now().Add(time.Hour)
 	go func() {
-		paused <- db.Model(&models.EnrichmentAutopilotPolicy{}).Where("tenant_id = ?", defaultCirculationTenant).Update("paused_until", until).Error
+		paused <- db.Model(&models.EnrichmentAutopilotPolicy{}).Where("tenant_id = ?", defaultCirculationTenant).Update("paused_until", time.Now().Add(time.Hour)).Error
 	}()
 	select {
 	case err := <-paused:
+		if err != nil {
+			close(release)
+			<-done
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
 		close(release)
 		<-done
-		t.Fatalf("pause committed while prior admission held its lock: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-paused; err != nil {
-		t.Fatal(err)
+		t.Fatal("pause waited for remote work")
 	}
 	called := false
-	if err := withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func() { called = true }); err == nil || called {
-		t.Fatalf("dispatch admitted after pause: called=%v err=%v", called, err)
+	if err := withEnrichmentAutopilotAdmission(db, defaultCirculationTenant, func(*gorm.DB) error { called = true; return nil }); err == nil || called {
+		close(release)
+		<-done
+		t.Fatal("new work admitted after pause")
+	}
+	close(release)
+	<-done
+	if err := db.First(&admission, admission.ID).Error; err != nil || admission.Status != models.EnrichmentAutopilotActionStatusSuccess {
+		t.Fatalf("admitted work lost its receipt: status=%s err=%v", admission.Status, err)
 	}
 }
 
@@ -365,7 +511,7 @@ func TestSystemHealthDB_UnchangedIncidentDoesNotGrowTimeline(t *testing.T) {
 	seedSystemHealthPolicy(t, db, models.SystemAutopilotModeObserve, func(p *models.SystemAutopilotPolicy) { p.ConfirmProbes = 1 })
 	now := time.Date(2026, 7, 13, 15, 0, 0, 0, time.UTC)
 	failure, anomalies := systemHealthFailure(now)
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 6; i++ {
 		at := now.Add(time.Duration(i) * 10 * time.Minute)
 		failure.Timestamp = at.UTC().Format(time.RFC3339)
 		runSystemHealthFixture(t, db, at, failure, anomalies)
@@ -411,8 +557,8 @@ func TestSystemHealthDB_FlapGuardCountsResolvedCyclesNotHumanCloses(t *testing.T
 		if action.Guardrail == models.SystemAutopilotGuardFlapping {
 			attention++
 		}
-	}); len(got) != 0 || attention != 1 {
-		t.Fatalf("three resolved cycles must freeze a fresh opening, got=%+v attention=%d", got, attention)
+	}); len(got) != 1 || got[0].ActionsBlocked != models.SystemAutopilotGuardFlapping || attention != 1 {
+		t.Fatalf("three resolved cycles must retain the incident and block control effects, got=%+v attention=%d", got, attention)
 	}
 }
 

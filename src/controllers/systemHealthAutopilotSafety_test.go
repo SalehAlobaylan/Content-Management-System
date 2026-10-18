@@ -10,6 +10,28 @@ import (
 	"time"
 )
 
+func TestSystemCurrentOutcomeDoesNotReuseLastRunHeadline(t *testing.T) {
+	latest := &models.SystemAutopilotRun{Status: "completed", Headline: "contained", ProbeResults: marshalAutopilotJSON(map[string]interface{}{"snapshot": systemHealthSnapshot{Overall: "healthy"}})}
+	for _, tc := range []struct {
+		name             string
+		open, recovering int64
+		containment      systemContainmentProjection
+		want             string
+	}{
+		{"clear after expiry", 0, 0, systemContainmentProjection{Expired: 1}, "all_clear"},
+		{"legacy ownership needs review", 0, 0, systemContainmentProjection{Pending: 1}, "release_pending"},
+		{"recovery before release", 0, 1, systemContainmentProjection{Active: 1}, "recovering"},
+		{"resolved release pending", 0, 0, systemContainmentProjection{Active: 1, Pending: 1}, "release_pending"},
+		{"active without pause", 1, 0, systemContainmentProjection{}, "incident_open"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := projectSystemOutcome(systemMonitorProjection{Fresh: true}, latest, tc.open, tc.recovering, tc.containment, nil); got.Headline != tc.want {
+				t.Fatalf("outcome=%+v", got)
+			}
+		})
+	}
+}
+
 func TestSystemSafetyReleaseRequiresRecoveryWindow(t *testing.T) {
 	for _, state := range []string{"open", "recovering", "closed_by_human", "resolved"} {
 		t.Run(state, func(t *testing.T) {
@@ -50,6 +72,7 @@ func TestSystemSafetyVerifiedResolvedIncidentReleases(t *testing.T) {
 	healthy, _ := healthySystemSnapshotAt(now)
 	evidence := systemRecoveryEvidence{Snapshot: healthy, Previous: []systemRunSnapshot{{Services: healthy.Services}, {Services: healthy.Services}}}
 	mock.ExpectQuery(`SELECT .*system_incident_episodes`).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(`SELECT count.*system_incident_episodes`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT .*system_autopilot_policies.*FOR UPDATE`).WillReturnRows(sqlmock.NewRows([]string{"scope", "enabled", "mode"}).AddRow("platform", true, "safe_auto"))
 	mock.ExpectQuery(`SELECT .*system_incident_episodes.*FOR UPDATE`).WillReturnRows(sqlmock.NewRows([]string{"id", "root_service", "status"}).AddRow(1, "aggregation", "resolved"))
@@ -107,7 +130,7 @@ func TestSystemSafetyEnrichmentAdmissionChecksCurrentPolicy(t *testing.T) {
 				mock.ExpectRollback()
 			}
 			dispatched := false
-			err := withEnrichmentAutopilotAdmission(db, "tenant", func() { dispatched = true })
+			err := withEnrichmentAutopilotAdmission(db, "tenant", func(*gorm.DB) error { dispatched = true; return nil })
 			if dispatched != (name == "allowed") || (err == nil) != (name == "allowed") {
 				t.Fatalf("dispatched=%v err=%v", dispatched, err)
 			}

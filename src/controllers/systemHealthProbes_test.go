@@ -3,6 +3,7 @@ package controllers
 import (
 	"content-management-system/src/models"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,7 +36,7 @@ func TestSystemHTTPProbeRejectsMalformedJSON(t *testing.T) {
 }
 
 func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testing.T) {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	rawTopology, _ := json.Marshal(systemTestTopology("media-maintenance"))
 	cases := []struct {
 		name        string
 		readyStatus int
@@ -45,14 +46,16 @@ func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testi
 	}{
 		{name: "liveness only", readyStatus: http.StatusOK, readyBody: `{}`, observed: false},
 		{name: "malformed readiness", readyStatus: http.StatusOK, readyBody: `{"status":`, observed: false},
-		{name: "degraded role topology", readyStatus: http.StatusOK, readyBody: `{"schema_version":"aggregation-topology-readiness/v1","topology_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","captured_at":"` + now + `","status":"degraded","roles":{"media-maintenance":{"required":true,"ready":false,"reasons":["no live instance lease"]}},"capabilities":{"aggregation_pipeline":{"ready":false}}}`, observed: true, wantVerdict: models.SystemVerdictDependencyDown},
+		{name: "degraded role topology", readyStatus: http.StatusOK, readyBody: string(rawTopology), observed: true, wantVerdict: models.SystemVerdictDependencyDown},
+		{name: "valid degraded 503", readyStatus: http.StatusServiceUnavailable, readyBody: string(rawTopology), observed: true, wantVerdict: models.SystemVerdictDependencyDown},
+		{name: "denied topology", readyStatus: http.StatusUnauthorized, readyBody: string(rawTopology), observed: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/health":
-					_, _ = w.Write([]byte(`{"status":"ok"}`))
+					_, _ = w.Write([]byte(`{"status":"healthy"}`))
 				case "/internal/readiness/topology":
 					if r.Header.Get("Authorization") != "Bearer system-probe-test" {
 						http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -89,11 +92,16 @@ func TestSystemAggregationProbeRequiresReadinessAndPreserves503Evidence(t *testi
 			if len(probe.Deps) == 0 {
 				t.Fatalf("topology dependency evidence was lost: %+v", probe.Deps)
 			}
+			found := false
 			for _, dependency := range probe.Deps {
-				if dependency.Status != "unhealthy" {
-					t.Fatalf("degraded topology dependency was not preserved: %+v", probe.Deps)
+				if dependency.Name == "capability:aggregation_pipeline" && dependency.Status == "unhealthy" {
+					found = true
 				}
 			}
+			if !found {
+				t.Fatal("required capability evidence was lost")
+			}
+
 		})
 	}
 }

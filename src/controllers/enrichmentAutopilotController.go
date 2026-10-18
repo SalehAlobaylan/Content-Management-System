@@ -311,7 +311,16 @@ func (r *enrichmentAutopilotRunner) writeAction(a models.EnrichmentAutopilotActi
 		now := time.Now()
 		a.FinishedAt = &now
 	}
-	_ = r.db.Create(&a).Error
+	var err error
+	if a.ID != 0 {
+		err = r.db.Save(&a).Error
+	} else {
+		err = r.db.Create(&a).Error
+	}
+	if err != nil {
+		r.admissionStopped = true
+		r.errored++
+	}
 }
 
 // classBlock writes one summary row for a class-level gate (service/trust/queue/
@@ -639,29 +648,32 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 	}
 
 	// Safe Auto: execute through the shared traced path with autopilot attribution.
-	var outcomes []artifactOutcome
-	dispatched := false
-	admissionErr := withEnrichmentAutopilotAdmission(r.db, r.run.TenantID, func() {
-		dispatched = true
-		outcomes = triggerItemArtifactsTraced(r.db, item, []string{artifact}, false, models.TranscriptionTriggerEnrichmentAutopilot)
+	admission := models.EnrichmentAutopilotAction{RunID: r.run.ID, TenantID: r.run.TenantID, ContentID: &id, Artifact: artifact,
+		Status: models.EnrichmentAutopilotActionStatusAdmitted, Guardrail: "native_admission", Reason: "One operation admitted under the current policy; execution receipt is pending", StartedAt: startedAt}
+	admissionErr := withEnrichmentAutopilotAdmission(r.db, r.run.TenantID, func(tx *gorm.DB) error {
+		var pending int64
+		if err := tx.Model(&models.EnrichmentAutopilotAction{}).Where("tenant_id = ? AND content_id = ? AND artifact = ? AND status = ?", r.run.TenantID, id, artifact, models.EnrichmentAutopilotActionStatusAdmitted).Count(&pending).Error; err != nil {
+			return err
+		}
+		if pending > 0 {
+			return errors.New("A prior admission has no terminal receipt; inspect it before admitting this artifact again")
+		}
+		return tx.Create(&admission).Error
 	})
 	if admissionErr != nil {
 		r.admissionStopped = true
-		if !dispatched {
-			r.itemSkip(item, artifact, "admission_blocked", admissionErr.Error())
-			return
-		}
-		// Dispatch receipts still stand if releasing the admission transaction
-		// fails. Record that uncertainty and stop; never call it an unissued skip.
 		r.errored++
-		r.writeAction(models.EnrichmentAutopilotAction{ContentID: &id, Artifact: artifact, Status: models.EnrichmentAutopilotActionStatusError, Guardrail: "admission_commit_unknown", Reason: "Dispatch was attempted; inspect its receipt. Admission transaction failed: " + admissionErr.Error()})
+		r.itemSkip(item, artifact, "admission_blocked", admissionErr.Error())
+		return
 	}
+	// The committed admission is ordered before a later pause. Remote work and
+	// its receipts use no open policy transaction, so containment never waits
+	// for a slow provider. An interrupted admitted row is inspected, not replayed.
+	outcomes := triggerItemArtifactsTraced(r.db, item, []string{artifact}, false, models.TranscriptionTriggerEnrichmentAutopilot)
 	finishedAt := time.Now()
-	action := models.EnrichmentAutopilotAction{
-		ContentID: &id, Artifact: artifact,
-		StartedAt: startedAt, FinishedAt: &finishedAt,
-		DurationMs: int(finishedAt.Sub(startedAt).Milliseconds()),
-	}
+	action := admission
+	action.Guardrail = ""
+	action.FinishedAt, action.DurationMs = &finishedAt, int(finishedAt.Sub(startedAt).Milliseconds())
 	if len(outcomes) == 0 {
 		action.Status = models.EnrichmentAutopilotActionStatusSkipped
 		action.Guardrail = models.EnrichmentAutopilotGuardAlreadyPresent
@@ -715,11 +727,9 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 	}
 }
 
-// Hold a policy row lock through one native dispatch. Pause updates acquire
-// that same row lock, so dispatch is ordered before or after the committed
-// pause. The effect uses the normal DB connection: admission rollback cannot
-// erase receipts for work already accepted by another service.
-func withEnrichmentAutopilotAdmission(db *gorm.DB, tenantID string, dispatch func()) error {
+// Serialize a durable, local admission with policy updates. The callback may
+// only write admission evidence through tx; dispatch runs after this commits.
+func withEnrichmentAutopilotAdmission(db *gorm.DB, tenantID string, admit func(*gorm.DB) error) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		var policy models.EnrichmentAutopilotPolicy
 		if err := tx.Clauses(clause.Locking{Strength: "SHARE"}).Where("tenant_id = ?", tenantID).First(&policy).Error; err != nil {
@@ -734,8 +744,7 @@ func withEnrichmentAutopilotAdmission(db *gorm.DB, tenantID string, dispatch fun
 		if policy.PausedUntil != nil && policy.PausedUntil.After(time.Now().UTC()) {
 			return errEnrichmentAutopilotPaused
 		}
-		dispatch()
-		return nil
+		return admit(tx)
 	})
 }
 

@@ -46,7 +46,9 @@ const (
 
 	// Action statuses. Observe writes would_trigger/would_skip instead of
 	// success/skipped — same rows, only the terminal execute flips.
-	EnrichmentAutopilotActionStatusSuccess          = "success"
+	EnrichmentAutopilotActionStatusSuccess = "success"
+	// Admitted is durable permission for one operation, not a success receipt.
+	EnrichmentAutopilotActionStatusAdmitted         = "admitted"
 	EnrichmentAutopilotActionStatusError            = "error"
 	EnrichmentAutopilotActionStatusSkipped          = "skipped"
 	EnrichmentAutopilotActionStatusApprovalRequired = "approval_required"

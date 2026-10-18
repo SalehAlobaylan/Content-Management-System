@@ -16,6 +16,60 @@ type systemRecoveryEvidence struct {
 	Previous []systemRunSnapshot
 }
 
+type systemStatusOutcome struct {
+	Headline string `json:"headline"`
+	Summary  string `json:"summary"`
+}
+
+func projectSystemOutcome(monitor systemMonitorProjection, latest *models.SystemAutopilotRun, open, recovering int64, containment systemContainmentProjection, attention []systemAttentionProjection) systemStatusOutcome {
+	if !monitor.Fresh {
+		return systemStatusOutcome{Headline: "watching", Summary: monitor.Reason}
+	}
+	if open == 0 && recovering > 0 {
+		return systemStatusOutcome{Headline: "recovering", Summary: fmt.Sprintf("%d incident(s) are checking recovery; %d policy lease(s) remain active", recovering, containment.Active)}
+	}
+	if open+recovering == 0 && (containment.Pending > 0 || containment.HumanOwned > 0 || len(attention) > 0) {
+		return systemStatusOutcome{Headline: "release_pending", Summary: "Incident recovery does not account for every control yet; inspect pending ownership and human decisions"}
+	}
+	if containment.Active > 0 {
+		return systemStatusOutcome{Headline: "contained", Summary: fmt.Sprintf("%d active policy lease(s); %d incident(s). Inspect each target for its native enforcement scope", containment.Active, open+recovering)}
+	}
+	if open > 0 {
+		return systemStatusOutcome{Headline: "incident_open", Summary: fmt.Sprintf("%d active incident(s); no currently verified System Health policy lease", open+recovering)}
+	}
+	var evidence struct {
+		Snapshot systemHealthSnapshot `json:"snapshot"`
+	}
+	if latest != nil && latest.Status == models.SystemAutopilotRunStatusCompleted && json.Unmarshal(latest.ProbeResults, &evidence) == nil && evidence.Snapshot.Overall == "healthy" {
+		return systemStatusOutcome{Headline: "all_clear", Summary: "Required service observations are healthy and containment is accounted for"}
+	}
+	return systemStatusOutcome{Headline: "watching", Summary: "Service observation is incomplete or awaiting confirmation"}
+}
+
+func systemSiblingEffectScope(key string) string {
+	switch key {
+	case "pipeline":
+		return "Observe-only cockpit pause; canonical pipeline repairs are not stopped by this policy"
+	case "enrichment":
+		return "New Enrichment admissions are blocked after the pause commits; already admitted work and receipts may finish"
+	default:
+		return "Native policy pause recorded; stronger per-operation admission enforcement has not been qualified"
+	}
+}
+
+func systemAttentionNextAction(target string) systemRecommendedAction {
+	action := systemRecommendedAction{Label: "Inspect service configuration and current controls", Kind: "system_health.inspect", Target: target, Href: "/platform/system-health?tab=configuration"}
+	switch target {
+	case "enrichment", "embedding_lifecycle":
+		action.Label, action.Href = "Review Enrichment policy and receipts", "/platform/enrichment"
+	case "aggregation", "pipeline":
+		action.Label, action.Href = "Inspect Pipeline evidence", "/platform/pipeline"
+	case "media", "media_studio", "media_circulation":
+		action.Label, action.Href = "Review Media operations and controls", "/platform/media"
+	}
+	return action
+}
+
 // Both human close and observation updates lock the same row. Preserve the
 // independently maintained containment ledger when writing an observation.
 func saveSystemEpisodeObservation(db *gorm.DB, episode *models.SystemIncidentEpisode) error {
@@ -41,7 +95,7 @@ func systemRecoverySamples(episode models.SystemIncidentEpisode, snapshot system
 		if count >= required {
 			break
 		}
-		if !systemEpisodeObservablyHealthyServices(episode, sample.Services) {
+		if !systemEpisodeObservablyHealthyServices(episode, sample.Services) || !systemRecoveryContractsMatch(episode, snapshot.Services, sample.Services) {
 			break
 		}
 		if !sample.TooClose {
@@ -149,7 +203,7 @@ func projectSystemContainment(db *gorm.DB, episodes []models.SystemIncidentEpiso
 }
 
 func projectSystemContainmentTarget(episode models.SystemIncidentEpisode, sibling, tenant string, entry systemContainmentLedgerEntry, row systemSiblingPolicyRow, now time.Time) systemContainmentTargetProjection {
-	target := systemContainmentTargetProjection{EpisodeID: episode.PublicID.String(), Sibling: sibling, TenantID: tenant, Outcome: entry.Outcome, Until: entry.WrittenUntil, Reason: entry.Reason}
+	target := systemContainmentTargetProjection{EpisodeID: episode.PublicID.String(), Sibling: sibling, TenantID: tenant, Outcome: entry.Outcome, Until: entry.WrittenUntil, Reason: entry.Reason, EffectScope: systemSiblingEffectScope(sibling), AdmissionEnforced: sibling == "enrichment"}
 	if entry.Outcome == "resumed" || entry.Outcome == "expired" {
 		return target
 	}
@@ -223,6 +277,8 @@ func unresolvedSystemAttention(decisions []models.SystemAutopilotAction, episode
 			continue
 		}
 		item := systemAttentionProjection{Target: action.Target, Guardrail: action.Guardrail, Status: action.Status, Reason: action.Reason, At: action.StartedAt.UTC().Format(time.RFC3339)}
+		item.ResponsibleRole = "Platform administrator"
+		item.RecommendedAction = systemAttentionNextAction(action.Target)
 		var output struct {
 			TenantID string `json:"tenant_id"`
 		}

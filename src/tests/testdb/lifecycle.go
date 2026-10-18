@@ -4,6 +4,7 @@ package testdb
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -148,6 +149,16 @@ func validateAdminDSN(raw, marker string) error {
 		return fmt.Errorf("CMS_TEST_ADMIN_URL must be a PostgreSQL URL")
 	}
 	host := strings.ToLower(u.Hostname())
+	if strings.HasSuffix(host, ".neon.tech") {
+		// Only the create-random-database path can use an explicitly approved
+		// Neon parent. The parent is never migrated, cleared, or dropped. Bind
+		// approval to the exact DSN so an inherited opt-in cannot select another
+		// runtime database. Existing-database fallback still rejects Neon.
+		expected := fmt.Sprintf("%x", sha256.Sum256([]byte(raw)))
+		if os.Getenv("CMS_TEST_NEON_ADMIN_SHA256") == expected {
+			return nil
+		}
+	}
 	if strings.Contains(host, "supabase") || strings.Contains(host, "neon") {
 		return fmt.Errorf("managed production database hosts are forbidden for tests")
 	}

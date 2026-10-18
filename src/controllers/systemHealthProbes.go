@@ -24,6 +24,7 @@ type systemProbeModel struct {
 
 type systemProbeWorker struct {
 	Configured bool `json:"configured"`
+	Reachable  bool `json:"reachable"`
 	Alive      bool `json:"alive"`
 	Queued     int  `json:"queued"`
 	Ongoing    int  `json:"ongoing"`
@@ -38,6 +39,7 @@ type systemProbeResult struct {
 	EndpointURL       string                  `json:"endpoint_url"`
 	Status            string                  `json:"status"`
 	ReadinessObserved bool                    `json:"readiness_observed"`
+	ContractIdentity  string                  `json:"contract_identity,omitempty"`
 	LatencyMS         *int64                  `json:"latency_ms,omitempty"`
 	HTTPStatus        *int                    `json:"http_status,omitempty"`
 	Version           string                  `json:"version,omitempty"`

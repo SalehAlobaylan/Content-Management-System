@@ -1,6 +1,10 @@
 package testdb
 
-import "testing"
+import (
+	"crypto/sha256"
+	"fmt"
+	"testing"
+)
 
 func TestValidateDisposableDSNRejectsUnsafeTargetsBeforeConnection(t *testing.T) {
 	marker := "I_UNDERSTAND_THIS_DATABASE_IS_DISPOSABLE"
@@ -55,5 +59,19 @@ func TestValidateAdminDSNRejectsUnsafeHostsBeforeConnection(t *testing.T) {
 	}
 	if err := validateAdminDSN("postgres://x:y@localhost:5432/postgres?sslmode=disable", marker); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNeonAdminApprovalIsExactAndOnlyAllowsFreshDatabaseCreation(t *testing.T) {
+	dsn := "postgres://fixture:example@ep-fixture.neon.tech/neondb"
+	t.Setenv("CMS_TEST_NEON_ADMIN_SHA256", fmt.Sprintf("%x", sha256.Sum256([]byte(dsn))))
+	if err := validateAdminDSN(dsn, disposableMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateAdminDSN(dsn+"?application_name=changed", disposableMarker); err == nil {
+		t.Fatal("approval leaked to another connection")
+	}
+	if _, err := ValidateDisposableDSN("postgres://fixture:example@ep-fixture.neon.tech/wahb_cms_test_a1b2c3d4", "", disposableMarker); err == nil {
+		t.Fatal("Neon existing-database fallback bypassed isolation")
 	}
 }

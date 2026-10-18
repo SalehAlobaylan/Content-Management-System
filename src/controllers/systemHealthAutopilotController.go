@@ -69,13 +69,14 @@ var defaultSystemAutopilotDeps = systemAutopilotDeps{
 }
 
 type systemAnomaly struct {
-	Key       string                 `json:"key"`
-	Service   string                 `json:"service"`
-	Verdict   string                 `json:"verdict"`
-	Severity  string                 `json:"severity"`
-	Summary   string                 `json:"summary"`
-	Evidence  map[string]interface{} `json:"evidence,omitempty"`
-	Confirmed bool                   `json:"confirmed"`
+	Key            string                 `json:"key"`
+	Service        string                 `json:"service"`
+	Verdict        string                 `json:"verdict"`
+	Severity       string                 `json:"severity"`
+	Summary        string                 `json:"summary"`
+	Evidence       map[string]interface{} `json:"evidence,omitempty"`
+	Confirmed      bool                   `json:"confirmed"`
+	ActionsBlocked string                 `json:"actions_blocked,omitempty"`
 }
 
 type systemRunSnapshot struct {
@@ -211,7 +212,10 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	defer releaseLock()
 
 	now := deps.now()
-	policy := loadSystemAutopilotPolicy(db)
+	policy, policyErr := loadSystemAutopilotPolicyWithError(db)
+	if policyErr != nil {
+		return models.SystemAutopilotRun{}, nil, policyErr
+	}
 	allowContainment := opts.Trigger == "scheduled" && policy.Enabled && policy.Mode == models.SystemAutopilotModeSafeAuto && !opts.ObservationOnly
 	run := models.SystemAutopilotRun{
 		Trigger:       opts.Trigger,
@@ -229,6 +233,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	}
 
 	actions := []models.SystemAutopilotAction{}
+	episodeWriteErrors := 0
 	storeAction := func(actionDB *gorm.DB, a models.SystemAutopilotAction) (models.SystemAutopilotAction, error) {
 		t := deps.now()
 		if a.StartedAt.IsZero() {
@@ -249,14 +254,19 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	writeAction := func(a models.SystemAutopilotAction) {
 		if stored, err := storeAction(db, a); err == nil {
 			actions = append(actions, stored)
+		} else {
+			episodeWriteErrors++
 		}
 	}
 
 	snapshot, anomalies := deps.collect(db)
-	prev := recentSystemRunSnapshots(db, systemAutopilotHistoryRuns, now, policy.IntervalMinutes)
+	prev, historyErr := recentSystemRunSnapshotsWithError(db, systemAutopilotHistoryRuns, now, policy.IntervalMinutes)
+	if historyErr != nil {
+		episodeWriteErrors++
+		allowContainment = false
+	}
 	confirmed := confirmSystemAnomalies(anomalies, prev, policy.ConfirmProbes)
 	confirmed = correlateSystemAnomalies(confirmed)
-	confirmed = applySystemFlapGuard(db, confirmed, policy.FlapCycles24h, now, writeAction)
 	observed := correlateSystemAnomalies(anomalies)
 
 	for _, anomaly := range observed {
@@ -276,7 +286,14 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 		}
 	}
 
-	openEpisodes := openSystemIncidentEpisodes(db)
+	openEpisodes, episodesErr := openSystemIncidentEpisodesWithError(db)
+	if episodesErr != nil {
+		episodeWriteErrors++
+		allowContainment = false
+		// Missing state is not permission to create replacement episodes.
+		confirmed = nil
+		writeAction(models.SystemAutopilotAction{Target: "platform", Action: models.SystemAutopilotActionSkipped, Status: "error", Reason: "Active incident evidence is unavailable; episode and containment mutations are blocked"})
+	}
 	episodesByKey := map[string]models.SystemIncidentEpisode{}
 	for _, ep := range openEpisodes {
 		episodesByKey[systemIncidentKey(ep.RootService, ep.Verdict)] = ep
@@ -284,7 +301,7 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	// A confirmed episode in recovery relapses immediately when its own evidence
 	// returns. Opening needs N probes; a known incident never forgets its signal.
 	for _, anomaly := range observed {
-		if ep, exists := episodesByKey[systemIncidentKey(anomaly.Service, anomaly.Verdict)]; exists && ep.Status == models.SystemIncidentStatusRecovering {
+		if ep, exists := episodesByKey[systemIncidentKey(anomaly.Service, anomaly.Verdict)]; exists && ep.Status == models.SystemIncidentStatusRecovering && !systemEpisodeScopeChanged(ep, anomaly) {
 			already := false
 			for _, current := range confirmed {
 				if current.Key == anomaly.Key {
@@ -298,12 +315,30 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 		}
 	}
 
+	flapDecisions := map[string]models.SystemAutopilotAction{}
+	confirmed = applySystemFlapGuard(db, confirmed, policy.FlapCycles24h, now, func(action models.SystemAutopilotAction) {
+		flapDecisions[systemIncidentKey(action.Target, action.Verdict)] = action
+		if action.Status == "error" {
+			episodeWriteErrors++
+		}
+	})
 	contained := false
-	episodeWriteErrors := 0
 	handledConfirmed := []systemAnomaly{}
 	mutationContext, cancelMutations := context.WithTimeout(context.Background(), systemAutopilotMutationTimeout)
 	defer cancelMutations()
 	mutationDB := db.WithContext(mutationContext)
+	if allowContainment {
+		existing, readErr := allSystemIncidentEpisodesWithContainmentErr(mutationDB)
+		scope, scopeErr := prepareSystemMutationScope(mutationDB, policy, confirmed, existing)
+		if readErr != nil || scopeErr != nil {
+			scope.Denied, scope.Reason = true, "Containment scope evidence is unavailable; no policy effects are permitted"
+			episodeWriteErrors++
+		}
+		mutationDB = mutationDB.WithContext(context.WithValue(mutationContext, systemMutationScopeKey{}, &scope))
+		if scope.Denied {
+			writeAction(models.SystemAutopilotAction{Target: "platform", Action: models.SystemAutopilotActionSkipped, Status: "attention", Guardrail: models.SystemAutopilotGuardScopeCap, Reason: scope.Reason})
+		}
+	}
 	for _, anomaly := range confirmed {
 		if anomaly.Verdict == models.SystemVerdictQueueBacklog {
 			continue
@@ -391,7 +426,11 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 				Output:    marshalAutopilotJSON(anomaly),
 			})
 		}
-		if isSystemHardDownVerdict(anomaly.Verdict) {
+		if anomaly.ActionsBlocked != "" {
+			action := flapDecisions[systemIncidentKey(anomaly.Service, anomaly.Verdict)]
+			action.EpisodeID = &ep.ID
+			writeAction(action)
+		} else if isSystemHardDownVerdict(anomaly.Verdict) {
 			applied, containmentWriteErrors := handleSystemContainment(mutationDB, policy, anomaly, &ep, now, storeAction, func(action models.SystemAutopilotAction) {
 				actions = append(actions, action)
 			}, allowContainment)
@@ -415,14 +454,20 @@ func runSystemHealthAutopilotWithDeps(db *gorm.DB, opts systemAutopilotRunOption
 	resolvedEpisodes, resolutionWriteErrors := resolveRecoveredSystemEpisodes(db, openEpisodes, snapshot, prev, policy.ResolveProbes, now, writeAction)
 	episodeWriteErrors += resolutionWriteErrors
 	if allowContainment {
-		allContainmentEpisodes := allSystemIncidentEpisodesWithContainment(mutationDB)
+		allContainmentEpisodes, containmentReadErr := allSystemIncidentEpisodesWithContainmentErr(mutationDB)
+		if containmentReadErr != nil {
+			episodeWriteErrors++
+		}
 		episodeWriteErrors += resumeRecoveredSystemContainment(mutationDB, policy, allContainmentEpisodes, now, systemRecoveryEvidence{Snapshot: snapshot, Previous: prev}, storeAction, func(action models.SystemAutopilotAction) {
 			actions = append(actions, action)
 		}, true)
 	} else if opts.Trigger != "scheduled" {
 		// Manual and recovery callers still expose what would be released; they
 		// never acquire a mutation path through the diagnostic endpoint.
-		allContainmentEpisodes := allSystemIncidentEpisodesWithContainment(mutationDB)
+		allContainmentEpisodes, containmentReadErr := allSystemIncidentEpisodesWithContainmentErr(mutationDB)
+		if containmentReadErr != nil {
+			episodeWriteErrors++
+		}
 		episodeWriteErrors += resumeRecoveredSystemContainment(mutationDB, policy, allContainmentEpisodes, now, systemRecoveryEvidence{Snapshot: snapshot, Previous: prev}, storeAction, func(action models.SystemAutopilotAction) {
 			actions = append(actions, action)
 		}, false)
@@ -569,12 +614,15 @@ func checkSystemAggregation(ctx context.Context) systemProbeResult {
 	display.HTTPStatus = firstHTTPStatus(health.HTTPStatus, ready.HTTPStatus)
 	display.RawError = firstNonEmpty(health.Error, ready.Error)
 	readyBody := asSystemRecord(ready.Body)
-	healthObserved := health.JSONObserved && systemHealthStatusObserved(asSystemRecord(health.Body), "healthy")
-	display.ReadinessObserved = ready.JSONObserved && readinessAggregationBodyObserved(readyBody)
+	healthObserved := health.OK && health.JSONObserved && systemHealthStatusObserved(asSystemRecord(health.Body), "healthy")
+	display.ReadinessObserved = (ready.OK || (ready.HTTPStatus != nil && *ready.HTTPStatus == http.StatusServiceUnavailable)) && ready.JSONObserved && readinessAggregationBodyObserved(readyBody)
 	// A response that fails the topology contract is observation-unknown. Do
 	// not turn its partial role payload into a durable dependency-down verdict.
 	if display.ReadinessObserved {
 		display.Deps = mapAggregationTopologyDependencies(readyBody)
+		display.ContractIdentity = systemString(readyBody["schema_version"]) + ":" + systemString(readyBody["topology_digest"])
+	} else {
+		display.RawError = firstNonEmpty(display.RawError, "Aggregation topology evidence is missing, stale, denied, or incompatible")
 	}
 	if queueErr == nil {
 		display.Queues = queues
@@ -633,15 +681,27 @@ func checkSystemMLService(ctx context.Context, name, displayName, envKey string,
 	healthBody := asSystemRecord(health.Body)
 	readyBody := asSystemRecord(ready.Body)
 	display.Version = systemString(healthBody["version"])
-	display.Models = mapSystemModels(readyBody)
-	display.Deps = mapSystemDependencies(asSystemRecord(readyBody["dependencies"]))
-	healthObserved := health.JSONObserved && systemHealthStatusObserved(healthBody, "ok")
-	display.ReadinessObserved = ready.JSONObserved && readinessMLBodyObserved(readyBody)
+	healthObserved := health.OK && health.JSONObserved && systemHealthStatusObserved(healthBody, "ok")
+	display.ReadinessObserved = (ready.OK || (ready.HTTPStatus != nil && *ready.HTTPStatus == http.StatusServiceUnavailable)) && ready.JSONObserved && readinessMLBodyObserved(readyBody)
+	if display.ReadinessObserved {
+		display.Models = mapSystemModels(readyBody)
+		display.Deps = mapSystemDependencies(asSystemRecord(readyBody["dependencies"]))
+		identities := []string{name + "-readiness/v1", display.Version}
+		for _, model := range display.Models {
+			identities = append(identities, model.Name+":"+model.Detail)
+		}
+		display.ContractIdentity = strings.Join(identities, "|")
+	}
+	workerObserved := !includeWorker
 	if includeWorker {
-		if worker := mapSystemWorker(asSystemRecord(queue.Body)); queue.JSONObserved && worker != nil {
+		if worker := mapSystemWorker(asSystemRecord(queue.Body)); queue.OK && queue.JSONObserved && worker != nil {
 			display.Worker = worker
+			workerObserved = !worker.Configured || worker.Reachable
 			// A stalled worker is degraded execution evidence, not a hard
 			// service dependency eligible for sibling containment.
+		}
+		if !workerObserved {
+			display.RawError = firstNonEmpty(queue.Error, "Media worker/queue evidence is unavailable")
 		}
 	}
 	reachable := health.HTTPStatus != nil || ready.HTTPStatus != nil
@@ -652,14 +712,16 @@ func checkSystemMLService(ctx context.Context, name, displayName, envKey string,
 	case hasUnhealthySystemDeps(display.Deps):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictDependencyDown}
-	case !healthObserved || !display.ReadinessObserved:
+	case !healthObserved || !display.ReadinessObserved || !workerObserved:
 		display.Status = "degraded"
 	case hasUnloadedModels(display.Models):
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictModelUnloaded}
-	case display.Worker != nil && display.Worker.Configured && !display.Worker.Alive && display.Worker.Queued > 0:
+	case display.Worker != nil && display.Worker.Configured && !display.Worker.Alive:
 		display.Status = "degraded"
 		display.Verdicts = []string{models.SystemVerdictWorkerStalled}
+	case systemString(readyBody["status"]) != "ok":
+		display.Status = "degraded"
 	default:
 		display.Status = "healthy"
 		display.Verdicts = []string{models.SystemVerdictHealthy}
@@ -795,15 +857,7 @@ func fetchSystemAggregationQueueStats(parent context.Context) ([]autopilotQueueS
 }
 
 func readinessAggregationBodyObserved(body map[string]interface{}) bool {
-	status := systemString(body["status"])
-	capturedAt, capturedErr := time.Parse(time.RFC3339, systemString(body["captured_at"]))
-	_, hasRoles := body["roles"]
-	_, hasCapabilities := body["capabilities"]
-	digest := systemString(body["topology_digest"])
-	return systemString(body["schema_version"]) == "aggregation-topology-readiness/v1" &&
-		(status == "healthy" || status == "degraded") && hasRoles && hasCapabilities &&
-		validSystemTopologyDigest(digest) && capturedErr == nil && time.Since(capturedAt.UTC()) <= 45*time.Second &&
-		capturedAt.UTC().Before(time.Now().UTC().Add(5*time.Second))
+	return systemTopologyObserved(body, time.Now().UTC())
 }
 
 func validSystemTopologyDigest(value string) bool {
@@ -853,10 +907,7 @@ func mapAggregationTopologyDependencies(body map[string]interface{}) []systemPro
 }
 
 func readinessMLBodyObserved(body map[string]interface{}) bool {
-	status := systemString(body["status"])
-	_, hasModels := body["models"]
-	_, hasDeps := body["dependencies"]
-	return (status == "ok" || status == "not_ready") && hasModels && hasDeps
+	return systemMLReadinessObserved(body)
 }
 
 func systemHealthStatusObserved(body map[string]interface{}, expected string) bool {
@@ -958,49 +1009,43 @@ func systemDependencyStatus(value string) string {
 
 func mapSystemModels(readyBody map[string]interface{}) []systemProbeModel {
 	modelsOut := []systemProbeModel{}
-	if detail, ok := readyBody["models_detail"].([]interface{}); ok {
-		for _, raw := range detail {
+	details := map[string]map[string]interface{}{}
+	if items, ok := readyBody["models_detail"].([]interface{}); ok {
+		for _, raw := range items {
 			record := asSystemRecord(raw)
-			role := systemString(record["type"])
-			if role == "" {
-				role = systemString(record["name"])
-			}
-			name := systemString(record["name"])
-			detailText := name
-			if dims, ok := record["dimensions"].(float64); ok && dims > 0 {
-				detailText = fmt.Sprintf("%s · %dd", name, int(dims))
-			}
-			modelsOut = append(modelsOut, systemProbeModel{Name: role, Loaded: record["loaded"] == true, Detail: detailText})
+			role := firstNonEmpty(systemString(record["type"]), systemString(record["name"]))
+			details[role] = record
 		}
-		return modelsOut
 	}
-	modelMap := asSystemRecord(readyBody["models"])
-	for name, raw := range modelMap {
-		loaded := raw == true
-		if record := asSystemRecord(raw); len(record) > 0 {
-			loaded = record["loaded"] == true
+	// The readiness bool-map is authoritative. Rich identity is additive and
+	// cannot erase a missing/unready model merely by returning an empty list.
+	for role, raw := range asSystemRecord(readyBody["models"]) {
+		detail := details[role]
+		text := systemString(detail["name"])
+		if dims, ok := detail["dimensions"].(float64); ok && dims > 0 {
+			text = fmt.Sprintf("%s · %dd", text, int(dims))
 		}
-		modelsOut = append(modelsOut, systemProbeModel{Name: name, Loaded: loaded})
+		modelsOut = append(modelsOut, systemProbeModel{Name: role, Loaded: raw == true, Detail: text})
 	}
 	sort.Slice(modelsOut, func(i, j int) bool { return modelsOut[i].Name < modelsOut[j].Name })
 	return modelsOut
 }
 
 func mapSystemWorker(body map[string]interface{}) *systemProbeWorker {
-	if len(body) == 0 {
+	configured, ok := body["configured"].(bool)
+	if !ok {
 		return nil
 	}
-	if _, ok := body["configured"]; !ok {
+	reachable, reachableOK := body["reachable"].(bool)
+	alive, aliveOK := body["worker_alive"].(bool)
+	queued, queuedOK := body["queued"].(float64)
+	if !reachableOK || !aliveOK || !queuedOK || queued < 0 || queued > float64(math.MaxInt) || math.Trunc(queued) != queued {
 		return nil
 	}
 	return &systemProbeWorker{
-		Configured: body["configured"] == true,
-		Alive:      body["worker_alive"] == true,
-		Queued:     systemInt(body["queued"]),
-		Ongoing:    systemInt(body["jobs_ongoing"]),
-		Complete:   systemInt(body["jobs_complete"]),
-		Failed:     systemInt(body["jobs_failed"]),
-		Retried:    systemInt(body["jobs_retried"]),
+		Configured: configured, Reachable: reachable, Alive: alive, Queued: int(queued),
+		Ongoing: systemInt(body["jobs_ongoing"]), Complete: systemInt(body["jobs_complete"]),
+		Failed: systemInt(body["jobs_failed"]), Retried: systemInt(body["jobs_retried"]),
 	}
 }
 
@@ -1130,13 +1175,19 @@ func systemAnomalySummary(svc systemProbeResult, verdict string) string {
 // scope. Probe payloads contain latency and other live diagnostics that change
 // on every run and must not grow an incident timeline indefinitely.
 func systemEpisodeScopeChanged(ep models.SystemIncidentEpisode, anomaly systemAnomaly) bool {
-	var stored struct {
-		Evidence map[string]interface{} `json:"evidence"`
+	return systemEvidenceIdentity(systemEpisodeEvidence(ep)) != systemEvidenceIdentity(anomaly.Evidence)
+}
+
+func systemEpisodeEvidence(ep models.SystemIncidentEpisode) map[string]interface{} {
+	var evidence map[string]interface{}
+	if json.Unmarshal(ep.Evidence, &evidence) != nil {
+		return nil
 	}
-	if err := json.Unmarshal(ep.Evidence, &stored); err != nil {
-		return true
+	// Historical wrappers remain readable, but new records store direct evidence.
+	if wrapped, ok := evidence["evidence"].(map[string]interface{}); ok {
+		return wrapped
 	}
-	return systemEvidenceScope(stored.Evidence, ep.RootService) != systemEvidenceScope(anomaly.Evidence, anomaly.Service)
+	return evidence
 }
 
 func systemEvidenceScope(evidence map[string]interface{}, fallback string) string {
@@ -1298,10 +1349,15 @@ func hardDownServiceNames(anomalies []systemAnomaly) []string {
 }
 
 func recentSystemRunSnapshots(db *gorm.DB, limit int, now time.Time, intervalMinutes int) []systemRunSnapshot {
+	samples, _ := recentSystemRunSnapshotsWithError(db, limit, now, intervalMinutes)
+	return samples
+}
+
+func recentSystemRunSnapshotsWithError(db *gorm.DB, limit int, now time.Time, intervalMinutes int) ([]systemRunSnapshot, error) {
 	var runs []models.SystemAutopilotRun
 	if err := db.Where("started_at < ?", now).
 		Order("started_at DESC").Limit(limit * 16).Find(&runs).Error; err != nil {
-		return nil
+		return nil, err
 	}
 	if intervalMinutes < 2 {
 		intervalMinutes = 10
@@ -1342,7 +1398,7 @@ func recentSystemRunSnapshots(db *gorm.DB, limit int, now time.Time, intervalMin
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func confirmSystemAnomalies(current []systemAnomaly, prev []systemRunSnapshot, confirmProbes int) []systemAnomaly {
@@ -1356,7 +1412,7 @@ func confirmSystemAnomalies(current []systemAnomaly, prev []systemRunSnapshot, c
 	for _, anomaly := range current {
 		count := 1
 		for _, run := range prev {
-			if runHasSystemAnomaly(run, anomaly.Key) {
+			if runHasMatchingSystemAnomaly(run, anomaly) {
 				if run.TooClose {
 					continue
 				}
@@ -1374,6 +1430,17 @@ func confirmSystemAnomalies(current []systemAnomaly, prev []systemRunSnapshot, c
 		}
 	}
 	return confirmed
+}
+
+func runHasMatchingSystemAnomaly(run systemRunSnapshot, current systemAnomaly) bool {
+	for _, candidates := range [][]systemAnomaly{run.Anomalies, correlateSystemAnomalies(run.Anomalies)} {
+		for _, prior := range candidates {
+			if systemAnomalyIdentity(prior) == systemAnomalyIdentity(current) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func runHasSystemAnomaly(run systemRunSnapshot, key string) bool {
@@ -1395,7 +1462,7 @@ func runHasSystemAnomaly(run systemRunSnapshot, key string) bool {
 func systemAnomalyStreak(current systemAnomaly, prev []systemRunSnapshot) int {
 	count := 1
 	for _, run := range prev {
-		if !runHasSystemAnomaly(run, current.Key) {
+		if !runHasMatchingSystemAnomaly(run, current) {
 			break
 		}
 		if run.TooClose {
@@ -1406,39 +1473,39 @@ func systemAnomalyStreak(current systemAnomaly, prev []systemRunSnapshot) int {
 	return count
 }
 
-func applySystemFlapGuard(db *gorm.DB, current []systemAnomaly, maxFlaps int, now time.Time, writeAction func(models.SystemAutopilotAction)) []systemAnomaly {
+func systemFlapBlocked(db *gorm.DB, service, verdict string, maxFlaps int, now time.Time) (bool, error) {
 	if maxFlaps <= 0 {
-		return current
+		return false, nil
 	}
-	out := []systemAnomaly{}
-	for _, anomaly := range current {
-		var count int64
-		since := now.UTC().Add(-24 * time.Hour)
-		_ = db.Model(&models.SystemIncidentEpisode{}).
-			Where("root_service = ? AND verdict = ? AND status = ? AND resolved_at >= ?", anomaly.Service, anomaly.Verdict, models.SystemIncidentStatusResolved, since).
-			Count(&count).Error
-		if int(count) >= maxFlaps {
-			writeAction(models.SystemAutopilotAction{
-				Target:    anomaly.Service,
-				Action:    models.SystemAutopilotActionSkipped,
-				Verdict:   anomaly.Verdict,
-				Status:    "attention",
-				Guardrail: models.SystemAutopilotGuardFlapping,
-				Reason:    "incident has flapped repeatedly in the last 24h",
-				Output:    marshalAutopilotJSON(anomaly),
-			})
-			continue
+	var count int64
+	err := db.Model(&models.SystemIncidentEpisode{}).Where("root_service = ? AND verdict = ? AND status = ? AND resolved_at >= ?", service, verdict, models.SystemIncidentStatusResolved, now.UTC().Add(-24*time.Hour)).Count(&count).Error
+	return int(count) >= maxFlaps, err
+}
+
+func applySystemFlapGuard(db *gorm.DB, current []systemAnomaly, maxFlaps int, now time.Time, writeAction func(models.SystemAutopilotAction)) []systemAnomaly {
+	for i := range current {
+		blocked, err := systemFlapBlocked(db, current[i].Service, current[i].Verdict, maxFlaps, now)
+		if blocked || err != nil {
+			current[i].ActionsBlocked = models.SystemAutopilotGuardFlapping
+			status, reason := "attention", "Incident has flapped repeatedly in the last 24h; observation continues but automatic controls are blocked"
+			if err != nil {
+				status, reason = "error", "Flap history is unavailable; automatic controls are blocked"
+			}
+			writeAction(models.SystemAutopilotAction{Target: current[i].Service, Action: models.SystemAutopilotActionSkipped, Verdict: current[i].Verdict, Status: status, Guardrail: models.SystemAutopilotGuardFlapping, Reason: reason})
 		}
-		out = append(out, anomaly)
 	}
-	return out
+	return current
 }
 
 func openSystemIncidentEpisodes(db *gorm.DB) []models.SystemIncidentEpisode {
-	var episodes []models.SystemIncidentEpisode
-	_ = db.Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).
-		Order("last_seen_at DESC").Find(&episodes).Error
+	episodes, _ := openSystemIncidentEpisodesWithError(db)
 	return episodes
+}
+
+func openSystemIncidentEpisodesWithError(db *gorm.DB) ([]models.SystemIncidentEpisode, error) {
+	var episodes []models.SystemIncidentEpisode
+	err := db.Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).Order("last_seen_at DESC").Find(&episodes).Error
+	return episodes, err
 }
 
 func resolveRecoveredSystemEpisodes(db *gorm.DB, openEpisodes []models.SystemIncidentEpisode, snapshot systemHealthSnapshot, prev []systemRunSnapshot, resolveProbes int, now time.Time, writeAction func(models.SystemAutopilotAction)) ([]models.SystemIncidentEpisode, int) {
@@ -1625,6 +1692,22 @@ func storeSystemContainmentEntry(tx *gorm.DB, ep *models.SystemIncidentEpisode, 
 }
 
 func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, anomaly systemAnomaly, ep *models.SystemIncidentEpisode, now time.Time, storeAction systemAutopilotActionStore, actionSink func(models.SystemAutopilotAction), containmentOverride ...bool) (bool, int) {
+	if scope, _ := db.Statement.Context.Value(systemMutationScopeKey{}).(*systemMutationScope); scope != nil && scope.Denied {
+		action, err := storeAction(db, models.SystemAutopilotAction{EpisodeID: &ep.ID, Target: anomaly.Service, Action: models.SystemAutopilotActionSkipped, Status: "attention", Guardrail: models.SystemAutopilotGuardScopeCap, Reason: scope.Reason})
+		if err != nil {
+			return false, 1
+		}
+		actionSink(action)
+		return false, 0
+	}
+	if anomaly.ActionsBlocked != "" {
+		action, err := storeAction(db, models.SystemAutopilotAction{EpisodeID: &ep.ID, Target: anomaly.Service, Action: models.SystemAutopilotActionSkipped, Status: "attention", Guardrail: anomaly.ActionsBlocked, Reason: "Incident observations continue; automatic containment is blocked"})
+		if err != nil {
+			return false, 1
+		}
+		actionSink(action)
+		return false, 0
+	}
 	disabled := containmentDisabledSet(policy)
 	now = now.UTC()
 	containmentPaused := policy.ContainmentPausedUntil != nil && policy.ContainmentPausedUntil.After(now)
@@ -1728,6 +1811,12 @@ func handleSystemContainment(db *gorm.DB, policy models.SystemAutopilotPolicy, a
 		for _, row := range rows {
 			action := base
 			action.Output = marshalAutopilotJSON(gin.H{"tenant_id": row.TenantID, "paused_until": desiredUntil.Format(time.RFC3339Nano), "incident": anomaly.Key})
+			if !systemMutationTargetAllowed(db, sibling.Key, row.TenantID) {
+				action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionSkipped, "attention", models.SystemAutopilotGuardScopeCap
+				action.Reason = "Target was not admitted by the complete run scope; no pause was written"
+				write(action)
+				continue
+			}
 			ledger, _ := readSystemContainmentLedger(ep.Containment)
 			owned, ownsPause := containmentEntry(ledger, sibling.Key, row.TenantID)
 			var stored models.SystemAutopilotAction
@@ -2110,6 +2199,20 @@ func resumeRecoveredSystemContainment(db *gorm.DB, policy models.SystemAutopilot
 					}
 					continue
 				}
+				flapping, flapErr := systemFlapBlocked(db, episode.RootService, episode.Verdict, policy.FlapCycles24h, now)
+				if flapping || flapErr != nil || !systemMutationTargetAllowed(db, sibling.Key, tenantID) {
+					action.Action, action.Status, action.Guardrail = models.SystemAutopilotActionWouldResume, "attention", models.SystemAutopilotGuardFlapping
+					action.Reason = "Release is blocked by flapping, unavailable flap evidence, or the run target bound"
+					if !systemMutationTargetAllowed(db, sibling.Key, tenantID) {
+						action.Guardrail = models.SystemAutopilotGuardScopeCap
+					}
+					if stored, err := storeAction(db, action); err != nil {
+						writeErrors++
+					} else {
+						actionSink(stored)
+					}
+					continue
+				}
 				var stored models.SystemAutopilotAction
 				var updated datatypes.JSON
 				err = db.Transaction(func(tx *gorm.DB) error {
@@ -2405,10 +2508,10 @@ func latestSystemRunWithError(db *gorm.DB) (*models.SystemAutopilotRun, error) {
 	return &run, nil
 }
 
-func runDetailWithActions(db *gorm.DB, run models.SystemAutopilotRun) gin.H {
+func runDetailWithActions(db *gorm.DB, run models.SystemAutopilotRun) (gin.H, error) {
 	var actions []models.SystemAutopilotAction
-	_ = db.Where("run_id = ?", run.ID).Order("started_at ASC").Find(&actions).Error
-	return gin.H{"run": run, "actions": actions}
+	err := db.Where("run_id = ?", run.ID).Order("started_at ASC").Find(&actions).Error
+	return gin.H{"run": run, "actions": actions}, err
 }
 
 type systemMonitorProjection struct {
@@ -2422,13 +2525,15 @@ type systemMonitorProjection struct {
 }
 
 type systemContainmentTargetProjection struct {
-	EpisodeID  string `json:"episode_id"`
-	Sibling    string `json:"sibling"`
-	TenantID   string `json:"tenant_id"`
-	Outcome    string `json:"outcome"`
-	Until      string `json:"until,omitempty"`
-	HumanOwned bool   `json:"human_owned,omitempty"`
-	Reason     string `json:"reason,omitempty"`
+	EpisodeID         string `json:"episode_id"`
+	Sibling           string `json:"sibling"`
+	TenantID          string `json:"tenant_id"`
+	Outcome           string `json:"outcome"`
+	Until             string `json:"until,omitempty"`
+	HumanOwned        bool   `json:"human_owned,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	EffectScope       string `json:"effect_scope,omitempty"`
+	AdmissionEnforced bool   `json:"admission_enforced"`
 }
 
 type systemContainmentProjection struct {
@@ -2440,13 +2545,15 @@ type systemContainmentProjection struct {
 }
 
 type systemAttentionProjection struct {
-	EpisodeID string `json:"episode_id,omitempty"`
-	TenantID  string `json:"tenant_id,omitempty"`
-	Target    string `json:"target"`
-	Guardrail string `json:"guardrail,omitempty"`
-	Status    string `json:"status"`
-	Reason    string `json:"reason,omitempty"`
-	At        string `json:"at"`
+	EpisodeID         string                  `json:"episode_id,omitempty"`
+	TenantID          string                  `json:"tenant_id,omitempty"`
+	Target            string                  `json:"target"`
+	Guardrail         string                  `json:"guardrail,omitempty"`
+	Status            string                  `json:"status"`
+	Reason            string                  `json:"reason,omitempty"`
+	At                string                  `json:"at"`
+	ResponsibleRole   string                  `json:"responsible_role"`
+	RecommendedAction systemRecommendedAction `json:"recommended_action"`
 }
 
 func systemRunObservationAt(run *models.SystemAutopilotRun) *time.Time {
@@ -2556,6 +2663,23 @@ func GetSystemAutopilotStatus(c *gin.Context) {
 		return
 	}
 	var episodes []models.SystemIncidentEpisode
+	var counts []struct {
+		Status string
+		Total  int64
+	}
+	if err := db.Model(&models.SystemIncidentEpisode{}).Select("status, COUNT(*) AS total").Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).Group("status").Scan(&counts).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health incident total is unavailable", "code": "STATUS_READ_FAILED"})
+		return
+	}
+	var openCount, recoveringCount int64
+	for _, count := range counts {
+		if count.Status == models.SystemIncidentStatusOpen {
+			openCount = count.Total
+		}
+		if count.Status == models.SystemIncidentStatusRecovering {
+			recoveringCount = count.Total
+		}
+	}
 	if err := db.Where("status IN ?", []string{models.SystemIncidentStatusOpen, models.SystemIncidentStatusRecovering}).
 		Order("last_seen_at DESC").Limit(10).Find(&episodes).Error; err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "System Health incident state is unavailable", "code": "STATUS_READ_FAILED"})
@@ -2591,16 +2715,21 @@ func GetSystemAutopilotStatus(c *gin.Context) {
 			"dependencies":        sibling.Dependencies,
 			"capabilities":        sibling.Capabilities,
 			"containment_enabled": !disabled[sibling.Key],
+			"effect_scope":        systemSiblingEffectScope(sibling.Key),
+			"admission_enforced":  sibling.Key == "enrichment",
 		})
 	}
+	monitor := systemMonitorStatus(policy, latest, time.Now().UTC())
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{
 		"policy":                policy,
 		"state":                 systemAutopilotState(policy),
 		"latest_run":            latest,
 		"open_episodes":         episodes,
+		"open_episode_count":    openCount + recoveringCount,
 		"recent_episodes":       recentEpisodes,
 		"registered_autopilots": registry,
-		"monitor":               systemMonitorStatus(policy, latest, time.Now().UTC()),
+		"monitor":               monitor,
+		"outcome":               projectSystemOutcome(monitor, latest, openCount, recoveringCount, containment, attention),
 		"containment":           containment,
 		"attention":             attention,
 		"status_version":        "system-health-autopilot/v2",
@@ -2805,7 +2934,10 @@ func ListSystemIncidentEpisodes(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	limit := clampQueryInt(c, "limit", 50, 1, 200)
 	var episodes []models.SystemIncidentEpisode
-	_ = db.Order("last_seen_at DESC").Limit(limit).Find(&episodes).Error
+	if err := db.Order("last_seen_at DESC").Limit(limit).Find(&episodes).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Incident history is unavailable"})
+		return
+	}
 	items := make([]systemIncidentEpisodeListItem, 0, len(episodes))
 	for _, episode := range episodes {
 		items = append(items, systemIncidentEpisodeListProjection(episode))
@@ -2825,7 +2957,11 @@ func GetSystemIncidentEpisode(c *gin.Context) {
 	}
 	var ep models.SystemIncidentEpisode
 	if err := db.Where("public_id = ?", id).First(&ep).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "episode not found"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "episode not found"})
+		} else {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Incident state is unavailable"})
+		}
 		return
 	}
 	var actions []models.SystemAutopilotAction
@@ -2846,7 +2982,11 @@ func GetSystemIncidentEpisode(c *gin.Context) {
 	now := time.Now().UTC()
 	previous := []systemRunSnapshot{}
 	if latest != nil {
-		previous = recentSystemRunSnapshots(db, systemAutopilotHistoryRuns, latest.StartedAt, policy.IntervalMinutes)
+		previous, err = recentSystemRunSnapshotsWithError(db, systemAutopilotHistoryRuns, latest.StartedAt, policy.IntervalMinutes)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Recovery history is unavailable"})
+			return
+		}
 	}
 	containment, err := projectSystemContainment(db, []models.SystemIncidentEpisode{ep}, now)
 	if err != nil {
@@ -2962,7 +3102,10 @@ func ListSystemAutopilotRuns(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	limit := clampQueryInt(c, "limit", 20, 1, 100)
 	var runs []models.SystemAutopilotRun
-	_ = db.Order("started_at DESC").Limit(limit).Find(&runs).Error
+	if err := db.Order("started_at DESC").Limit(limit).Find(&runs).Error; err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Run history is unavailable"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": runs}})
 }
 
@@ -2978,10 +3121,19 @@ func GetSystemAutopilotRun(c *gin.Context) {
 	}
 	var run models.SystemAutopilotRun
 	if err := db.Where("public_id = ?", id).First(&run).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		} else {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Run state is unavailable"})
+		}
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": runDetailWithActions(db, run)})
+	detail, detailErr := runDetailWithActions(db, run)
+	if detailErr != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Run actions are unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": detail})
 }
 
 func clampQueryInt(c *gin.Context, name string, fallback, minValue, maxValue int) int {
