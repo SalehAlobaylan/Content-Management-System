@@ -74,6 +74,24 @@ func plannedApplyOutcome(unitType, verdict string) (kind string, executes bool) 
 // and returns the outcome. On execution failure it returns mediaCircOutcomeFailed +
 // the error so the caller can leave the recommendation pending/retryable.
 func applyRecommendation(db *gorm.DB, tenantID, setBy, authorization string, rec models.MediaCirculationRecommendation) (string, error) {
+	if !isRedundancyRecommendation(rec) {
+		return applyRecommendationCurrent(db, tenantID, setBy, authorization, rec)
+	}
+	outcome := mediaCircOutcomeFailed
+	err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockRedundancyFamilies(tx, tenantID); err != nil {
+			return err
+		}
+		if err := validateRedundancyRecommendation(tx, tenantID, rec); err != nil {
+			return err
+		}
+		var err error
+		outcome, err = applyRecommendationCurrent(tx, tenantID, setBy, authorization, rec)
+		return err
+	})
+	return outcome, err
+}
+func applyRecommendationCurrent(db *gorm.DB, tenantID, setBy, authorization string, rec models.MediaCirculationRecommendation) (string, error) {
 	kind, executes := plannedApplyOutcome(rec.UnitType, rec.Verdict)
 	if !executes {
 		return kind, nil

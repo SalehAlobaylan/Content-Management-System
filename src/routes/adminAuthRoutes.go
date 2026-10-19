@@ -383,6 +383,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/media/redundancy/families/:id/canonical", perm("aggregation", "manage"), controllers.SetRedundancyCanonical)
 	adminGroup.POST("/media/redundancy/families/:id/dissolve", perm("aggregation", "manage"), controllers.DissolveRedundancyFamily)
 	adminGroup.GET("/media/redundancy/actions", perm("aggregation", "read"), controllers.ListRedundancyActions)
+	adminGroup.GET("/media/redundancy/actions/:id", perm("aggregation", "read"), controllers.GetRedundancyAction)
 	// Media Studio Clearance Autopilot — stage 6: policy + manual trigger + runs ledger.
 	adminGroup.GET("/media/studio/autopilot/status", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotStatus)
 	adminGroup.GET("/media/studio/autopilot/insights", perm("aggregation", "read"), controllers.GetMediaStudioAutopilotInsights)

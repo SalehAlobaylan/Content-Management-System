@@ -469,7 +469,7 @@ func reconcileHistoricalRedundancy(tx *gorm.DB, tenant string, ids []uuid.UUID, 
 			}
 			metadata = retentionActionEvidence(map[string]interface{}{"historical_retirement": true, "family_id": family.PublicID.String(), "operation": "dissolve"})
 		}
-		if err := tx.Create(&models.RedundancyAction{TenantID: tenant, FamilyID: &family.ID, ActionKind: "historical_retirement_reconcile", Actor: actor, Outcome: "completed", Reason: "approved historical retention", Metadata: metadata, IdempotencyKey: "historical-retention-family:" + family.PublicID.String()}).Error; err != nil {
+		if err := tx.Create(&models.RedundancyAction{TenantID: tenant, FamilyID: &family.ID, ActionKind: "historical_retirement_reconcile", Actor: actor, Outcome: "completed", Reason: "approved historical retention", Metadata: metadata, IdempotencyKey: redundancyStringPtr("historical-retention-family:" + family.PublicID.String())}).Error; err != nil {
 			return err
 		}
 	}
@@ -479,7 +479,7 @@ func reconcileHistoricalRedundancy(tx *gorm.DB, tenant string, ids []uuid.UUID, 
 	}
 	for _, pair := range pairs {
 		metadata := retentionActionEvidence(map[string]interface{}{"historical_retirement": true, "pair_id": pair.PublicID.String(), "latest_evaluation_id": pair.LatestEvaluationID})
-		if err := tx.Create(&models.RedundancyAction{TenantID: tenant, PairID: &pair.ID, FamilyID: pair.FamilyID, ActionKind: "historical_retirement_pair", Actor: actor, Outcome: "retired", Reason: "approved historical retention", Metadata: metadata, IdempotencyKey: "historical-retention-pair:" + pair.PublicID.String()}).Error; err != nil {
+		if err := tx.Create(&models.RedundancyAction{TenantID: tenant, PairID: &pair.ID, FamilyID: pair.FamilyID, ActionKind: "historical_retirement_pair", Actor: actor, Outcome: "retired", Reason: "approved historical retention", Metadata: metadata, IdempotencyKey: redundancyStringPtr("historical-retention-pair:" + pair.PublicID.String())}).Error; err != nil {
 			return err
 		}
 	}

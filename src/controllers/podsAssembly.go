@@ -262,7 +262,6 @@ func assemblePods(db *gorm.DB, req podsAssemblyRequest) (podsAssemblyResult, err
 	if err := query.Find(&candidates).Error; err != nil {
 		return result, err
 	}
-	candidates = excludeCollapsedRedundancyMembers(db, req.TenantID, candidates)
 	if len(req.SuppressedIDs) > 0 || len(req.HardHiddenIDs) > 0 {
 		if req.RecycleSuppressed {
 			candidates = prioritizePodsForSession(candidates, req.SuppressedIDs, req.HardHiddenIDs)

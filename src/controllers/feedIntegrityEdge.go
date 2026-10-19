@@ -126,6 +126,12 @@ func integrityNewsDiagnostics(h http.Header, window string) (newsServeMeta, erro
 }
 func collectFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.FeedIntegrityPolicy, tier string, c *integrityCollector) []integrityProbeTarget {
 	db = db.WithContext(ctx)
+	var redundancyPolicy models.RedundancyPolicy
+	redundancyErr := db.Where("tenant_id=?", policy.TenantID).First(&redundancyPolicy).Error
+	if errors.Is(redundancyErr, gorm.ErrRecordNotFound) {
+		redundancyErr = nil
+	}
+	collapseActive := redundancyPolicy.Enabled && redundancyPolicy.CollapseEnabled
 	targets := []integrityProbeTarget{}
 	for _, minutes := range []int{0, 5, 10, 15, 20, 30, 40} {
 		variant := "default"
@@ -191,7 +197,10 @@ func collectFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.Fe
 				FamilyID      uint
 			}
 			var rows []familyRow
-			familyErr := db.Table("redundancy_family_members m").Select("m.content_item_id,m.family_id").Joins("JOIN redundancy_families f ON f.id=m.family_id").Where("m.content_item_id IN ? AND m.ended_at IS NULL AND f.status='active' AND f.tenant_id=?", ids, policy.TenantID).Scan(&rows).Error
+			familyErr := redundancyErr
+			if familyErr == nil && collapseActive {
+				familyErr = db.Table("redundancy_family_members m").Select("m.content_item_id,m.family_id").Joins("JOIN redundancy_families f ON f.id=m.family_id").Where("m.content_item_id IN ? AND m.ended_at IS NULL AND f.status='active' AND f.tenant_id=?", ids, policy.TenantID).Scan(&rows).Error
+			}
 			familyMap := map[uuid.UUID]uint{}
 			for _, row := range rows {
 				familyMap[row.ContentItemID] = row.FamilyID
@@ -217,6 +226,8 @@ func collectFeedIntegrityEdge(ctx context.Context, db *gorm.DB, policy models.Fe
 				}
 				if familyErr != nil {
 					c.add("edge_pods_family_dup", "edge", "pods", variant, "consumer", "major", "check_error", "content_item", id, 1, nil)
+				} else if !collapseActive {
+					c.add("edge_pods_family_dup", "edge", "pods", variant, "consumer", "major", "skipped:collapse_disabled", "content_item", id, 0, nil)
 				} else {
 					c.predicate("edge_pods_family_dup", variant, "content_item", id, badFamily, map[string]interface{}{"family_id": family})
 				}

@@ -277,6 +277,7 @@ func persistRecommendationsForUnit(db *gorm.DB, tenantID, unitType string, recs 
 		if err := tx.Model(&models.MediaCirculationRecommendation{}).
 			Where("tenant_id = ? AND unit_type = ? AND status = ?",
 				tenantID, unitType, models.MediaCirculationRecStatusPending).
+			Where("COALESCE(metrics->>'origin','') <> 'redundancy'").
 			Update("status", models.MediaCirculationRecStatusSuperseded).Error; err != nil {
 			return err
 		}

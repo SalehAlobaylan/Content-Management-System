@@ -400,39 +400,6 @@ func prioritizeScoredPodsForSession(items []ScoredItem, suppressedIDs, hardHidde
 	return append(ordered, deferred...)
 }
 
-// excludeCollapsedRedundancyMembers is deliberately an inventory filter, not
-// cursor/session state: once a human confirms a family, only its canonical
-// member may enter Pods until the family is dissolved or collapse is off.
-func excludeCollapsedRedundancyMembers(db *gorm.DB, tenantID string, items []models.ContentItem) []models.ContentItem {
-	if len(items) == 0 {
-		return items
-	}
-	var policy models.RedundancyPolicy
-	if db.Where("tenant_id = ?", tenantID).First(&policy).Error != nil || !policy.Enabled || !policy.CollapseEnabled {
-		return items
-	}
-	ids := extractPublicIDs(items)
-	var hidden []uuid.UUID
-	db.Table("redundancy_family_members m").
-		Joins("JOIN redundancy_families f ON f.id = m.family_id").
-		Where("m.tenant_id = ? AND m.role = ? AND m.ended_at IS NULL AND f.status = ? AND m.content_item_id IN ?", tenantID, "redundant", "active", ids).
-		Pluck("m.content_item_id", &hidden)
-	if len(hidden) == 0 {
-		return items
-	}
-	hiddenSet := make(map[uuid.UUID]struct{}, len(hidden))
-	for _, id := range hidden {
-		hiddenSet[id] = struct{}{}
-	}
-	filtered := items[:0]
-	for _, item := range items {
-		if _, ok := hiddenSet[item.PublicID]; !ok {
-			filtered = append(filtered, item)
-		}
-	}
-	return filtered
-}
-
 // recordPodsServe fires the Ranking/Intelligence serve-side telemetry
 // (impressions + demand stats) for one Pods response. Runs after the
 // response is written and in its own goroutine — the serve path never waits

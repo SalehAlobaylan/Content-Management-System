@@ -168,6 +168,21 @@ func SupportsStorageStateSchema(db *gorm.DB) bool {
 	return !isDryRun(db) && db != nil && db.Migrator().HasColumn(&models.ContentItem{}, "storage_state")
 }
 
+// ApplyRedundancyCollapse is inventory policy shared by feeds and frozen sessions.
+// A schema without this feature remains compatible. A migrated schema uses one
+// indexed predicate; policy read failures cannot silently claim collapse worked.
+func ApplyRedundancyCollapse(db *gorm.DB, query *gorm.DB, tenant string) *gorm.DB {
+	if db == nil || isDryRun(db) || !db.Migrator().HasTable(&models.RedundancyPolicy{}) {
+		return query
+	}
+	return query.Where(`NOT EXISTS (
+ SELECT 1 FROM redundancy_family_members rm JOIN redundancy_families rf ON rf.id=rm.family_id
+ JOIN redundancy_policies rp ON rp.tenant_id=rm.tenant_id
+ WHERE rm.content_item_id=content_items.public_id AND rm.tenant_id=?
+ AND rm.ended_at IS NULL AND rm.role='redundant' AND rf.status='active' AND rf.tenant_id=rm.tenant_id
+ AND rp.enabled=TRUE AND rp.collapse_enabled=TRUE)`, tenant)
+}
+
 // PodsEligibleMediaQuery is the canonical public serving predicate before
 // ranking and per-viewer suppression.
 func PodsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema bool) *gorm.DB {
@@ -192,7 +207,7 @@ func PodsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema boo
 		if SupportsStorageStateSchema(db) {
 			q = q.Where("(storage_state IS NULL OR storage_state NOT IN ?)", storageUnavailableStates)
 		}
-		return q
+		return ApplyRedundancyCollapse(db, q, tenantID)
 	}
 
 	q := db.Model(&models.ContentItem{}).
@@ -215,7 +230,7 @@ func PodsEligibleMediaQuery(db *gorm.DB, tenantID string, atomizedFeedSchema boo
 			AND ag.parent_content_item_id=content_items.parent_content_item_id
 			AND ag.public_id::text=content_items.metadata->>'atomization_generation_id' AND ag.state='active'))`)
 	}
-	return q
+	return ApplyRedundancyCollapse(db, q, tenantID)
 }
 
 // ApplyActiveGenerationMembership applies the same serving-generation fence as
