@@ -697,7 +697,7 @@ func promoteCandidatesForAllProfiles(db *gorm.DB, tenantID string) int {
 	}
 
 	// Classify each candidate ONCE (class is per-account, not per-profile).
-	classMap, methodMap := classifyCandidates(candidates)
+	classMap, methodMap := classifyCandidates(db, candidates)
 
 	total := 0
 	for i := range profiles {
@@ -711,7 +711,7 @@ func promoteCandidatesForAllProfiles(db *gorm.DB, tenantID string) int {
 // carry a bio escalate, in one batch, to Enrichment's cached LLM classifier
 // (on by default; set LLM_SOURCE_CLASSIFY_ENABLED=false to disable). Returns
 // candID -> class and candID -> method ("rule" | "llm").
-func classifyCandidates(candidates []models.SourceCandidate) (map[uint]string, map[uint]string) {
+func classifyCandidates(db *gorm.DB, candidates []models.SourceCandidate) (map[uint]string, map[uint]string) {
 	classMap := make(map[uint]string, len(candidates))
 	methodMap := make(map[uint]string, len(candidates))
 	for i := range candidates {
@@ -752,7 +752,7 @@ func classifyCandidates(candidates []models.SourceCandidate) (map[uint]string, m
 		return classMap, methodMap
 	}
 
-	results, err := classifyAccountsViaEnrichment(batch, spendContext(candidates[0].TenantID, "source_intelligence", ""))
+	results, err := classifyAccountsViaEnrichment(batch, guardedSpendContext(db, spendContext(candidates[0].TenantID, "source_intelligence", ""), float64(len(batch))*.01))
 	if err != nil {
 		if isAISpendCapped(err) {
 			for _, id := range ids {
@@ -796,7 +796,7 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 		relevance := 0.0
 		novelty := 1.0
 		if len(titles) > 0 {
-			if vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles, spendContext(cand.TenantID, "source_intelligence", cand.PublicID.String())); err == nil && len(vecs) > 0 &&
+			if vecs, sampleSpaceID, err := embedBatchViaEnrichmentWithSpace(titles, withWorkloadContext(db, spendContext(cand.TenantID, "source_intelligence", cand.PublicID.String()), "automation")); err == nil && len(vecs) > 0 &&
 				profile.EmbeddingSpaceID != nil && sampleSpaceID == *profile.EmbeddingSpaceID {
 				var sum float64
 				n := 0

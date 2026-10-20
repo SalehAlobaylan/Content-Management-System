@@ -380,6 +380,17 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 			return 0
 		}
 	}
+	class := "text_embedding"
+	if s.Space == EmbeddingSpaceImage {
+		class = "image_embedding"
+	}
+	lease, capacityErr := acquireControllerWorkload(db, c.TenantID, "embedding_campaign", class, batchID, "campaign")
+	if capacityErr != nil {
+		return 0
+	} // no attempt or retry budget is consumed
+	defer lease.cancelBeforeEffect()
+	callContext := withWorkloadContext(db, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)), "campaign")
+	callContext.workloadLease = lease
 	action := models.EmbeddingCampaignAction{
 		CampaignID: c.ID, TenantID: c.TenantID, BatchID: batchID,
 		SurfaceKey: s.Key, TargetID: targetID, ExpectedProducerID: expectedProducer,
@@ -401,10 +412,17 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 	}
 
 	tool := toolForSurface(s)
-	err := invokeItemAdapter(db, s, targetID, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)))
+	err := invokeItemAdapter(db, s, targetID, callContext)
 	action.LatencyMS = time.Since(start).Milliseconds()
 	action.Tool = tool
 	if err != nil {
+		if isWorkloadDeferred(err) {
+			// No model effect began. Remove only this unstarted claim so the
+			// same native retry identity remains available on the next tick.
+			// The Governor retains the reasoned decision in its own ledger.
+			_ = db.Delete(&action).Error
+			return 0
+		}
 		recordAdapterFailure(db, c, s, targetID, err.Error())
 		action.Status = models.EmbeddingActionFailed
 		action.Reason = err.Error()

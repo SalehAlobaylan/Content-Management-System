@@ -772,7 +772,7 @@ func SaveTranscript(c *gin.Context) {
 	itemCopy := *item
 	go func() {
 		if text := buildEmbeddingText(&itemCopy); text != "" {
-			_ = triggerEmbedding(text, itemCopy.PublicID.String(), spendContext(itemCopy.TenantID, "manual_transcript_edit", itemCopy.PublicID.String()))
+			_ = triggerEmbedding(text, itemCopy.PublicID.String(), withWorkloadContext(db, spendContext(itemCopy.TenantID, "manual_transcript_edit", itemCopy.PublicID.String()), "human"))
 		}
 	}()
 

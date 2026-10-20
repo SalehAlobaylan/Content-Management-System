@@ -122,7 +122,7 @@ func checkMediaHealth() (*serviceHealthResponse, error) {
 // empty preserves the historical ingest_auto/manual derivation from `force`.
 // Returns the created job's public id (empty when the guard skips) so callers can
 // cross-link it (e.g. the Enrichment Autopilot ledger).
-func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, triggerSource string) (string, error) {
+func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, triggerSource string, workloadOrigins ...string) (string, error) {
 	trigger := triggerSource
 	if trigger == "" {
 		trigger = models.TranscriptionTriggerIngestAuto
@@ -130,7 +130,7 @@ func triggerTranscription(item *models.ContentItem, db *gorm.DB, force bool, tri
 			trigger = models.TranscriptionTriggerManual
 		}
 	}
-	job, triggered, reason, kind, err := createTranscriptionJobForItem(db, item, trigger, force)
+	job, triggered, reason, kind, err := createTranscriptionJobForItem(db, item, trigger, force, workloadOrigins...)
 	if err != nil {
 		return "", err
 	}
@@ -273,7 +273,7 @@ func triggerImageEmbedding(imageURL string, contentID string, contexts ...AISpen
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "image_embedding")
 	if err != nil {
 		return fmt.Errorf("media image-embed request failed: %w", err)
 	}
@@ -458,7 +458,7 @@ func generateStorySummaryViaEnrichment(texts []string, contexts ...AISpendContex
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return "", nil, "", fmt.Errorf("enrichment story-digest request failed: %w", err)
 	}
@@ -513,7 +513,7 @@ func classifyAccountsViaEnrichment(accounts []accountToClassify, contexts ...AIS
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return nil, fmt.Errorf("enrichment classify request failed: %w", err)
 	}
@@ -572,7 +572,7 @@ func generateTopicLabelViaEnrichment(texts []string, contexts ...AISpendContext)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return "", fmt.Errorf("enrichment topic-label request failed: %w", err)
 	}
@@ -675,7 +675,7 @@ func generateChaptersViaEnrichment(
 
 	// LLM segmentation over a long transcript — allow generous time.
 	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return nil, fmt.Errorf("enrichment chapters request failed: %w", err)
 	}
@@ -731,7 +731,7 @@ func translateViaEnrichment(text, targetLanguage string, contexts ...AISpendCont
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return "", err
 	}
@@ -801,7 +801,7 @@ func embedQueryViaEnrichmentWithSpace(text string, contexts ...AISpendContext) (
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "text_embedding")
 	if err != nil {
 		return nil, "", err
 	}
@@ -853,7 +853,7 @@ func embedBatchViaEnrichmentWithSpace(texts []string, contexts ...AISpendContext
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "text_embedding")
 	if err != nil {
 		return nil, "", err
 	}
@@ -911,7 +911,7 @@ func triggerEmbedding(text string, contentID string, contexts ...AISpendContext)
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "text_embedding")
 	if err != nil {
 		return fmt.Errorf("enrichment embedding request failed: %w", err)
 	}

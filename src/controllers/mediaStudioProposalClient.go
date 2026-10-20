@@ -79,7 +79,7 @@ func generateChapterProposalsViaEnrichment(items []studioProposalItem, contexts 
 	// Enrichment bounds each case to 12s with concurrency three; 75s leaves
 	// response overhead while retaining partial valid results from the batch.
 	client := &http.Client{Timeout: 75 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := workloadModelDo(client, req, firstSpendContext(contexts), "llm_batch")
 	if err != nil {
 		return nil, fmt.Errorf("enrichment chapter-proposal request failed: %w", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
+	"content-management-system/src/workload"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -497,7 +498,7 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 	var claim Claim
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var requests []models.PipelineRepairRequest
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ?", models.PipelineRepairQueued).Order("created_at ASC").Limit(16).Find(&requests).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("state = ?", models.PipelineRepairQueued).Order("updated_at ASC, created_at ASC").Limit(16).Find(&requests).Error; err != nil {
 			return err
 		}
 		for _, r := range requests {
@@ -529,6 +530,14 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 					continue
 				}
 				return err
+			}
+			if decision := workload.RequestPermit(tx, pipelineWorkloadRequest(r)); !decision.Allowed() {
+				// Rotate soft deferrals without consuming a native attempt; a
+				// saturated resource cannot monopolize this bounded scan.
+				if err := tx.Model(&r).UpdateColumn("updated_at", now).Error; err != nil {
+					return err
+				}
+				continue
 			}
 			// A claim that expired before Begin is proven not to have crossed the
 			// effect boundary. Reclaim its same attempt/fence/job identity instead
@@ -733,6 +742,9 @@ func transition(db *gorm.DB, requestID, owner string, token uuid.UUID, kind stri
 			if candidateErr != nil || current.Stage != r.Stage || !current.Item.UpdatedAt.Equal(r.ExpectedItemUpdatedAt) || current.EvidenceDigest != r.PriorStageEvidenceDigest {
 				return fmt.Errorf("pipeline repair target evidence changed before effect")
 			}
+			if err := workload.BeginOwner(tx, r.TenantID, workloadOwner, r.PublicID.String()); err != nil {
+				return err
+			}
 			if err := tx.Model(&r).Updates(map[string]any{"state": models.PipelineRepairRunning, "claim_expires_at": expires, "before_effects": jsonValue(map[string]any{"status": r.ExpectedStatus, "stage": r.Stage})}).Error; err != nil {
 				return err
 			}
@@ -840,6 +852,7 @@ func Cancel(db *gorm.DB, tenantID, requestID, actor string) (models.PipelineRepa
 			if err := tx.Model(&r).Updates(map[string]any{"state": models.PipelineRepairCancelled, "cancellation_requested_at": now, "finished_at": now}).Error; err != nil {
 				return err
 			}
+			_ = workload.SettleOwner(tx, r.TenantID, workloadOwner, r.PublicID.String(), 0, "pipeline_cancelled_before_effect")
 		} else if r.State == models.PipelineRepairRunning || r.State == models.PipelineRepairVerifying {
 			if err := tx.Model(&r).Update("cancellation_requested_at", now).Error; err != nil {
 				return err
@@ -918,6 +931,7 @@ func VerifyOne(db *gorm.DB) (bool, error) {
 		if err := completeLinkedAction(tx, r, event, now); err != nil {
 			return err
 		}
+		_ = workload.SettleOwner(tx, r.TenantID, workloadOwner, r.PublicID.String(), 1, "pipeline_exact_event_and_artifact_verified")
 		return appendEvent(tx, r, nil, "verified", map[string]any{"event_id": event.PublicID.String()})
 	})
 }
@@ -1043,6 +1057,9 @@ func RecoverExpired(db *gorm.DB) error {
 			}
 			if err := recoverLinkedAction(tx, r, next, now); err != nil {
 				return err
+			}
+			if next == models.PipelineRepairUncertain {
+				_ = workload.MarkOwnerUncertain(tx, r.TenantID, workloadOwner, r.PublicID.String(), "native_pipeline_lease_expired_after_effect")
 			}
 			if err := appendEvent(tx, r, nil, "claim_expired", map[string]any{"next": next}); err != nil {
 				return err

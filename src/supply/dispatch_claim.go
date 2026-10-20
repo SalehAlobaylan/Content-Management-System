@@ -8,6 +8,7 @@ import (
 
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"content-management-system/src/workload"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -79,6 +80,14 @@ func ClaimNextDispatchableRequest(db *gorm.DB, owner string, dispatcherLease, ex
 			if candidate.Purpose == "content_reset_replay" {
 				skipCandidate = true
 				return nil
+			}
+			decision := workload.RequestPermit(tx, sourceRunWorkloadRequest(candidate))
+			if !decision.Allowed() {
+				// A soft capacity wait does not allocate an attempt or consume the
+				// native provider budget. Rotate it out of the bounded due window.
+				skipCandidate = true
+				return tx.Model(&models.SourceRunRequest{}).Where("tenant_id=? AND public_id=?", candidate.TenantID, candidate.PublicID).
+					UpdateColumn("next_dispatch_at", now.Add(time.Minute)).Error
 			}
 			if candidate.State == string(RequestRequested) {
 				var err error

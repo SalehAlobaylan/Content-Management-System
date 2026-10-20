@@ -34,12 +34,13 @@ const (
 )
 
 type autopilotQueueStat struct {
-	Queue     string `json:"queue"`
-	Waiting   int    `json:"waiting"`
-	Active    int    `json:"active"`
-	Completed int    `json:"completed"`
-	Failed    int    `json:"failed"`
-	Delayed   int    `json:"delayed"`
+	Queue       string `json:"queue"`
+	Waiting     int    `json:"waiting"`
+	Active      int    `json:"active"`
+	Completed   int    `json:"completed"`
+	Failed      int    `json:"failed"`
+	Delayed     int    `json:"delayed"`
+	Prioritized *int   `json:"prioritized,omitempty"`
 }
 
 type autopilotSnapshotSignal struct {

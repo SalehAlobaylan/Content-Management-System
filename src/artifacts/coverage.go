@@ -13,6 +13,7 @@ import (
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/supply"
+	"content-management-system/src/workload"
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -280,6 +281,9 @@ func ClaimNext(db *gorm.DB, owner string) (Claim, bool, error) {
 				}
 				continue
 			}
+			if decision := workload.RequestPermit(tx, artifactWorkloadRequest(r)); !decision.Allowed() {
+				continue
+			}
 			if adopting {
 				fence = attempt.FenceToken
 				if e = tx.Model(&attempt).Updates(map[string]any{"claim_token": token, "lease_expires_at": expires, "heartbeat_at": now, "adoption_count": gorm.Expr("adoption_count + 1"), "last_adopted_at": now}).Error; e != nil {
@@ -417,6 +421,9 @@ func updateLease(db *gorm.DB, id, owner string, token uuid.UUID, begin bool) (mo
 			if e = tx.Where("tenant_id=? AND request_id=? AND state=?", r.TenantID, r.PublicID, "reserved").First(&reservation).Error; e != nil {
 				return fmt.Errorf("artifact workload reservation is unavailable: %w", e)
 			}
+			if e = workload.BeginOwner(tx, r.TenantID, workloadOwner, r.PublicID.String()); e != nil {
+				return e
+			}
 			updates["state"] = "running"
 			updates["effect_started_at"] = now
 			requestUpdates["state"] = "running"
@@ -484,6 +491,7 @@ func MarkUncertain(db *gorm.DB, id, owner string, token uuid.UUID, failureClass 
 		if e := tx.Model(&r).Updates(map[string]any{"state": "uncertain", "failure_class": failureClass, "claim_expires_at": nil}).Error; e != nil {
 			return e
 		}
+		_ = workload.MarkOwnerUncertain(tx, r.TenantID, workloadOwner, r.PublicID.String(), "native_artifact_effect_uncertain")
 		if e := tx.Model(&a).Updates(map[string]any{"state": "uncertain", "finished_at": now}).Error; e != nil {
 			return e
 		}
@@ -625,6 +633,7 @@ func VerifyOne(db *gorm.DB) (bool, error) {
 		if e := terminalizeLinkedAction(tx, r, true, proof, ""); e != nil {
 			return e
 		}
+		_ = workload.SettleOwner(tx, r.TenantID, workloadOwner, r.PublicID.String(), 1, "artifact_and_correlated_receipt_verified")
 		return appendEvent(tx, r, nil, "verified", map[string]any{"artifact": r.Artifact})
 	})
 	return true, e
@@ -649,6 +658,7 @@ func RecoverExpired(db *gorm.DB) error {
 				return e
 			}
 			if next == "uncertain" {
+				_ = workload.MarkOwnerUncertain(tx, r.TenantID, workloadOwner, r.PublicID.String(), "native_artifact_lease_expired_after_effect")
 				if e := settleArtifactBudget(tx, r, "retained_uncertain"); e != nil {
 					return e
 				}
@@ -682,6 +692,9 @@ func Cancel(db *gorm.DB, tenant, id, actor string) (models.ArtifactCoverageReque
 		}
 		if e := tx.Save(&r).Error; e != nil {
 			return e
+		}
+		if r.State == "cancelled" {
+			_ = workload.SettleOwner(tx, r.TenantID, workloadOwner, r.PublicID.String(), 0, "artifact_cancelled_before_effect")
 		}
 		return appendEvent(tx, r, nil, "cancellation_requested", map[string]any{"actor": actor})
 	})

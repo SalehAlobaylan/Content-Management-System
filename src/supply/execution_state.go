@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/workload"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -326,6 +327,9 @@ func BeginUnitEffect(db *gorm.DB, input UnitLeaseInput) (models.SourceRunExecuti
 			return fmt.Errorf("source-run execution unit cannot begin an effect from %s", unit.State)
 		}
 		if err := validateReplayUnitAdmission(tx, unit); err != nil {
+			return err
+		}
+		if err := workload.BeginOwner(tx, unit.TenantID, workloadOwner, unit.SourceRunRequestID.String()); err != nil {
 			return err
 		}
 		if err := tx.Model(&unit).Updates(map[string]any{"state": string(UnitRunning), "effect_started_at": now, "started_at": now, "heartbeat_at": now}).Error; err != nil {
@@ -812,6 +816,7 @@ func reconcileAttemptAndRequest(tx *gorm.DB, tenantID string, attemptID, request
 		return err
 	}
 	if attemptState == AttemptVerificationRequired {
+		_ = workload.MarkOwnerUncertain(tx, tenantID, workloadOwner, requestID.String(), "native_source_effect_requires_verification")
 		return tx.Model(&request).Updates(map[string]any{"state": string(RequestVerificationRequired), "evidence_state": "unknown"}).Error
 	}
 	if !allTerminal || request.ManifestState != string(ManifestSealed) {
@@ -832,7 +837,16 @@ func reconcileAttemptAndRequest(tx *gorm.DB, tenantID string, attemptID, request
 	if err := settleSourceRunBudget(tx, request, now); err != nil {
 		return err
 	}
-	return tx.Model(&request).Updates(requestUpdates).Error
+	if err := tx.Model(&request).Updates(requestUpdates).Error; err != nil {
+		return err
+	}
+	// Unknown outcomes retain the shared reservation: a finished CMS row is
+	// not proof that the provider stopped. Known terminal receipts and proven
+	// pre-effect completion may settle even when the run itself failed.
+	if proven, actual := sourceRunEffectsSettled(units); proven {
+		_ = workload.SettleOwner(tx, tenantID, workloadOwner, requestID.String(), actual, "source_manifest_effects_terminal_with_known_outcomes")
+	}
+	return nil
 }
 
 // AdvanceSourceRunManifests is CMS-only convergence work. It never contacts a

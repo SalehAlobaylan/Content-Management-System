@@ -708,7 +708,9 @@ func (r *enrichmentAutopilotRunner) dispatchItem(item *models.ContentItem, artif
 	case artifactOutcomeSkipped:
 		r.skipped++
 		action.Status = models.EnrichmentAutopilotActionStatusSkipped
-		if o.SkipKind == string(sttSkipBudget) {
+		if o.SkipKind == "workload_governor" {
+			action.Guardrail = "workload_governor"
+		} else if o.SkipKind == string(sttSkipBudget) {
 			action.Guardrail = models.EnrichmentAutopilotGuardBudget
 			r.budgetCapped = true
 		} else {

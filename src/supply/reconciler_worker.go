@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/workload"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -173,6 +174,7 @@ func expireOverdueSourceRunRequests(db *gorm.DB, limit int) (int, error) {
 				if err := tx.Model(&request).Updates(map[string]any{"state": string(RequestExpired), "finished_at": now, "finalized_at": now, "evidence_state": "unknown"}).Error; err != nil {
 					return err
 				}
+				_ = workload.SettleOwner(tx, request.TenantID, workloadOwner, request.PublicID.String(), 0, "source_request_expired_with_no_started_units")
 			}
 			count++
 			return nil

@@ -307,7 +307,7 @@ func TriggerEnrichment(c *gin.Context) {
 		return
 	}
 
-	results, errors := triggerItemArtifacts(db, &item, req.Types, req.Force)
+	results, errors := triggerItemArtifacts(db, &item, req.Types, req.Force, "admin_enrichment")
 
 	c.JSON(http.StatusOK, utils.ResponseMessage{
 		Code:    http.StatusOK,
@@ -551,7 +551,7 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeSkipped, "not VIDEO/PODCAST"
 			} else if item.MediaURL == nil || *item.MediaURL == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no media_url available"
-			} else if jobID, err := triggerTranscription(item, db, force, triggerSource); err != nil {
+			} else if jobID, err := triggerTranscription(item, db, force, enrichmentNativeTranscriptionTrigger(triggerSource), enrichmentWorkloadContext(db, item.TenantID, triggerSource, id).workloadOrigin); err != nil {
 				if isSTTSkipped(err) {
 					o.Status, o.Reason = artifactOutcomeSkipped, err.Error()
 					o.SkipKind = string(sttSkipKindOf(err))
@@ -569,8 +569,11 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
 			} else if text := buildEmbeddingText(item); text == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no text content available"
-			} else if err := triggerEmbedding(text, id, spendContext(item.TenantID, triggerSource, "")); err != nil {
+			} else if err := triggerEmbedding(text, id, enrichmentWorkloadContext(db, item.TenantID, triggerSource, id)); err != nil {
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
+				if isWorkloadDeferred(err) {
+					o.Status, o.SkipKind = artifactOutcomeSkipped, "workload_governor"
+				}
 			} else {
 				o.Status = artifactOutcomeTriggered
 			}
@@ -582,8 +585,11 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 				o.Status, o.Reason = artifactOutcomeAlready, "already exists"
 			} else if item.ThumbnailURL == nil || *item.ThumbnailURL == "" {
 				o.Status, o.Reason = artifactOutcomeError, "no thumbnail_url available"
-			} else if err := triggerImageEmbedding(*item.ThumbnailURL, id, spendContext(item.TenantID, "admin_enrichment", id)); err != nil {
+			} else if err := triggerImageEmbedding(*item.ThumbnailURL, id, enrichmentWorkloadContext(db, item.TenantID, triggerSource, id)); err != nil {
 				o.Status, o.Reason = artifactOutcomeError, err.Error()
+				if isWorkloadDeferred(err) {
+					o.Status, o.SkipKind = artifactOutcomeSkipped, "workload_governor"
+				}
 			} else {
 				o.Status = artifactOutcomeTriggered
 			}
@@ -596,8 +602,12 @@ func triggerItemArtifactsTraced(db *gorm.DB, item *models.ContentItem, types []s
 // triggerItemArtifacts is the string-shaped wrapper kept for the single, batch,
 // and bulk human trigger paths so their behaviour is identical. Already-present
 // artifacts are reported as skips (in results), not errors.
-func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string, force bool) (results, errs []string) {
-	for _, o := range triggerItemArtifactsTraced(db, item, types, force, "") {
+func triggerItemArtifacts(db *gorm.DB, item *models.ContentItem, types []string, force bool, triggers ...string) (results, errs []string) {
+	trigger := "enrichment_campaign"
+	if len(triggers) > 0 {
+		trigger = triggers[0]
+	}
+	for _, o := range triggerItemArtifactsTraced(db, item, types, force, trigger) {
 		switch o.Status {
 		case artifactOutcomeError:
 			errs = append(errs, o.Artifact+": "+o.Reason)

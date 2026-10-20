@@ -104,9 +104,10 @@ type proposalScorer struct {
 	catVecs    map[string][]float32
 	persist    bool
 
-	embedCalls     int
-	translateCalls int
-	budgetCapped   bool
+	embedCalls       int
+	translateCalls   int
+	budgetCapped     bool
+	workloadDeferred bool
 }
 
 func newProposalScorer(db *gorm.DB, tenantID string, policy models.PreferenceAutopilotPolicy, persist bool) *proposalScorer {
@@ -133,18 +134,27 @@ func parseProposalEvidence(raw datatypes.JSON) proposalEvidence {
 }
 
 type proposalScore struct {
-	ProposalID      uint    `json:"proposal_id"`
-	Slug            string  `json:"slug"`
-	Confidence      float64 `json:"confidence"`
-	Verdict         string  `json:"verdict"`
-	ReviewPriority  float64 `json:"review_priority"`
-	Duplicate       bool    `json:"duplicate"`
-	DuplicateOfSlug string  `json:"duplicate_of_slug,omitempty"`
-	CategoryUnknown bool    `json:"category_unknown"`
-	NeedsLabel      bool    `json:"needs_label"`
-	EmbeddingReady  bool    `json:"embedding_ready"`
-	Reason          string  `json:"reason"`
-	BudgetCapped    bool    `json:"budget_capped"`
+	ProposalID       uint    `json:"proposal_id"`
+	Slug             string  `json:"slug"`
+	Confidence       float64 `json:"confidence"`
+	Verdict          string  `json:"verdict"`
+	ReviewPriority   float64 `json:"review_priority"`
+	Duplicate        bool    `json:"duplicate"`
+	DuplicateOfSlug  string  `json:"duplicate_of_slug,omitempty"`
+	CategoryUnknown  bool    `json:"category_unknown"`
+	NeedsLabel       bool    `json:"needs_label"`
+	EmbeddingReady   bool    `json:"embedding_ready"`
+	Reason           string  `json:"reason"`
+	BudgetCapped     bool    `json:"budget_capped"`
+	WorkloadDeferred bool    `json:"workload_deferred"`
+}
+
+func preferenceCapacityDeferredScore(res proposalScore) proposalScore {
+	res.WorkloadDeferred = true
+	res.NeedsLabel, res.CategoryUnknown = true, true
+	res.Verdict = models.PreferenceVerdictReview
+	res.Reason = "Model work deferred for capacity; proposal remains pending without a new prediction."
+	return res
 }
 
 // score computes the deterministic confidence + verdict for one proposal and, when
@@ -158,7 +168,11 @@ func (s *proposalScorer) score(p *models.TopicProposal) proposalScore {
 	// from the other language via the Enrichment translate wrapper. Display prefill
 	// only; a still-unresolved label is a blocker flag, not evidence quality.
 	s.budgetCapped = false
+	s.workloadDeferred = false
 	ar, en, needsLabel := s.fillLabels(p)
+	if s.workloadDeferred {
+		return preferenceCapacityDeferredScore(res)
+	}
 	res.BudgetCapped = s.budgetCapped
 	if res.BudgetCapped {
 		res.NeedsLabel = true
@@ -171,6 +185,9 @@ func (s *proposalScorer) score(p *models.TopicProposal) proposalScore {
 	// Embedding (cached; bounded per run). Without it, duplicate/category are
 	// unknowable and high-confidence is blocked by construction.
 	vec, embReady := s.ensureEmbedding(p, ar, en)
+	if s.workloadDeferred {
+		return preferenceCapacityDeferredScore(res)
+	}
 	res.EmbeddingReady = embReady
 
 	support := clamp01(math.Log1p(float64(ev.MemberCount)) / math.Log1p(prefSupportSaturation))
@@ -277,6 +294,9 @@ func (s *proposalScorer) fillLabels(p *models.TopicProposal) (string, string, bo
 		if t, err := translateViaEnrichment(en, "ar", guardedSpendContext(s.db, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID), .01)); err == nil && hasArabicScript(t) {
 			ar = t
 			arSluggish = false
+		} else if isWorkloadDeferred(err) {
+			s.workloadDeferred = true
+			return ar, en, true
 		} else if isAISpendCapped(err) {
 			s.budgetCapped = true
 		}
@@ -286,6 +306,9 @@ func (s *proposalScorer) fillLabels(p *models.TopicProposal) (string, string, bo
 		if t, err := translateViaEnrichment(ar, "en", guardedSpendContext(s.db, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID), .01)); err == nil && strings.TrimSpace(t) != "" {
 			en = t
 			enSluggish = false
+		} else if isWorkloadDeferred(err) {
+			s.workloadDeferred = true
+			return ar, en, true
 		} else if isAISpendCapped(err) {
 			s.budgetCapped = true
 		}
@@ -313,7 +336,11 @@ func (s *proposalScorer) ensureEmbedding(p *models.TopicProposal, ar, en string)
 		return nil, false
 	}
 	text := strings.TrimSpace(en + " " + ar + " " + strings.ReplaceAll(p.SuggestedSlug, "-", " "))
-	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID))
+	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, withWorkloadContext(s.db, spendContext(s.tenantID, "preferences_autopilot", s.spendRunID), "automation"))
+	if isWorkloadDeferred(err) {
+		s.workloadDeferred = true
+		return nil, false
+	}
 	s.embedCalls++
 	if err != nil || len(emb) != 1024 {
 		return nil, false

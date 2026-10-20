@@ -273,10 +273,13 @@ func InternalCreateTranscript(c *gin.Context) {
 		}
 		wasTerminal := terminalTranscriptionStatus(transcriptionJob.Status) && transcriptionJob.CompletedAt != nil
 		updateTranscriptionJobFromRequest(db, transcriptionJob, jobReq)
-		if err := db.Save(transcriptionJob).Error; err == nil && !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
-			actual := transcriptionJob.ActualCostUsd
-			settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
-			updateBatchItemForJob(db, transcriptionJob)
+		if err := db.Save(transcriptionJob).Error; err == nil {
+			settleLegacySTTReceipt(db, *transcriptionJob, &status)
+			if !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
+				actual := transcriptionJob.ActualCostUsd
+				settleTranscriptionBudget(db, transcriptionJob.TenantID, transcriptionJob.ReservedCostUsd, actual)
+				updateBatchItemForJob(db, transcriptionJob)
+			}
 		}
 		c.JSON(http.StatusOK, internalCreateTranscriptResponse{
 			ID:        transcript.PublicID.String(),
@@ -321,6 +324,7 @@ func InternalCreateTranscript(c *gin.Context) {
 				wasTerminal := terminalTranscriptionStatus(transcriptionJob.Status) && transcriptionJob.CompletedAt != nil
 				updateTranscriptionJobFromRequest(db, transcriptionJob, jobReq)
 				if err := db.Save(transcriptionJob).Error; err == nil {
+					settleLegacySTTReceipt(db, *transcriptionJob, &status)
 					if !wasTerminal && terminalTranscriptionStatus(transcriptionJob.Status) {
 						actual := transcriptionJob.ActualCostUsd
 						if actual == 0 {

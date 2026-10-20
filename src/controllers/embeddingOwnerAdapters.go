@@ -92,6 +92,11 @@ func advanceCampaignVerification(db *gorm.DB, c *models.EmbeddingCampaign) {
 // rebuildCentroidSurface rebuilds every stale/unstamped centroid whose members
 // are all target-space, via the owning surface's typed adapter, then verifies.
 func rebuildCentroidSurface(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurface, es expectedSpace, batchID string) {
+	capacityDone, capacityErr := beginWorkloadSweep(db, c.TenantID, "embedding_campaign", "campaign")
+	if capacityErr != nil {
+		return
+	}
+	defer capacityDone()
 	expectedProducer := campaignExpectedProducer(c, s)
 	var ids []string
 	db.Raw(fmt.Sprintf(
@@ -100,8 +105,19 @@ func rebuildCentroidSurface(db *gorm.DB, c *models.EmbeddingCampaign, s Embeddin
 
 	for _, id := range ids {
 		start := time.Now()
+		callContext := withWorkloadContext(db, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)), "campaign")
+		var lease *controllerWorkloadLease
+		if s.Key != "story_centroid" {
+			var capacityErr error
+			lease, capacityErr = acquireControllerWorkload(db, c.TenantID, "embedding_campaign", "text_embedding", batchID, "campaign")
+			if capacityErr != nil {
+				continue
+			}
+			callContext.workloadLease = lease
+		}
 		act, claimed := claimOwnerAction(db, c, s, id, batchID, toolForCentroid(s.Key), expectedProducer)
 		if !claimed {
+			lease.cancelBeforeEffect()
 			continue
 		}
 		var skip string
@@ -110,8 +126,13 @@ func rebuildCentroidSurface(db *gorm.DB, c *models.EmbeddingCampaign, s Embeddin
 		case "story_centroid":
 			skip, err = rebuildStoryCentroid(db, id, es)
 		case "topic_centroid":
-			skip, err = refreshTopicCentroid(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)))
+			skip, err = refreshTopicCentroid(db, id, es, callContext)
 		default:
+			continue
+		}
+		lease.cancelBeforeEffect()
+		if isWorkloadDeferred(err) {
+			_ = db.Delete(act).Error
 			continue
 		}
 		act.LatencyMS = time.Since(start).Milliseconds()
@@ -234,8 +255,11 @@ func refreshTopicCentroid(db *gorm.DB, topicPublicID string, es expectedSpace, c
 		return "", e
 	}
 	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(topic.LabelEN+" "+topic.LabelAR, contexts...)
-	if e != nil || len(emb) != 1024 {
-		return "", fmt.Errorf("label embed failed: %v", e)
+	if e != nil {
+		return "", fmt.Errorf("label embed failed: %w", e)
+	}
+	if len(emb) != 1024 {
+		return "", fmt.Errorf("label embed returned an invalid vector")
 	}
 	if observedSpace != es.SpaceID {
 		return "", fmt.Errorf("label embed space changed during campaign")
@@ -257,6 +281,11 @@ func refreshTopicCentroid(db *gorm.DB, topicPublicID string, es expectedSpace, c
 
 // refreshCacheSurface force-refreshes proposal/discovery cache vectors.
 func refreshCacheSurface(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurface, es expectedSpace, batchID string) {
+	capacityDone, capacityErr := beginWorkloadSweep(db, c.TenantID, "embedding_campaign", "campaign")
+	if capacityErr != nil {
+		return
+	}
+	defer capacityDone()
 	expectedProducer := campaignExpectedProducer(c, s)
 	var ids []string
 	db.Raw(fmt.Sprintf(
@@ -265,17 +294,33 @@ func refreshCacheSurface(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSu
 
 	for _, id := range ids {
 		start := time.Now()
+		callContext := withWorkloadContext(db, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)), "campaign")
+		var lease *controllerWorkloadLease
+		if s.Key != "story_centroid" {
+			var capacityErr error
+			lease, capacityErr = acquireControllerWorkload(db, c.TenantID, "embedding_campaign", "text_embedding", batchID, "campaign")
+			if capacityErr != nil {
+				continue
+			}
+			callContext.workloadLease = lease
+		}
 		act, claimed := claimOwnerAction(db, c, s, id, batchID, toolForCache(s.Key), expectedProducer)
 		if !claimed {
+			lease.cancelBeforeEffect()
 			continue
 		}
 		var err error
 		switch s.Key {
 		case "topic_proposal":
-			err = refreshTopicProposalVector(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)))
+			err = refreshTopicProposalVector(db, id, es, callContext)
 		case "discovery_profile":
-			err = refreshDiscoveryProfileVector(db, id, es, spendContext(c.TenantID, "embedding_campaign", fmt.Sprint(c.ID)))
+			err = refreshDiscoveryProfileVector(db, id, es, callContext)
 		default:
+			continue
+		}
+		lease.cancelBeforeEffect()
+		if isWorkloadDeferred(err) {
+			_ = db.Delete(act).Error
 			continue
 		}
 		act.LatencyMS = time.Since(start).Milliseconds()
@@ -349,8 +394,11 @@ func refreshTopicProposalVector(db *gorm.DB, proposalID string, es expectedSpace
 	}
 	text := p.SuggestedLabelEN + " " + p.SuggestedLabelAR + " " + p.SuggestedSlug
 	emb, observedSpace, e := embedQueryViaEnrichmentWithSpace(text, contexts...)
-	if e != nil || len(emb) != 1024 {
-		return fmt.Errorf("proposal embed failed: %v", e)
+	if e != nil {
+		return fmt.Errorf("proposal embed failed: %w", e)
+	}
+	if len(emb) != 1024 {
+		return fmt.Errorf("proposal embed returned an invalid vector")
 	}
 	if observedSpace != es.SpaceID {
 		return fmt.Errorf("proposal embed space changed during campaign")
@@ -376,8 +424,11 @@ func refreshDiscoveryProfileVector(db *gorm.DB, profilePublicID string, es expec
 		return fmt.Errorf("profile has no embedding input")
 	}
 	emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(text, contexts...)
-	if err != nil || len(emb) != 1024 {
-		return fmt.Errorf("profile embed failed: %v", err)
+	if err != nil {
+		return fmt.Errorf("profile embed failed: %w", err)
+	}
+	if len(emb) != 1024 {
+		return fmt.Errorf("profile embed returned an invalid vector")
 	}
 	if observedSpace != es.SpaceID {
 		return fmt.Errorf("profile embed space changed during campaign")

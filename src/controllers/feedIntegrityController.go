@@ -242,6 +242,13 @@ func runFeedIntegrity(db *gorm.DB, tenant string, opts feedIntegrityRunOptions) 
 	if tier != models.FeedIntegrityTierDeep {
 		tier = models.FeedIntegrityTierLight
 	}
+	if tier == models.FeedIntegrityTierDeep {
+		capacityDone, capacityErr := beginWorkloadSweep(db, tenant, "feed_integrity_deep", feedIntegrityOr(opts.Trigger, "manual"))
+		if capacityErr != nil {
+			return models.FeedIntegrityRun{}, capacityErr
+		}
+		defer capacityDone()
+	}
 	run := models.FeedIntegrityRun{TenantID: tenant, Trigger: feedIntegrityOr(opts.Trigger, "manual"), Tier: tier, Status: models.FeedIntegrityRunRunning, Headline: "running", StartedAt: now, CreatedBy: feedIntegrityOr(opts.CreatedBy, "automation"), ErrorClass: "none", CorrelationID: opts.CorrelationID, TriggerRef: opts.TriggerRef}
 	if err := db.Create(&run).Error; err != nil {
 		return run, err

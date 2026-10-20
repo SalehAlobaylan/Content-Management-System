@@ -749,6 +749,13 @@ func (r *studioRunner) runProposalPhase() {
 	context := spendContext(r.tenantID, "studio_autopilot", r.run.PublicID.String())
 	context = guardedSpendContext(r.db, context, float64(len(items))*.01)
 	proposals, err := generateChapterProposalsViaEnrichment(items, context)
+	if isWorkloadDeferred(err) {
+		for _, pc := range queue {
+			r.markProposalGuardrail(pc.ActionID, "workload_governor", "Proposal deferred for capacity; the chapter remains in review.")
+		}
+		r.record(studioActionInput{UnitType: models.StudioUnitChapterReview, Verdict: "proposal_phase", ToolName: "proposals.generate", Status: models.StudioActionStatusSkipped, Guardrail: "workload_governor", Reason: "Proposal deferred for capacity; no model attempt was consumed."})
+		return
+	}
 	if isAISpendCapped(err) {
 		for _, pc := range queue {
 			r.markProposalGuardrail(pc.ActionID, "budget_capped", "Proposal deferred; the chapter remains in review.")

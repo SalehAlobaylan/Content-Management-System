@@ -15,6 +15,9 @@ import (
 // Each owning workflow passes provenance explicitly; request-local values never
 // live in mutable package globals. Override IDs are minted by authenticated CMS.
 type AISpendContext struct {
+	workloadDB              *gorm.DB
+	workloadOrigin          string
+	workloadLease           *controllerWorkloadLease
 	EconomicsAttributionRef string         `json:"economics_attribution_ref,omitempty"`
 	HumanActorID            string         `json:"human_actor_id,omitempty"`
 	Admission               map[string]any `json:"admission,omitempty"`
@@ -116,6 +119,7 @@ var aiSpendCoverage = []map[string]string{
 
 func manualAISpendContext(c *gin.Context, tenant, trigger, run string) (AISpendContext, bool) {
 	ctx := spendContext(tenant, trigger, run)
+	ctx = withWorkloadContext(c.MustGet("db").(*gorm.DB), ctx, "human")
 	principal, _ := utils.GetAdminPrincipal(c)
 	ctx.HumanActorID = principal.UserID
 	if id := c.GetHeader("X-AI-Spend-Override"); id != "" {
@@ -132,6 +136,9 @@ func manualAISpendContext(c *gin.Context, tenant, trigger, run string) (AISpendC
 }
 
 func guardedSpendContext(db *gorm.DB, ctx AISpendContext, estimate float64) AISpendContext {
+	if ctx.workloadDB == nil {
+		ctx = withWorkloadContext(db, ctx, "automation")
+	}
 	ctx.Admission = CheckTenantSpendAllowance(db, ctx.TenantID, "llm", estimate, ctx.TriggerSource, ctx.OverrideID)
 	return ctx
 }

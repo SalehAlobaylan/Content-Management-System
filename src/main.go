@@ -405,6 +405,7 @@ func main() {
 	// healthy CMS. The work remains durable and self-healing; only boot ordering
 	// changes.
 	go func() {
+		controllers.StartWorkloadGovernorHeartbeat(db)
 		// Self-heal classification drift: classify any embedded-but-unclassified
 		// NEWS items (LLM outages, bulk re-embeds, taxonomy wipes) and rebuild the
 		// precompute News snapshot when done. Runs in the background.

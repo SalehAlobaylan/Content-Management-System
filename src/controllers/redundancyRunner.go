@@ -316,6 +316,11 @@ func runRedundancyScanScope(db *gorm.DB, trigger, actor, scope string) (models.R
 	return runRedundancyTenant(db, "default", trigger, actor, scope)
 }
 func runRedundancyTenant(db *gorm.DB, tenant, trigger, actor, scope string) (run models.RedundancyRun, err error) {
+	capacityDone, capacityErr := beginWorkloadSweep(db, tenant, "redundancy_hygiene", trigger)
+	if capacityErr != nil {
+		return run, capacityErr
+	}
+	defer capacityDone()
 	if !tryStartRedundancyRun() {
 		return run, errRedundancyBusy
 	}

@@ -13,6 +13,7 @@ import (
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/pipeline"
+	"content-management-system/src/workload"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -474,6 +475,17 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 					continue
 				}
 			}
+			decision := workload.RequestPermit(tx, stageWorkloadRequest(request))
+			if !decision.Allowed() {
+				next := now.Add(time.Minute)
+				if err := tx.Model(&request).Updates(map[string]any{"state": models.ContentStageDeferred, "failure_class": "capacity_deferred", "not_before_at": next, "updated_at": now}).Error; err != nil {
+					return err
+				}
+				if err := appendEvent(tx, request, nil, "capacity_deferred", map[string]any{"boundary": "workload_governor", "not_before_at": next, "reasons": decision.Reasons}); err != nil {
+					return err
+				}
+				continue
+			}
 			attempt, reclaimed, err := reclaimUnstartedAttempt(tx, request, claimOwner, now)
 			if err != nil {
 				return err
@@ -504,6 +516,7 @@ func claimNextForOwner(db *gorm.DB, tenantID, lane, expectedOwner, claimOwner st
 					}
 				}
 				if count >= maxEffectAttempts || (request.DeadlineAt != nil && !request.DeadlineAt.After(now)) {
+					_ = workload.SettleRequest(tx, stageWorkloadRequest(request), 0, "native_stage_budget_exhausted_before_claim")
 					if err := failRequest(tx, request, "execution_budget_exhausted", "verified effect remains absent"); err != nil {
 						return err
 					}
@@ -757,6 +770,9 @@ func transitionClaim(db *gorm.DB, requestID uuid.UUID, input Correlation, begin 
 			if request.State != models.ContentStageClaimed || attempt.State != models.ContentStageClaimed {
 				return fmt.Errorf("content stage cannot begin")
 			}
+			if err := workload.BeginRequest(tx, activeStageWorkloadRequest(request)); err != nil {
+				return err
+			}
 			requestState, attemptState, event = models.ContentStageRunning, models.ContentStageRunning, "began"
 			updates["state"] = requestState
 			updates["not_before_at"] = nil
@@ -844,6 +860,7 @@ func MarkNotRequired(db *gorm.DB, requestID uuid.UUID, input Correlation, proof 
 		}
 		request.State, request.VerifiedAt, request.FinishedAt, request.TerminalProof = models.ContentStageVerified, &now, &now, terminalProof
 		attempt.State, attempt.FinishedAt = models.ContentStageVerified, &now
+		settleStageWorkload(tx, request, 0, "conditional_atomization_not_required")
 		if err := appendEvent(tx, request, &attempt, "verified_not_required", proof); err != nil {
 			return err
 		}
@@ -954,6 +971,10 @@ func terminalTransition(db *gorm.DB, requestID uuid.UUID, input Correlation, sta
 		attempt.State, attempt.FailureClass, attempt.FailureSummary, attempt.FinishedAt = state, failureClass, boundedFailureSummary(summary), &now
 		if state == models.ContentStageDeferred && failureClass == "capacity_deferred" {
 			attempt.EffectStartedAt = nil
+			settleStageWorkload(tx, request, 0, "native_dependency_rejected_before_effect")
+		}
+		if state == models.ContentStageUncertain {
+			_ = workload.MarkRequestUncertain(tx, activeStageWorkloadRequest(request), "native_stage_effect_uncertain")
 		}
 		if err := appendEvent(tx, request, &attempt, state, map[string]any{"failure_class": failureClass, "summary": summary, "not_before_at": notBefore}); err != nil {
 			return err
@@ -1254,6 +1275,7 @@ func VerifyRequest(db *gorm.DB, requestID uuid.UUID) error {
 			if err := settleVerifiedAttemptReceipts(tx, request); err != nil {
 				return err
 			}
+			settleVerifiedStageWorkload(tx, request)
 			if request.Stage == models.ContentStagePodsMediaArtifacts {
 				if err := settleConditionalPodsStages(tx, item); err != nil {
 					return err
@@ -1527,6 +1549,7 @@ func settleConditionalPodsStages(tx *gorm.DB, item models.ContentItem) error {
 			return err
 		}
 		request.State, request.VerifiedAt, request.FinishedAt, request.TerminalProof = models.ContentStageVerified, &now, &now, proof
+		settleUnstartedStageWorkload(tx, request, "conditional_stage_not_required_without_effect")
 		if err := appendEvent(tx, request, nil, "verified_not_required", map[string]any{"duration_sec": *item.DurationSec}); err != nil {
 			return err
 		}
@@ -1571,6 +1594,7 @@ func RecoverExpired(db *gorm.DB) error {
 				if err := appendEvent(tx, request, &attempt, "lease_expired_before_effect", map[string]any{"reclaimable": true, "retry_at": retryAt, "retry_after_sec": int(preEffectLeaseBackoff(attempt.AttemptNumber).Seconds())}); err != nil {
 					return err
 				}
+				settleStageWorkload(tx, request, 0, "native_claim_expired_without_effect_start")
 				if err := reduceReadiness(tx, request.TenantID, request.ContentItemID, request.ProcessingGeneration); err != nil {
 					return err
 				}
@@ -1583,6 +1607,7 @@ func RecoverExpired(db *gorm.DB) error {
 				return err
 			}
 			request.State = models.ContentStageUncertain
+			_ = workload.MarkRequestUncertain(tx, activeStageWorkloadRequest(request), "native_stage_lease_expired_after_effect")
 			if err := appendEvent(tx, request, &attempt, "lease_expired_after_effect", map[string]any{"verification_required": true}); err != nil {
 				return err
 			}
@@ -1796,6 +1821,7 @@ func cancelRequest(tx *gorm.DB, request *models.ContentStageRequest, attempt *mo
 	if err := appendEvent(tx, *request, attempt, "cancelled", map[string]any{"reason": reason}); err != nil {
 		return err
 	}
+	settleUnstartedStageWorkload(tx, *request, "stage_cancelled_without_effect_start")
 	return reduceReadiness(tx, request.TenantID, request.ContentItemID, request.ProcessingGeneration)
 }
 
@@ -1805,6 +1831,7 @@ func supersede(tx *gorm.DB, request models.ContentStageRequest, reason string) e
 		return err
 	}
 	request.State, request.FailureClass, request.FinishedAt = models.ContentStageSuperseded, reason, &now
+	settleUnstartedStageWorkload(tx, request, "stage_superseded_without_effect_start")
 	return appendEvent(tx, request, nil, "superseded", map[string]any{"reason": reason})
 }
 
@@ -1815,6 +1842,7 @@ func failRequest(tx *gorm.DB, request models.ContentStageRequest, failureClass, 
 		return err
 	}
 	request.State, request.FailureClass, request.FinishedAt, request.TerminalProof = models.ContentStageFailed, failureClass, &now, proof
+	settleUnstartedStageWorkload(tx, request, "stage_failed_without_effect_start")
 	if err := appendEvent(tx, request, nil, "failed", map[string]any{"failure_class": failureClass, "summary": summary}); err != nil {
 		return err
 	}

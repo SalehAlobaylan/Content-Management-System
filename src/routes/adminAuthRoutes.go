@@ -43,6 +43,20 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/ops/commands/pause-all", utils.RequireAdminRole("admin"), controllers.PauseOpsFleet)
 	adminGroup.POST("/ops/commands/resume", utils.RequireAdminRole("admin"), controllers.ResumeOpsCommand)
 
+	// Capacity policy is platform-global; feed permissions alone cannot read
+	// other tenants' workload or enable deployment-wide enforcement.
+	workloadAdmin := adminGroup.Group("/workload", utils.RequireAdminRole("admin"))
+	workloadAdmin.GET("/status", controllers.GetWorkloadStatus)
+	workloadAdmin.GET("/policy", controllers.GetWorkloadPolicy)
+	workloadAdmin.PUT("/policy", controllers.UpdateWorkloadPolicy)
+	workloadAdmin.GET("/registry", controllers.GetWorkloadRegistry)
+	workloadAdmin.GET("/qualification", controllers.GetWorkloadQualification)
+	workloadAdmin.GET("/permits", controllers.ListWorkloadPermits)
+	workloadAdmin.GET("/decisions", controllers.ListWorkloadDecisions)
+	workloadAdmin.GET("/snapshots", controllers.ListWorkloadSnapshots)
+	workloadAdmin.POST("/pause", controllers.PauseWorkloadGovernor)
+	workloadAdmin.POST("/permits/:id/revoke", controllers.RevokeWorkloadPermit)
+
 	adminGroup.GET("/sources", perm("source", "read"), controllers.ListContentSources)
 	adminGroup.POST("/sources", perm("source", "write"), controllers.CreateContentSource)
 	adminGroup.POST("/sources/bulk", perm("source", "write"), controllers.BulkCreateContentSources)

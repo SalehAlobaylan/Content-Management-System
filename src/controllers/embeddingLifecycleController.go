@@ -95,6 +95,11 @@ func tryEmbeddingAdvisoryLock(db *gorm.DB) (func(), bool) {
 // surface, persisting a run + findings. Single-flight; returns the run or nil if
 // another run holds the lock.
 func runEmbeddingAudit(db *gorm.DB, trigger string) (*models.EmbeddingLifecycleRun, bool, error) {
+	capacityDone, capacityErr := beginWorkloadSweep(db, embeddingLifecycleTenant, "embedding_lifecycle", trigger)
+	if capacityErr != nil {
+		return nil, true, capacityErr
+	}
+	defer capacityDone()
 	if !embeddingLifecycleMu.TryLock() {
 		return nil, false, nil
 	}

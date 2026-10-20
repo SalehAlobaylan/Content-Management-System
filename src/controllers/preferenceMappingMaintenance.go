@@ -378,7 +378,10 @@ func refreshNullCentroidsBounded(db *gorm.DB, tenantID string, limitN int) (int,
 	}
 	recovered, failed := 0, 0
 	for _, topic := range topics {
-		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN+" "+topic.LabelAR, spendContext(tenantID, "topics_maintenance", topic.PublicID.String()))
+		emb, observedSpace, err := embedQueryViaEnrichmentWithSpace(topic.LabelEN+" "+topic.LabelAR, withWorkloadContext(db, spendContext(tenantID, "topics_maintenance", topic.PublicID.String()), "automation"))
+		if isWorkloadDeferred(err) {
+			return recovered, err
+		}
 		if err != nil || len(emb) != 1024 {
 			failed++
 			continue

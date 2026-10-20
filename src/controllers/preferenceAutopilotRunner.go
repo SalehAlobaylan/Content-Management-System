@@ -600,6 +600,10 @@ func (r *preferenceAutopilotRunner) enrichProposals() []proposalScore {
 		started := time.Now()
 		sc := scorer.score(&pending[i])
 		out = append(out, sc)
+		if sc.WorkloadDeferred {
+			r.writeAction(models.PreferenceActionProposalEnrich, models.PreferenceSubjectProposal, fmt.Sprintf("%d", pending[i].ID), models.PreferenceActionStatusSkipped, "workload_governor", "Proposal model work deferred for capacity; proposal remains pending.", started)
+			continue
+		}
 		if sc.BudgetCapped {
 			r.writeAction(models.PreferenceActionProposalEnrich, models.PreferenceSubjectProposal, fmt.Sprintf("%d", pending[i].ID), models.PreferenceActionStatusSkipped, "budget_capped", "Translation deferred by AI spend allowance; proposal remains pending.", started)
 			continue
@@ -666,6 +670,10 @@ func (r *preferenceAutopilotRunner) actionCentroidRefresh() {
 		return
 	}
 	recovered, err := refreshNullCentroidsBounded(r.db, r.run.TenantID, r.policy.MaxCentroidRefresh)
+	if isWorkloadDeferred(err) {
+		r.writeAction(models.PreferenceActionCentroidRefresh, models.PreferenceSubjectAggregate, "", models.PreferenceActionStatusSkipped, "workload_governor", "Centroid work deferred for capacity; remaining topics stay queued.", started)
+		return
+	}
 	if err != nil {
 		r.writeAction(models.PreferenceActionCentroidRefresh, models.PreferenceSubjectAggregate, "", models.PreferenceActionStatusError, models.PreferenceGuardEnrichmentDown, err.Error(), started)
 		return

@@ -6,6 +6,7 @@ import (
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
+	"content-management-system/src/workload"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -219,8 +220,9 @@ func createSkippedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigge
 	return job
 }
 
-func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, triggerSource string) (models.TranscriptionJob, error) {
+func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, triggerSource string, workloadOrigins ...string) (models.TranscriptionJob, error) {
 	var job models.TranscriptionJob
+	var capacityErr error
 	err := db.Transaction(func(tx *gorm.DB) error {
 		collect := item.EconomicsRequesterID != "" && economics.DefaultCollector.Enabled(item.TenantID)
 		if collect {
@@ -254,6 +256,7 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 			return errTranscriptionBudgetCapReached
 		}
 		job = models.TranscriptionJob{
+			PublicID:         uuid.New(),
 			TenantID:         current.TenantID,
 			ContentItemID:    current.PublicID,
 			TranscriptID:     current.TranscriptID,
@@ -261,6 +264,15 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 			Status:           models.TranscriptionJobStatusQueued,
 			EstimatedCostUsd: est,
 			ReservedCostUsd:  est,
+		}
+		// Promoted lanes acquire at the exact durable stage claim. Legacy direct
+		// jobs acquire here, before creating a native attempt or reserving money.
+		if !durablePodsTranscriptStageEnabled(tx, &current) {
+			decision := workload.RequestPermit(tx, transcriptionWorkloadRequest(current.TenantID, job.PublicID, triggerSource, workloadOrigins...))
+			if !decision.Allowed() {
+				capacityErr = &workloadDeferredError{Reason: "Transcription capacity is busy; retry on the next owner tick"}
+				return nil // Commit the decision without creating a job or spending.
+			}
 		}
 		if collect {
 			job.EconomicsAttributionRef = uuid.NewString()
@@ -286,6 +298,9 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 	if err != nil {
 		return job, err
 	}
+	if capacityErr != nil {
+		return models.TranscriptionJob{}, capacityErr
+	}
 	return job, nil
 }
 
@@ -294,9 +309,10 @@ func createAcceptedTranscriptionJob(db *gorm.DB, item *models.ContentItem, trigg
 type sttSkipKind string
 
 const (
-	sttSkipNone   sttSkipKind = ""
-	sttSkipBudget sttSkipKind = "budget"
-	sttSkipGuard  sttSkipKind = "guard"
+	sttSkipNone     sttSkipKind = ""
+	sttSkipBudget   sttSkipKind = "budget"
+	sttSkipGuard    sttSkipKind = "guard"
+	sttSkipCapacity sttSkipKind = "capacity"
 )
 
 func latestTranscriptQuality(db *gorm.DB, contentID uuid.UUID) *models.TranscriptQuality {
@@ -357,9 +373,12 @@ func evaluateSTTAdmissionWithConfig(db *gorm.DB, item *models.ContentItem, trigg
 	return true, ""
 }
 
-func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, triggerSource string, force bool) (models.TranscriptionJob, bool, string, sttSkipKind, error) {
+func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, triggerSource string, force bool, workloadOrigins ...string) (models.TranscriptionJob, bool, string, sttSkipKind, error) {
 	if triggerSource == "" {
 		triggerSource = models.TranscriptionTriggerManual
+	}
+	if len(workloadOrigins) == 0 {
+		workloadOrigins = []string{transcriptionWorkloadRequest(item.TenantID, uuid.Nil, triggerSource).Origin}
 	}
 	// Force may override STT retry policy, but not replace a usable provider
 	// caption with a paid generation. A stale caption_state or empty metadata
@@ -393,8 +412,11 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 			// exactly the condition this manual prerequisite path is meant to
 			// repair.  Budget and active-job guards remain enforced by
 			// createAcceptedTranscriptionJob below.
-			job, err := createAcceptedTranscriptionJob(db, item, triggerSource)
+			job, err := createAcceptedTranscriptionJob(db, item, triggerSource, workloadOrigins...)
 			if err != nil {
+				if isWorkloadDeferred(err) {
+					return models.TranscriptionJob{}, false, err.Error(), sttSkipCapacity, nil
+				}
 				if errors.Is(err, errTranscriptionBudgetCapReached) {
 					job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
 					return job, false, job.SkipReason, sttSkipBudget, nil
@@ -425,8 +447,11 @@ func createTranscriptionJobForItem(db *gorm.DB, item *models.ContentItem, trigge
 		}
 	}
 
-	job, err := createAcceptedTranscriptionJob(db, item, triggerSource)
+	job, err := createAcceptedTranscriptionJob(db, item, triggerSource, workloadOrigins...)
 	if err != nil {
+		if isWorkloadDeferred(err) {
+			return models.TranscriptionJob{}, false, err.Error(), sttSkipCapacity, nil
+		}
 		if errors.Is(err, errTranscriptionBudgetCapReached) {
 			job := createSkippedTranscriptionJob(db, item, triggerSource, "monthly STT budget cap reached")
 			return job, false, job.SkipReason, sttSkipBudget, nil
@@ -628,10 +653,20 @@ func submitTranscriptionJobToMedia(db *gorm.DB, item *models.ContentItem, jobID 
 		// second queue delivery.
 		return contentstage.ExpediteManualTranscript(db, item.TenantID, item.PublicID, item.ProcessingGeneration)
 	}
+	// Local preflight failure cannot have started a remote effect. Leave the
+	// unstarted permit eligible for safe expiry instead of inventing uncertainty.
+	if mediaBaseURL() == "" || mediaServiceToken() == "" || ((item.MediaURL == nil || strings.TrimSpace(*item.MediaURL) == "") && (item.PlaybackURL == nil || strings.TrimSpace(*item.PlaybackURL) == "")) {
+		return errors.New("legacy transcription submission requires media URL and service configuration")
+	}
+	if err := workload.BeginOwner(db, item.TenantID, legacySTTWorkloadOwner, jobID); err != nil {
+		return &workloadDeferredError{Reason: "Transcription permit changed before submission"}
+	}
 	mediaJobID, err := triggerTranscriptionForJob(item, jobID)
 	if err != nil {
+		_ = workload.MarkOwnerUncertain(db, item.TenantID, legacySTTWorkloadOwner, jobID, "Legacy transcription submission has no verified terminal receipt")
 		return err
 	}
+	_ = workload.HandoffOwner(db, item.TenantID, legacySTTWorkloadOwner, jobID)
 	if strings.TrimSpace(mediaJobID) != "" {
 		db.Model(&models.TranscriptionJob{}).
 			Where("public_id = ?", jobID).
@@ -757,6 +792,7 @@ func InternalUpdateTranscriptionJob(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update transcription job"})
 		return
 	}
+	settleLegacySTTReceipt(db, job, req.Status)
 	if !wasTerminal && terminalTranscriptionStatus(job.Status) {
 		actual := 0.0
 		if job.Status == models.TranscriptionJobStatusSucceeded || job.Status == models.TranscriptionJobStatusWritebackFailed ||
@@ -1199,9 +1235,12 @@ func dispatchTranscriptionBatch(db *gorm.DB, batchID uuid.UUID) {
 			if err := tx.Where("public_id = ? AND tenant_id = ?", batchItem.ContentItemID, batch.TenantID).First(&item).Error; err != nil {
 				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": "content item not found"}).Error
 			}
-			job, triggered, reason, _, err := createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerBulkManual, batch.Force)
+			job, triggered, reason, kind, err := createTranscriptionJobForItem(tx, &item, models.TranscriptionTriggerBulkManual, batch.Force)
 			if err != nil {
 				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusFailed, "error": err.Error()}).Error
+			}
+			if !triggered && kind == sttSkipCapacity {
+				return tx.Model(&batchItem).Updates(map[string]interface{}{"status": models.TranscriptionBatchItemStatusPending, "reason": reason}).Error
 			}
 			job.BatchID = &batch.PublicID
 			job.BatchItemID = &batchItem.PublicID
