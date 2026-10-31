@@ -50,7 +50,7 @@ func defaultCoverageAdapters() map[string]coverageAdapter {
 		"atomization":        newAdapter("atomization", "content:read", "/platform/media/atomization", tenant("policy", "media_atomization_policies", "updated_at DESC"), tenant("latest_run", "media_atomization_runs", "updated_at DESC"), tenant("studio_policy", "media_studio_autopilot_policies", "updated_at DESC")),
 		"redundancy":         newAdapter("redundancy", "content:read", "/platform/media/redundancy", tenant("policy", "redundancy_policies", "updated_at DESC"), tenant("latest_run", "redundancy_runs", "updated_at DESC"), tenant("pair", "redundancy_pairs", "updated_at DESC")),
 		"media_library":      newAdapter("media_library", "content:read", "/platform/media", coverageRead{Key: "item", Table: "content_items", TenantScoped: true, Where: "type IN ('VIDEO', 'PODCAST')", Order: "updated_at DESC", Scope: "tenant"}, tenant("atomization_run", "media_atomization_runs", "updated_at DESC")),
-		"storage_quality":    newAdapter("storage_quality", "content:read", "/platform/storage", tenant("policy", "storage_policies", "updated_at DESC"), tenant("sweep", "storage_sweep_runs", "updated_at DESC"), coverageRead{Key: "quality_profile", Table: "quality_profiles", TenantScoped: false, Where: "tenant_id IS NULL", Order: "updated_at DESC", Scope: "platform_global"}),
+		"storage_quality":    newAdapter("storage_quality", "content:read", "/platform/storage", tenant("policy", "storage_policies", "updated_at DESC"), tenant("sweep", "storage_sweep_runs", "started_at DESC"), coverageRead{Key: "quality_profile", Table: "quality_profiles", TenantScoped: false, Where: "tenant_id IS NULL", Order: "updated_at DESC", Scope: "platform_global"}),
 		"pipeline":           newAdapter("pipeline", "aggregation:read", "/platform/pipeline", tenant("policy", "pipeline_autopilot_policies", "updated_at DESC"), tenant("latest_run", "pipeline_autopilot_runs", "started_at DESC")),
 		"enrichment":         newAdapter("enrichment", "content:read", "/platform/enrichment", tenant("policy", "enrichment_autopilot_policies", "updated_at DESC"), tenant("latest_run", "enrichment_autopilot_runs", "started_at DESC")),
 		"intelligence":       newAdapter("intelligence", "feed:read", "/platform/intelligence", tenant("ranking", "ranking_configs", "updated_at DESC"), tenant("flag", "content_flags", "updated_at DESC")),
@@ -85,6 +85,10 @@ func (fabric *ContextFabric) BuildCoveragePacket(ctx context.Context, visible Vi
 	evidence, facts, unknowns := []EvidenceRef{}, []Fact{}, []string{}
 	for _, read := range adapter.Reads {
 		row, observedAt, err := fabric.coverageRow(ctx, read, access.TenantID)
+		if err == nil && row == nil && visible.Domain == "storage_quality" && read.Key == "policy" {
+			read.TenantScoped, read.Where, read.Scope = false, "tenant_id IS NULL", "platform_global"
+			row, observedAt, err = fabric.coverageRow(ctx, read, access.TenantID)
+		}
 		if err != nil {
 			return DecisionPacket{}, err
 		}
@@ -93,7 +97,22 @@ func (fabric *ContextFabric) BuildCoveragePacket(ctx context.Context, visible Vi
 			continue
 		}
 		row["scope"] = read.Scope
-		ref := fabric.evidence(descriptor, access.TenantID, descriptor.Key+":"+read.Key+":"+coverageRecordID(row), []SubjectRef{{Type: read.Key, ID: coverageRecordID(row), Label: read.Scope}}, observedAt, observedAt, evidenceAvailabilityForUpdatedAt(observedAt, now), row)
+		readAt, availability := observedAt, evidenceAvailabilityForUpdatedAt(observedAt, now)
+		if visible.Domain == "storage_quality" && (read.Key == "policy" || read.Key == "quality_profile") {
+			// A current configuration read is fresh even if its saved version is old.
+			// Historical sweep runs retain their original observation time.
+			readAt, availability = fabric.now(), EvidenceAvailable
+		}
+		if visible.Domain == "storage_quality" && read.Key == "policy" {
+			// Request-count budgets are a different metric from storage byte usage.
+			// This storage-status projection intentionally omits those counters.
+			for key := range row {
+				if strings.HasPrefix(key, "class_a_") || strings.HasPrefix(key, "class_b_") {
+					delete(row, key)
+				}
+			}
+		}
+		ref := fabric.evidence(descriptor, access.TenantID, descriptor.Key+":"+read.Key+":"+coverageRecordID(row), []SubjectRef{{Type: read.Key, ID: coverageRecordID(row), Label: read.Scope}}, readAt, observedAt, availability, row)
 		evidence = append(evidence, ref)
 		facts = append(facts, Fact{Key: visible.Domain + "." + read.Key, Value: row, EvidenceIDs: []string{ref.EvidenceID}})
 	}

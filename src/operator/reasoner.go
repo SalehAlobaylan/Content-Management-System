@@ -201,6 +201,24 @@ func (output ReasonResponse) ValidateAgainst(input ReasonRequest) error {
 	return nil
 }
 
+// The durable conversation stores blocks, so caveats returned in the separate
+// reasoning field must join them before persistence. Preserve existing prose
+// and avoid repeating a caveat already included in the answer.
+func responseBlocksWithUncertainties(blocks []ResponseBlock, uncertainties []string) []ResponseBlock {
+	seen := make(map[string]bool, len(blocks)+len(uncertainties))
+	for _, block := range blocks {
+		seen[strings.TrimSpace(block.Text)] = true
+	}
+	for _, text := range uncertainties {
+		text = strings.TrimSpace(text)
+		if text != "" && !seen[text] {
+			blocks = append(blocks, ResponseBlock{Kind: "unknown", Text: text})
+			seen[text] = true
+		}
+	}
+	return blocks
+}
+
 // DeterministicDegradedBlocks make a read-only investigation useful when LLM
 // use is disabled or unavailable, without creating action authority from prose.
 func DeterministicDegradedBlocks(packet DecisionPacket, reason string) []ResponseBlock {
@@ -211,17 +229,21 @@ func DeterministicDegradedBlocks(packet DecisionPacket, reason string) []Respons
 // in the thread locale when Enrichment is disabled or cannot return a valid
 // response. It never introduces action authority or translates identifiers.
 func DeterministicDegradedBlocksForLocale(packet DecisionPacket, locale, reason string) []ResponseBlock {
-	blocks := []ResponseBlock{}
+	blocks := storageAnswerBlocks(packet, locale)
 	factText := "CMS collected the current registered operational context."
 	if locale == "ar" {
 		factText = "جمع CMS السياق التشغيلي الحالي من السجلات المسجّلة."
 	}
-	if len(packet.Evidence) > 0 {
+	if len(blocks) == 0 && len(packet.Evidence) > 0 {
 		blocks = append(blocks, ResponseBlock{Kind: "fact", Text: factText, EvidenceIDs: []string{packet.Evidence[0].EvidenceID}})
 	}
 	blocks = append(blocks, mediaSupplyContinuityDegradedBlocks(packet, locale)...)
 	blocks = append(blocks, mediaContinuityDegradedBlocks(packet, locale)...)
 	for _, unknown := range packet.Unknowns {
+		if packet.VisibleContext.Domain == "storage_quality" {
+			blocks = append(blocks, ResponseBlock{Kind: "unknown", Text: storageUnknown(unknown, locale)})
+			continue
+		}
 		if locale == "ar" {
 			blocks = append(blocks, ResponseBlock{Kind: "unknown", Text: "توجد حالة تشغيلية مطلوبة لا تثبتها سجلات CMS الحالية."})
 			continue
@@ -436,6 +458,8 @@ func localizedRecommendationSummary(recommendation Recommendation) string {
 		return "راجع الدليل التشغيلي الحالي في CMS قبل اتخاذ أي تغيير."
 	}
 	switch strings.TrimPrefix(recommendation.ID, "inspect:") {
+	case "storage_quality":
+		return "افتح التخزين لمراجعة الاستهلاك وإعدادات التنظيف."
 	case "media_sources":
 		return "راجع المصدر وطلب التشغيل الدائم ومسار المعالجة في مصادر الوسائط."
 	case "media_circulation":

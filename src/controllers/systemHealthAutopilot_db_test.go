@@ -29,6 +29,12 @@ var systemHealthFixtureErr error
 
 func TestMain(m *testing.M) {
 	code := m.Run()
+	if opsFixtureClose != nil {
+		if err := opsFixtureClose(); err != nil {
+			fmt.Fprintln(os.Stderr, "Operations disposable fixture cleanup failed:", err)
+			code = 1
+		}
+	}
 	if systemHealthFixtureClose != nil {
 		if err := systemHealthFixtureClose(); err != nil {
 			fmt.Fprintln(os.Stderr, "System Health disposable fixture cleanup failed:", err)

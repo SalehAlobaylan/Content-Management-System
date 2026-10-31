@@ -918,6 +918,8 @@ func deterministicRecommendations(visible VisibleContext, evidence []EvidenceRef
 	title, summary := "Inspect the registered operational surface", "Review the current CMS evidence before deciding on a change."
 	manualOnly := false
 	switch visible.Domain {
+	case "storage_quality":
+		title, summary, manualOnly = "Review storage usage", "Open Storage to review usage and cleanup settings.", true
 	case "media_sources":
 		title, summary = "Review approval handoff evidence", "Inspect the source, its durable run request, and processing lineage in Media Sources."
 	case "media_circulation":
@@ -945,11 +947,12 @@ func (registry AdapterRegistry) EdgesFrom(kind string) []RelationshipEdge {
 }
 
 type ContextFabric struct {
-	db       *gorm.DB
-	registry AdapterRegistry
-	now      func() time.Time
-	memory   *MemoryStore
-	embedder MemoryEmbedder
+	storageReader StorageSnapshotReader
+	db            *gorm.DB
+	registry      AdapterRegistry
+	now           func() time.Time
+	memory        *MemoryStore
+	embedder      MemoryEmbedder
 }
 
 func NewContextFabric(db *gorm.DB, registry AdapterRegistry) *ContextFabric {
@@ -981,6 +984,8 @@ func (fabric *ContextFabric) BuildPacket(ctx context.Context, visible VisibleCon
 		return DecisionPacket{}, err
 	}
 	switch visible.Domain {
+	case "storage_quality":
+		return fabric.BuildStoragePacket(ctx, visible, access)
 	case "media_sources":
 		for _, subject := range visible.Subjects {
 			if subject.Type == "content_source" || subject.Type == "source" {

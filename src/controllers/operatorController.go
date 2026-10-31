@@ -5,12 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -122,6 +122,10 @@ func ListOperatorEligibleActions(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"items": []gin.H{}, "execution_enabled": policy.ExecutionEnabled})
 		return
 	}
+	if operatorpkg.IsGreeting(input.Message) {
+		c.JSON(http.StatusOK, gin.H{"items": []gin.H{}, "execution_enabled": policy.ExecutionEnabled})
+		return
+	}
 	accessClient, err := operatorpkg.NewIAMAccessClientFromEnv()
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Current Operator access cannot be verified"})
@@ -132,7 +136,7 @@ func ListOperatorEligibleActions(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Current Operator access cannot be verified"})
 		return
 	}
-	packet, err := operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()).BuildPacket(c.Request.Context(), input.VisibleContext, access)
+	packet, err := newOperatorContextFabric(db).BuildPacket(c.Request.Context(), input.VisibleContext, access)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{"items": []gin.H{}, "execution_enabled": policy.ExecutionEnabled})
 		return
@@ -266,31 +270,33 @@ func CreateOperatorInvestigation(c *gin.Context) {
 		return
 	}
 	var spendOverride string
-	allowance := CheckTenantSpendAllowance(db, tenantID, "llm", .02, "operator", "")
-	if allowance["allowed"] == false {
-		if allowance["reason"] != "budget_capped" || body.Tier == "reasoning" {
-			c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": "Operator LLM admission is paused or capped", "allowance": allowance})
+	if runtimePolicy.LLMEnabled && !operatorpkg.IsGreeting(body.Message) {
+		allowance := CheckTenantSpendAllowance(db, tenantID, "llm", .02, "operator", "")
+		if allowance["allowed"] == false {
+			if allowance["reason"] != "budget_capped" || body.Tier == "reasoning" {
+				c.JSON(409, gin.H{"code": "AI_BUDGET_CAPPED", "message": "Operator LLM admission is paused or capped", "allowance": allowance})
+				return
+			}
+			if !body.SpendAcknowledged {
+				c.JSON(409, gin.H{"code": "ai_budget_confirmation_required", "message": "The LLM budget is reached. Confirm a paid interactive answer above the cap.", "allowance": allowance})
+				return
+			}
+			var err error
+			spendOverride, err = confirmedOperatorSpend(db, tenantID, principal.UserID)
+			if err != nil {
+				c.JSON(500, gin.H{"message": "Could not persist spend confirmation"})
+				return
+			}
+		}
+		softSpend, hardSpend := operatorSpendStatus(db, tenantID, persisted.InteractiveSoftSpendLimit, persisted.DeepHardSpendLimit)
+		if body.Tier == "reasoning" && hardSpend {
+			c.JSON(http.StatusTooManyRequests, gin.H{"message": "Deep Operator reasoning is hard-stopped by the current spend policy", "code": "deep_hard_spend_stop"})
 			return
 		}
-		if !body.SpendAcknowledged {
-			c.JSON(409, gin.H{"code": "ai_budget_confirmation_required", "message": "The LLM budget is reached. Confirm a paid interactive answer above the cap.", "allowance": allowance})
+		if body.Tier != "reasoning" && softSpend && !body.SpendAcknowledged {
+			c.JSON(http.StatusConflict, gin.H{"message": "Interactive Operator spend warning requires acknowledgement", "code": "interactive_soft_spend_warning"})
 			return
 		}
-		var err error
-		spendOverride, err = confirmedOperatorSpend(db, tenantID, principal.UserID)
-		if err != nil {
-			c.JSON(500, gin.H{"message": "Could not persist spend confirmation"})
-			return
-		}
-	}
-	softSpend, hardSpend := operatorSpendStatus(db, tenantID, persisted.InteractiveSoftSpendLimit, persisted.DeepHardSpendLimit)
-	if body.Tier == "reasoning" && hardSpend {
-		c.JSON(http.StatusTooManyRequests, gin.H{"message": "Deep Operator reasoning is hard-stopped by the current spend policy", "code": "deep_hard_spend_stop"})
-		return
-	}
-	if body.Tier != "reasoning" && softSpend && !body.SpendAcknowledged {
-		c.JSON(http.StatusConflict, gin.H{"message": "Interactive Operator spend warning requires acknowledgement", "code": "interactive_soft_spend_warning"})
-		return
 	}
 	body.Locale = strings.TrimSpace(body.Locale)
 	if body.Locale == "" {
@@ -325,7 +331,7 @@ func CreateOperatorInvestigation(c *gin.Context) {
 		reasoner, _ = operatorpkg.NewHTTPReasonerFromEnv() // nil produces a safe deterministic degradation.
 	}
 	store := operatorpkg.NewInvestigationStore(db)
-	fabric := operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry())
+	fabric := newOperatorContextFabric(db)
 	memoryToken := os.Getenv("ENRICHMENT_SERVICE_TOKEN")
 	if memoryToken == "" {
 		memoryToken = os.Getenv("SERVICE_AUTH_TOKEN")
@@ -347,7 +353,7 @@ func CreateOperatorInvestigation(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Operator investigation could not be queued"})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"investigation_id": investigation.PublicID, "state": "backgrounded"})
+	c.JSON(http.StatusAccepted, gin.H{"investigation_id": investigation.PublicID, "state": "backgrounded", "visible_context": investigation.VisibleContext})
 	go runBackgroundOperatorInvestigation(db, accessClient, coordinator, store, investigation, input)
 }
 
@@ -394,7 +400,7 @@ func CreateOperatorBriefing(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Current Operator access cannot be verified"})
 		return
 	}
-	packet, err := operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()).BuildPacket(c.Request.Context(), body.VisibleContext, access)
+	packet, err := newOperatorContextFabric(db).BuildPacket(c.Request.Context(), body.VisibleContext, access)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Current Operator evidence cannot be collected"})
 		return
@@ -418,7 +424,7 @@ func CreateOperatorBriefing(c *gin.Context) {
 }
 
 func runBackgroundOperatorInvestigation(db *gorm.DB, accessClient *operatorpkg.IAMAccessClient, coordinator *operatorpkg.InvestigationCoordinator, store *operatorpkg.InvestigationStore, investigation models.OperatorInvestigation, input operatorpkg.InvestigationInput) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), operatorInvestigationWorkerTimeout)
 	defer cancel()
 	access, err := accessClient.Snapshot(ctx, investigation.ActorID, investigation.TenantID)
 	if err != nil {
@@ -432,7 +438,7 @@ func runBackgroundOperatorInvestigation(db *gorm.DB, accessClient *operatorpkg.I
 		_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "policy_unavailable")
 		return
 	}
-	if input.Tier == "reasoning" && operatorScheduledHardSpendStop(db, investigation.TenantID, persisted.DeepHardSpendLimit) {
+	if input.Tier == "reasoning" && !operatorpkg.IsGreeting(input.Message) && operatorScheduledHardSpendStop(db, investigation.TenantID, persisted.DeepHardSpendLimit) {
 		_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "deep_hard_spend_stop")
 		return
 	}
@@ -572,6 +578,24 @@ func ListOperatorThreads(c *gin.Context) {
 	}
 	var threads []models.OperatorThread
 	query := db.Where("tenant_id=? AND creator_id=? AND expires_at>?", tenantID, principal.UserID, time.Now().UTC())
+	if _, selected := c.Request.URL.Query()["ids"]; selected {
+		ids, err := operatorSelectedThreadIDs(c.Query("ids"))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid open chat IDs"})
+			return
+		}
+		if err := query.Where("public_id IN ?", ids).Find(&threads).Error; err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Open chat status is unavailable"})
+			return
+		}
+		items, err := operatorOpenThreadSummaries(db.WithContext(c.Request.Context()), tenantID, principal.UserID, threads, time.Now().UTC())
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Open chat status is unavailable"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"items": items, "next_cursor": ""})
+		return
+	}
 	if c.Query("archived") == "true" {
 		query = query.Where("archived_at IS NOT NULL")
 	} else {
@@ -612,7 +636,7 @@ func ListOperatorThreads(c *gin.Context) {
 			item["last_domain"] = operatorTaskDomain(latest)
 		}
 		var unread int64
-		_ = db.Model(&models.OperatorInvestigation{}).Where("thread_id=? AND tenant_id=? AND actor_id=? AND read_at IS NULL", thread.ID, tenantID, principal.UserID).Count(&unread).Error
+		_ = db.Model(&models.OperatorInvestigation{}).Where("thread_id=? AND tenant_id=? AND actor_id=? AND read_at IS NULL AND state IN ('completed','failed','cancelled')", thread.ID, tenantID, principal.UserID).Count(&unread).Error
 		item["unread_count"] = unread
 		items = append(items, item)
 	}
@@ -644,10 +668,58 @@ func GetOperatorThread(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"message": "Operator thread not found"})
 		return
 	}
-	var messages []models.OperatorMessage
-	if err := db.Where("thread_id=? AND tenant_id=?", thread.ID, tenantID).Order("created_at ASC").Limit(200).Find(&messages).Error; err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Operator thread messages are unavailable"})
+	messages, before, err := operatorThreadMessagePage(db.WithContext(c.Request.Context()), thread, c.Query("before"))
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errOperatorMessageCursor) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"message": "Operator thread messages are unavailable", "code": "operator_history_unavailable"})
 		return
+	}
+	if focus := c.Query("focus"); focus != "" && c.Query("before") == "" {
+		messages, err = operatorIncludeFocusedMessages(db.WithContext(c.Request.Context()), thread, focus, messages)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, errOperatorMessageCursor) {
+				status = 400
+			}
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				status = 404
+			}
+			c.JSON(status, gin.H{"message": "Selected Operator question is unavailable"})
+			return
+		}
+	}
+	investigationIDs, planIDs := []uint{}, []uint{}
+	for _, message := range messages {
+		if message.InvestigationID != nil {
+			investigationIDs = append(investigationIDs, *message.InvestigationID)
+		}
+		if message.PlanID != nil {
+			planIDs = append(planIDs, *message.PlanID)
+		}
+	}
+	investigations, plans := map[uint]uuid.UUID{}, map[uint]uuid.UUID{}
+	if len(investigationIDs) > 0 {
+		var rows []models.OperatorInvestigation
+		if err := db.WithContext(c.Request.Context()).Select("id,public_id").Where("id IN ? AND tenant_id=? AND actor_id=?", investigationIDs, tenantID, principal.UserID).Find(&rows).Error; err != nil {
+			c.JSON(503, gin.H{"message": "Operator question links are unavailable"})
+			return
+		}
+		for _, row := range rows {
+			investigations[row.ID] = row.PublicID
+		}
+	}
+	if len(planIDs) > 0 {
+		var rows []models.OperatorActionPlan
+		if err := db.WithContext(c.Request.Context()).Select("id,public_id").Where("id IN ? AND tenant_id=? AND actor_id=?", planIDs, tenantID, principal.UserID).Find(&rows).Error; err != nil {
+			c.JSON(503, gin.H{"message": "Operator plan links are unavailable"})
+			return
+		}
+		for _, row := range rows {
+			plans[row.ID] = row.PublicID
+		}
 	}
 	response := make([]gin.H, 0, len(messages))
 	for _, message := range messages {
@@ -655,20 +727,18 @@ func GetOperatorThread(c *gin.Context) {
 		_ = json.Unmarshal(message.Content, &content)
 		item := gin.H{"id": message.PublicID, "kind": message.MessageKind, "actor_type": message.ActorType, "created_at": message.CreatedAt, "content": content}
 		if message.InvestigationID != nil {
-			var linked models.OperatorInvestigation
-			if err := db.Select("public_id").Where("id=? AND tenant_id=? AND actor_id=?", *message.InvestigationID, tenantID, principal.UserID).First(&linked).Error; err == nil {
-				item["investigation_id"] = linked.PublicID
+			if id, ok := investigations[*message.InvestigationID]; ok {
+				item["investigation_id"] = id
 			}
 		}
 		if message.PlanID != nil {
-			var linked models.OperatorActionPlan
-			if err := db.Select("public_id").Where("id=? AND tenant_id=? AND actor_id=?", *message.PlanID, tenantID, principal.UserID).First(&linked).Error; err == nil {
-				item["plan_id"] = linked.PublicID
+			if id, ok := plans[*message.PlanID]; ok {
+				item["plan_id"] = id
 			}
 		}
 		response = append(response, item)
 	}
-	c.JSON(http.StatusOK, gin.H{"thread": operatorThreadResponse(thread), "messages": response})
+	c.JSON(http.StatusOK, gin.H{"thread": operatorThreadResponse(thread), "messages": response, "older_cursor": before})
 }
 
 func UpdateOperatorThread(c *gin.Context) {
@@ -959,14 +1029,15 @@ func ListOperatorInvestigationEvidence(c *gin.Context) {
 }
 
 type operatorTaskItem struct {
-	updated time.Time
-	id      string
-	kind    string
-	value   gin.H
+	investigationID *uint
+	updated         time.Time
+	id              string
+	kind            string
+	value           gin.H
 }
 
 func operatorTaskInGroup(state, group string) bool {
-	if group == "" {
+	if group == "" || group == "all" {
 		return true
 	}
 	active := map[string]bool{"accepted": true, "backgrounded": true, "running": true, "queued": true, "claimed": true, "verifying": true, "active": true}
@@ -984,174 +1055,6 @@ func operatorTaskInGroup(state, group string) bool {
 	default:
 		return false
 	}
-}
-
-// ListOperatorTasks is the owner-bound, cursor-based task center across read
-// investigations, signed plans, schedules, and their runs.
-func ListOperatorTasks(c *gin.Context) {
-	principal, tenantID, db, ok := operatorGovernancePrincipal(c)
-	if !ok {
-		return
-	}
-	_, policy, err := operatorExecutionPolicy(db, tenantID)
-	if err != nil || !policy.ReadEnabled {
-		c.Status(http.StatusNotFound)
-		return
-	}
-	limit := 50
-	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
-		if parsed, parseErr := strconv.Atoi(raw); parseErr != nil || parsed < 1 || parsed > 100 {
-			c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Operator task limit"})
-			return
-		} else {
-			limit = parsed
-		}
-	}
-	state, kind, group := strings.TrimSpace(c.Query("state")), strings.TrimSpace(c.Query("kind")), strings.TrimSpace(c.Query("group"))
-	if kind == "" {
-		kind = "all"
-	}
-	validKinds := map[string]bool{"all": true, "investigation": true, "plan": true, "schedule": true, "schedule_run": true}
-	validGroups := map[string]bool{"": true, "active": true, "needs_approval": true, "failed": true, "completed": true}
-	if !validKinds[kind] || !validGroups[group] {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Operator task filter"})
-		return
-	}
-	var after *operatorCursor
-	if raw := strings.TrimSpace(c.Query("cursor")); raw != "" {
-		parsed, cursorErr := decodeOperatorCursor(raw)
-		if cursorErr != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid Operator task cursor"})
-			return
-		}
-		after = &parsed
-	}
-	tasks := make([]operatorTaskItem, 0)
-	if kind == "all" || kind == "investigation" {
-		query := db.Where("tenant_id=? AND actor_id=?", tenantID, principal.UserID)
-		if after != nil {
-			query = query.Where("updated_at <= ?", after.Time)
-		}
-		if state != "" {
-			query = query.Where("state=?", state)
-		}
-		var rows []models.OperatorInvestigation
-		if err := query.Order("updated_at DESC").Limit(101).Find(&rows).Error; err == nil {
-			for _, row := range rows {
-				if !operatorTaskInGroup(row.State, group) {
-					continue
-				}
-				item := gin.H{"id": row.PublicID, "kind": "investigation", "title": operatorTaskTitle(row), "domain": operatorTaskDomain(row), "state": row.State, "started_at": row.StartedAt, "updated_at": row.UpdatedAt, "unread": row.ReadAt == nil, "can_cancel": row.State == "accepted" || row.State == "backgrounded", "investigation_id": row.PublicID, "deep_link": "/platform/operator?investigation=" + row.PublicID.String()}
-				if row.ThreadID != nil {
-					var thread models.OperatorThread
-					if db.Select("public_id").Where("id=? AND tenant_id=? AND creator_id=?", *row.ThreadID, tenantID, principal.UserID).First(&thread).Error == nil {
-						item["thread_id"] = thread.PublicID
-						item["deep_link"] = "/platform/operator?thread=" + thread.PublicID.String() + "&investigation=" + row.PublicID.String()
-					}
-				}
-				tasks = append(tasks, operatorTaskItem{updated: row.UpdatedAt, id: row.PublicID.String(), kind: "investigation", value: item})
-			}
-		}
-	}
-	if kind == "all" || kind == "plan" {
-		query := db.Where("tenant_id=? AND actor_id=?", tenantID, principal.UserID)
-		if after != nil {
-			query = query.Where("updated_at <= ?", after.Time)
-		}
-		if state != "" {
-			query = query.Where("state=?", state)
-		}
-		var rows []models.OperatorActionPlan
-		if err := query.Order("updated_at DESC").Limit(101).Find(&rows).Error; err == nil {
-			for _, row := range rows {
-				if !operatorTaskInGroup(row.State, group) {
-					continue
-				}
-				item := gin.H{"id": row.PublicID, "kind": "plan", "title": row.ToolKey, "state": row.State, "risk_tier": row.RiskTier, "started_at": row.CreatedAt, "updated_at": row.UpdatedAt, "can_cancel": row.State == "awaiting_approval" || row.State == "queued", "plan_id": row.PublicID, "deep_link": "/platform/operator?plan=" + row.PublicID.String()}
-				if row.InvestigationID != nil {
-					var investigation models.OperatorInvestigation
-					if db.Select("public_id").Where("id=? AND tenant_id=? AND actor_id=?", *row.InvestigationID, tenantID, principal.UserID).First(&investigation).Error == nil {
-						item["investigation_id"] = investigation.PublicID
-						item["deep_link"] = "/platform/operator?investigation=" + investigation.PublicID.String() + "&plan=" + row.PublicID.String()
-					}
-				}
-				tasks = append(tasks, operatorTaskItem{updated: row.UpdatedAt, id: row.PublicID.String(), kind: "plan", value: item})
-			}
-		}
-	}
-	if kind == "all" || kind == "schedule" {
-		var rows []models.OperatorSchedule
-		query := db.Where("tenant_id=? AND (creator_id=? OR owner_id=?)", tenantID, principal.UserID, principal.UserID)
-		if after != nil {
-			query = query.Where("updated_at <= ?", after.Time)
-		}
-		if err := query.Order("updated_at DESC").Limit(101).Find(&rows).Error; err == nil {
-			for _, row := range rows {
-				if state != "" && row.State != state || !operatorTaskInGroup(row.State, group) {
-					continue
-				}
-				item := gin.H{"id": row.PublicID, "kind": "schedule", "title": row.Cadence, "domain": "operator", "state": row.State, "started_at": row.CreatedAt, "updated_at": row.UpdatedAt, "unread": false, "can_cancel": false, "schedule_id": row.PublicID, "deep_link": "/platform/operator?task_kind=schedule"}
-				tasks = append(tasks, operatorTaskItem{updated: row.UpdatedAt, id: row.PublicID.String(), kind: "schedule", value: item})
-			}
-		}
-	}
-	if kind == "all" || kind == "schedule_run" {
-		var rows []models.OperatorScheduleRun
-		query := db.Joins("JOIN operator_schedules ON operator_schedules.id = operator_schedule_runs.schedule_id").Where("operator_schedule_runs.tenant_id=? AND (operator_schedules.creator_id=? OR operator_schedules.owner_id=?)", tenantID, principal.UserID, principal.UserID)
-		if after != nil {
-			query = query.Where("operator_schedule_runs.updated_at <= ?", after.Time)
-		}
-		if err := query.Order("operator_schedule_runs.updated_at DESC").Limit(101).Find(&rows).Error; err == nil {
-			for _, row := range rows {
-				if state != "" && row.State != state || !operatorTaskInGroup(row.State, group) {
-					continue
-				}
-				item := gin.H{"id": row.PublicID, "kind": "schedule_run", "title": row.State, "domain": "operator", "state": row.State, "started_at": row.StartedAt, "updated_at": row.UpdatedAt, "unread": false, "can_cancel": false, "schedule_run_id": row.PublicID, "deep_link": "/platform/operator?task_kind=schedule_run"}
-				var schedule models.OperatorSchedule
-				if db.Select("public_id").Where("id=? AND tenant_id=?", row.ScheduleID, tenantID).First(&schedule).Error == nil {
-					item["schedule_id"] = schedule.PublicID
-				}
-				if row.ResultInvestigationID != nil {
-					var investigation models.OperatorInvestigation
-					if db.Select("public_id").Where("id=? AND tenant_id=? AND actor_id=?", *row.ResultInvestigationID, tenantID, principal.UserID).First(&investigation).Error == nil {
-						item["investigation_id"] = investigation.PublicID
-						item["deep_link"] = "/platform/operator?investigation=" + investigation.PublicID.String() + "&task_kind=schedule_run"
-					}
-				}
-				tasks = append(tasks, operatorTaskItem{updated: row.UpdatedAt, id: row.PublicID.String(), kind: "schedule_run", value: item})
-			}
-		}
-	}
-	sort.Slice(tasks, func(i, j int) bool {
-		if tasks[i].updated.Equal(tasks[j].updated) {
-			if tasks[i].kind == tasks[j].kind {
-				return tasks[i].id > tasks[j].id
-			}
-			return tasks[i].kind > tasks[j].kind
-		}
-		return tasks[i].updated.After(tasks[j].updated)
-	})
-	filtered := tasks[:0]
-	for _, task := range tasks {
-		if after != nil && (task.updated.After(after.Time) || task.updated.Equal(after.Time) && (task.kind > after.Kind || task.kind == after.Kind && task.id >= after.ID)) {
-			continue
-		}
-		filtered = append(filtered, task)
-	}
-	hasMore := len(filtered) > limit
-	if hasMore {
-		filtered = filtered[:limit]
-	}
-	items := make([]gin.H, 0, len(filtered))
-	for _, task := range filtered {
-		items = append(items, task.value)
-	}
-	nextCursor := ""
-	if hasMore && len(filtered) > 0 {
-		last := filtered[len(filtered)-1]
-		nextCursor = encodeOperatorCursor(operatorCursor{Time: last.updated, ID: last.id, Kind: last.kind})
-	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "next_cursor": nextCursor})
 }
 
 func operatorTaskDomain(investigation models.OperatorInvestigation) string {
@@ -1229,7 +1132,7 @@ func CreateOperatorPlan(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Current Operator access cannot be verified"})
 		return
 	}
-	packet, err := operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()).BuildPacket(c.Request.Context(), input.VisibleContext, access)
+	packet, err := newOperatorContextFabric(db).BuildPacket(c.Request.Context(), input.VisibleContext, access)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": "Fresh context could not be collected for this plan"})
 		return

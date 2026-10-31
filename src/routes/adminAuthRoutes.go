@@ -39,6 +39,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/ops/briefing/seen", utils.RequireAdminRole("admin"), controllers.MarkOpsBriefingSeen)
 	adminGroup.GET("/ops/commands", utils.RequireAdminRole("admin"), controllers.ListOpsCommands)
 	adminGroup.GET("/ops/commands/:id", utils.RequireAdminRole("admin"), controllers.GetOpsCommand)
+	adminGroup.POST("/ops/commands/preview", utils.RequireAdminRole("admin"), controllers.PreviewOpsCommand)
 	adminGroup.POST("/ops/commands/pause-member", utils.RequireAdminRole("admin"), controllers.PauseOpsMember)
 	adminGroup.POST("/ops/commands/pause-all", utils.RequireAdminRole("admin"), controllers.PauseOpsFleet)
 	adminGroup.POST("/ops/commands/resume", utils.RequireAdminRole("admin"), controllers.ResumeOpsCommand)

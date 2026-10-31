@@ -12,7 +12,7 @@ type OpsAttentionState struct {
 	TenantID            string     `gorm:"type:varchar(64);not null;uniqueIndex:idx_ops_attention_state_key,priority:1" json:"tenant_id"`
 	AttentionKey        string     `gorm:"type:varchar(255);not null;uniqueIndex:idx_ops_attention_state_key,priority:2" json:"attention_key"`
 	State               string     `gorm:"type:varchar(16);not null" json:"state"`
-	SnoozedUntil        *time.Time `gorm:"type:timestamp" json:"snoozed_until,omitempty"`
+	SnoozedUntil        *time.Time `gorm:"type:timestamptz" json:"snoozed_until,omitempty"`
 	BaselineFingerprint string     `gorm:"type:varchar(255);not null" json:"baseline_fingerprint"`
 	BaselineSeverity    string     `gorm:"type:varchar(16);not null" json:"baseline_severity"`
 	BaselineCount       int        `gorm:"not null" json:"baseline_count"`
@@ -28,7 +28,7 @@ type OpsBriefingCursor struct {
 	ID         uint      `gorm:"primaryKey" json:"-"`
 	TenantID   string    `gorm:"type:varchar(64);not null;uniqueIndex:idx_ops_briefing_cursor,priority:1" json:"tenant_id"`
 	AdminID    string    `gorm:"type:varchar(128);not null;uniqueIndex:idx_ops_briefing_cursor,priority:2" json:"admin_id"`
-	LastSeenAt time.Time `gorm:"type:timestamp;not null" json:"last_seen_at"`
+	LastSeenAt time.Time `gorm:"type:timestamptz;not null" json:"last_seen_at"`
 	CreatedAt  time.Time `gorm:"autoCreateTime" json:"created_at"`
 	UpdatedAt  time.Time `gorm:"autoUpdateTime" json:"updated_at"`
 }
@@ -63,8 +63,8 @@ type OpsFleetCommandAction struct {
 	MemberKey          string     `gorm:"type:varchar(64);not null;index" json:"member_key"`
 	LaneKey            string     `gorm:"type:varchar(64);not null;index" json:"lane_key"`
 	TenantID           string     `gorm:"type:varchar(64);not null;index" json:"tenant_id"`
-	PriorPausedUntil   *time.Time `gorm:"type:timestamp" json:"prior_paused_until,omitempty"`
-	WrittenPausedUntil *time.Time `gorm:"type:timestamp" json:"written_paused_until,omitempty"`
+	PriorPausedUntil   *time.Time `gorm:"type:timestamptz" json:"prior_paused_until,omitempty"`
+	WrittenPausedUntil *time.Time `gorm:"type:timestamptz" json:"written_paused_until,omitempty"`
 	Outcome            string     `gorm:"type:varchar(24);not null" json:"outcome"`
 	Guardrail          string     `gorm:"type:varchar(64)" json:"guardrail,omitempty"`
 	Reason             string     `gorm:"type:text" json:"reason,omitempty"`

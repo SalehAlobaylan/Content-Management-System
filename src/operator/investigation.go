@@ -85,10 +85,10 @@ func (request InvestigationRequest) Validate() error {
 }
 
 func (block ResponseBlock) Validate() error {
-	if strings.TrimSpace(block.Text) == "" || (block.Kind != "fact" && block.Kind != "interpretation" && block.Kind != "unknown" && block.Kind != "recommendation" && block.Kind != "degraded") {
+	if strings.TrimSpace(block.Text) == "" || (block.Kind != "conclusion" && block.Kind != "fact" && block.Kind != "interpretation" && block.Kind != "unknown" && block.Kind != "recommendation" && block.Kind != "degraded" && block.Kind != "message") {
 		return fmt.Errorf("%w: invalid response block", ErrInvalidContract)
 	}
-	if (block.Kind == "fact" || block.Kind == "interpretation") && len(block.EvidenceIDs) == 0 {
+	if (block.Kind == "conclusion" || block.Kind == "fact" || block.Kind == "interpretation") && len(block.EvidenceIDs) == 0 {
 		return fmt.Errorf("%w: factual response blocks require evidence", ErrInvalidContract)
 	}
 	return nil
@@ -204,6 +204,34 @@ func (store *InvestigationStore) PersistPacket(ctx context.Context, investigatio
 		if investigation.TenantID != packet.TenantID || investigation.ActorID != packet.ActorID || investigation.State != "running" || investigation.ClaimToken == nil || *investigation.ClaimToken != claimToken || investigation.ClaimExpiresAt == nil || !store.now().Before(*investigation.ClaimExpiresAt) {
 			return fmt.Errorf("%w: investigation context changed", ErrInvalidContract)
 		}
+		// The canonical CHAR(64) column returns its empty default as spaces.
+		priorFingerprint := strings.TrimSpace(investigation.PacketFingerprint)
+		if priorFingerprint == packet.Fingerprint {
+			return nil // The complete snapshot was already committed atomically.
+		}
+		if priorFingerprint != "" {
+			// A recovered read-only attempt collects fresh context. Preserve its
+			// previous snapshot in the event trail before replacing the working
+			// evidence. Detach old recommendations rather than deleting feedback
+			// or changing any signed plan or approval record.
+			var prior []models.OperatorEvidence
+			if err := tx.Where("investigation_id=? AND tenant_id=?", investigation.ID, packet.TenantID).Order("id").Find(&prior).Error; err != nil {
+				return err
+			}
+			var recommendationIDs []uint
+			if err := tx.Model(&models.OperatorRecommendation{}).Where("investigation_id=? AND tenant_id=?", investigation.ID, packet.TenantID).Pluck("id", &recommendationIDs).Error; err != nil {
+				return err
+			}
+			if err := appendInvestigationEvent(tx, investigation.ID, packet.TenantID, "packet_superseded", map[string]any{"packet_fingerprint": priorFingerprint, "evidence": prior, "recommendation_ids": recommendationIDs}); err != nil {
+				return err
+			}
+			if err := tx.Where("investigation_id=? AND tenant_id=?", investigation.ID, packet.TenantID).Delete(&models.OperatorEvidence{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&models.OperatorRecommendation{}).Where("investigation_id=? AND tenant_id=?", investigation.ID, packet.TenantID).Updates(map[string]any{"investigation_id": nil, "rank": 0, "state": "expired"}).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Model(&investigation).Updates(map[string]any{"state": "running", "packet_fingerprint": packet.Fingerprint}).Error; err != nil {
 			return err
 		}
@@ -306,6 +334,7 @@ func (store *InvestigationStore) Complete(ctx context.Context, investigationID u
 		for _, row := range evidence {
 			knownEvidence[row.EvidenceID] = struct{}{}
 		}
+		events := make([]investigationEvent, 0, len(blocks)+1)
 		for _, block := range blocks {
 			if err := block.Validate(); err != nil {
 				return err
@@ -315,9 +344,7 @@ func (store *InvestigationStore) Complete(ctx context.Context, investigationID u
 					return fmt.Errorf("%w: response cites unknown evidence", ErrInvalidContract)
 				}
 			}
-			if err := appendInvestigationEvent(tx, investigation.ID, tenantID, "response_block", map[string]any{"kind": block.Kind, "text": block.Text, "evidence_ids": block.EvidenceIDs}); err != nil {
-				return err
-			}
+			events = append(events, investigationEvent{"response_block", map[string]any{"kind": block.Kind, "text": block.Text, "evidence_ids": block.EvidenceIDs}})
 		}
 		if err := tx.Model(&investigation).Updates(map[string]any{"state": "completed", "finished_at": now, "claim_token": nil, "claim_expires_at": nil}).Error; err != nil {
 			return err
@@ -335,7 +362,8 @@ func (store *InvestigationStore) Complete(ctx context.Context, investigationID u
 				return err
 			}
 		}
-		return appendInvestigationEvent(tx, investigation.ID, tenantID, "done", map[string]any{"state": "completed"})
+		events = append(events, investigationEvent{"done", map[string]any{"state": "completed"}})
+		return appendInvestigationEvents(tx, investigation.ID, tenantID, events)
 	})
 }
 
@@ -539,15 +567,33 @@ func (store *InvestigationStore) Cancel(ctx context.Context, publicID string, te
 }
 
 func appendInvestigationEvent(tx *gorm.DB, investigationID uint, tenantID, eventType string, payload map[string]any) error {
+	return appendInvestigationEvents(tx, investigationID, tenantID, []investigationEvent{{eventType, payload}})
+}
+
+type investigationEvent struct {
+	kind    string
+	payload map[string]any
+}
+
+// Callers hold the investigation row lock. Allocate the sequence once and
+// persist a reply in batches instead of two network round trips per block.
+func appendInvestigationEvents(tx *gorm.DB, investigationID uint, tenantID string, events []investigationEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
 	var sequence int64
 	if err := tx.Model(&models.OperatorInvestigationEvent{}).Where("investigation_id=?", investigationID).Select("COALESCE(MAX(sequence), 0)").Scan(&sequence).Error; err != nil {
 		return err
 	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return err
+	rows := make([]models.OperatorInvestigationEvent, 0, len(events))
+	for index, event := range events {
+		raw, err := json.Marshal(event.payload)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, models.OperatorInvestigationEvent{InvestigationID: investigationID, TenantID: tenantID, Sequence: sequence + int64(index) + 1, EventType: event.kind, Payload: datatypes.JSON(raw)})
 	}
-	return tx.Create(&models.OperatorInvestigationEvent{InvestigationID: investigationID, TenantID: tenantID, Sequence: sequence + 1, EventType: eventType, Payload: datatypes.JSON(raw)}).Error
+	return tx.CreateInBatches(&rows, 100).Error
 }
 
 // RecordSpendSkip leaves a durable explanation while the evidence-only answer completes.

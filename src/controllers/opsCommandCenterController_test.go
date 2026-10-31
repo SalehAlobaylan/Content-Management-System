@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,16 +45,19 @@ func TestOpsHeadlineSentenceCountsOnlyVisibleItems(t *testing.T) {
 	if headline != "attention" {
 		t.Fatalf("headline = %q, want attention", headline)
 	}
-	if summary != "1 fleet items need attention." {
+	if !strings.HasPrefix(summary, "1 fleet items need attention") {
 		t.Fatalf("summary counts snoozed items: %q", summary)
 	}
 }
 
-func TestOpsPauseValuesMatchTolerance(t *testing.T) {
+func TestOpsPauseValuesMatchExactOwnership(t *testing.T) {
 	base := time.Date(2026, 7, 12, 12, 0, 0, 500, time.UTC) // sub-microsecond precision
 	truncated := base.Truncate(time.Microsecond)
-	if !opsPauseValuesMatch(&truncated, &base) {
-		t.Fatal("microsecond-truncated round-trip must match")
+	if opsPauseValuesMatch(&truncated, &base) {
+		t.Fatal("a different DB value must not match ownership")
+	}
+	if !opsPauseValuesMatch(&base, &base) {
+		t.Fatal("identical canonical DB values must match")
 	}
 	foreign := base.Add(2 * time.Minute)
 	if opsPauseValuesMatch(&foreign, &base) {

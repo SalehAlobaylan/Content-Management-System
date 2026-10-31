@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"content-management-system/src/models"
+	"github.com/google/uuid"
 )
 
 type InvestigationInput struct {
@@ -51,6 +52,7 @@ func (coordinator *InvestigationCoordinator) Start(ctx context.Context, access A
 	if strings.TrimSpace(input.Message) == "" || len(input.Message) > 8000 || (input.Locale != "ar" && input.Locale != "en") || (input.Tier != "fast" && input.Tier != "reasoning") || !visibleIntentAllowed(input.VisibleContext, input.Intent) {
 		return models.OperatorInvestigation{}, fmt.Errorf("%w: invalid investigation input", ErrInvalidContract)
 	}
+	input.VisibleContext = ResolveQuestionContext(input.Message, input.VisibleContext, input.Intent)
 	request, err := NewInvestigationRequest(input.Intent, input.Message, input.Tier)
 	if err != nil {
 		return models.OperatorInvestigation{}, err
@@ -83,6 +85,22 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 	if err != nil {
 		return InvestigationResult{Investigation: investigation}, err
 	}
+	if reply, ok := greetingReply(input.Message, input.Locale); ok {
+		// A greeting needs no domain reads, historical retrieval, paid model
+		// request or action proposal. Keep normal ownership and durable delivery.
+		now := coordinator.store.now()
+		packet := DecisionPacket{SchemaVersion: ContractVersion, PacketID: uuid.NewString(), TenantID: access.TenantID, ActorID: access.UserID, VisibleContext: input.VisibleContext, CollectionStartedAt: now, CollectionEndedAt: now, Completeness: "complete", Facts: []Fact{}, Evidence: []EvidenceRef{}}
+		packet.Fingerprint = fingerprintPacket(packet)
+		if err := coordinator.store.PersistPacket(ctx, investigation.ID, claimToken, packet); err != nil {
+			return InvestigationResult{Investigation: investigation}, err
+		}
+		blocks := []ResponseBlock{{Kind: "message", Text: reply}}
+		if err := coordinator.store.Complete(ctx, investigation.ID, access.TenantID, claimToken, blocks); err != nil {
+			return InvestigationResult{Investigation: investigation}, err
+		}
+		return InvestigationResult{Investigation: investigation, Packet: packet, Response: ReasonResponse{SchemaVersion: ContractVersion, Language: input.Locale, TaskKind: input.Intent, Blocks: blocks, Provider: "cms", Model: "deterministic", Tier: input.Tier, Cache: "disabled"}}, nil
+	}
+	input.VisibleContext = ResolveQuestionContext(input.Message, input.VisibleContext, input.Intent)
 	ctx = withMemorySpendContext(ctx, investigation.TenantID, investigation.PublicID.String(), investigation.ActorID)
 	packet, err := coordinator.fabric.BuildPacket(ctx, input.VisibleContext, access)
 	if err != nil {
@@ -100,7 +118,7 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 		return InvestigationResult{Investigation: investigation, Packet: packet}, err
 	}
 	if !policy.LLMEnabled || coordinator.reasoner == nil {
-		blocks := DeterministicDegradedBlocksForLocale(packet, input.Locale, localizedDegradedReason(input.Locale, false))
+		blocks := DeterministicDegradedBlocksForLocale(packet, input.Locale, localizedDegradedReason(input.Locale, policy.LLMEnabled))
 		if err := coordinator.store.Complete(ctx, investigation.ID, access.TenantID, claimToken, blocks); err != nil {
 			return InvestigationResult{Investigation: investigation, Packet: packet, Degraded: true}, err
 		}
@@ -121,6 +139,7 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 	if err := coordinator.store.RankRecommendations(ctx, investigation.ID, access.TenantID, output.PrimaryRecommendationID, output.SecondaryRecommendationIDs); err != nil {
 		return InvestigationResult{Investigation: investigation, Packet: packet, Response: output}, err
 	}
+	output.Blocks = responseBlocksWithUncertainties(output.Blocks, output.Uncertainties)
 	if err := coordinator.store.Complete(ctx, investigation.ID, access.TenantID, claimToken, output.Blocks); err != nil {
 		return InvestigationResult{Investigation: investigation, Packet: packet, Response: output}, err
 	}
@@ -130,14 +149,14 @@ func (coordinator *InvestigationCoordinator) Process(ctx context.Context, invest
 func localizedDegradedReason(locale string, unavailable bool) string {
 	if locale == "ar" {
 		if unavailable {
-			return "استدلال الذكاء الاصطناعي غير متاح حالياً؛ تظل حزمة أدلة CMS متاحة."
+			return "التفسير بالذكاء الاصطناعي غير متاح حالياً. تقتصر الإجابة على الأدلة المسجلة للنظام."
 		}
-		return "تم تعطيل استدلال الذكاء الاصطناعي حالياً؛ تظل حزمة أدلة CMS متاحة."
+		return "التفسير بالذكاء الاصطناعي معطّل حالياً. تقتصر الإجابة على الأدلة المسجلة للنظام."
 	}
 	if unavailable {
-		return "LLM reasoning is unavailable; the CMS evidence packet remains available."
+		return "AI interpretation is unavailable. This answer is limited to recorded system evidence."
 	}
-	return "LLM reasoning is currently disabled; the CMS evidence packet remains available."
+	return "AI interpretation is turned off. This answer is limited to recorded system evidence."
 }
 
 func localizePacketRecommendations(packet *DecisionPacket, locale string) {
@@ -152,6 +171,8 @@ func localizePacketRecommendations(packet *DecisionPacket, locale string) {
 		recommendation.Summary = localizedRecommendationSummary(*recommendation)
 		recommendation.Title = "راجع السطح التشغيلي المسجّل"
 		switch strings.TrimPrefix(recommendation.ID, "inspect:") {
+		case "storage_quality":
+			recommendation.Title = "راجع استهلاك التخزين"
 		case "media_sources":
 			recommendation.Title = "راجع دليل تسليم المصدر"
 		case "media_circulation":

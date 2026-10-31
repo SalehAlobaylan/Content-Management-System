@@ -85,6 +85,22 @@ func TestDeterministicDegradedBlocksPreserveUnknowns(t *testing.T) {
 	}
 }
 
+func TestReasonResponseKeepsSeparateUncertaintiesVisibleWithoutDuplicates(t *testing.T) {
+	blocks := []ResponseBlock{
+		{Kind: "conclusion", Text: "Tenant usage is measured.", EvidenceIDs: []string{"usage"}},
+		{Kind: "unknown", Text: "Provider quota is unknown."},
+	}
+	result := responseBlocksWithUncertainties(blocks, []string{"Provider quota is unknown.", "  Current cleanup activity is unverified.  ", "", "Current cleanup activity is unverified.", "حالة النسخ الاحتياطي غير مؤكدة."})
+	if len(result) != 4 || result[0].Kind != "conclusion" || result[0].EvidenceIDs[0] != "usage" || result[2].Kind != "unknown" || result[2].Text != "Current cleanup activity is unverified." || result[3].Text != "حالة النسخ الاحتياطي غير مؤكدة." {
+		t.Fatalf("answer caveats were lost or duplicated: %+v", result)
+	}
+	for _, block := range result {
+		if err := block.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestHTTPReasonerNormalizesEmptyAdvertisedArrays(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any
@@ -175,5 +191,21 @@ func TestDeterministicDegradedBlocksLocalizeSupplyContinuity(t *testing.T) {
 	blocks := DeterministicDegradedBlocksForLocale(packet, "ar", "تعذر الاستدلال")
 	if len(blocks) < 3 || blocks[1].Kind != "fact" || !strings.Contains(blocks[1].Text, "استمرارية الإمداد") || !strings.Contains(blocks[1].Text, "قراءة فقط") {
 		t.Fatalf("Arabic supply headline must remain localized and bounded: %#v", blocks)
+	}
+}
+
+func TestConclusionRequiresRegisteredEvidence(t *testing.T) {
+	input := validReasonRequest()
+	output := ReasonResponse{SchemaVersion: ContractVersion, Language: input.Language, TaskKind: input.TaskKind, Tier: input.Tier, Provider: "test", Model: "test", Cache: "disabled", Blocks: []ResponseBlock{{Kind: "conclusion", Text: "The latest run needs attention."}}}
+	for _, ids := range [][]string{nil, {"not-in-packet"}, {"ev-1"}} {
+		output.Blocks[0].EvidenceIDs = ids
+		err := output.ValidateAgainst(input)
+		if len(ids) == 1 && ids[0] == "ev-1" {
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else if err == nil {
+			t.Fatal("a conclusion without registered evidence was accepted")
+		}
 	}
 }

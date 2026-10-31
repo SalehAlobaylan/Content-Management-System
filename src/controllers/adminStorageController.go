@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/intelligence"
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,28 +93,12 @@ func GetStorageStats(c *gin.Context) {
 		LiveStatsAt:    time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// CMS-side aggregates from DB
-	type contentTypeAgg struct {
-		Type  string
-		Bytes int64
-		Count int64
-	}
-	var rows []contentTypeAgg
-	if err := db.Model(&models.ContentItem{}).
-		Select("type, COALESCE(SUM(file_size_bytes),0) as bytes, COUNT(*) as count").
-		Where("tenant_id = ? AND status != ?", principal.TenantID, models.ContentStatusArchived).
-		Group("type").
-		Scan(&rows).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, authErrorResponse{
-			Message: "Failed to aggregate content sizes",
-			Code:    "STATS_FAILED",
-		})
+	totals, trackedBytes, err := readStorageContentTotals(db.WithContext(c.Request.Context()), principal.TenantID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to aggregate content sizes", Code: "STATS_FAILED"})
 		return
 	}
-	for _, r := range rows {
-		resp.ByContentType[r.Type] = contentSize{Bytes: r.Bytes, Count: r.Count}
-		resp.DBTrackedBytes += r.Bytes
-	}
+	resp.ByContentType, resp.DBTrackedBytes = totals, trackedBytes
 
 	// Live numbers from Aggregation
 	live, err := callAggregationStorageStats(c.GetHeader("Authorization"))
@@ -135,6 +120,26 @@ func GetStorageStats(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// readStorageContentTotals is the owner-owned, read-only CMS ledger aggregate.
+// Operator and the native Storage page must use the same tenant/status rules.
+func readStorageContentTotals(db *gorm.DB, tenantID string) (map[string]contentSize, int64, error) {
+	var rows []struct {
+		Type  string
+		Bytes int64
+		Count int64
+	}
+	err := db.Model(&models.ContentItem{}).Select("type, COALESCE(SUM(file_size_bytes),0) as bytes, COUNT(*) as count").Where("tenant_id = ? AND status != ?", tenantID, models.ContentStatusArchived).Group("type").Scan(&rows).Error
+	if err != nil {
+		return nil, 0, err
+	}
+	totals, total := map[string]contentSize{}, int64(0)
+	for _, row := range rows {
+		totals[row.Type] = contentSize{Bytes: row.Bytes, Count: row.Count}
+		total += row.Bytes
+	}
+	return totals, total, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1450,7 +1455,19 @@ func aggregationBaseURL() (string, error) {
 }
 
 func callAggregationStorageStats(authHeader string) (aggStatsResponse, error) {
-	body, status, err := proxyAggregationGet(authHeader, "/admin/storage/stats")
+	return callAggregationStorageStatsContext(context.Background(), authHeader)
+}
+
+func callAggregationStorageStatsContext(ctx context.Context, authHeader string) (aggStatsResponse, error) {
+	path := "/admin/storage/stats"
+	if strings.TrimSpace(authHeader) == "" {
+		token := strings.TrimSpace(os.Getenv("AGGREGATION_SERVICE_TOKEN"))
+		if token == "" {
+			return aggStatsResponse{}, errors.New("storage owner service credential is unavailable")
+		}
+		authHeader, path = "Bearer "+token, "/internal/storage/stats"
+	}
+	body, status, err := proxyAggregationGetContext(ctx, authHeader, path)
 	if err != nil {
 		return aggStatsResponse{}, err
 	}
@@ -1553,11 +1570,15 @@ func proxyAggregationPost(authHeader, path string, payload any) ([]byte, int, er
 }
 
 func proxyAggregationGet(authHeader, path string) ([]byte, int, error) {
+	return proxyAggregationGetContext(context.Background(), authHeader, path)
+}
+
+func proxyAggregationGetContext(ctx context.Context, authHeader, path string) ([]byte, int, error) {
 	base, err := aggregationBaseURL()
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequest(http.MethodGet, base+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	if err != nil {
 		return nil, 0, err
 	}

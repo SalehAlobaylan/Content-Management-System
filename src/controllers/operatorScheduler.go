@@ -4,12 +4,14 @@ import (
 	"context"
 	"time"
 
+	"content-management-system/src/models"
 	operatorpkg "content-management-system/src/operator"
 
 	"gorm.io/gorm"
 )
 
 const operatorInvestigationHeartbeatInterval = time.Minute
+const operatorInvestigationWorkerTimeout = 60 * time.Second
 
 // StartOperatorInvestigationHeartbeat resumes only expired, persisted work.
 // It has no browser dependency: every candidate receives a fresh IAM snapshot
@@ -43,26 +45,36 @@ func runOperatorInvestigationHeartbeat(db *gorm.DB) {
 		return
 	}
 	for _, investigation := range investigations {
-		input, err := operatorpkg.DecodeStoredInvestigationInput(investigation)
-		if err != nil {
-			_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "invalid_persisted_request")
-			continue
-		}
-		access, err := accessClient.Snapshot(ctx, investigation.ActorID, investigation.TenantID)
-		if err != nil {
-			_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "access_unavailable")
-			continue
-		}
-		_, policy, err := operatorExecutionPolicy(db, investigation.TenantID)
-		if err != nil || !policy.ReadEnabled {
-			_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "policy_unavailable")
-			continue
-		}
-		var reasoner operatorpkg.Reasoner
-		if policy.LLMEnabled {
-			reasoner, _ = operatorpkg.NewHTTPReasonerFromEnv()
-		}
-		coordinator := operatorpkg.NewInvestigationCoordinator(operatorpkg.NewContextFabric(db, operatorpkg.DefaultAdapterRegistry()), store, reasoner)
-		_, _ = coordinator.Process(ctx, investigation, access, policy, input)
+		// Each investigation owns its bounded budget. A slow first candidate
+		// must not leave later candidates running under an expired poll context.
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), operatorInvestigationWorkerTimeout)
+			defer cancel()
+			resumeOperatorInvestigation(ctx, db, accessClient, store, investigation)
+		}()
 	}
+}
+
+func resumeOperatorInvestigation(ctx context.Context, db *gorm.DB, accessClient *operatorpkg.IAMAccessClient, store *operatorpkg.InvestigationStore, investigation models.OperatorInvestigation) {
+	input, err := operatorpkg.DecodeStoredInvestigationInput(investigation)
+	if err != nil {
+		_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "invalid_persisted_request")
+		return
+	}
+	access, err := accessClient.Snapshot(ctx, investigation.ActorID, investigation.TenantID)
+	if err != nil {
+		_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "access_unavailable")
+		return
+	}
+	_, policy, err := operatorExecutionPolicy(db, investigation.TenantID)
+	if err != nil || !policy.ReadEnabled {
+		_ = store.Fail(ctx, investigation.ID, investigation.TenantID, "policy_unavailable")
+		return
+	}
+	var reasoner operatorpkg.Reasoner
+	if policy.LLMEnabled {
+		reasoner, _ = operatorpkg.NewHTTPReasonerFromEnv()
+	}
+	coordinator := operatorpkg.NewInvestigationCoordinator(newOperatorContextFabric(db), store, reasoner)
+	_, _ = coordinator.Process(ctx, investigation, access, policy, input)
 }
