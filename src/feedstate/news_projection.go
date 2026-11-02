@@ -140,6 +140,56 @@ func RebuildNewsGenerationProjections(tx *gorm.DB, tenant string, generationID u
 	return rebuildNewsProjections(tx, tenant, generationID, nil)
 }
 
+// RefreshActiveNewsStoryProjection participates in the owner's transaction. The
+// lane-head lock pins the serving generation while the exact member set is
+// rebuilt; vectors from a partially migrated set are never published.
+func RefreshActiveNewsStoryProjection(tx *gorm.DB, tenant string, storyID uuid.UUID, targetSpaceID, producerID string) error {
+	if targetSpaceID == "" || producerID == "" {
+		return errors.New("News projection target identity is unavailable")
+	}
+	if !feedcontract.HasNewsStoryProjection(tx) {
+		return nil
+	}
+	var head models.FeedGenerationHead
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND lane='news'", tenant).First(&head).Error; err != nil {
+		return err
+	}
+	if head.ActiveGenerationID == nil {
+		return errors.New("News projection has no active serving generation")
+	}
+	var projection models.NewsFeedStoryProjection
+	err := tx.Where("tenant_id=? AND generation_id=? AND story_id=?", tenant, *head.ActiveGenerationID, storyID).First(&projection).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil // this story currently uses the canonical view
+	}
+	if err != nil {
+		return err
+	}
+	var pending int64
+	if err := tx.Raw(`SELECT COUNT(*) FROM content_items c JOIN feed_generation_memberships m
+	 ON m.member_id=c.public_id AND m.generation_id=? AND m.member_type='news_item'
+	 WHERE c.tenant_id=? AND c.story_id=? AND (c.embedding IS NULL OR c.embedding_space_id IS DISTINCT FROM ?)`,
+		*head.ActiveGenerationID, tenant, storyID, targetSpaceID).Scan(&pending).Error; err != nil {
+		return err
+	}
+	if pending > 0 {
+		return errors.New("News projection members are not target-space")
+	}
+	if err := RebuildNewsStoryProjection(tx, tenant, *head.ActiveGenerationID, storyID); err != nil {
+		return err
+	}
+	result := tx.Exec(`UPDATE news_feed_story_projections SET projection=projection || jsonb_build_object('embedding_producer_id',?::text)
+	 WHERE tenant_id=? AND generation_id=? AND story_id=? AND projection->>'embedding_space_id'=?`,
+		producerID, tenant, *head.ActiveGenerationID, storyID, targetSpaceID)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("News projection target identity was not rebuilt")
+	}
+	return nil
+}
+
 func rebuildNewsProjections(tx *gorm.DB, tenant string, generationID uuid.UUID, storyID *uuid.UUID) error {
 	var invalid int64
 	if err := tx.Raw(`SELECT COUNT(*) FROM (

@@ -397,11 +397,12 @@ type internalUpdateEmbeddingRequest struct {
 	// recomputed?". When absent both are cleared so the row is visibly unstamped
 	// debt rather than silently inheriting a stale identity. The comparability
 	// guards exclude NULL-space rows from similarity.
-	SpaceID          string                              `json:"space_id"`
-	ProducerID       string                              `json:"producer_id"`
-	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
-	PipelineRepair   *pipelineRepairCorrelationRequest   `json:"pipeline_repair,omitempty"`
-	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
+	SpaceID           string                              `json:"space_id"`
+	ProducerID        string                              `json:"producer_id"`
+	ArtifactRecovery  *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	PipelineRepair    *pipelineRepairCorrelationRequest   `json:"pipeline_repair,omitempty"`
+	EmbeddingCampaign *embeddingCampaignCorrelation       `json:"embedding_campaign,omitempty"`
+	ContentStage      *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
 }
 
 // Topic tags are optional enrichment metadata. They deliberately have a
@@ -456,11 +457,12 @@ type internalUpdateImageEmbeddingRequest struct {
 	Embedding []float32 `json:"embedding"`
 	// Vector-space provenance for the CLIP space (stage 10), mirroring the text
 	// write-back. Media supplies these on write-back; absent ⇒ cleared.
-	Model            string                              `json:"model"`
-	SpaceID          string                              `json:"space_id"`
-	ProducerID       string                              `json:"producer_id"`
-	ArtifactRecovery *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
-	ContentStage     *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
+	Model             string                              `json:"model"`
+	SpaceID           string                              `json:"space_id"`
+	ProducerID        string                              `json:"producer_id"`
+	ArtifactRecovery  *artifactRecoveryCorrelationRequest `json:"artifact_recovery,omitempty"`
+	EmbeddingCampaign *embeddingCampaignCorrelation       `json:"embedding_campaign,omitempty"`
+	ContentStage      *contentStageCorrelationRequest     `json:"content_stage,omitempty"`
 }
 
 type internalLinkTranscriptRequest struct {
@@ -1520,6 +1522,7 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	// producer — a rolling old model instance overwriting a migrated row — is
 	// rejected as writer_regression; a missing stamp is rejected too.
 	if reason, blocked := fenceEmbeddingWrite(db, EmbeddingSpaceText, spaceid.RecipeContentText, req.SpaceID, req.ProducerID); blocked {
+		recordEmbeddingWriterRegression(db, "text", id.String(), reason)
 		c.JSON(http.StatusConflict, gin.H{"error": reason, "code": "writer_regression"})
 		return
 	}
@@ -1540,6 +1543,9 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockEmbeddingWrite(tx, EmbeddingSpaceText); err != nil {
+			return err
+		}
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
 		stageKey := models.ContentStageNewsTextEmbedding
@@ -1559,7 +1565,10 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 				}
 			}
 		}
-		if err := requireNormalStageCorrelation(tx, item, stageKey, req.ContentStage, req.ArtifactRecovery != nil || req.PipelineRepair != nil); err != nil {
+		if req.EmbeddingCampaign != nil && (req.ContentStage != nil || req.ArtifactRecovery != nil || req.PipelineRepair != nil) {
+			return fmt.Errorf("embedding campaign correlation cannot be combined with other writers")
+		}
+		if err := requireNormalStageCorrelation(tx, item, stageKey, req.ContentStage, req.ArtifactRecovery != nil || req.PipelineRepair != nil || req.EmbeddingCampaign != nil); err != nil {
 			return err
 		}
 		if req.ContentStage != nil {
@@ -1575,6 +1584,18 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 			}
 		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
+			return err
+		}
+		if req.Model == "" {
+			return fmt.Errorf("embedding model label is required")
+		}
+		if reason, blocked := fenceEmbeddingWrite(tx, EmbeddingSpaceText, spaceid.RecipeContentText, req.SpaceID, req.ProducerID); blocked {
+			return fmt.Errorf("writer_regression: %s", reason)
+		}
+		if err := authorizeEmbeddingCampaignWrite(tx, item, "content_text", req.EmbeddingCampaign, req.SpaceID, req.ProducerID); err != nil {
+			return err
+		}
+		if err := validateCampaignEmbeddingInput(tx, &item, "content_text", req.EmbeddingCampaign); err != nil {
 			return err
 		}
 		if err := checkContentLifecycleMutation(tx, item); err != nil {
@@ -1602,6 +1623,10 @@ func InternalUpdateContentEmbedding(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if strings.HasPrefix(err.Error(), "writer_regression:") || req.EmbeddingCampaign != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "embedding_write_rejected"})
+			return
+		}
 		if writeLifecycleConflict(c, err) {
 			return
 		}
@@ -1739,6 +1764,7 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 
 	// Write fence (stage 10 §7) for the image space.
 	if reason, blocked := fenceEmbeddingWrite(db, EmbeddingSpaceImage, spaceid.RecipeContentImage, req.SpaceID, req.ProducerID); blocked {
+		recordEmbeddingWriterRegression(db, "image", id.String(), reason)
 		c.JSON(http.StatusConflict, gin.H{"error": reason, "code": "writer_regression"})
 		return
 	}
@@ -1759,9 +1785,15 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 	}
 
 	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := lockEmbeddingWrite(tx, EmbeddingSpaceImage); err != nil {
+			return err
+		}
 		var stageRequest models.ContentStageRequest
 		var stageAttempt models.ContentStageAttempt
-		if err := requireNormalStageCorrelation(tx, item, models.ContentStagePodsImageEmbedding, req.ContentStage, req.ArtifactRecovery != nil); err != nil {
+		if req.EmbeddingCampaign != nil && (req.ContentStage != nil || req.ArtifactRecovery != nil) {
+			return fmt.Errorf("embedding campaign correlation cannot be combined with other writers")
+		}
+		if err := requireNormalStageCorrelation(tx, item, models.ContentStagePodsImageEmbedding, req.ContentStage, req.ArtifactRecovery != nil || req.EmbeddingCampaign != nil); err != nil {
 			return err
 		}
 		if req.ContentStage != nil {
@@ -1772,6 +1804,18 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 			}
 		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", item.TenantID, item.PublicID).First(&item).Error; err != nil {
+			return err
+		}
+		if req.Model == "" {
+			return fmt.Errorf("embedding model label is required")
+		}
+		if reason, blocked := fenceEmbeddingWrite(tx, EmbeddingSpaceImage, spaceid.RecipeContentImage, req.SpaceID, req.ProducerID); blocked {
+			return fmt.Errorf("writer_regression: %s", reason)
+		}
+		if err := authorizeEmbeddingCampaignWrite(tx, item, "content_image", req.EmbeddingCampaign, req.SpaceID, req.ProducerID); err != nil {
+			return err
+		}
+		if err := validateCampaignEmbeddingInput(tx, &item, "content_image", req.EmbeddingCampaign); err != nil {
 			return err
 		}
 		if err := checkContentLifecycleMutation(tx, item); err != nil {
@@ -1796,6 +1840,10 @@ func InternalUpdateContentImageEmbedding(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
+		if strings.HasPrefix(err.Error(), "writer_regression:") || req.EmbeddingCampaign != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "embedding_write_rejected"})
+			return
+		}
 		if writeLifecycleConflict(c, err) {
 			return
 		}

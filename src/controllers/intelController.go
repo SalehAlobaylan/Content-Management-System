@@ -809,7 +809,7 @@ func promoteForProfile(db *gorm.DB, tenantID string, profile *models.DiscoveryPr
 				if n > 0 {
 					relevance = sum / float64(n)
 				}
-				novelty = noveltyFactor(db, tenantID, meanVector(vecs), cfg.DupThreshold, cfg.DupPenalty)
+				novelty = noveltyFactor(db, tenantID, meanVector(vecs), cfg.DupThreshold, cfg.DupPenalty, sampleSpaceID)
 			}
 		}
 		// Relevance gate: don't let a high-authority source flood interests it

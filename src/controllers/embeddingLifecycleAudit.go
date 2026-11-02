@@ -3,7 +3,9 @@ package controllers
 import (
 	"fmt"
 
+	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -17,19 +19,21 @@ import (
 
 // surfaceAudit is the per-surface result rolled into the run.
 type surfaceAudit struct {
-	Surface        EmbeddingSurface
-	ExpectedSpace  expectedSpace
-	WithVec        int64  `json:"with_vec"`
-	Current        int64  `json:"current"`
-	Stale          int64  `json:"stale"`
-	Unstamped      int64  `json:"unstamped"`
-	Missing        int64  `json:"missing"`
-	MixedSpace     int64  `json:"mixed_space"`
-	NumericInvalid int64  `json:"numeric_invalid"`
-	CheckFailed    bool   `json:"-"`
-	Verdict        string `json:"verdict"`
-	Note           string `json:"note,omitempty"`
-	findings       []models.EmbeddingLifecycleFinding
+	Surface            EmbeddingSurface
+	ExpectedSpace      expectedSpace
+	EligibleCandidates int64
+	CurrentCandidates  int64
+	WithVec            int64  `json:"with_vec"`
+	Current            int64  `json:"current"`
+	Stale              int64  `json:"stale"`
+	Unstamped          int64  `json:"unstamped"`
+	Missing            int64  `json:"missing"`
+	MixedSpace         int64  `json:"mixed_space"`
+	NumericInvalid     int64  `json:"numeric_invalid"`
+	CheckFailed        bool   `json:"-"`
+	Verdict            string `json:"verdict"`
+	Note               string `json:"note,omitempty"`
+	findings           []models.EmbeddingLifecycleFinding
 }
 
 // auditSurface runs Lanes A+B for one surface and returns its rolled verdict.
@@ -92,8 +96,8 @@ func auditSurface(db *gorm.DB, runID uint, tenant string, s EmbeddingSurface) su
 	}
 	if err := db.Raw(fmt.Sprintf(
 		`SELECT
-		   COUNT(*) FILTER (WHERE %[1]s = ? AND %[3]s = ?) AS current,
-		   COUNT(*) FILTER (WHERE %[1]s IS NOT NULL AND %[3]s IS NOT NULL AND (%[1]s <> ? OR %[3]s <> ?)) AS stale,
+		   COUNT(*) FILTER (WHERE %[2]s IS NOT NULL AND %[1]s = ? AND %[3]s = ?) AS current,
+		   COUNT(*) FILTER (WHERE %[2]s IS NOT NULL AND %[1]s IS NOT NULL AND %[3]s IS NOT NULL AND (%[1]s <> ? OR %[3]s <> ?)) AS stale,
 		   COUNT(*) FILTER (WHERE %[2]s IS NOT NULL AND (%[3]s IS NULL OR %[1]s IS NULL)) AS unstamped
 		 FROM %[4]s`,
 		s.ProducerIDCol, s.VecCol, s.SpaceIDCol, s.Table),
@@ -106,6 +110,29 @@ func auditSurface(db *gorm.DB, runID uint, tenant string, s EmbeddingSurface) su
 	res.Current = counts.Current
 	res.Stale = counts.Stale
 	res.Unstamped = counts.Unstamped
+	if s.Key == "story_centroid" && feedcontract.HasNewsStoryProjection(db) {
+		var projected struct{ WithVec, Current, Stale, Unstamped int64 }
+		err := db.Raw(`SELECT COUNT(*) AS with_vec,
+          COUNT(*) FILTER(WHERE p.projection->>'embedding_space_id'=? AND p.projection->>'embedding_producer_id'=?) AS current,
+          COUNT(*) FILTER(WHERE p.projection->>'embedding_space_id' IS NOT NULL AND p.projection->>'embedding_producer_id' IS NOT NULL AND (p.projection->>'embedding_space_id'<>? OR p.projection->>'embedding_producer_id'<>?)) AS stale,
+          COUNT(*) FILTER(WHERE p.projection->>'embedding_space_id' IS NULL OR p.projection->>'embedding_producer_id' IS NULL) AS unstamped
+          FROM news_feed_story_projections p JOIN feed_generation_heads h ON h.tenant_id=p.tenant_id AND h.lane='news' AND h.active_generation_id=p.generation_id WHERE p.projection->>'embedding' IS NOT NULL`, es.SpaceID, expectedProducer, es.SpaceID, expectedProducer).Scan(&projected).Error
+		if err != nil {
+			res.CheckFailed = true
+			res.findings = append(res.findings, checkErrorFinding(runID, tenant, s.Key, "projection_inventory", err.Error()))
+		} else {
+			res.WithVec += projected.WithVec
+			res.Current += projected.Current
+			res.Stale += projected.Stale
+			res.Unstamped += projected.Unstamped
+		}
+	}
+	eligible, current, availabilityErr := embeddingAvailability(db, s, es.SpaceID)
+	res.EligibleCandidates, res.CurrentCandidates = eligible, current
+	if availabilityErr != nil {
+		res.CheckFailed = true
+		res.findings = append(res.findings, checkErrorFinding(runID, tenant, s.Key, "semantic_availability", availabilityErr.Error()))
+	}
 
 	// Lane B — mixed-space centroid coherence (only for centroid surfaces).
 	if s.Kind == SurfaceKindCentroid {
@@ -175,7 +202,18 @@ func auditSurface(db *gorm.DB, runID uint, tenant string, s EmbeddingSurface) su
 		}),
 	})
 
+	var regressions int64
+	if err := db.Model(&models.AuditLog{}).Where("action=? AND created_at>? AND payload->>'space'=?", "embedding_writer_regression", time.Now().Add(-24*time.Hour), s.Space).Count(&regressions).Error; err != nil {
+		res.CheckFailed = true
+		res.findings = append(res.findings, checkErrorFinding(runID, tenant, s.Key, "writer_regression", err.Error()))
+	} else if regressions > 0 {
+		res.findings = append(res.findings, models.EmbeddingLifecycleFinding{RunID: runID, TenantID: tenant, SurfaceKey: s.Key, CheckKey: "writer_regression", Status: models.EmbeddingFindingViolation, Severity: models.EmbeddingSevCritical, Count: int(regressions)})
+		res.Note = "Rejected stale writer requests in the last 24h"
+	}
 	res.Verdict = rollupSurfaceVerdict(res)
+	if regressions > 0 {
+		res.Verdict = models.EmbeddingVerdictBlocked
+	}
 	if res.Verdict == models.EmbeddingVerdictDrifting {
 		if campaign, active := activeCampaignForSpace(db, s.Space); active &&
 			(campaign.State == models.EmbeddingCampaignRunning || campaign.State == models.EmbeddingCampaignVerifying) {

@@ -15,6 +15,7 @@ import (
 // Each owning workflow passes provenance explicitly; request-local values never
 // live in mutable package globals. Override IDs are minted by authenticated CMS.
 type AISpendContext struct {
+	embeddingCampaign       *embeddingCampaignCorrelation
 	workloadDB              *gorm.DB
 	workloadOrigin          string
 	workloadLease           *controllerWorkloadLease

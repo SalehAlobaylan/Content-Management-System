@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Embedding text cleanup: strip URLs + collapse whitespace so a noisy YouTube
@@ -438,26 +439,46 @@ func GetEnrichmentServiceHealth(c *gin.Context) {
 // ── Helpers ─────────────────────────────────────────────────
 
 // buildEmbeddingText constructs a text string from content item fields for embedding.
-func buildEmbeddingText(item *models.ContentItem) string {
-	parts := []string{}
-	if item.Title != nil && *item.Title != "" {
-		parts = append(parts, *item.Title)
-	}
-	if item.Excerpt != nil && *item.Excerpt != "" {
-		parts = append(parts, *item.Excerpt)
-	}
-	if item.BodyText != nil && *item.BodyText != "" {
-		// Clean (strip URLs / collapse whitespace) then cap — the fuller body
-		// contributes to the vector without its boilerplate/links. Capped for
-		// UTF-8 safety; raised from 500 so the description meaningfully counts.
-		body := cleanForEmbedding(*item.BodyText)
-		runes := []rune(body)
-		if len(runes) > 3000 {
-			body = string(runes[:3000])
+func buildEmbeddingText(item *models.ContentItem, transcripts ...string) string {
+	part := func(value string, cap int) string {
+		runes := []rune(value)
+		if len(runes) > cap {
+			return string(runes[:cap])
 		}
-		parts = append(parts, body)
+		return value
 	}
-	return strings.Join(parts, " ")
+	value := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+	parts := []string{value(item.Title)}
+	if len(transcripts) > 0 && transcripts[0] != "" {
+		parts = append(parts, part(transcripts[0], 3000))
+	}
+	body := value(item.BodyText)
+	if body != "" {
+		parts = append(parts, part(cleanForEmbedding(body), 3000))
+	}
+	excerpt := value(item.Excerpt)
+	if excerpt != "" && !strings.HasPrefix(body, excerpt) {
+		parts = append(parts, excerpt)
+	}
+	return part(strings.TrimSpace(strings.Join(parts, " ")), 8192)
+}
+
+// Lifecycle uses the same optional transcript input as the ingest builder.
+func buildLifecycleEmbeddingText(db *gorm.DB, item *models.ContentItem) (string, error) {
+	var transcript string
+	if item.TranscriptID != nil {
+		var row models.Transcript
+		if err := db.Clauses(clause.Locking{Strength: "SHARE"}).Where("public_id=? AND content_item_id=?", *item.TranscriptID, item.PublicID).First(&row).Error; err != nil {
+			return "", err
+		}
+		transcript = strings.TrimSpace(row.FullText)
+	}
+	return buildEmbeddingText(item, transcript), nil
 }
 
 // ── Shared query + trigger helpers ──────────────────────────

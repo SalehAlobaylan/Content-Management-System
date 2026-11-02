@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -67,28 +68,33 @@ func getOrCreateEmbeddingPolicy(db *gorm.DB) (*models.EmbeddingLifecyclePolicy, 
 // tryEmbeddingAdvisoryLock grabs a cross-instance advisory lock; the returned
 // release func is always safe to call.
 func tryEmbeddingAdvisoryLock(db *gorm.DB) (func(), bool) {
-	ctx := context.Background()
+	key := int64(0)
+	// Version the namespace so leaked legacy session locks cannot block a new
+	// launcher after all old application processes have stopped.
+	for _, b := range []byte("wahb:embedding-lifecycle:v2:" + embeddingLifecycleTenant) {
+		key = key*31 + int64(b)
+	}
+	return tryTransactionAdvisoryLock(db, key)
+}
+
+// A checked-out client connection is not a stable backend session through
+// Neon's transaction pooler. Keep a real transaction open for the lock lifetime;
+// the protected owner work uses its normal DB transactions on other connections.
+func tryTransactionAdvisoryLock(db *gorm.DB, key int64) (func(), bool) {
 	sqlDB, err := db.DB()
 	if err != nil {
 		return func() {}, false
 	}
-	conn, err := sqlDB.Conn(ctx)
+	tx, err := sqlDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		return func() {}, false
 	}
-	key := int64(0)
-	for _, b := range []byte("wahb:embedding-lifecycle:" + embeddingLifecycleTenant) {
-		key = key*31 + int64(b)
-	}
 	var acquired bool
-	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", key).Scan(&acquired); err != nil || !acquired {
-		conn.Close()
+	if err := tx.QueryRowContext(context.Background(), "SELECT pg_try_advisory_xact_lock($1)", key).Scan(&acquired); err != nil || !acquired {
+		_ = tx.Rollback()
 		return func() {}, false
 	}
-	return func() {
-		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
-		_ = conn.Close()
-	}, true
+	return func() { _ = tx.Rollback() }, true
 }
 
 // runEmbeddingAudit executes one audit pass (Lanes A+B) over every registered
@@ -207,7 +213,10 @@ func finishEmbeddingRun(db *gorm.DB, run *models.EmbeddingLifecycleRun, start ti
 			"stale": v.Stale, "unstamped": v.Unstamped, "missing": v.Missing,
 			"mixed_space": v.MixedSpace, "numeric_invalid": v.NumericInvalid,
 			"space": v.Surface.Space, "note": v.Note,
-			"expected_space_id": v.ExpectedSpace.SpaceID,
+			"expected_space_id":   v.ExpectedSpace.SpaceID,
+			"eligible_candidates": v.EligibleCandidates, "current_candidates": v.CurrentCandidates,
+			"excluded_candidates":           v.EligibleCandidates - v.CurrentCandidates,
+			"semantic_availability_percent": availabilityPercent(v.EligibleCandidates, v.CurrentCandidates, v.CheckFailed),
 		}
 	}
 	run.PerSurface = jsonEvidence(summary)
@@ -225,17 +234,80 @@ func GetEmbeddingLifecycleStatus(c *gin.Context) {
 		return
 	}
 	var latest models.EmbeddingLifecycleRun
-	db.Where("tenant_id = ?", embeddingLifecycleTenant).Order("started_at DESC").First(&latest)
+	err = db.Where("tenant_id = ?", embeddingLifecycleTenant).Order("started_at DESC").First(&latest).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
+		c.JSON(500, gin.H{"error": "audit history unavailable"})
+		return
+	}
+	var latestRun *models.EmbeddingLifecycleRun
+	if err == nil {
+		latestRun = &latest
+	}
+	held, heldErr := embeddingHeldWork(db)
+	if heldErr != nil {
+		c.JSON(500, gin.H{"error": "held-work inventory unavailable"})
+		return
+	}
+	var campaigns []models.EmbeddingCampaign
+	if err := db.Where("tenant_id=? AND state IN ?", embeddingLifecycleTenant, []string{models.EmbeddingCampaignDraft, models.EmbeddingCampaignRunning, models.EmbeddingCampaignPaused, models.EmbeddingCampaignBlocked, models.EmbeddingCampaignVerifying}).Order("created_at DESC").Find(&campaigns).Error; err != nil {
+		c.JSON(500, gin.H{"error": "active campaign inventory unavailable"})
+		return
+	}
+	recommendation := embeddingRecommendation(latestRun, campaigns, held)
 
 	c.JSON(http.StatusOK, gin.H{
-		"policy":     policy,
-		"latest_run": latest,
-		"surfaces":   EmbeddingSurfaces(),
+		"policy":             policy,
+		"latest_run":         latestRun,
+		"held_work":          held,
+		"recommended_action": recommendation,
+		"surfaces":           EmbeddingSurfaces(),
 		"spaces": gin.H{
 			"text":  currentExpectedSpace(EmbeddingSpaceText),
 			"image": currentExpectedSpace(EmbeddingSpaceImage),
 		},
 	})
+}
+
+// Current work takes precedence over an older audit headline. In particular,
+// a formerly coherent snapshot cannot dismiss a blocked campaign or backlog.
+func embeddingRecommendation(latest *models.EmbeddingLifecycleRun, campaigns []models.EmbeddingCampaign, held map[string]int64) map[string]string {
+	for _, state := range []string{models.EmbeddingCampaignBlocked, models.EmbeddingCampaignPaused, models.EmbeddingCampaignVerifying, models.EmbeddingCampaignRunning, models.EmbeddingCampaignDraft} {
+		for _, campaign := range campaigns {
+			if campaign.State != state {
+				continue
+			}
+			label, description := "Monitor campaign progress", "Review the latest actions and exceptions before changing execution."
+			switch state {
+			case models.EmbeddingCampaignBlocked:
+				label = "Resolve the blocked campaign"
+				description = "Inspect exceptions and retry preflight after resolving the blocker."
+				if campaign.BlockedReason != "" {
+					description = campaign.BlockedReason
+				}
+			case models.EmbeddingCampaignPaused:
+				label, description = "Review the paused campaign", "Resume when ready; scheduled observation remains independent."
+			case models.EmbeddingCampaignVerifying:
+				label, description = "Monitor campaign verification", "Owner readback and held work must finish before completion."
+			case models.EmbeddingCampaignDraft:
+				label, description = "Review the drafted campaign", "Review its target, scope and execution limits before starting."
+			}
+			return map[string]string{"label": label, "description": fmt.Sprintf("Campaign #%d: %s", campaign.ID, description), "href": "/platform/intelligence/embeddings#campaigns"}
+		}
+	}
+	if held["classification"] > 0 || held["topic_remap"] > 0 || held["relations"] > 0 {
+		href := "/platform/news"
+		if held["classification"] == 0 && held["relations"] == 0 {
+			href = "/platform/topics"
+		}
+		return map[string]string{"label": "Review held semantic work", "description": fmt.Sprintf("%d classifications, %d topic remaps and %d relation rebuilds remain.", held["classification"], held["topic_remap"], held["relations"]), "href": href}
+	}
+	if latest == nil {
+		return map[string]string{"label": "Run an audit", "description": "Review current vector identity and affected surfaces."}
+	}
+	if latest.Headline == models.EmbeddingHeadlineAllClear {
+		return map[string]string{"label": "No action needed", "description": "The latest audit found coherent surfaces."}
+	}
+	return map[string]string{"label": "Review findings and preview a campaign", "description": "Inspect the evidence before approving bounded recomputation.", "href": "/platform/intelligence/embeddings#audit-evidence"}
 }
 
 // GetEmbeddingLifecyclePolicy / UpdateEmbeddingLifecyclePolicy.
@@ -290,7 +362,12 @@ func UpdateEmbeddingLifecyclePolicy(c *gin.Context) {
 	if body.RetryCeiling != nil && *body.RetryCeiling >= 0 {
 		policy.RetryCeiling = clampEmbeddingInt(*body.RetryCeiling, 1, 10)
 	}
-	if err := db.Save(policy).Error; err != nil {
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(policy).Error; err != nil {
+			return err
+		}
+		return writeEmbeddingAdminAudit(c, tx, "policy_update", "policy", map[string]any{"audit_enabled": policy.AuditEnabled, "daily_item_cap": policy.DailyItemCap, "items_per_batch": policy.ItemsPerBatch, "retry_ceiling": policy.RetryCeiling})
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -332,7 +409,10 @@ func ListEmbeddingLifecycleRuns(c *gin.Context) {
 		}
 	}
 	var runs []models.EmbeddingLifecycleRun
-	db.Where("tenant_id = ?", embeddingLifecycleTenant).Order("started_at DESC").Limit(limit).Find(&runs)
+	if err := db.Where("tenant_id = ?", embeddingLifecycleTenant).Order("started_at DESC").Limit(limit).Find(&runs).Error; err != nil {
+		c.JSON(500, gin.H{"error": "audit history unavailable"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"runs": runs})
 }
 
@@ -345,11 +425,18 @@ func GetEmbeddingLifecycleRun(c *gin.Context) {
 	}
 	var run models.EmbeddingLifecycleRun
 	if err := db.First(&run, id).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "run not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "audit history unavailable"})
+		}
 		return
 	}
 	var findings []models.EmbeddingLifecycleFinding
-	db.Where("run_id = ?", id).Order("severity DESC, surface_key").Find(&findings)
+	if err := db.Where("run_id = ?", id).Order("severity DESC, surface_key").Find(&findings).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "audit evidence unavailable"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"run": run, "findings": findings})
 }
 
@@ -376,11 +463,21 @@ func ListEmbeddingLifecycleFindings(c *gin.Context) {
 		}
 	}
 	var findings []models.EmbeddingLifecycleFinding
-	q.Order("id DESC").Limit(limit).Find(&findings)
+	if err := q.Order("id DESC").Limit(limit).Find(&findings).Error; err != nil {
+		c.JSON(500, gin.H{"error": "audit evidence unavailable"})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"findings": findings})
 }
 
 // GetEmbeddingLifecycleSurfaces — the registry (UI renders from this).
 func GetEmbeddingLifecycleSurfaces(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"surfaces": EmbeddingSurfaces()})
+}
+
+func availabilityPercent(eligible, current int64, failed bool) any {
+	if failed || eligible == 0 {
+		return nil
+	}
+	return float64(current) * 100 / float64(eligible)
 }

@@ -103,3 +103,50 @@ func TestResetNewsMetadataRejectsChangedMembers(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestLifecycleProjectionRefreshRequiresTargetSpaceMembers(t *testing.T) {
+	db, mock := newsProjectionTestDB(t)
+	generation, story := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT count\(\*\) FROM information_schema.tables`).WithArgs("news_feed_story_projections", "BASE TABLE").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT .* FROM "feed_generation_heads".*FOR UPDATE`).WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "lane", "active_generation_id"}).AddRow("tenant", "news", generation))
+	mock.ExpectQuery(`SELECT .* FROM "news_feed_story_projections"`).WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "generation_id", "story_id", "member_hash"}).AddRow("tenant", generation, story, "old-member-hash"))
+	mock.ExpectQuery(`(?s)SELECT COUNT\(\*\).*m.generation_id=.*c.embedding_space_id IS DISTINCT FROM`).WithArgs(generation, "tenant", story, "target-space").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	if err := RefreshActiveNewsStoryProjection(db, "tenant", story, "target-space", "producer"); err == nil {
+		t.Fatal("partially migrated projected members were published")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleProjectionRefreshPinsHeadAndStampsRebuiltView(t *testing.T) {
+	db, mock := newsProjectionTestDB(t)
+	generation, story := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT count\(\*\) FROM information_schema.tables`).WithArgs("news_feed_story_projections", "BASE TABLE").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT .* FROM "feed_generation_heads".*FOR UPDATE`).WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "lane", "active_generation_id"}).AddRow("tenant", "news", generation))
+	mock.ExpectQuery(`SELECT .* FROM "news_feed_story_projections"`).WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "generation_id", "story_id", "member_hash"}).AddRow("tenant", generation, story, "old-member-hash"))
+	mock.ExpectQuery(`(?s)SELECT COUNT\(\*\).*c.embedding_space_id IS DISTINCT FROM`).WithArgs(generation, "tenant", story, "target-space").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`(?s)SELECT COUNT\(\*\).*COUNT\(DISTINCT c.embedding_space_id\)<>1`).WithArgs(generation, "tenant", story, story).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec(`(?s)WITH members AS.*m.member_type='news_item'.*AVG\(embedding\).*sha256.*ON CONFLICT`).WithArgs(generation, "tenant", story, story, "tenant", generation, "tenant").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`(?s)DELETE FROM news_feed_story_projections`).WithArgs("tenant", generation, story, story).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)DELETE FROM feed_generation_memberships`).WithArgs(generation, story, story, "tenant").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`(?s)UPDATE news_feed_story_projections.*embedding_producer_id.*generation_id=.*embedding_space_id`).WithArgs("producer", "tenant", generation, story, "target-space").WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := RefreshActiveNewsStoryProjection(db, "tenant", story, "target-space", "producer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleProjectionRefreshRefusesMissingServingHead(t *testing.T) {
+	db, mock := newsProjectionTestDB(t)
+	mock.ExpectQuery(`SELECT count\(\*\) FROM information_schema.tables`).WithArgs("news_feed_story_projections", "BASE TABLE").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectQuery(`SELECT .* FROM "feed_generation_heads".*FOR UPDATE`).WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "lane", "active_generation_id"}).AddRow("tenant", "news", nil))
+	if err := RefreshActiveNewsStoryProjection(db, "tenant", uuid.New(), "target", "producer"); err == nil {
+		t.Fatal("missing serving generation was treated as completed projected work")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

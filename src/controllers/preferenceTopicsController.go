@@ -593,8 +593,9 @@ type topicVector struct {
 
 func activeTopicVectors(db *gorm.DB, tenantID string) ([]topicVector, error) {
 	spaceID := currentTextSpaceIDForSimilarity()
-	if spaceID == "" {
-		return nil, nil
+	ready, err := topicMappingReady(db, tenantID, spaceID)
+	if err != nil || !ready {
+		return nil, err
 	}
 	var topics []models.Topic
 	if err := db.Where("tenant_id = ? AND active = ? AND centroid IS NOT NULL AND centroid_space_id = ?", tenantID, true, spaceID).Find(&topics).Error; err != nil {

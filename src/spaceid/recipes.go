@@ -14,7 +14,7 @@ package spaceid
 const (
 	// RecipeContentText — content_items.embedding. Input = title + excerpt + body
 	// assembled by Enrichment's canonical builder.
-	RecipeContentText = "content-title-excerpt-body:v1"
+	RecipeContentText = "content-title-transcript-body-excerpt:v2"
 	// RecipeContentImage — content_items.image_embedding. CLIP over hero image /
 	// video thumbnail, Media preprocessing.
 	RecipeContentImage = "content-hero-thumbnail:v1"

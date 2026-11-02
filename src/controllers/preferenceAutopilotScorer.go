@@ -102,6 +102,7 @@ type proposalScorer struct {
 	policy     models.PreferenceAutopilotPolicy
 	topics     []topicVector
 	catVecs    map[string][]float32
+	spaceID    string
 	persist    bool
 
 	embedCalls       int
@@ -111,11 +112,16 @@ type proposalScorer struct {
 }
 
 func newProposalScorer(db *gorm.DB, tenantID string, policy models.PreferenceAutopilotPolicy, persist bool) *proposalScorer {
+	spaceID := currentTextSpaceIDForSimilarity()
 	topics, _ := activeTopicVectors(db, tenantID)
+	if spaceID != currentTextSpaceIDForSimilarity() {
+		spaceID, topics = "", nil
+	}
 	return &proposalScorer{
 		db: db, tenantID: tenantID, policy: policy, persist: persist,
 		topics:  topics,
 		catVecs: buildDerivedCategoryVectors(topics),
+		spaceID: spaceID,
 	}
 }
 
@@ -323,12 +329,13 @@ func (s *proposalScorer) fillLabels(p *models.TopicProposal) (string, string, bo
 // advisory suggestion, so caching it in observe is safe and avoids re-embedding the
 // same unchanged proposals on every scheduled run (§0.1.8).
 func (s *proposalScorer) ensureEmbedding(p *models.TopicProposal, ar, en string) ([]float32, bool) {
-	hash := hashProposalEmbeddingInput(p.SuggestedSlug, ar, en, p.SuggestedCategory)
-	expectedProducer := ""
-	if _, _, producer := textSurfaceStamp(spaceid.RecipeTopicProposal); producer != nil {
-		expectedProducer = *producer
+	if s.spaceID == "" || currentTextSpaceIDForSimilarity() != s.spaceID {
+		return nil, false
 	}
+	hash := hashProposalEmbeddingInput(p.SuggestedSlug, ar, en, p.SuggestedCategory)
+	expectedProducer := spaceid.ProducerID(s.spaceID, spaceid.RecipeTopicProposal)
 	if p.Embedding != nil && p.EmbeddingInputHash == hash && expectedProducer != "" &&
+		p.EmbeddingSpaceID != nil && *p.EmbeddingSpaceID == s.spaceID &&
 		p.EmbeddingProducerID != nil && *p.EmbeddingProducerID == expectedProducer {
 		return p.Embedding.Slice(), true
 	}
@@ -342,20 +349,22 @@ func (s *proposalScorer) ensureEmbedding(p *models.TopicProposal, ar, en string)
 		return nil, false
 	}
 	s.embedCalls++
-	if err != nil || len(emb) != 1024 {
+	if err != nil || len(emb) != 1024 || observedSpace != s.spaceID {
+		return nil, false
+	}
+	model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicProposal, observedSpace)
+	if !ok {
 		return nil, false
 	}
 	vec := pgvector.NewVector(emb)
 	now := time.Now()
 	upd := map[string]interface{}{
 		"embedding": vec, "embedding_input_hash": hash, "embedded_at": now,
+		"embedding_model": model, "embedding_space_id": observedSpace, "embedding_producer_id": producer,
 	}
-	// Stamp vector-space provenance (stage 10) so new proposal seeds carry
-	// identity; left NULL (unstamped debt) when the text space is unresolved.
-	if model, producer, ok := textStampForObservedSpace(spaceid.RecipeTopicProposal, observedSpace); ok {
-		upd["embedding_model"], upd["embedding_space_id"], upd["embedding_producer_id"] = model, observedSpace, producer
+	if err := s.db.Model(&models.TopicProposal{}).Where("tenant_id = ? AND id = ?", s.tenantID, p.ID).Updates(upd).Error; err != nil {
+		return nil, false
 	}
-	_ = s.db.Model(&models.TopicProposal{}).Where("id = ?", p.ID).Updates(upd).Error
 	return emb, true
 }
 

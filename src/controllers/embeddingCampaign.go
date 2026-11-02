@@ -19,9 +19,7 @@ import (
 // owner inference paths (which stamp the new identity on write-back), then
 // verifying by database readback. It NEVER writes a vector itself.
 //
-// Not built here (Slice 4): centroid/cache owner rebuild adapters + the held
-// derived-work handshake. Slice 3 covers item surfaces (content_text,
-// content_image) end-to-end plus write fencing that protects a running campaign.
+// Derived surface rebuilds and the completion handshake live in embeddingOwnerAdapters.go.
 
 // activeCampaignForSpace returns the non-terminal campaign for a space, if any.
 func activeCampaignForSpace(db *gorm.DB, space string) (*models.EmbeddingCampaign, bool) {
@@ -43,7 +41,7 @@ func activeCampaignForSpace(db *gorm.DB, space string) (*models.EmbeddingCampaig
 func runningCampaignTargetProducer(db *gorm.DB, space, recipe string) (string, bool, error) {
 	var c models.EmbeddingCampaign
 	err := db.Where("space = ? AND state IN ?", space,
-		[]string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying}).
+		[]string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying, models.EmbeddingCampaignPaused, models.EmbeddingCampaignBlocked}).
 		First(&c).Error
 	if err == gorm.ErrRecordNotFound {
 		return "", false, nil
@@ -73,14 +71,18 @@ func campaignExpectedProducer(c *models.EmbeddingCampaign, s EmbeddingSurface) s
 
 // fenceEmbeddingWrite returns (reason, blocked). While a campaign is running or
 // verifying for a space, an item write must carry the target producer; anything
-// else (old producer, or missing stamp) is rejected as writer_regression. No
-// active campaign ⇒ never blocked (normal operation is unaffected).
+// else (old producer, or missing stamp) is rejected as writer_regression.
+// Outside a campaign the freshly reported service identity remains mandatory.
 func fenceEmbeddingWrite(db *gorm.DB, space, recipe, writeSpaceID, writeProducer string) (string, bool) {
 	if (writeSpaceID == "") != (writeProducer == "") {
 		return "space_id and producer_id must be supplied together", true
 	}
 	if writeSpaceID != "" && spaceid.ProducerID(writeSpaceID, recipe) != writeProducer {
 		return "producer_id does not match space_id and registered recipe", true
+	}
+	es := refreshExpectedSpace(space)
+	if es.SpaceID == "" || writeSpaceID != es.SpaceID || writeProducer != es.ProducerFor(recipe) {
+		return "write identity does not match a freshly resolved service identity", true
 	}
 	target, active, err := runningCampaignTargetProducer(db, space, recipe)
 	if err != nil {
@@ -97,7 +99,7 @@ func fenceEmbeddingWrite(db *gorm.DB, space, recipe, writeSpaceID, writeProducer
 	}
 	var c models.EmbeddingCampaign
 	if err := db.Where("space = ? AND state IN ?", space,
-		[]string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying}).First(&c).Error; err == nil && writeSpaceID != c.TargetSpaceID {
+		[]string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying, models.EmbeddingCampaignPaused, models.EmbeddingCampaignBlocked}).First(&c).Error; err == nil && writeSpaceID != c.TargetSpaceID {
 		return "campaign active: write space_id does not match the migration target", true
 	}
 	return "", false
@@ -106,13 +108,16 @@ func fenceEmbeddingWrite(db *gorm.DB, space, recipe, writeSpaceID, writeProducer
 // campaignPreview computes the dry-run impact for a proposed space campaign:
 // how many item rows are stale/unstamped per in-scope surface, and readiness.
 type campaignPreviewResult struct {
-	Space        string                   `json:"space"`
-	ExpectedID   string                   `json:"expected_space_id"`
-	Resolved     bool                     `json:"resolved"`
-	DimOK        bool                     `json:"dim_ok"`
-	Surfaces     []campaignPreviewSurface `json:"surfaces"`
-	TotalTargets int64                    `json:"total_targets"`
-	Blockers     []string                 `json:"blockers"`
+	Space                   string                   `json:"space"`
+	TargetModel             string                   `json:"target_model"`
+	TargetRevision          string                   `json:"target_revision"`
+	ExpectedID              string                   `json:"expected_space_id"`
+	Resolved                bool                     `json:"resolved"`
+	DimOK                   bool                     `json:"dim_ok"`
+	Surfaces                []campaignPreviewSurface `json:"surfaces"`
+	TotalTargets            int64                    `json:"total_targets"`
+	EstimatedInferenceCalls int64                    `json:"estimated_inference_calls"`
+	Blockers                []string                 `json:"blockers"`
 }
 
 type campaignPreviewSurface struct {
@@ -123,7 +128,7 @@ type campaignPreviewSurface struct {
 
 func computeCampaignPreview(db *gorm.DB, space string) campaignPreviewResult {
 	es := refreshExpectedSpace(space) // fresh — this gates a mutating decision
-	res := campaignPreviewResult{Space: space, ExpectedID: es.SpaceID, Resolved: es.SpaceID != ""}
+	res := campaignPreviewResult{Space: space, ExpectedID: es.SpaceID, TargetModel: es.Model, TargetRevision: es.Revision, Resolved: es.SpaceID != "", Surfaces: []campaignPreviewSurface{}, Blockers: []string{}}
 	if es.SpaceID == "" {
 		res.Blockers = append(res.Blockers, "expected space unresolved: "+es.Err)
 		return res
@@ -140,11 +145,18 @@ func computeCampaignPreview(db *gorm.DB, space string) campaignPreviewResult {
 		}
 		expectedProducer := es.ProducerFor(s.Recipe)
 		var n int64
-		db.Raw(fmt.Sprintf(
-			`SELECT COUNT(*) FROM %[1]s WHERE %[2]s IS NOT NULL AND (%[3]s IS DISTINCT FROM ?)`,
-			s.Table, s.VecCol, s.ProducerIDCol), expectedProducer).Scan(&n)
+		err := db.Raw(fmt.Sprintf(
+			`SELECT COUNT(*) FROM %[1]s WHERE %[2]s IS NOT NULL AND (%[3]s IS DISTINCT FROM ? OR %[4]s IS DISTINCT FROM ?)`,
+			s.Table, s.VecCol, s.ProducerIDCol, s.SpaceIDCol), expectedProducer, es.SpaceID).Scan(&n).Error
+		if err != nil {
+			res.Blockers = append(res.Blockers, s.Key+": inventory unavailable")
+			continue
+		}
 		res.Surfaces = append(res.Surfaces, campaignPreviewSurface{Key: s.Key, Kind: s.Kind, Targets: n})
 		res.TotalTargets += n
+		if s.Key != "story_centroid" {
+			res.EstimatedInferenceCalls += n
+		}
 	}
 	return res
 }
@@ -199,13 +211,23 @@ type campaignCaps struct {
 
 // startCampaign freezes the target and transitions draft/paused → running after
 // a fresh preflight (target still resolved + matches the frozen snapshot).
-func startCampaign(db *gorm.DB, id uint, startedBy, reason string) (*models.EmbeddingCampaign, error) {
+func startCampaign(db *gorm.DB, id uint, startedBy, reason string, confirmedTargets ...string) (*models.EmbeddingCampaign, error) {
 	var c models.EmbeddingCampaign
 	if err := db.First(&c, id).Error; err != nil {
 		return nil, fmt.Errorf("campaign not found")
 	}
 	if c.State != models.EmbeddingCampaignDraft && c.State != models.EmbeddingCampaignPaused {
 		return nil, fmt.Errorf("campaign is %s, cannot start", c.State)
+	}
+	if len(confirmedTargets) > 0 && confirmedTargets[0] != c.TargetSpaceID {
+		return nil, fmt.Errorf("confirmed target does not match campaign")
+	}
+	if err := db.Exec("SELECT pg_advisory_xact_lock(hashtext(?))", "embedding-write:"+c.Space).Error; err != nil {
+		return nil, err
+	}
+	preview := computeCampaignPreview(db, c.Space)
+	if len(preview.Blockers) > 0 {
+		return nil, fmt.Errorf("campaign preflight blocked: %v", preview.Blockers)
 	}
 	// Preflight: the service's current identity must still equal the frozen target.
 	es := refreshExpectedSpace(c.Space)
@@ -226,8 +248,12 @@ func startCampaign(db *gorm.DB, id uint, startedBy, reason string) (*models.Embe
 	c.ApprovalReason = reason
 	c.StartedAt = &now
 	c.BlockedReason = ""
-	if err := db.Save(&c).Error; err != nil {
-		return nil, err
+	result := db.Model(&models.EmbeddingCampaign{}).Where("id=? AND state IN ?", c.ID, []string{models.EmbeddingCampaignDraft, models.EmbeddingCampaignPaused}).Updates(map[string]any{"state": c.State, "started_by": c.StartedBy, "approval_reason": c.ApprovalReason, "started_at": c.StartedAt, "blocked_reason": ""})
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, fmt.Errorf("campaign state changed; reload before starting")
 	}
 	return &c, nil
 }
@@ -238,10 +264,11 @@ func transitionCampaign(db *gorm.DB, id uint, action string) (*models.EmbeddingC
 	if err := db.First(&c, id).Error; err != nil {
 		return nil, fmt.Errorf("campaign not found")
 	}
+	previousState := c.State
 	switch action {
 	case "pause":
-		if c.State != models.EmbeddingCampaignRunning {
-			return nil, fmt.Errorf("only a running campaign can be paused")
+		if c.State != models.EmbeddingCampaignRunning && c.State != models.EmbeddingCampaignVerifying {
+			return nil, fmt.Errorf("only an active campaign can be paused")
 		}
 		c.State = models.EmbeddingCampaignPaused
 	case "resume":
@@ -269,8 +296,12 @@ func transitionCampaign(db *gorm.DB, id uint, action string) (*models.EmbeddingC
 	default:
 		return nil, fmt.Errorf("unknown action %q", action)
 	}
-	if err := db.Save(&c).Error; err != nil {
-		return nil, err
+	r := db.Model(&models.EmbeddingCampaign{}).Where("id=? AND state=?", c.ID, previousState).Updates(map[string]any{"state": c.State, "blocked_reason": c.BlockedReason, "completed_at": c.CompletedAt})
+	if r.Error != nil {
+		return nil, r.Error
+	}
+	if r.RowsAffected != 1 {
+		return nil, fmt.Errorf("campaign state changed; reload before retrying")
 	}
 	return &c, nil
 }
@@ -280,31 +311,18 @@ func transitionCampaign(db *gorm.DB, id uint, action string) (*models.EmbeddingC
 // verifies by readback. Returns (processed, error). Precondition-abort then
 // per-action isolation (family G11).
 func executeCampaignBatch(db *gorm.DB, c *models.EmbeddingCampaign) (int, error) {
-	if c.State != models.EmbeddingCampaignRunning {
+	if !campaignCanContinue(db, c) || c.State != models.EmbeddingCampaignRunning {
 		return 0, nil
 	}
 	// Fresh identity required for mutating work.
 	es := refreshExpectedSpace(c.Space)
 	if es.SpaceID == "" || es.SpaceID != c.TargetSpaceID {
-		c.State = models.EmbeddingCampaignBlocked
-		c.BlockedReason = "expected space unavailable or diverged from target"
-		db.Save(c)
+		campaignSetState(db, c, models.EmbeddingCampaignBlocked, "expected space unavailable or diverged from target")
 		return 0, fmt.Errorf("blocked: %s", c.BlockedReason)
 	}
-	// Daily cap.
-	batchLimit := c.ItemsPerBatch
-	if c.DailyItemCap > 0 {
-		var todayCount int64
-		db.Model(&models.EmbeddingCampaignAction{}).
-			Where("campaign_id = ? AND status = ? AND created_at > ?", c.ID, models.EmbeddingActionCompleted, time.Now().Add(-24*time.Hour)).
-			Count(&todayCount)
-		if todayCount >= int64(c.DailyItemCap) {
-			return 0, nil // cap reached; not an error
-		}
-		remaining := c.DailyItemCap - int(todayCount)
-		if remaining < batchLimit {
-			batchLimit = remaining
-		}
+	batchLimit, err := campaignBudgetRemaining(db, c)
+	if err != nil {
+		return 0, err
 	}
 	if batchLimit <= 0 {
 		return 0, nil
@@ -318,8 +336,11 @@ func executeCampaignBatch(db *gorm.DB, c *models.EmbeddingCampaign) (int, error)
 			continue
 		}
 		expectedProducer := campaignExpectedProducer(c, s)
-		targets := claimBatchTargets(db, s, expectedProducer, batchLimit-attempted)
+		targets := campaignBatchTargets(db, c, s, expectedProducer, batchLimit-attempted)
 		for _, tid := range targets {
+			if !campaignCanContinue(db, c) {
+				return processed, nil
+			}
 			processed += runCampaignTarget(db, c, s, tid, expectedProducer, batchID)
 			attempted++
 			if attempted >= batchLimit || c.State == models.EmbeddingCampaignBlocked {
@@ -333,9 +354,12 @@ func executeCampaignBatch(db *gorm.DB, c *models.EmbeddingCampaign) (int, error)
 
 	// If no item targets remain across scope, move to verifying (Slice 4 drives
 	// the centroid handshake before completed).
-	if remainingItemTargets(db, c, es) == 0 {
-		c.State = models.EmbeddingCampaignVerifying
-		db.Save(c)
+	remaining := remainingItemTargets(db, c, es)
+	if remaining < 0 {
+		return processed, fmt.Errorf("item inventory unavailable")
+	}
+	if remaining == 0 {
+		campaignSetState(db, c, models.EmbeddingCampaignVerifying, "")
 	}
 	return processed, nil
 }
@@ -358,6 +382,15 @@ func claimBatchTargets(db *gorm.DB, s EmbeddingSurface, expectedProducer string,
 	return ids
 }
 
+func campaignBatchTargets(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurface, producer string, limit int) []string {
+	var ids []string
+	q := fmt.Sprintf(`SELECT x.%s::text FROM %s x WHERE x.%s IS NOT NULL AND (x.%s IS DISTINCT FROM ? OR x.%s IS DISTINCT FROM ?)
+      AND NOT EXISTS (SELECT 1 FROM embedding_campaign_exceptions e WHERE e.campaign_id=? AND e.surface_key=? AND e.target_id=x.%s::text AND e.status='waived' AND e.waiver_expires>now())
+      ORDER BY CASE WHEN status='READY' THEN 0 ELSE 1 END, created_at DESC LIMIT ?`, s.IDCol, s.Table, s.VecCol, s.ProducerIDCol, s.SpaceIDCol, s.IDCol)
+	db.Raw(q, producer, c.TargetSpaceID, c.ID, s.Key, limit).Scan(&ids)
+	return ids
+}
+
 // runCampaignTarget claims one target (unique ownership), calls the adapter, and
 // verifies by readback. Returns 1 if the target reached completed, else 0.
 func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurface, targetID, expectedProducer, batchID string) int {
@@ -374,35 +407,56 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 		}
 		retryNumber = existing.Attempts
 		if existing.Attempts >= c.RetryCeiling && existing.Status != models.EmbeddingExceptionRetrying {
-			c.State = models.EmbeddingCampaignBlocked
-			c.BlockedReason = fmt.Sprintf("retry ceiling reached for %s/%s", s.Key, targetID)
-			_ = db.Save(c).Error
+			campaignSetState(db, c, models.EmbeddingCampaignBlocked, fmt.Sprintf("retry ceiling reached for %s/%s", s.Key, targetID))
 			return 0
 		}
 	}
+	var latest models.EmbeddingCampaignAction
+	if err := db.Where("campaign_id=? AND surface_key=? AND target_id=? AND expected_producer_id=?", c.ID, s.Key, targetID, expectedProducer).Order("retry_number DESC").First(&latest).Error; err == nil {
+		if latest.Status == models.EmbeddingActionAttempted {
+			return 0
+		}
+		retryNumber = latest.RetryNumber + 1
+	} else if err != gorm.ErrRecordNotFound {
+		return 0
+	}
+	var target models.ContentItem
+	if db.Where("public_id=?", targetID).First(&target).Error != nil {
+		return 0
+	}
+	fingerprint, inputErr := campaignInputFingerprint(db, &target, s.Key)
 	class := "text_embedding"
 	if s.Space == EmbeddingSpaceImage {
 		class = "image_embedding"
 	}
-	lease, capacityErr := acquireControllerWorkload(db, c.TenantID, "embedding_campaign", class, batchID, "campaign")
-	if capacityErr != nil {
-		return 0
-	} // no attempt or retry budget is consumed
-	defer lease.cancelBeforeEffect()
-	callContext := withWorkloadContext(db, spendContext(c.TenantID, "embedding_campaign", fmt.Sprintf("%d", c.ID)), "campaign")
-	callContext.workloadLease = lease
 	action := models.EmbeddingCampaignAction{
-		CampaignID: c.ID, TenantID: c.TenantID, BatchID: batchID,
+		CampaignID: c.ID, TenantID: target.TenantID, BatchID: batchID,
 		SurfaceKey: s.Key, TargetID: targetID, ExpectedProducerID: expectedProducer,
-		Status: models.EmbeddingActionAttempted, RetryNumber: retryNumber,
+		Status: models.EmbeddingActionAttempted, RetryNumber: retryNumber, Tool: toolForSurface(s),
+		Evidence: jsonEvidence(map[string]any{"input_fingerprint": fingerprint}),
 	}
 	// Claim ownership: unique (campaign, surface, target, expected_producer). A
 	// concurrent runner that already claimed this target hits the unique index
 	// and we skip — no double call.
-	if err := db.Create(&action).Error; err != nil {
+	if err := claimCampaignAction(db, c, &action); err != nil {
 		return 0 // already claimed by another runner/attempt
 	}
-	if observed := readbackProducer(db, s, targetID); observed == expectedProducer {
+	if inputErr != nil {
+		action.Status, action.Reason = models.EmbeddingActionFailed, inputErr.Error()
+		recordAdapterFailure(db, c, s, targetID, inputErr.Error())
+		_ = db.Save(&action).Error
+		return 0
+	}
+	lease, capacityErr := acquireControllerWorkload(db, target.TenantID, "embedding_campaign", class, batchID, "campaign")
+	if capacityErr != nil {
+		action.Status, action.Guardrail, action.Reason = models.EmbeddingActionSkipped, "capacity", capacityErr.Error()
+		_ = db.Save(&action).Error
+		return 0
+	}
+	defer lease.cancelBeforeEffect()
+	callContext := withWorkloadContext(db, spendContext(target.TenantID, "embedding_campaign", fmt.Sprint(c.ID)), "campaign")
+	callContext.workloadLease = lease
+	if observed := readbackProducer(db, s, targetID); ownerReadback(db, s, targetID, c.TargetSpaceID, expectedProducer) == nil {
 		action.Status = models.EmbeddingActionSkipped
 		action.Guardrail = "staleness"
 		action.ObservedProducerID = observed
@@ -412,15 +466,16 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 	}
 
 	tool := toolForSurface(s)
+	callContext.TenantID = target.TenantID
+	callContext.embeddingCampaign = &embeddingCampaignCorrelation{CampaignID: c.ID, ActionID: action.ID, RequestID: action.RequestID}
 	err := invokeItemAdapter(db, s, targetID, callContext)
 	action.LatencyMS = time.Since(start).Milliseconds()
 	action.Tool = tool
 	if err != nil {
 		if isWorkloadDeferred(err) {
-			// No model effect began. Remove only this unstarted claim so the
-			// same native retry identity remains available on the next tick.
-			// The Governor retains the reasoned decision in its own ledger.
-			_ = db.Delete(&action).Error
+			// No model effect began; keep the reasoned skip and retry next tick.
+			action.Status, action.Guardrail, action.Reason = models.EmbeddingActionSkipped, "capacity", err.Error()
+			_ = db.Save(&action).Error
 			return 0
 		}
 		recordAdapterFailure(db, c, s, targetID, err.Error())
@@ -434,7 +489,7 @@ func runCampaignTarget(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingSurf
 	// the target producer.
 	observed := readbackProducer(db, s, targetID)
 	action.ObservedProducerID = observed
-	if observed != expectedProducer {
+	if ownerReadback(db, s, targetID, c.TargetSpaceID, expectedProducer) != nil {
 		recordAdapterFailure(db, c, s, targetID, "readback mismatch: "+observed)
 		action.Status = models.EmbeddingActionFailed
 		action.Reason = "readback producer mismatch"
@@ -467,7 +522,10 @@ func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string, context
 	}
 	switch s.Key {
 	case "content_text":
-		text := buildEmbeddingText(&item)
+		text, err := buildLifecycleEmbeddingText(db, &item)
+		if err != nil {
+			return err
+		}
 		if text == "" {
 			return fmt.Errorf("no text content to embed")
 		}
@@ -485,7 +543,7 @@ func invokeItemAdapter(db *gorm.DB, s EmbeddingSurface, targetID string, context
 // readbackProducer reads the freshly-written producer_id for a target.
 func readbackProducer(db *gorm.DB, s EmbeddingSurface, targetID string) string {
 	var producer *string
-	db.Raw(fmt.Sprintf(`SELECT %s FROM %s WHERE %s = ?`, s.ProducerIDCol, s.Table, s.IDCol), targetID).Scan(&producer)
+	db.Raw(fmt.Sprintf(`SELECT %s FROM %s WHERE %s = ? AND %s IS NOT NULL AND %s IS NOT NULL`, s.ProducerIDCol, s.Table, s.IDCol, s.VecCol, s.SpaceIDCol), targetID).Scan(&producer)
 	if producer == nil {
 		return ""
 	}
@@ -499,8 +557,13 @@ func recordAdapterFailure(db *gorm.DB, c *models.EmbeddingCampaign, s EmbeddingS
 	var ex models.EmbeddingCampaignException
 	err := db.Where("campaign_id = ? AND surface_key = ? AND target_id = ?", c.ID, s.Key, targetID).First(&ex).Error
 	if err == gorm.ErrRecordNotFound {
+		tenant := c.TenantID
+		var action models.EmbeddingCampaignAction
+		if db.Where("campaign_id=? AND surface_key=? AND target_id=?", c.ID, s.Key, targetID).Order("id DESC").First(&action).Error == nil {
+			tenant = action.TenantID
+		}
 		ex = models.EmbeddingCampaignException{
-			CampaignID: c.ID, TenantID: c.TenantID, SurfaceKey: s.Key, TargetID: targetID,
+			CampaignID: c.ID, TenantID: tenant, SurfaceKey: s.Key, TargetID: targetID,
 			Attempts: 1, Status: models.EmbeddingExceptionOpen, FailureClass: "adapter_error",
 			LatestEvidence: jsonEvidence(map[string]any{"error": msg}),
 		}
@@ -524,11 +587,12 @@ func remainingItemTargets(db *gorm.DB, c *models.EmbeddingCampaign, es expectedS
 		if s.Space != c.Space || s.Kind != SurfaceKindItem {
 			continue
 		}
-		expectedProducer := campaignExpectedProducer(c, s)
 		var n int64
-		db.Raw(fmt.Sprintf(
-			`SELECT COUNT(*) FROM %[1]s WHERE %[2]s IS NOT NULL AND (%[3]s IS DISTINCT FROM ?)`,
-			s.Table, s.VecCol, s.ProducerIDCol), expectedProducer).Scan(&n)
+		err := db.Raw(fmt.Sprintf(`SELECT COUNT(*) FROM %s x WHERE x.%s IS NOT NULL AND (x.%s IS DISTINCT FROM ? OR x.%s IS DISTINCT FROM ?) AND NOT EXISTS
+          (SELECT 1 FROM embedding_campaign_exceptions e WHERE e.campaign_id=? AND e.surface_key=? AND e.target_id=x.%s::text AND e.status='waived' AND e.waiver_expires>now())`, s.Table, s.VecCol, s.ProducerIDCol, s.SpaceIDCol, s.IDCol), campaignExpectedProducer(c, s), c.TargetSpaceID, c.ID, s.Key).Scan(&n).Error
+		if err != nil {
+			return -1
+		}
 		total += n
 	}
 	return total

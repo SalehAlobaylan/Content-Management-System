@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"net/http"
@@ -1036,27 +1037,36 @@ func relatedCandidatesForPage(db, activeStories *gorm.DB, storyIDs []uuid.UUID, 
 // Self-contained — fetches the one centroid it needs (the bulk topic load
 // deliberately skips centroids; see topicMetaColumns).
 func relatedKNNIDs(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) []uuid.UUID {
+	ids, _ := relatedKNNIDsChecked(db, tenantID, storyID, limit)
+	return ids
+}
+
+func relatedKNNIDsChecked(db *gorm.DB, tenantID string, storyID uuid.UUID, limit int) ([]uuid.UUID, error) {
 	var anchor struct {
 		Embedding string
 		SpaceID   string
 	}
-	feedstate.ActiveNewsStoryQuery(db, tenantID).
+	if err := feedstate.ActiveNewsStoryQuery(db, tenantID).
 		Select("embedding::text AS embedding, embedding_space_id AS space_id").
 		Where("public_id = ? AND embedding IS NOT NULL AND embedding_space_id IS NOT NULL", storyID).
-		Scan(&anchor)
+		Scan(&anchor).Error; err != nil {
+		return nil, err
+	}
 	if anchor.Embedding == "" || anchor.SpaceID == "" {
-		return nil
+		return nil, nil
 	}
 	relatedFloor := time.Now().AddDate(0, 0, -storyRelatedWindowDays)
 	var relIDs []uuid.UUID
-	feedstate.ActiveNewsStoryQuery(db, tenantID).
+	if err := feedstate.ActiveNewsStoryQuery(db, tenantID).
 		Where("tenant_id = ? AND public_id != ? AND embedding IS NOT NULL AND embedding_space_id = ? AND article_count > 0", tenantID, storyID, anchor.SpaceID).
 		Where("last_member_at IS NULL OR last_member_at > ?", relatedFloor).
 		Where("embedding <=> '"+anchor.Embedding+"' <= ?", 1-storyRelatedMinSimilarity).
 		Order("embedding <=> '"+anchor.Embedding+"'").
 		Limit(limit).
-		Pluck("public_id", &relIDs)
-	return relIDs
+		Pluck("public_id", &relIDs).Error; err != nil {
+		return nil, err
+	}
+	return relIDs, nil
 }
 
 // leadSummariesByStory hydrates summaries for a SET of stories in one query:
@@ -1685,8 +1695,12 @@ func normalizeStoryCategory(category string) string {
 // (pure quality knob — disabled means centroid order, still precomputed).
 // Best-effort: any failure leaves the previous list in place.
 func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
+	_ = refreshStoryRelatedChecked(db, tenantID, storyID)
+}
+
+func refreshStoryRelatedChecked(db *gorm.DB, tenantID string, storyID uuid.UUID) error {
 	if _, busy := storyRelatedRefreshInFlight.LoadOrStore(storyID, true); busy {
-		return
+		return fmt.Errorf("related-story refresh already running")
 	}
 	defer storyRelatedRefreshInFlight.Delete(storyID)
 
@@ -1694,13 +1708,16 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 	defer func() { <-storyRelatedWorkers }()
 	scope, err := feedstate.CaptureNewsMetadataScope(db, tenantID, storyID)
 	if err != nil {
-		return
+		return err
 	}
 
 	// NOTE: an empty result is STORED (as []) — "computed, nothing genuinely
 	// related" is a real answer that stops the read path from re-running a
 	// live kNN for this story on every request.
-	ids := relatedKNNIDs(db, tenantID, storyID, storyRelatedPoolLimit*2)
+	ids, err := relatedKNNIDsChecked(db, tenantID, storyID, storyRelatedPoolLimit*2)
+	if err != nil {
+		return err
+	}
 
 	if loadTenantConfig(db, tenantID).NewsRerankEnabled && len(ids) > 1 {
 		// Hydrate candidate + self summaries in ONE batched query, rerank
@@ -1745,9 +1762,9 @@ func refreshStoryRelated(db *gorm.DB, tenantID string, storyID uuid.UUID) {
 	}
 	data, err := json.Marshal(raw)
 	if err != nil {
-		return
+		return err
 	}
-	_ = feedstate.WriteNewsMetadata(db, tenantID, storyID, scope, map[string]any{"related_ids": datatypes.JSON(data)})
+	return feedstate.WriteNewsMetadata(db, tenantID, storyID, scope, map[string]any{"related_ids": datatypes.JSON(data)})
 }
 
 type storyRerankResponse struct {

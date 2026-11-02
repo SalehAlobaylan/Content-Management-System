@@ -1,0 +1,5 @@
+[
+  {"title":"خبر اليوم","excerpt":"تفاصيل","body":"تفاصيل الخبر https://example.test/x\nالمزيد","transcript":"","expected":"خبر اليوم تفاصيل الخبر المزيد"},
+  {"title":"حلقة","excerpt":"مقدمة","body":"وصف  الحلقة","transcript":"نص الحوار","expected":"حلقة نص الحوار وصف الحلقة مقدمة"},
+  {"title":"Hello 😀","excerpt":"Summary","body":"Body\nwith  spaces","transcript":"","expected":"Hello 😀 Body with spaces Summary"}
+]

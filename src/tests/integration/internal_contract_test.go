@@ -43,6 +43,29 @@ func internalRequest(t *testing.T, method, path string, body any, token string) 
 
 func TestInternalServiceAuthAndReplaySafeWritebackContract(t *testing.T) {
 	clearWahbTables()
+	imageModel := "clip-ViT-B-32"
+	imageRevision := strings.Repeat("a", 40)
+	imageSpaceID := (spaceid.Basis{
+		Model: imageModel, Revision: imageRevision, Dimensions: 512,
+		Normalized: true, Pooling: "clip-visual-proj",
+	}).SpaceID()
+	imageProducerID := spaceid.ProducerID(imageSpaceID, spaceid.RecipeContentImage)
+	media := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer media-model-test-token" {
+			t.Errorf("unexpected model identity request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{{
+			"name": imageModel, "type": "clip", "loaded": true,
+			"revision": imageRevision, "dimensions": 512, "normalized": true,
+			"pooling": "clip-visual-proj", "space_id": imageSpaceID,
+			"producer_recipe": spaceid.RecipeContentImage, "producer_id": imageProducerID,
+		}}})
+	}))
+	t.Cleanup(media.Close)
+	t.Setenv("MEDIA_BASE_URL", media.URL)
+	t.Setenv("MEDIA_SERVICE_TOKEN", "media-model-test-token")
 
 	if response := internalRequest(t, http.MethodPost, "/internal/content-items", map[string]string{}, ""); response.Code != http.StatusUnauthorized {
 		t.Fatalf("missing internal token: want 401, got %d", response.Code)
@@ -91,18 +114,26 @@ func TestInternalServiceAuthAndReplaySafeWritebackContract(t *testing.T) {
 	}
 
 	imageEmbedding := make([]float32, 512)
-	imageSpaceID := "image-space-v1"
 	if denied := internalRequest(t, http.MethodPatch, "/internal/content-items/"+created.ID+"/image-embedding", map[string]any{}, integrationAggregationToken); denied.Code != http.StatusForbidden {
 		t.Fatalf("Aggregation must not write image vectors: want 403, got %d", denied.Code)
 	}
-	writeback := internalRequest(t, http.MethodPatch, "/internal/content-items/"+created.ID+"/image-embedding", map[string]any{
+	if missing := internalRequest(t, http.MethodPatch, "/internal/content-items/"+created.ID+"/image-embedding", map[string]any{
+		"embedding": imageEmbedding, "model": imageModel,
+	}, integrationMediaToken); missing.Code != http.StatusConflict {
+		t.Fatalf("missing image provenance: want 409, got %d: %s", missing.Code, missing.Body.String())
+	}
+	writebackPayload := map[string]any{
 		"embedding":   imageEmbedding,
-		"model":       "clip-ViT-B-32",
+		"model":       imageModel,
 		"space_id":    imageSpaceID,
-		"producer_id": spaceid.ProducerID(imageSpaceID, spaceid.RecipeContentImage),
-	}, integrationMediaToken)
+		"producer_id": imageProducerID,
+	}
+	writeback := internalRequest(t, http.MethodPatch, "/internal/content-items/"+created.ID+"/image-embedding", writebackPayload, integrationMediaToken)
 	if writeback.Code != http.StatusOK {
 		t.Fatalf("image provenance writeback: want 200, got %d: %s", writeback.Code, writeback.Body.String())
+	}
+	if replay := internalRequest(t, http.MethodPatch, "/internal/content-items/"+created.ID+"/image-embedding", writebackPayload, integrationMediaToken); replay.Code != http.StatusOK {
+		t.Fatalf("image provenance replay: want 200, got %d: %s", replay.Code, replay.Body.String())
 	}
 
 	id, err := uuid.Parse(created.ID)
@@ -113,7 +144,9 @@ func TestInternalServiceAuthAndReplaySafeWritebackContract(t *testing.T) {
 	if err := testDB.Where("public_id = ?", id).First(&stored).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stored.ImageEmbedding == nil || stored.ImageEmbeddingSpaceID == nil || *stored.ImageEmbeddingSpaceID == "" || stored.ImageEmbeddingProducerID == nil || *stored.ImageEmbeddingProducerID == "" {
+	if stored.ImageEmbedding == nil || stored.ImageEmbeddingModel == nil || *stored.ImageEmbeddingModel != imageModel ||
+		stored.ImageEmbeddingSpaceID == nil || *stored.ImageEmbeddingSpaceID != imageSpaceID ||
+		stored.ImageEmbeddingProducerID == nil || *stored.ImageEmbeddingProducerID != imageProducerID {
 		t.Fatalf("image provenance was not persisted: %#v", stored)
 	}
 

@@ -260,6 +260,10 @@ func triggerImageEmbedding(imageURL string, contentID string, contexts ...AISpen
 	writer := multipart.NewWriter(&buf)
 	spendJSON, _ := json.Marshal(firstSpendContext(contexts))
 	_ = writer.WriteField("spend_context_json", string(spendJSON))
+	if correlation := firstSpendContext(contexts).embeddingCampaign; correlation != nil {
+		raw, _ := json.Marshal(correlation)
+		_ = writer.WriteField("embedding_campaign_json", string(raw))
+	}
 	writer.WriteField("url", imageURL)
 	writer.WriteField("content_id", contentID)
 	writer.Close()
@@ -897,6 +901,9 @@ func triggerEmbedding(text string, contentID string, contexts ...AISpendContext)
 	}
 
 	payload["spend_context"] = firstSpendContext(contexts)
+	if correlation := firstSpendContext(contexts).embeddingCampaign; correlation != nil {
+		payload["embedding_campaign"] = correlation
+	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal embedding request: %w", err)

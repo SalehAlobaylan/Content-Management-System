@@ -35,6 +35,22 @@ func tickEmbeddingCampaigns(db *gorm.DB) {
 		}
 	}()
 
+	release, acquired := tryEmbeddingAdvisoryLock(db)
+	if !acquired {
+		return
+	}
+	defer release()
+	var unfinished []models.EmbeddingCampaign
+	if db.Where("state IN ?", []string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying, models.EmbeddingCampaignPaused, models.EmbeddingCampaignBlocked, models.EmbeddingCampaignAborted}).Where("EXISTS (SELECT 1 FROM embedding_campaign_actions a WHERE a.campaign_id=embedding_campaigns.id AND a.status=?)", models.EmbeddingActionAttempted).Find(&unfinished).Error != nil {
+		return
+	}
+	for i := range unfinished {
+		if err := recoverCampaignActions(db, &unfinished[i]); err != nil {
+			log.Printf("embedding campaign recovery: %v", err)
+			return
+		}
+	}
+
 	var policy models.EmbeddingLifecyclePolicy
 	if err := db.Where("tenant_id = ?", embeddingLifecycleTenant).First(&policy).Error; err != nil {
 		return
@@ -63,6 +79,14 @@ func tickEmbeddingCampaigns(db *gorm.DB) {
 	db.Where("state = ?", models.EmbeddingCampaignVerifying).Find(&verifying)
 	for i := range verifying {
 		advanceCampaignVerification(db, &verifying[i])
+	}
+	var counters []models.EmbeddingCampaign
+	db.Where("state IN ?", []string{models.EmbeddingCampaignRunning, models.EmbeddingCampaignVerifying, models.EmbeddingCampaignPaused, models.EmbeddingCampaignBlocked, models.EmbeddingCampaignCompleted, models.EmbeddingCampaignCompletedWithWaiver}).Find(&counters)
+	for _, c := range counters {
+		db.Exec(`UPDATE embedding_campaigns SET
+          completed_count=(SELECT COUNT(*) FROM embedding_campaign_actions WHERE campaign_id=? AND status='completed'),
+          failed_count=(SELECT COUNT(*) FROM embedding_campaign_actions WHERE campaign_id=? AND status='failed'),
+          skipped_count=(SELECT COUNT(*) FROM embedding_campaign_actions WHERE campaign_id=? AND status='skipped') WHERE id=?`, c.ID, c.ID, c.ID, c.ID)
 	}
 }
 

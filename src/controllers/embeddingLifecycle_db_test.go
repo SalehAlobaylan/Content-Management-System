@@ -98,12 +98,12 @@ func TestUniqueActionOwnership(t *testing.T) {
 }
 
 // TestFenceEmbeddingWrite proves the write fence blocks stale/missing producers
-// only while a campaign is running, and never otherwise.
+// in every state, including outside a campaign.
 func TestFenceEmbeddingWrite(t *testing.T) {
 	db := embeddingLifecycleTestDB(t)
-	// No campaign → never blocked.
-	if _, blocked := fenceEmbeddingWrite(db, "text", "content-title-excerpt-body:v1", "", ""); blocked {
-		t.Fatal("no active campaign must never block a write")
+	// Missing provenance is never accepted.
+	if _, blocked := fenceEmbeddingWrite(db, "text", "content-title-transcript-body-excerpt:v2", "", ""); !blocked {
+		t.Fatal("missing identity must be blocked even without a campaign")
 	}
 	// Running campaign → fence active.
 	camp := models.EmbeddingCampaign{TenantID: "default", Space: "text", State: models.EmbeddingCampaignRunning, TargetSpaceID: "space-1"}

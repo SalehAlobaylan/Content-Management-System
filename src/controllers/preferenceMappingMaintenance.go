@@ -77,6 +77,18 @@ type mapSweepResult struct {
 	EmptyCatalog    bool
 }
 
+// A partial target-space catalog must not prune existing topic mappings. Keep
+// dirty flags and cursors intact until every active topic can participate.
+func topicMappingReady(db *gorm.DB, tenantID, spaceID string) (bool, error) {
+	if strings.TrimSpace(spaceID) == "" {
+		return false, nil
+	}
+	var pending int64
+	err := db.Model(&models.Topic{}).Where("tenant_id=? AND active=?", tenantID, true).
+		Where("centroid IS NULL OR centroid_space_id IS DISTINCT FROM ?", spaceID).Count(&pending).Error
+	return pending == 0 && err == nil, err
+}
+
 // itemTopicMapping and storyTopicMapping keep one subject's complete desired
 // top-K set together so a bounded page can be replaced in a handful of database
 // round trips. The caller wraps replacement in a transaction, so observers never
@@ -251,6 +263,10 @@ func sweepDirtyTopics(db *gorm.DB, tenantID string, maxDirty, itemCap, storyCap 
 	res := dirtySweepResult{NextItemCursor: itemCursor, NextStoryCursor: storyCursor}
 	if maxDirty <= 0 {
 		return res, nil
+	}
+	ready, err := topicMappingReady(db, tenantID, currentTextSpaceIDForSimilarity())
+	if err != nil || !ready {
+		return res, err
 	}
 	var dirty []models.Topic
 	if err := db.Where("tenant_id = ? AND needs_remap = ?", tenantID, true).

@@ -2,7 +2,6 @@ package controllers
 
 import (
 	"content-management-system/src/models"
-	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -47,30 +46,12 @@ func finishPreferenceAutopilotRun(tenantID string) {
 	delete(preferenceAutopilotRunInFlight, tenantID)
 }
 
-// tryAcquirePreferenceAutopilotLock holds a PostgreSQL session advisory lock
-// for one tenant's complete maintenance pass. The connection owns the lock, so
-// a crashed replica or lost connection releases it automatically.
+// Hold the owner's tenant lock in a real transaction so Neon transaction
+// pooling preserves backend ownership for both scheduled and campaign callers.
 func tryAcquirePreferenceAutopilotLock(db *gorm.DB, tenantID string) (func(), bool) {
-	sqlDB, err := db.DB()
-	if err != nil {
-		return func() {}, false
-	}
-	conn, err := sqlDB.Conn(context.Background())
-	if err != nil {
-		return func() {}, false
-	}
 	h := fnv.New64a()
-	_, _ = h.Write([]byte("preferences-autopilot/v1/" + tenantID))
-	key := int64(h.Sum64())
-	var acquired bool
-	if err := conn.QueryRowContext(context.Background(), "SELECT pg_try_advisory_lock($1)", key).Scan(&acquired); err != nil || !acquired {
-		_ = conn.Close()
-		return func() {}, false
-	}
-	return func() {
-		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
-		_ = conn.Close()
-	}, true
+	_, _ = h.Write([]byte("preferences-autopilot/v2/" + tenantID))
+	return tryTransactionAdvisoryLock(db, int64(h.Sum64()))
 }
 
 // ----------------------------------------------------------------
