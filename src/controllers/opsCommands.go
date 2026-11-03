@@ -263,7 +263,7 @@ func PreviewOpsCommand(c *gin.Context) {
 			configured++
 		}
 	}
-	c.JSON(200, gin.H{"data": gin.H{"snapshot_at": now, "target_digest": opsTargetsDigest(scope, targets), "targets": targets, "target_count": configured, "scope": scope, "expires_at": now.Add(opsCommandFreshness), "excluded": []string{"Services and queues", "In-flight work", "Workload protection", "Ranking Intelligence", "Storage operations", "Atomization execution", "System Health observation (only containment is pausable)"}}})
+	c.JSON(200, gin.H{"data": gin.H{"snapshot_at": now, "target_digest": opsTargetsDigest(scope, targets), "targets": targets, "target_count": configured, "scope": scope, "expires_at": now.Add(opsCommandFreshness), "excluded": []string{"Services and queues", "In-flight work", "Workload protection", "Ranking Intelligence", "Storage operations", "Atomization execution", "Pods pipeline (use its own Pause/Resume controls)", "System Health observation (only containment is pausable)"}}})
 }
 
 func opsWriteAudit(tx *gorm.DB, principal utils.AdminPrincipal, action, resource, status string, payload any) error {

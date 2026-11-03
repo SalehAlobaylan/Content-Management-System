@@ -20,6 +20,12 @@ type LocalMigrationPolicy struct{ Checksum, WorkScope string }
 // Maintainer policy, not an operator setting. Each entry records review of the
 // exact canonical SQL bytes; it does not approve execution or destructive SQL.
 var localMigrationPolicies = map[string]LocalMigrationPolicy{
+	// Catalog changes preserve processing history. The older workload migration
+	// retains conservative owner reconciliation rather than relaxed qualification.
+	"20261020010000_workload_governor.sql":      {"739b6f0ed8cd197164cdb5394dbaa0226758ec3f0d61b91f776c7a5ccae9d786", RequiresOwnerReconciliation},
+	"20261102010000_reference_catalog.sql":      {"ac99195e0500767fb4affcfe137ba32c93a6f219f0ca744c48510d800e601de9", PreservesExpiredProcessingHistory},
+	"20261102020000_reference_source_types.sql": {"88981ba5090ab183d5842bb63f1ddd31c1cc14f37de95e5cd8f5e134286f7c99", PreservesExpiredProcessingHistory},
+	"20261103010000_news_source_activation.sql": {"858fc867e8af3add104ed70d63337979a3f4b50f7e0cfc92f631e26137117b41", PreservesExpiredProcessingHistory},
 	// Redundancy tables/indexes only; no processing attempt/history is changed.
 	"20261019010000_redundancy_hygiene_completion.sql":               {"8f5fa8bc2f235312ef7b19d52cce586d45af2e0f654b83fa64c17d9ef266773b", PreservesExpiredProcessingHistory},
 	"20261018020000_supply_owner_recovery.sql":                       {"bbfe3d0612715cd63e7fc872e728877fa6b64c80cfb185ac33e0b90dcd1b94ab", PreservesExpiredProcessingHistory},

@@ -20,7 +20,7 @@ const queuedAdmissionYieldAfter = 5 * time.Minute
 type Slot struct {
 	Singleton            bool `gorm:"primaryKey"`
 	TenantID             *string
-	RootContentItemID    *uuid.UUID
+	RootContentItemID    *uuid.UUID `gorm:"type:uuid"`
 	ProcessingGeneration int64
 	Epoch                int64
 	UpdatedAt            time.Time
@@ -30,7 +30,7 @@ func (Slot) TableName() string { return "pods_episode_execution_slot" }
 
 type Disposition struct {
 	TenantID             string    `gorm:"primaryKey" json:"tenant_id"`
-	RootContentItemID    uuid.UUID `gorm:"primaryKey" json:"root_content_item_id"`
+	RootContentItemID    uuid.UUID `gorm:"type:uuid;primaryKey" json:"root_content_item_id"`
 	ProcessingGeneration int64     `gorm:"primaryKey" json:"processing_generation"`
 	Disposition          string    `json:"disposition"`
 	Reason               string    `json:"reason"`

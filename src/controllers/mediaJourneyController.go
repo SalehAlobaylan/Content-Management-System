@@ -309,7 +309,7 @@ func AdminGetMediaJourney(c *gin.Context) {
 		for _, state := range unitStates {
 			states[state.State] = state.Count
 		}
-		steps[5] = journeyCuttingState(states)
+		steps[5] = journeyCuttingState(states, byStage[models.ContentStagePodsAtomization])
 		for _, unit := range unitStates {
 			if unit.StartedAt != nil && (steps[5].StartedAt == nil || unit.StartedAt.Before(*steps[5].StartedAt)) {
 				steps[5].StartedAt = unit.StartedAt
@@ -531,7 +531,7 @@ func journeyActions(item mediaAtomizationPipelineItem, principal utils.AdminPrin
 	return actions
 }
 
-func journeyCuttingState(states map[string]int64) mediaJourneyStep {
+func journeyCuttingState(states map[string]int64, request *models.ContentStageRequest) mediaJourneyStep {
 	s := mediaJourneyStep{Key: "cutting", Required: true, State: "queued", Reason: "awaiting_execution"}
 	switch {
 	case states["uncertain"]+states["reconciling"] > 0:
@@ -540,6 +540,14 @@ func journeyCuttingState(states map[string]int64) mediaJourneyStep {
 		s.State, s.Reason = "failed", "cutting_failed"
 	case states["running"]+states["verifying"] > 0:
 		s.State, s.Reason = "running", "cutting"
+	}
+	// A frozen plan does not prove its executor is still queued. Surface the
+	// owner's failure/reconciliation/deferral when no unit is in progress.
+	if s.State == "queued" && request != nil {
+		owner := journeyStage("cutting", request)
+		if owner.State == "failed" || owner.State == "reconciling" || owner.State == "waiting" {
+			s.State, s.Reason, s.WaitingCategory = owner.State, owner.Reason, owner.WaitingCategory
+		}
 	}
 	return s
 }

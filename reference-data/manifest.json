@@ -1,0 +1,58 @@
+{
+  "format_version": 1,
+  "catalog_name": "wahb",
+  "release_version": "1.0.0",
+  "required_migration": "20261102020000_reference_source_types.sql",
+  "files": {
+    "discovery-profiles.json": "ce40f7300177f94e74fdeaa2e57e6acb0a925d043d0338ceb0150cb4d55f807d",
+    "media-sources.json": "c9d3eaf4949fe1b6eaaaf460be1155576958c643baa12a1174d0f8268aee4dbc",
+    "news-sources.json": "3c5bbb564a438a073990baed999c5721fdfbf7b6931d7f0b6294af27185471dd",
+    "quality-profiles.json": "0f444a408bd2f7afec1455263d77af5e0d24abc793f6078e9112c4655f353abe",
+    "topic-categories.json": "b98482ce1f469990b20045c25a16d50a598cf057680228469536673d919cc221",
+    "topics.json": "ebf7a97823e3cd0d29a140895aef755ad23e57805a5e9828b08a538d5390d280"
+  },
+  "origins": {
+    "media-discovery": {
+      "environment": "dev",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:04Z",
+      "projection_hash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    "media-sources": {
+      "environment": "dev",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:04Z",
+      "projection_hash": "c9d3eaf4949fe1b6eaaaf460be1155576958c643baa12a1174d0f8268aee4dbc"
+    },
+    "news-discovery": {
+      "environment": "stable",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:02Z",
+      "projection_hash": "ce40f7300177f94e74fdeaa2e57e6acb0a925d043d0338ceb0150cb4d55f807d"
+    },
+    "news-sources": {
+      "environment": "stable",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:02Z",
+      "projection_hash": "3c5bbb564a438a073990baed999c5721fdfbf7b6931d7f0b6294af27185471dd"
+    },
+    "quality-profiles": {
+      "environment": "stable",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:02Z",
+      "projection_hash": "0f444a408bd2f7afec1455263d77af5e0d24abc793f6078e9112c4655f353abe"
+    },
+    "topic-categories": {
+      "environment": "stable",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:02Z",
+      "projection_hash": "b98482ce1f469990b20045c25a16d50a598cf057680228469536673d919cc221"
+    },
+    "topics": {
+      "environment": "stable",
+      "tenant": "default",
+      "captured_at": "2026-11-02T15:53:02Z",
+      "projection_hash": "ebf7a97823e3cd0d29a140895aef755ad23e57805a5e9828b08a538d5390d280"
+    }
+  }
+}

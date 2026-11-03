@@ -1,6 +1,7 @@
 package contentstage
 
 import (
+	"content-management-system/src/podscontrol"
 	"content-management-system/src/podsflow"
 	"encoding/json"
 	"fmt"
@@ -1930,6 +1931,14 @@ func reduceReadiness(tx *gorm.DB, tenantID string, contentID uuid.UUID, generati
 	}
 	if item.Status == next && !publishChild {
 		return nil
+	}
+	// A final proof may arrive after pause. Retain it, but hold a new raw
+	// publication until the same lane control permits publishing again.
+	if laneForType(item.Type) == models.ContentStageLanePods && next == models.ContentStatusReady && item.ParentContentItemID == nil && item.IsFeedUnit && item.FeedVisibility == "visible" {
+		allowed, err := podscontrol.Allowed(tx, tenantID)
+		if err != nil || !allowed {
+			return err
+		}
 	}
 	item.Status = next
 	if publishChild {

@@ -49,8 +49,15 @@ func TestActivateEmptyBootstrapContentStagesPromotesBothLanes(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT count\(\*\) FROM "content_items"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectQuery(`SELECT count\(\*\) FROM "content_sources"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectQuery(`SELECT count\(\*\) FROM "source_run_requests"`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec(`UPDATE content_stage_cutovers`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "news").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE content_stage_cutovers`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), "pods").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT epoch FROM source_run_admission_protocol`).WillReturnRows(sqlmock.NewRows([]string{"epoch"}).AddRow("compatibility"))
+	mock.ExpectExec(`UPDATE source_run_admission_protocol`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	for _, lane := range []string{"news", "media"} {
+		mock.ExpectExec(`INSERT INTO source_run_admission_cutovers`).WithArgs(lane, sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
+	}
+	mock.ExpectExec(`INSERT INTO source_run_cutover_audit_events`).WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	if err := activateEmptyBootstrapContentStages(db); err != nil {
@@ -480,5 +487,39 @@ func TestAppliedVersionsReadsLegacyChecksumEvidenceWithoutChangingLedger(t *test
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestEmptyBootstrapRefusesSourceInventoryOrRunHistory(t *testing.T) {
+	for _, populated := range []string{"content_sources", "source_run_requests"} {
+		t.Run(populated, func(t *testing.T) {
+			sqlDB, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqlDB.Close()
+			db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mock.ExpectBegin()
+			for _, table := range []string{"content_items", "content_sources", "source_run_requests"} {
+				n := 0
+				if table == populated {
+					n = 1
+				}
+				mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM "` + table + `"`)).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+				if n == 1 {
+					break
+				}
+			}
+			mock.ExpectRollback()
+			if err = activateEmptyBootstrapContentStages(db); err == nil || !strings.Contains(err.Error(), populated+" contains 1 row") {
+				t.Fatal("populated bootstrap was not refused", err)
+			}
+			if err = mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

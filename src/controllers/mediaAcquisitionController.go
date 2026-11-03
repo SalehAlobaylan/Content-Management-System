@@ -3,8 +3,11 @@ package controllers
 import (
 	"content-management-system/src/contentstage"
 	"content-management-system/src/models"
+	"errors"
 	"net/http"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -32,7 +35,11 @@ func GetMediaAcquisitionConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to load media acquisition config", Code: "FETCH_FAILED"})
 		return
 	}
-	c.JSON(http.StatusOK, value)
+	c.JSON(http.StatusOK, struct {
+		models.MediaAcquisitionConfig
+		CanManage   bool   `json:"can_manage"`
+		Environment string `json:"environment"`
+	}{value, principal.HasPermission("content:write"), os.Getenv("WAHB_ENVIRONMENT_ID")})
 }
 
 func UpdateMediaAcquisitionConfig(c *gin.Context) {
@@ -41,8 +48,9 @@ func UpdateMediaAcquisitionConfig(c *gin.Context) {
 		return
 	}
 	var req struct {
-		DefaultMode            *string `json:"default_mode"`
-		PodsSourceRunItemLimit *int    `json:"pods_source_run_item_limit"`
+		DefaultMode            *string    `json:"default_mode"`
+		PodsSourceRunItemLimit *int       `json:"pods_source_run_item_limit"`
+		ExpectedUpdatedAt      *time.Time `json:"expected_updated_at"`
 	}
 	if c.ShouldBindJSON(&req) != nil {
 		c.JSON(http.StatusBadRequest, authErrorResponse{Message: "Invalid request", Code: "INVALID_REQUEST"})
@@ -66,11 +74,18 @@ func UpdateMediaAcquisitionConfig(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var value models.MediaAcquisitionConfig
+	conflict := errors.New("Processing settings changed; refresh the saved values before applying your draft")
 	err := db.Transaction(func(tx *gorm.DB) error {
 		var err error
 		value, err = getMediaAcquisitionConfig(tx, principal.TenantID)
 		if err != nil {
 			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=?", principal.TenantID).First(&value).Error; err != nil {
+			return err
+		}
+		if req.ExpectedUpdatedAt != nil && !value.UpdatedAt.Equal(*req.ExpectedUpdatedAt) {
+			return conflict
 		}
 		if req.DefaultMode != nil {
 			value.DefaultMode = mode
@@ -96,10 +111,18 @@ func UpdateMediaAcquisitionConfig(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, conflict) {
+			c.JSON(http.StatusConflict, authErrorResponse{Message: conflict.Error(), Code: "SETTINGS_CHANGED"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, authErrorResponse{Message: "Failed to update media acquisition config", Code: "UPDATE_FAILED"})
 		return
 	}
-	c.JSON(http.StatusOK, value)
+	c.JSON(http.StatusOK, struct {
+		models.MediaAcquisitionConfig
+		CanManage   bool   `json:"can_manage"`
+		Environment string `json:"environment"`
+	}{value, principal.HasPermission("content:write"), os.Getenv("WAHB_ENVIRONMENT_ID")})
 }
 
 func RequestMediaAcquisition(c *gin.Context) {

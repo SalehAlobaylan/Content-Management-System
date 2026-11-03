@@ -108,6 +108,10 @@ func runWorkerOnce(db *gorm.DB, classify ClassifyFunc) {
 		log.Printf("content-stage generation activation failed: %v", err)
 		return
 	}
+	if err := reconcileHeldPodsPublications(db); err != nil {
+		log.Printf("content-stage held Pods publication failed: %v", err)
+		return
+	}
 	for index := 0; index < verificationBatchPerTick; index++ {
 		found, err := VerifyShadowOne(db)
 		if err != nil {

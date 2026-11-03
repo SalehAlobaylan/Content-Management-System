@@ -30,6 +30,26 @@ func TestActivationRequiresReadyEditoriallyAdmittedChildren(t *testing.T) {
 	}
 }
 
+func TestAutomationPauseHoldsGenerationActivationBeforeAnyPublicationWrite(t *testing.T) {
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	db, err := gorm.Open(postgres.New(postgres.Config{Conn: sqlDB}), &gorm.Config{SkipDefaultTransaction: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectExec("SELECT pg_advisory_xact_lock_shared").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT .*content_stage_controls").WillReturnRows(sqlmock.NewRows([]string{"tenant_id", "lane", "scheduling_enabled", "execution_enabled"}).AddRow("tenant-a", "pods", false, false))
+	if err := ActivateReady(db, models.ContentItem{TenantID: "tenant-a", PublicID: uuid.New()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPartialUploadRecoveryStopsAtAttemptLimit(t *testing.T) {
 	sqlDB, mock, err := sqlmock.New()
 	if err != nil {

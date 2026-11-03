@@ -1,0 +1,721 @@
+[
+  {
+    "key": "news.sources.00152cd441e4c65955ca",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "SPAeconomic"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/SPAeconomic",
+      "image_url": "https://pbs.twimg.com/profile_images/1312742731194793984/88-QUojp_200x200.jpg",
+      "metadata": {},
+      "name": "@SPAeconomic",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.01340cdef61f12f7e4c8",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/media_ksa",
+      "image_url": "https://pbs.twimg.com/profile_images/2061736082937458688/ryytCgno_400x400.jpg",
+      "metadata": {},
+      "name": "media_ksa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.017206118b47643fa6a1",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/spaeconomic",
+      "image_url": "https://pbs.twimg.com/profile_images/1312742731194793984/88-QUojp_400x400.jpg",
+      "metadata": {},
+      "name": "spaeconomic",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.b2969bb12930a46aa56e"
+  },
+  {
+    "key": "news.sources.09598e9c3b15da56bf3e",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.unlimit-tech.com/feed/",
+      "image_url": "https://www.unlimit-tech.com/wp-content/uploads/cropped-favicon-32x32.png",
+      "metadata": {},
+      "name": "أنليميتد تك",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.fe5607d9e67a89c4f345"
+  },
+  {
+    "key": "news.sources.0a66befc424c1551a533",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://arabic.sport360.com/feed",
+      "image_url": null,
+      "metadata": {},
+      "name": "سبورت 360 عربية",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.ef0420449068da570ef8"
+  },
+  {
+    "key": "news.sources.14abf2b596f33089a62e",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/ajarabic",
+      "image_url": "https://pbs.twimg.com/profile_images/1057294709280788480/nKrtTjSc_400x400.jpg",
+      "metadata": {},
+      "name": "ajarabic",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.14bbe425c2369cfc90a4",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "AlHadath"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/AlHadath",
+      "image_url": "https://pbs.twimg.com/profile_images/1728142260775108608/-rIPG6PV_200x200.jpg",
+      "metadata": {},
+      "name": "@AlHadath",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.18a7b6820d7f5d2b0eab",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/emoroor",
+      "image_url": null,
+      "metadata": {},
+      "name": "emoroor",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.1c568cfbb413b54ff5d6",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/ppgovsa",
+      "image_url": null,
+      "metadata": {},
+      "name": "ppgovsa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.1cd162b1d7f91d68b87a",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "Eyaaaad"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/Eyaaaad",
+      "image_url": "https://pbs.twimg.com/profile_images/1617557465997918210/wRkbwWP0_200x200.jpg",
+      "metadata": {},
+      "name": "@Eyaaaad",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.1cf326a1db0fb78fe4f6",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "channel_username": "@saudinews50",
+        "max_age_hours": 24,
+        "max_results": 100,
+        "media_types": [
+          "text"
+        ],
+        "min_text_length": 10
+      },
+      "category": "news",
+      "feed_url": "https://t.me/saudinews50",
+      "image_url": "https://cdn4.telesco.pe/file/ga35sfSAs1tfDWAmb-8NroQCmxyvThAYkZey40E9rWjllzYhLcqL7vrGxApve7VyvnJBkW-zT08tsFNPz7tqP2_muV0fvTWiOMwxyL5x6gLUYxc2Uq4P-vkJKluokDdYuHFiv5FqirtfNafDTs1CMP2QA2Blj8_2kCygvXtFx7hELiRxoTEoGHS962TKY3m0TR9iDdofEjxGfl4EeBjluP3cBLJBNt-XKr4f1EiBAWiMEunP71glo2Rct31KgeUhgfihRIZJQIzZ2Bm8bnaYJ6jW5OF4zQ-OJFC9UeID_r2GP5spbF7d7A36bk2fue7PYJB6kOtqcPqRbaNw4XZBgg.jpg",
+      "metadata": {},
+      "name": "أخبار السعودية",
+      "type": "TELEGRAM"
+    }
+  },
+  {
+    "key": "news.sources.2149283b63f6af8b97c4",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/moisaudiarabia",
+      "image_url": null,
+      "metadata": {},
+      "name": "moisaudiarabia",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.2cce6dd832d3174a9c20",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://sa.investing.com/rss/news.rss",
+      "image_url": null,
+      "metadata": {},
+      "name": "Investing عربية",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.b2969bb12930a46aa56e"
+  },
+  {
+    "key": "news.sources.3470fa2ca9a98eb11ecd",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "alrougui"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/alrougui",
+      "image_url": "https://pbs.twimg.com/profile_images/1621999837708173312/g1x5NCdB_200x200.jpg",
+      "metadata": {},
+      "name": "@alrougui",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.3638efdf68cc85bffb39",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.alhadath.net/.mrss/alhadath.xml",
+      "image_url": null,
+      "metadata": {},
+      "name": "الحدث الصفحة الرئيسية",
+      "type": "RSS"
+    }
+  },
+  {
+    "key": "news.sources.3b95b8de3adcde3b5484",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "spagov"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/spagov",
+      "image_url": "https://pbs.twimg.com/profile_images/1176417909054328832/9vRqF_-__200x200.jpg",
+      "metadata": {},
+      "name": "@spagov",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.4ebdd31f0211fb023f84",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://arabic.rt.com/rss/",
+      "image_url": null,
+      "metadata": {},
+      "name": "RT الروسية",
+      "type": "RSS"
+    }
+  },
+  {
+    "key": "news.sources.54780ea000c42fdc28de",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/alarabiya_brk",
+      "image_url": null,
+      "metadata": {},
+      "name": "alarabiya_brk",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.c3b561eac81c4c784419"
+  },
+  {
+    "key": "news.sources.56bd4c2c7d68cfbd7423",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/modgovksa",
+      "image_url": "https://pbs.twimg.com/profile_images/1607032803534716930/yUkGxZCe_400x400.jpg",
+      "metadata": {},
+      "name": "modgovksa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.572cc7544572792f9e73",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.tech-wd.com/wd/feed/",
+      "image_url": "https://www.tech-wd.com/wd/wp-content/uploads/2018/11/cropped-logo-32x32.png",
+      "metadata": {},
+      "name": "عالم التقنية",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.fe5607d9e67a89c4f345"
+  },
+  {
+    "key": "news.sources.58347f55b1337b184de0",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://arabic.cnn.com/api/v1/rss/rss.xml",
+      "image_url": null,
+      "metadata": {},
+      "name": "CNN Arabic RSS Feed",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.c8b718949fb1ca8a2434"
+  },
+  {
+    "key": "news.sources.5ca271904adfb8e45ae3",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://feeds.bbci.co.uk/arabic/rss.xml",
+      "image_url": "http://www.bbc.co.uk/arabic/images/gel/rss_logo.gif",
+      "metadata": {},
+      "name": "BBC عربي",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.c8b718949fb1ca8a2434"
+  },
+  {
+    "key": "news.sources.5ed92fd1e18fac1e3a0d",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "alekhbariyatv"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/alekhbariyatv",
+      "image_url": "https://pbs.twimg.com/profile_images/1991964810083196928/XfALjbw5_200x200.jpg",
+      "metadata": {},
+      "name": "@alekhbariyatv",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.645ee4e1260eb1cfcf67",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/kingsalman",
+      "image_url": null,
+      "metadata": {},
+      "name": "kingsalman",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.70c78425db0de82605a2",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.skynewsarabia.com/rss.xml",
+      "image_url": "https://www.skynewsarabia.com/asset/18.2.1/1643203811/images/sna_logo.png",
+      "metadata": {},
+      "name": "أخبار اليوم | سكاي نيوز عربية",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.c8b718949fb1ca8a2434"
+  },
+  {
+    "key": "news.sources.76672f53dcdcbdbc0c5e",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/ksamofa",
+      "image_url": null,
+      "metadata": {},
+      "name": "ksamofa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.7ba730b07bc3d4030b1c",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/mofksa",
+      "image_url": "https://pbs.twimg.com/profile_images/1498563900589101062/kyMXHGrd_400x400.jpg",
+      "metadata": {},
+      "name": "mofksa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.80197c98fe48d81e84fc",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/sparegions",
+      "image_url": "https://pbs.twimg.com/profile_images/1517944354572312576/-XX_V_3w_400x400.jpg",
+      "metadata": {},
+      "name": "sparegions",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.85a3168c3c4d89980554",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.france24.com/ar/%D8%A7%D9%84%D8%B4%D8%B1%D9%82-%D8%A7%D9%84%D8%A3%D9%88%D8%B3%D8%B7/rss",
+      "image_url": null,
+      "metadata": {},
+      "name": "فرانس24 — الشرق الأوسط",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.8a7bde292f574ca6a1ad",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/cgcsaudi",
+      "image_url": "https://pbs.twimg.com/profile_images/2061736170938048512/Cq9hBdVf_400x400.jpg",
+      "metadata": {},
+      "name": "cgcsaudi",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.9cd10f51dc2e82721f48",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/asharqnewsbrk",
+      "image_url": "https://pbs.twimg.com/profile_images/1693101761257521152/fWZIHaGm_400x400.jpg",
+      "metadata": {},
+      "name": "asharqnewsbrk",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.a0a7714c814ed2e719fc",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "AlArabiya"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/AlArabiya",
+      "image_url": "https://pbs.twimg.com/profile_images/2020559197470109696/ewLBQJzu_200x200.jpg",
+      "metadata": {},
+      "name": "@AlArabiya",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.b1fdecede49fa74f23fe",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "SPAregions"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/SPAregions",
+      "image_url": "https://pbs.twimg.com/profile_images/1517944354572312576/-XX_V_3w_200x200.jpg",
+      "metadata": {},
+      "name": "@SPAregions",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.b2c52f62963a63253402",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/ajelnews24",
+      "image_url": null,
+      "metadata": {},
+      "name": "ajelnews24",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.fe5607d9e67a89c4f345"
+  },
+  {
+    "key": "news.sources.bbdb2c3a2f8b2e2b2804",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/spa_sci",
+      "image_url": null,
+      "metadata": {},
+      "name": "spa_sci",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.fe5607d9e67a89c4f345"
+  },
+  {
+    "key": "news.sources.bd5409e0710918c96cb4",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "channel_username": "mounniis",
+        "max_results": 25,
+        "media_types": [
+          "audio",
+          "voice"
+        ],
+        "min_duration_sec": 120
+      },
+      "category": "news",
+      "feed_url": "https://t.me/mounniis",
+      "image_url": "https://cdn4.telesco.pe/file/HYNmgi4dyQ39Lx-wri80YQDozFt0856pET2vdor4xVslLQD4sHVhwjypUg183H-s9t8SvZaD51EimEmXtjVCJ-zAV9rDDYwHezawcrx4-zkEZMGk_k0jNRMipnBOkQ9SqpvV47VmQBFa-VYVWuBqTnVT5KjYfj-q4Jqkx8hHcdZ1ba-AnjQvdEXGAPPLSdWk-xH_-t7Gzh_qloOVFxXZL-PvftXdJ6PJ3bCTKP1Zm7yb4F7-1SFv5hKGtiiOuYbsqQYuMBiIbRZTDk5V9m-zpIg9IMLZwbgSBorxOl9I59m1xu5v5Ttann8jWX34L_wHEO49TByr4pg_l8mKqFfPBw.jpg",
+      "metadata": {},
+      "name": "مؤنس | كتب صوتية مقطعة",
+      "type": "TELEGRAM"
+    }
+  },
+  {
+    "key": "news.sources.bed991c2cc99d8fe33d5",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "mode": "scrape",
+        "username": "KSA24"
+      },
+      "category": "news",
+      "feed_url": "https://x.com/KSA24",
+      "image_url": "https://pbs.twimg.com/profile_images/2035448418592845824/65nIHU0g_200x200.jpg",
+      "metadata": {},
+      "name": "@KSA24",
+      "type": "TWITTER"
+    }
+  },
+  {
+    "key": "news.sources.c730c0eb8283b5f5080a",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/saudinews50",
+      "image_url": "https://pbs.twimg.com/profile_images/1351852829108015112/hR7fuFKQ_400x400.jpg",
+      "metadata": {},
+      "name": "saudinews50",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.de7a7dcf8936f94a7f10",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.independentarabia.com/rss.xml",
+      "image_url": "https://www.independentarabia.com/sites/default/files/logo-arabic.jpg",
+      "metadata": {},
+      "name": "اندبندنت عربية",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.c8b718949fb1ca8a2434"
+  },
+  {
+    "key": "news.sources.df00ad091e5785ee3b30",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.aljazeera.net/aljazeerarss/a7c186be-1baa-4bd4-9d80-a84db769f779/73d0e1b4-532f-45ef-b135-bfdff8b8cab9",
+      "image_url": "https://www.aljazeera.net/images/logo_aja.png",
+      "metadata": {},
+      "name": "الجزيرة نت",
+      "type": "RSS"
+    },
+    "discovery_profile_key": "discovery.profiles.c8b718949fb1ca8a2434"
+  },
+  {
+    "key": "news.sources.dfa6c55faf32f35cac8e",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/alhurranews",
+      "image_url": "https://pbs.twimg.com/profile_images/1838280199357468672/tguSag0z_400x400.jpg",
+      "metadata": {},
+      "name": "alhurranews",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.ee7af7096f60df7ff421",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/bbcarabic",
+      "image_url": null,
+      "metadata": {},
+      "name": "bbcarabic",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.f08d45933b9be56aab7d",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://www.alarabiya.net/feed/rss2/ar/arab-and-world.xml",
+      "image_url": null,
+      "metadata": {},
+      "name": "العربية | العالم العربي",
+      "type": "RSS"
+    }
+  },
+  {
+    "key": "news.sources.f86225d0c9b3fcbc51f8",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/mojksa",
+      "image_url": "https://pbs.twimg.com/profile_images/1177132404475142150/AkUUX8uD_400x400.jpg",
+      "metadata": {},
+      "name": "mojksa",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.fc9acf1b8b6d52cac64d",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/security_gov",
+      "image_url": null,
+      "metadata": {},
+      "name": "security_gov",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  },
+  {
+    "key": "news.sources.fe0cef1f5f31f7ecb4cc",
+    "kind": "news-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {},
+      "category": "news",
+      "feed_url": "https://x.com/no_rumors",
+      "image_url": null,
+      "metadata": {},
+      "name": "no_rumors",
+      "type": "TWITTER"
+    },
+    "discovery_profile_key": "discovery.profiles.76651cb5dee5dcb08459"
+  }
+]

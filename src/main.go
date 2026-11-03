@@ -87,13 +87,15 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 		if !projectionHealthy || !recoveryHealthy || !reconcilerHealthy || !supplyActionHealthy || !supplyEvaluationHealthy || !sourceRunSchedulerHealthy || !pipelineRepairHealthy || !contentStageHealthy || !artifactCoverageHealthy || !atomizationWorkHealthy || !studioClearanceHealthy || !upstreamObservationHealthy || !externalSupplyOwnersHealthy {
 			status = 503
 		}
-		contract, contractErr := utils.ReadDatabaseContract(db, "migrations")
-		if contractErr != nil {
+		healthCtx, cancel := context.WithTimeout(c.Request.Context(), 2500*time.Millisecond)
+		defer cancel()
+		database := utils.ReadHealthDatabaseState(healthCtx, db, "migrations")
+		if database.ContractError != nil || database.FenceError != nil {
 			status = 503
 		}
-		fence, fenceErr := utils.ReadWriterFence(db)
-		if fenceErr != nil {
-			status = 503
+		var databasePool any
+		if sqlDB, err := db.DB(); err == nil {
+			databasePool = sqlDB.Stats()
 		}
 		c.JSON(status, gin.H{
 			"status":                       map[bool]string{true: "ok", false: "degraded"}[status == 200],
@@ -110,10 +112,11 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB) {
 			"studio_clearance_ready":       studioClearanceHealthy,
 			"upstream_observation_ready":   upstreamObservationHealthy,
 			"supply_owner_readiness":       supplyOwners,
-			"database_contract":            contract,
-			"database_contract_error":      contractErrorMessage(contractErr),
-			"writer_fence":                 fence,
-			"writer_fence_error":           contractErrorMessage(fenceErr),
+			"database_contract":            database.Contract,
+			"database_contract_error":      contractErrorMessage(database.ContractError),
+			"writer_fence":                 database.Fence,
+			"writer_fence_error":           contractErrorMessage(database.FenceError),
+			"database_pool":                databasePool,
 		})
 	})
 

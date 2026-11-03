@@ -1,0 +1,134 @@
+[
+  {
+    "key": "discovery.profiles.482748e4907db938406f",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "أخبار الفن والثقافة والسينما والموسيقى والأدب والمسرح",
+      "keywords": [
+        "فن",
+        "ثقافة",
+        "سينما",
+        "موسيقى",
+        "أدب"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "فن وثقافة"
+    }
+  },
+  {
+    "key": "discovery.profiles.76651cb5dee5dcb08459",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "أخبار السياسة والشرق الأوسط والصراعات والدبلوماسية والحكومات",
+      "keywords": [
+        "سياسة",
+        "الشرق الأوسط",
+        "حكومة",
+        "دبلوماسية",
+        "انتخابات"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "سياسة والشرق الأوسط"
+    }
+  },
+  {
+    "key": "discovery.profiles.b2969bb12930a46aa56e",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "أخبار الاقتصاد والأعمال والأسواق المالية والنفط والبورصة",
+      "keywords": [
+        "اقتصاد",
+        "أعمال",
+        "أسواق",
+        "النفط",
+        "البورصة"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "اقتصاد وأعمال"
+    }
+  },
+  {
+    "key": "discovery.profiles.c3b561eac81c4c784419",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "ألعاب الفيديو",
+      "keywords": [
+        "ألعاب الفيديو"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "ألعاب"
+    }
+  },
+  {
+    "key": "discovery.profiles.c8b718949fb1ca8a2434",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "كأس العالم 2026",
+      "keywords": [
+        "كأس العالم"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "كاس العالم"
+    }
+  },
+  {
+    "key": "discovery.profiles.ef0420449068da570ef8",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "أخبار الرياضة وكرة القدم والمباريات والدوريات واللاعبين",
+      "keywords": [
+        "رياضة",
+        "كرة القدم",
+        "مباريات",
+        "الدوري",
+        "لاعبين"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "رياضة وكرة القدم"
+    }
+  },
+  {
+    "key": "discovery.profiles.fe5607d9e67a89c4f345",
+    "kind": "discovery-profiles",
+    "scope": "tenant",
+    "definition": {
+      "category": "news",
+      "description": "أخبار التكنولوجيا والعلوم والذكاء الاصطناعي والهواتف والإنترنت",
+      "keywords": [
+        "تقنية",
+        "تكنولوجيا",
+        "علوم",
+        "الذكاء الاصطناعي",
+        "إنترنت"
+      ],
+      "languages": [
+        "ar"
+      ],
+      "name": "تقنية وعلوم"
+    }
+  }
+]

@@ -77,8 +77,24 @@ func TestJourneyCuttingUsesUnitEvidence(t *testing.T) {
 		{map[string]int64{"running": 1, "uncertain": 1}, "reconciling"},
 		{map[string]int64{"failed": 1}, "failed"},
 	} {
-		if got := journeyCuttingState(tc.units); got.State != tc.state {
+		if got := journeyCuttingState(tc.units, nil); got.State != tc.state {
 			t.Fatalf("%v: %+v", tc.units, got)
+		}
+	}
+}
+
+func TestJourneyFrozenPlanRetainsExecutorOutcomeBeforeCapacity(t *testing.T) {
+	for _, tc := range []struct{ request, state, reason string }{
+		{models.ContentStageFailed, "failed", "verified_absent_budget_exhausted"},
+		{models.ContentStageUncertain, "reconciling", "effects_unresolved"},
+		{models.ContentStageDeferred, "waiting", "scheduled_retry"},
+	} {
+		request := &models.ContentStageRequest{State: tc.request, FailureClass: "verified_absent_budget_exhausted"}
+		steps := []mediaJourneyStep{journeyCuttingState(map[string]int64{"queued": 6}, request)}
+		other, holder := "other-tenant", uuid.New()
+		capacity := journeyCapacity(nil, models.ContentItem{TenantID: "default", PublicID: uuid.New()}, podsflow.Slot{TenantID: &other, RootContentItemID: &holder}, steps)
+		if steps[0].State != tc.state || steps[0].Reason != tc.reason || capacity["waiting"] != false {
+			t.Fatalf("%s was hidden by capacity: %+v %+v", tc.request, steps[0], capacity)
 		}
 	}
 }

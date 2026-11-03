@@ -38,6 +38,13 @@ func ConnectDB() (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get database connection pool: %w", err)
+	}
+	// Worker bursts were repeatedly closing connections above Go's two-idle
+	// default. Keep a small warm reserve to avoid costly remote reconnects.
+	sqlDB.SetMaxIdleConns(8)
 
 	return db, nil
 }

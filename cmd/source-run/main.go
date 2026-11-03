@@ -23,15 +23,19 @@ func main() {
 	repairApply := flag.Bool("repair-apply", false, "apply the exact compatibility repair preview")
 	digest := flag.String("digest", "", "verification digest returned by --preflight")
 	actor := flag.String("actor", "", "human/operator identity for promotion")
+	lanePreview := flag.Bool("inactive-lane-preview", false, "review provisioning one inactive lane after durable cutover")
+	laneApply := flag.Bool("inactive-lane-apply", false, "provision an inactive lane using its exact preview digest")
+	tenant := flag.String("tenant", "", "explicit tenant for inactive lane provisioning")
+	lane := flag.String("lane", "", "explicit news or media lane")
 	flag.Parse()
 	actions := 0
-	for _, selected := range []bool{*status, *preflight, *promote, *repairPreview, *repairApply} {
+	for _, selected := range []bool{*status, *preflight, *promote, *repairPreview, *repairApply, *lanePreview, *laneApply} {
 		if selected {
 			actions++
 		}
 	}
 	if actions != 1 {
-		log.Fatal("choose exactly one of --status, --preflight, --promote, --repair-preview, or --repair-apply")
+		log.Fatal("choose exactly one of --status, --preflight, --promote, --repair-preview, --repair-apply, --inactive-lane-preview, or --inactive-lane-apply")
 	}
 	db, err := utils.ConnectDB()
 	if err != nil {
@@ -42,6 +46,23 @@ func main() {
 		log.Fatalf("get database connection: %v", err)
 	}
 	defer sqlDB.Close()
+	if *lanePreview || *laneApply {
+		if *laneApply {
+			if err := supply.ProvisionInactiveLane(db, *tenant, *lane, *digest, *actor); err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println("inactive source lane provisioned")
+			return
+		}
+		report, err := supply.PreviewInactiveLane(db, *tenant, *lane)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(report); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if *promote {
 		if err := supply.PromoteSourceRunCutover(db, strings.TrimSpace(*digest), strings.TrimSpace(*actor)); err != nil {

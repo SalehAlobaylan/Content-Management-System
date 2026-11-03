@@ -1,0 +1,51 @@
+[
+  {
+    "key": "media.sources.6002f12c38faf50ef8e1",
+    "kind": "media-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "atomization_min_parent_seconds": 2400,
+        "audio_only_allowed": true,
+        "auto_publish_high_confidence": true,
+        "chaptering_enabled": true,
+        "chaptering_mode": "contextual",
+        "fallback_playback_rendition": "mp4",
+        "hard_max_chapter_minutes": 40,
+        "high_confidence_threshold": 0.82,
+        "initial_atomization_limit": 5,
+        "max_chapters_per_parent": 5,
+        "max_results": 5,
+        "min_chapter_minutes": 5,
+        "min_feed_unit_seconds": 270,
+        "parent_feed_visible": false,
+        "preferred_playback_rendition": "hls",
+        "preserve_video": true,
+        "remove_sponsor_segments": true,
+        "soft_max_chapter_minutes": 30
+      },
+      "category": "media",
+      "feed_url": "https://www.youtube.com/channel/UC8vdjzu_0QMQlG9qNT5D_AQ",
+      "image_url": "https://yt3.googleusercontent.com/73c3-iw_Lubnz8tI6uxN17s1p8kOvwwsF5tatPe3JYAw_SRKeJfjprdH2wxHGPz3UHBM9NDxzs0=s900-c-k-c0x00ffffff-no-rj",
+      "metadata": {},
+      "name": "إذاعة مختلف",
+      "type": "YOUTUBE"
+    }
+  },
+  {
+    "key": "media.sources.8c3fc53f17926f42557d",
+    "kind": "media-sources",
+    "scope": "tenant",
+    "definition": {
+      "api_config": {
+        "max_results": 20
+      },
+      "category": "media",
+      "feed_url": "https://www.youtube.com/@thmanyahPodcasts",
+      "image_url": null,
+      "metadata": {},
+      "name": "ثمانية",
+      "type": "YOUTUBE"
+    }
+  }
+]

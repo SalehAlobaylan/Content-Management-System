@@ -1,0 +1,249 @@
+[
+  {
+    "key": "topics.091ff73019502fa7a3e7",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "culture",
+      "featured": true,
+      "label_ar": "ثقافة",
+      "label_en": "Culture",
+      "slug": "culture"
+    }
+  },
+  {
+    "key": "topics.0ebf576a56bf83899175",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "science",
+      "featured": true,
+      "label_ar": "علوم",
+      "label_en": "Science",
+      "slug": "science"
+    }
+  },
+  {
+    "key": "topics.18ce4b3be0416ed9bb33",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "سياسة",
+      "label_en": "سياسة",
+      "slug": "سياسة"
+    }
+  },
+  {
+    "key": "topics.254fa63d1348b727d047",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "دمشق",
+      "label_en": "دمشق",
+      "slug": "دمشق"
+    }
+  },
+  {
+    "key": "topics.2dd3dbce080df4f304d5",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "أطفال",
+      "label_en": "أطفال",
+      "slug": "أطفال"
+    }
+  },
+  {
+    "key": "topics.340a0c256abdc73f18e6",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "technology",
+      "featured": true,
+      "label_ar": "تقنية",
+      "label_en": "Technology",
+      "slug": "technology"
+    }
+  },
+  {
+    "key": "topics.4c2be0c4d30f96044169",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": false,
+      "category_slug": "politics",
+      "featured": true,
+      "label_ar": "سياسة",
+      "label_en": "Politics",
+      "slug": "politics"
+    }
+  },
+  {
+    "key": "topics.5ca5ef570dc772fd45cf",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "society",
+      "featured": true,
+      "label_ar": "مجتمع",
+      "label_en": "Society",
+      "slug": "society"
+    }
+  },
+  {
+    "key": "topics.69b7c75b4a0260f2e018",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "health",
+      "featured": true,
+      "label_ar": "صحة",
+      "label_en": "Health",
+      "slug": "health"
+    }
+  },
+  {
+    "key": "topics.77c14283c58bbf3de1ec",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "environment",
+      "featured": true,
+      "label_ar": "بيئة",
+      "label_en": "Environment",
+      "slug": "environment"
+    }
+  },
+  {
+    "key": "topics.788456d9bf596b697211",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "كأس العالم",
+      "label_en": "كأس العالم",
+      "slug": "كأس-العالم"
+    }
+  },
+  {
+    "key": "topics.7a2050d05816e7139798",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "سامسونج",
+      "label_en": "سامسونج",
+      "slug": "سامسونج"
+    }
+  },
+  {
+    "key": "topics.7c05e9a6b7b1470d8947",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "رياضة",
+      "label_en": "رياضة",
+      "slug": "رياضة"
+    }
+  },
+  {
+    "key": "topics.8e1ecb966fb973bc2668",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "sports",
+      "featured": true,
+      "label_ar": "رياضة",
+      "label_en": "Sports",
+      "slug": "sports"
+    }
+  },
+  {
+    "key": "topics.a427d1b880575038752a",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "دفاع",
+      "label_en": "دفاع",
+      "slug": "دفاع"
+    }
+  },
+  {
+    "key": "topics.a6f2c6606092db761773",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "عام",
+      "label_en": "General",
+      "slug": "general"
+    }
+  },
+  {
+    "key": "topics.bbb0ebc943daa52cd76c",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "general",
+      "featured": true,
+      "label_ar": "حرب",
+      "label_en": "حرب",
+      "slug": "حرب"
+    }
+  },
+  {
+    "key": "topics.fb61f9aec060aa11330d",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "economy",
+      "featured": true,
+      "label_ar": "اقتصاد",
+      "label_en": "Economy",
+      "slug": "economy"
+    }
+  },
+  {
+    "key": "topics.fbd5f2516c05880091e7",
+    "kind": "topics",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "category_slug": "religion",
+      "featured": true,
+      "label_ar": "دين",
+      "label_en": "Religion",
+      "slug": "religion"
+    }
+  }
+]

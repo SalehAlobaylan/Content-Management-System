@@ -321,7 +321,7 @@ func main() {
 		if err := activateEmptyBootstrapContentStages(db); err != nil {
 			log.Fatalf("activate empty-bootstrap content stages: %v", err)
 		}
-		log.Printf("Activated durable content-stage execution for the empty bootstrap.")
+		log.Printf("Activated durable content-stage and source-run execution for the empty bootstrap.")
 	}
 	if blockedAt != "" {
 		log.Printf("Stopped before destructive migration %s; safe preceding migrations were applied. Re-run with --allow-destructive only after reviewing that migration and satisfying its readiness guards.", blockedAt)
@@ -337,7 +337,7 @@ func activateEmptyBootstrapContentStages(db *gorm.DB) error {
 		if err := utils.CheckLocalPreparationAuthority(tx); err != nil {
 			return err
 		}
-		for _, table := range []string{"content_items", "content_sources"} {
+		for _, table := range []string{"content_items", "content_sources", "source_run_requests"} {
 			var count int64
 			if err := tx.Table(table).Count(&count).Error; err != nil {
 				return fmt.Errorf("count %s before durable activation: %w", table, err)
@@ -354,6 +354,43 @@ func activateEmptyBootstrapContentStages(db *gorm.DB) error {
 				    promoted_at=?, verification_digest=?, updated_at=?
 				WHERE tenant_id='default' AND lane=? AND mode='legacy'`, now, hex.EncodeToString(sum[:]), now, lane).Error; err != nil {
 				return fmt.Errorf("activate %s content-stage lane: %w", lane, err)
+			}
+		}
+
+		// This is the explicit, empty-database bootstrap only. No compatibility
+		// work exists to shadow; a source imported later must be runnable without
+		// silently promoting authority during source creation or normal startup.
+		var epoch string
+		if err := tx.Raw("SELECT epoch FROM source_run_admission_protocol WHERE protocol_key='source-run/v1' FOR UPDATE").Row().Scan(&epoch); err != nil {
+			return fmt.Errorf("read empty-bootstrap source admission: %w", err)
+		}
+		if epoch != "compatibility" && epoch != "durable_required" {
+			return fmt.Errorf("unsupported empty-bootstrap source admission epoch")
+		}
+		if epoch == "compatibility" {
+			if err := tx.Exec(`UPDATE source_run_admission_protocol SET epoch='durable_required',version=version+1,
+                activated_at=?,activated_by='cms-migrate-empty-bootstrap',build='cms-migrate-empty-bootstrap',updated_at=?
+                WHERE protocol_key='source-run/v1' AND epoch='compatibility'`, now, now).Error; err != nil {
+				return err
+			}
+		}
+		for _, lane := range []string{"news", "media"} {
+			if err := tx.Exec(`INSERT INTO source_run_admission_cutovers(tenant_id,lane,mode,protocol,version,activated_at,activated_by)
+                VALUES('default',?,'durable','source-run/v1',1,?,'cms-migrate-empty-bootstrap')
+                ON CONFLICT(tenant_id,lane) DO UPDATE SET mode='durable',protocol='source-run/v1',
+                version=GREATEST(source_run_admission_cutovers.version,1),
+                activated_at=COALESCE(source_run_admission_cutovers.activated_at,EXCLUDED.activated_at),
+                activated_by=COALESCE(source_run_admission_cutovers.activated_by,EXCLUDED.activated_by)
+                WHERE source_run_admission_cutovers.mode<>'durable' OR source_run_admission_cutovers.protocol<>'source-run/v1'`, lane, now).Error; err != nil {
+				return err
+			}
+		}
+		if epoch == "compatibility" {
+			proof := sha256.Sum256([]byte("source-run/v1|empty-bootstrap|default|news|media"))
+			if err := tx.Exec(`INSERT INTO source_run_cutover_audit_events(event_type,from_epoch,to_epoch,verification_digest,actor,payload,occurred_at)
+                VALUES('empty_bootstrap_activated','compatibility','durable_required',?,'cms-migrate-empty-bootstrap',
+                '{"schema_version":"source-run/v1","active_lanes":["default:news","default:media"],"empty_database_verified":true}'::jsonb,?)`, hex.EncodeToString(proof[:]), now).Error; err != nil {
+				return err
 			}
 		}
 		return nil

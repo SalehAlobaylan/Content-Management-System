@@ -52,6 +52,7 @@ type opsFleetMember struct {
 // All identifiers below are static code constants. Never derive a table or
 // column name from a request parameter.
 var opsFleetRegistry = []opsFleetMember{
+	{Key: "pods_pipeline", Label: "Pods pipeline", Family: "media", Kind: "pipeline", CockpitPath: "/platform/media/sources#pods-pipeline", Lanes: []opsFleetLane{{Key: "processing", Label: "Processing", CockpitPath: "/platform/media/sources#pods-pipeline", StatusSQL: opsPodsPipelineSQL}}},
 	// The governor is visible here but deliberately not pausable through the
 	// fleet switchboard: pausing it bypasses protection rather than stopping work.
 	{Key: "workload_governor", Label: "Workload & Capacity", Family: "platform", Kind: "governor", CockpitPath: "/platform/workload", Lanes: []opsFleetLane{{Key: "capacity", Label: "Capacity observation", Table: "workload_governor_policies", TenantColumn: "scope", Scheduled: true, CockpitPath: "/platform/workload", StatusSQL: "SELECT scope AS tenant_id, (mode <> 'off') AS enabled, mode, paused_until, (SELECT max(created_at) FROM workload_capacity_snapshots) AS last_run_at, 1 AS interval_minutes, updated_at AS created_at FROM workload_governor_policies WHERE scope='platform'"}}},
@@ -83,21 +84,27 @@ var opsFleetRegistry = []opsFleetMember{
 }
 
 type opsStatusRow struct {
-	TenantID          string     `gorm:"column:tenant_id" json:"tenant_id"`
-	Enabled           bool       `gorm:"column:enabled" json:"enabled"`
-	Mode              string     `gorm:"column:mode" json:"mode"`
-	PausedUntil       *time.Time `gorm:"column:paused_until" json:"paused_until,omitempty"`
-	LastRunAt         *time.Time `gorm:"column:last_run_at" json:"last_run_at,omitempty"`
-	IntervalMinutes   int        `gorm:"column:interval_minutes" json:"interval_minutes"`
-	CreatedAt         time.Time  `gorm:"column:created_at" json:"created_at"`
-	DeepLastRunAt     *time.Time
-	DeepIntervalHours int
-	OwnerOutcome      string
-	LatestRunID       *string
-	LatestRunStatus   string
-	LatestRunHeadline string
-	LatestStartedAt   *time.Time
-	LatestFinishedAt  *time.Time
+	PipelineReady      bool
+	PipelineRunning    int64
+	PipelineAdmitted   int64
+	PipelineVerifying  int64
+	PipelineUnresolved int64
+	PipelineQueued     int64
+	TenantID           string     `gorm:"column:tenant_id" json:"tenant_id"`
+	Enabled            bool       `gorm:"column:enabled" json:"enabled"`
+	Mode               string     `gorm:"column:mode" json:"mode"`
+	PausedUntil        *time.Time `gorm:"column:paused_until" json:"paused_until,omitempty"`
+	LastRunAt          *time.Time `gorm:"column:last_run_at" json:"last_run_at,omitempty"`
+	IntervalMinutes    int        `gorm:"column:interval_minutes" json:"interval_minutes"`
+	CreatedAt          time.Time  `gorm:"column:created_at" json:"created_at"`
+	DeepLastRunAt      *time.Time
+	DeepIntervalHours  int
+	OwnerOutcome       string
+	LatestRunID        *string
+	LatestRunStatus    string
+	LatestRunHeadline  string
+	LatestStartedAt    *time.Time
+	LatestFinishedAt   *time.Time
 }
 
 type opsMemberStatus struct {

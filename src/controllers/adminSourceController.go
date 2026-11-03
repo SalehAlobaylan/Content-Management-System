@@ -5,6 +5,7 @@ import (
 	"content-management-system/src/contentstage"
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"content-management-system/src/newscollection"
 	"content-management-system/src/utils"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,10 @@ func writeSourceLifecycleConflict(c *gin.Context, err error) bool {
 }
 
 type contentSourceResponse struct {
+	NextDueAt                    *string                  `json:"next_due_at,omitempty"`
+	FailureStreak                int                      `json:"failure_streak"`
+	IntakeCircuitUntil           *string                  `json:"intake_circuit_until,omitempty"`
+	SourceConfigVersion          int64                    `json:"source_config_version"`
 	ID                           string                   `json:"id"`
 	Name                         string                   `json:"name"`
 	Type                         string                   `json:"type"`
@@ -956,6 +961,35 @@ func UpdateContentSource(c *gin.Context) {
 		return
 	}
 	originalConfigVersion := source.SourceConfigVersion
+	// A direct News activation uses the same reviewed owner and durable receipt
+	// as the bulk surface; unrelated editor fields keep their existing path.
+	if source.Category == models.SourceCategoryNews && req.IsActive != nil && req.Name == nil && req.Type == nil && req.Category == nil && req.FeedURL == nil && req.ImageURL == nil && req.APIConfig == nil && req.MediaAcquisitionMode == nil && req.FetchIntervalMinutes == nil && req.Metadata == nil {
+		action := "disable"
+		if *req.IsActive {
+			action = "enable"
+		}
+		caps := newsCapabilities(c)
+		op, err := newscollection.Preview(db, principal.TenantID, principal.UserID, newscollection.Request{Action: action, Scope: "selected", IDs: []uuid.UUID{id}}, caps)
+		if err != nil {
+			newsCollectionError(c, err)
+			return
+		}
+		result, err := newscollection.Apply(db, principal.TenantID, principal.UserID, op.PublicID, caps)
+		if err != nil {
+			newsCollectionError(c, err)
+			return
+		}
+		if result.Excluded > 0 {
+			c.JSON(409, authErrorResponse{Message: "Source needs configuration; review News activation for details", Code: "SOURCE_CONFIGURATION_REQUIRED"})
+			return
+		}
+		if err := db.Where("tenant_id=? AND public_id=?", principal.TenantID, id).First(&source).Error; err != nil {
+			newsCollectionError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, mapContentSourceResponse(db, source))
+		return
+	}
 
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -1478,6 +1512,7 @@ func validMediaAcquisitionOverride(value *string) bool {
 func mapContentSourceResponse(db *gorm.DB, source models.ContentSource) contentSourceResponse {
 	resolved := contentstage.ResolveMediaAcquisitionMode(db, models.ContentItem{TenantID: source.TenantID, ContentSourceID: &source.PublicID})
 	return contentSourceResponse{
+		NextDueAt: formatSourceTime(source.NextDueAt), FailureStreak: source.FailureStreak, IntakeCircuitUntil: formatSourceTime(source.IntakeCircuitUntil), SourceConfigVersion: source.SourceConfigVersion,
 		ID:                           source.PublicID.String(),
 		Name:                         source.Name,
 		Type:                         string(source.Type),

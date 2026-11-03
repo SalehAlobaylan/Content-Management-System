@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -155,17 +156,25 @@ func Health(db *gorm.DB, tenantID string) ([]LaneHealth, error) {
 	return out, nil
 }
 
-func UpdateControl(db *gorm.DB, tenantID, lane, actor string, scheduling, execution, optionalMetadata, transcript *bool, reason string) (models.ContentStageControl, error) {
+func UpdateControl(db *gorm.DB, tenantID, lane, actor string, scheduling, execution, optionalMetadata, transcript *bool, reason string, expectedVersion ...string) (models.ContentStageControl, error) {
 	if lane != models.ContentStageLaneNews && lane != models.ContentStageLanePods {
 		return models.ContentStageControl{}, fmt.Errorf("invalid lane")
 	}
 	var value models.ContentStageControl
 	err := db.Transaction(func(tx *gorm.DB) error {
+		if lane == models.ContentStageLanePods {
+			if err := podscontrol.Lock(tx, tenantID, true); err != nil {
+				return err
+			}
+		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND lane=?", tenantID, lane).First(&value).Error; err != nil {
 			if err != gorm.ErrRecordNotFound {
 				return err
 			}
 			value = models.ContentStageControl{TenantID: tenantID, Lane: lane, SchedulingEnabled: true, ExecutionEnabled: true, OptionalMetadataEnabled: true, TranscriptExecutionEnabled: true}
+		}
+		if len(expectedVersion) > 0 && podscontrol.Version(value) != expectedVersion[0] {
+			return podscontrol.ErrChanged
 		}
 		if scheduling != nil {
 			value.SchedulingEnabled = *scheduling
@@ -180,6 +189,7 @@ func UpdateControl(db *gorm.DB, tenantID, lane, actor string, scheduling, execut
 			value.TranscriptExecutionEnabled = *transcript
 		}
 		value.Reason, value.UpdatedBy = strings.TrimSpace(reason), actor
+		value.UpdatedAt = time.Now().UTC()
 		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "tenant_id"}, {Name: "lane"}}, DoUpdates: clause.AssignmentColumns([]string{"scheduling_enabled", "execution_enabled", "optional_metadata_enabled", "transcript_execution_enabled", "reason", "updated_by", "updated_at"})}).Create(&value).Error
 	})
 	return value, err

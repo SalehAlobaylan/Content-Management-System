@@ -1,0 +1,134 @@
+[
+  {
+    "key": "topic.categories.091ff73019502fa7a3e7",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "ثقافة",
+      "label_en": "Culture",
+      "slug": "culture",
+      "sort_order": 50
+    }
+  },
+  {
+    "key": "topic.categories.0ebf576a56bf83899175",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "علوم",
+      "label_en": "Science",
+      "slug": "science",
+      "sort_order": 90
+    }
+  },
+  {
+    "key": "topic.categories.340a0c256abdc73f18e6",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "تقنية",
+      "label_en": "Technology",
+      "slug": "technology",
+      "sort_order": 40
+    }
+  },
+  {
+    "key": "topic.categories.4c2be0c4d30f96044169",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "سياسة",
+      "label_en": "Politics",
+      "slug": "politics",
+      "sort_order": 10
+    }
+  },
+  {
+    "key": "topic.categories.5ca5ef570dc772fd45cf",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "مجتمع",
+      "label_en": "Society",
+      "slug": "society",
+      "sort_order": 60
+    }
+  },
+  {
+    "key": "topic.categories.69b7c75b4a0260f2e018",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "صحة",
+      "label_en": "Health",
+      "slug": "health",
+      "sort_order": 80
+    }
+  },
+  {
+    "key": "topic.categories.77c14283c58bbf3de1ec",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "بيئة",
+      "label_en": "Environment",
+      "slug": "environment",
+      "sort_order": 100
+    }
+  },
+  {
+    "key": "topic.categories.8e1ecb966fb973bc2668",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "رياضة",
+      "label_en": "Sports",
+      "slug": "sports",
+      "sort_order": 30
+    }
+  },
+  {
+    "key": "topic.categories.a6f2c6606092db761773",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "عام",
+      "label_en": "General",
+      "slug": "general",
+      "sort_order": 999
+    }
+  },
+  {
+    "key": "topic.categories.fb61f9aec060aa11330d",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "اقتصاد",
+      "label_en": "Economy",
+      "slug": "economy",
+      "sort_order": 20
+    }
+  },
+  {
+    "key": "topic.categories.fbd5f2516c05880091e7",
+    "kind": "topic-categories",
+    "scope": "tenant",
+    "definition": {
+      "active": true,
+      "label_ar": "دين",
+      "label_en": "Religion",
+      "slug": "religion",
+      "sort_order": 70
+    }
+  }
+]

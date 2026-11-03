@@ -3,6 +3,7 @@ package podsflow
 import (
 	"content-management-system/src/feedstate"
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -85,11 +86,15 @@ func ActivateReady(tx *gorm.DB, root models.ContentItem) error {
 	if root.ParentContentItemID != nil {
 		return nil
 	}
+	allowed, err := podscontrol.Allowed(tx, root.TenantID)
+	if err != nil || !allowed {
+		return err
+	}
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND public_id=?", root.TenantID, root.PublicID).First(&root).Error; err != nil {
 		return err
 	}
 	var candidate models.AtomizationGeneration
-	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND parent_content_item_id=? AND processing_generation=? AND state='verifying' AND completed_units=expected_units AND expected_units>0", root.TenantID, root.PublicID, root.ProcessingGeneration).Order("generation_number DESC").First(&candidate).Error
+	err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("tenant_id=? AND parent_content_item_id=? AND processing_generation=? AND state='verifying' AND completed_units=expected_units AND expected_units>0", root.TenantID, root.PublicID, root.ProcessingGeneration).Order("generation_number DESC").First(&candidate).Error
 	if err == gorm.ErrRecordNotFound {
 		return nil
 	}

@@ -168,6 +168,10 @@ func opsStatusForLane(db *gorm.DB, member opsFleetMember, lane opsFleetLane, now
 		status.Mode = row.Mode
 		status.PausedUntil = row.PausedUntil
 		status.LastRunAt = row.LastRunAt
+		if member.Key == "pods_pipeline" {
+			out = append(out, opsPodsPipelineStatus(status, row))
+			continue
+		}
 		found := row.LatestRunID != nil
 		run := opsRunEvidence{TenantID: row.TenantID, Status: row.LatestRunStatus, Headline: row.LatestRunHeadline, FinishedAt: row.LatestFinishedAt}
 		if row.LatestRunID != nil {

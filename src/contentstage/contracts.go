@@ -13,6 +13,7 @@ import (
 
 	"content-management-system/src/feedcontract"
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -443,6 +444,12 @@ func DeliveryMode(db *gorm.DB, tenantID string, kind models.ContentType) (string
 func executionAllowed(tx *gorm.DB, tenantID, lane, stage string) (bool, error) {
 	if !SchemaAvailable(tx) {
 		return false, nil
+	}
+	if lane == models.ContentStageLanePods {
+		allowed, err := podscontrol.Allowed(tx, tenantID)
+		if err != nil || !allowed {
+			return false, err
+		}
 	}
 	mode, err := CutoverMode(tx, tenantID, lane)
 	if err != nil || mode != models.ContentStageCutoverDurableRequired {

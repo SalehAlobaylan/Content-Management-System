@@ -8,6 +8,7 @@ import (
 
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -99,8 +100,24 @@ func CreateRequest(db *gorm.DB, input CreateRequestInput) (models.SourceRunReque
 		if !current.IsActive || current.Category != request.Lane || current.SourceConfigVersion != input.Source.SourceConfigVersion {
 			return fmt.Errorf("source-run source version or authority changed")
 		}
+		if current.Category == models.SourceCategoryNews {
+			allowed, err := MayPullNews(tx, current.TenantID)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return fmt.Errorf("News collection is paused")
+			}
+		}
 		lifecycleLane := current.Category
 		if lifecycleLane == models.SourceCategoryMedia {
+			allowed, err := podscontrol.Allowed(tx, current.TenantID)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return fmt.Errorf("Pods pipeline is paused; resume it in Media Sources before running a source")
+			}
 			lifecycleLane = "pods"
 		}
 		if err := lifecycle.Check(tx, lifecycle.Scope{

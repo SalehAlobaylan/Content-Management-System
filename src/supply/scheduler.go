@@ -13,6 +13,7 @@ import (
 
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
@@ -73,6 +74,7 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
           AND EXISTS (SELECT 1 FROM source_run_admission_cutovers c
             WHERE c.tenant_id=content_sources.tenant_id AND c.lane=content_sources.category
               AND c.mode='durable' AND c.protocol='source-run/v1')
+		  AND `+newsIntakePredicate(db, "content_sources")+` AND `+podscontrol.SourcePredicate(db, "content_sources")+`
 	) ranked WHERE ranked.tenant_rank <= 2
 	ORDER BY ranked.tenant_rank ASC, ranked.next_due_at ASC, ranked.tenant_id ASC, ranked.public_id ASC LIMIT ?`, now, now, limit).Scan(&sources).Error; err != nil {
 		return nil, err
@@ -93,6 +95,15 @@ func AdmitDueSourceRuns(db *gorm.DB, now time.Time, limit int) ([]models.SourceR
 					return nil
 				}
 				return err
+			}
+			if source.Category == models.SourceCategoryNews {
+				allowed, err := MayPullNews(tx, source.TenantID)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					return nil
+				}
 			}
 			intakeEnabled, err := MayScheduleNormalIntake(tx, source.TenantID)
 			if err != nil || !intakeEnabled {
@@ -161,7 +172,8 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
           AND EXISTS (SELECT 1 FROM content_sources s JOIN source_run_admission_cutovers c
             ON c.tenant_id=s.tenant_id AND c.lane=s.category AND c.mode='durable' AND c.protocol='source-run/v1'
             WHERE s.tenant_id=o.tenant_id AND s.public_id=o.content_source_id AND s.is_active=TRUE
-              AND (s.intake_circuit_until IS NULL OR s.intake_circuit_until<=?))
+              AND (s.intake_circuit_until IS NULL OR s.intake_circuit_until<=?)
+			  AND `+newsIntakePredicate(db, "s")+` AND `+podscontrol.SourcePredicate(db, "s")+`)
           AND NOT EXISTS (SELECT 1 FROM source_run_requests r
             WHERE r.tenant_id=o.tenant_id AND r.content_source_id=o.content_source_id
               AND r.state IN ('requested','accepted','running','verification_required'))
@@ -221,6 +233,15 @@ func AdmitDeferredObservationRuns(db *gorm.DB, now time.Time, limit int) ([]mode
 					return nil
 				}
 				return err
+			}
+			if source.Category == models.SourceCategoryNews {
+				allowed, err := MayPullNews(tx, source.TenantID)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					return nil
+				}
 			}
 			enabled, err := MayScheduleNormalIntake(tx, source.TenantID)
 			if err != nil || !enabled {

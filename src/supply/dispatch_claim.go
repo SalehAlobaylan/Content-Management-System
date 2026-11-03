@@ -8,6 +8,7 @@ import (
 
 	"content-management-system/src/lifecycle"
 	"content-management-system/src/models"
+	"content-management-system/src/podscontrol"
 	"content-management-system/src/workload"
 
 	"github.com/google/uuid"
@@ -39,7 +40,7 @@ func ClaimNextDispatchableRequest(db *gorm.DB, owner string, dispatcherLease, ex
 	}
 	now := time.Now().UTC()
 	var candidates []models.SourceRunRequest
-	if err := db.Table("source_run_requests AS request").Select("request.*").Joins("JOIN content_sources AS source ON source.public_id = request.content_source_id AND source.tenant_id = request.tenant_id").Where("request.tenant_id <> '' AND request.budget_state = 'reserved' AND request.state IN ? AND (request.not_before_at IS NULL OR request.not_before_at <= ?) AND (request.next_dispatch_at IS NULL OR request.next_dispatch_at <= ?) AND (request.expires_at IS NULL OR request.expires_at > ?) AND (request.deadline_at IS NULL OR request.deadline_at > ?) AND source.is_active = TRUE AND (source.intake_circuit_until IS NULL OR source.intake_circuit_until <= ?)", []string{string(RequestRequested), string(RequestAccepted)}, now, now, now, now, now).Order("request.next_dispatch_at ASC NULLS FIRST, request.requested_at ASC, request.tenant_id ASC").Limit(maxDispatchCandidateScan).Find(&candidates).Error; err != nil {
+	if err := db.Table("source_run_requests AS request").Select("request.*").Joins("JOIN content_sources AS source ON source.public_id = request.content_source_id AND source.tenant_id = request.tenant_id").Where("request.tenant_id <> '' AND request.budget_state = 'reserved' AND request.state IN ? AND (request.not_before_at IS NULL OR request.not_before_at <= ?) AND (request.next_dispatch_at IS NULL OR request.next_dispatch_at <= ?) AND (request.expires_at IS NULL OR request.expires_at > ?) AND (request.deadline_at IS NULL OR request.deadline_at > ?) AND source.is_active = TRUE AND (source.intake_circuit_until IS NULL OR source.intake_circuit_until <= ?)", []string{string(RequestRequested), string(RequestAccepted)}, now, now, now, now, now).Where(newsIntakePredicate(db, "source")).Where(podscontrol.SourcePredicate(db, "source")).Order("request.next_dispatch_at ASC NULLS FIRST, request.requested_at ASC, request.tenant_id ASC").Limit(maxDispatchCandidateScan).Find(&candidates).Error; err != nil {
 		return DispatchClaim{}, false, err
 	}
 	for _, candidate := range candidates {
@@ -61,7 +62,25 @@ func ClaimNextDispatchableRequest(db *gorm.DB, owner string, dispatcherLease, ex
 				return err
 			}
 			lane := source.Category
+			if lane == models.SourceCategoryNews {
+				allowed, err := MayPullNews(tx, source.TenantID)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					skipCandidate = true
+					return nil
+				}
+			}
 			if lane == models.SourceCategoryMedia {
+				allowed, err := podscontrol.Allowed(tx, source.TenantID)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					skipCandidate = true
+					return nil
+				}
 				lane = "pods"
 			}
 			if err := lifecycle.Check(tx, lifecycle.Scope{

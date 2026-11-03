@@ -33,6 +33,8 @@ func openSupplyFixtureDB(t *testing.T) *gorm.DB {
 		&models.SourceRunAdmissionProtocol{}, &models.SourceRunAdmissionCutover{},
 		&models.SourceUpstreamObservation{}, &models.SourceUpstreamObservationEvent{}, &models.SourceUpstreamObservationDisposition{},
 		&models.MediaSupplyControl{},
+		&models.NewsCollectionControl{},
+		&models.ContentStageControl{},
 	); err != nil {
 		t.Fatalf("migrate supply fixture schema: %v", err)
 	}
@@ -55,6 +57,7 @@ func openSupplyFixtureDB(t *testing.T) *gorm.DB {
 		}
 	}
 	clearSupplyTables(t, db,
+		"content_stage_controls",
 		"source_run_projection_work", "source_run_verification_tasks", "source_run_reconciliation_events", "source_run_retained_receipts", "source_run_receipts", "source_run_execution_units", "source_run_attempts", "content_processing_events", "source_run_requests", "source_run_admission_cutovers", (models.SourceRunAdmissionProtocol{}).TableName(), "media_supply_controls", "content_items", "content_sources",
 	)
 	return db

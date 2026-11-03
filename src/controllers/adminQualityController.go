@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"content-management-system/src/definitionconfig"
 	"content-management-system/src/models"
 	"encoding/json"
 	"errors"
@@ -132,14 +133,14 @@ func validateAndApplyProfile(p *models.QualityProfile, req qualityProfileRequest
 	if codec == "" {
 		codec = "h264"
 	}
-	if codec != "h264" && codec != "h265" && codec != "av1" {
+	if !definitionconfig.VideoCodec(codec) {
 		return errors.New("video_codec must be h264, h265, or av1")
 	}
 	audio := strings.ToLower(strings.TrimSpace(req.AudioCodec))
 	if audio == "" {
 		audio = "aac"
 	}
-	if audio != "aac" && audio != "opus" {
+	if !definitionconfig.AudioCodec(audio) {
 		return errors.New("audio_codec must be aac or opus")
 	}
 	preset := strings.ToLower(strings.TrimSpace(req.Preset))
@@ -163,7 +164,7 @@ func validateAndApplyProfile(p *models.QualityProfile, req qualityProfileRequest
 	if container == "" {
 		container = "mp4"
 	}
-	if !validOutputContainers[container] {
+	if !definitionconfig.Container(container) {
 		return errors.New("output_container must be mp4, webm, or mov")
 	}
 
