@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const maxModerationDetailLength = 1_000
@@ -302,14 +303,17 @@ func AdminResolveCommentReview(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	err = db.Transaction(func(tx *gorm.DB) error {
 		var comment models.UserInteraction
-		if err := tx.Model(&models.UserInteraction{}).
+		if err := tx.Model(&models.UserInteraction{}).Clauses(clause.Locking{Strength: "UPDATE", Table: clause.Table{Name: "user_interactions"}}).
 			Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
 			Where("content_items.tenant_id = ? AND user_interactions.public_id = ? AND user_interactions.type = ? AND user_interactions.comment_moderation_status = ?", principal.TenantID, commentID, models.InteractionTypeComment, string(commentPolicyReview)).
 			First(&comment).Error; err != nil {
 			return err
 		}
 		if body.Status == "removed" {
-			return tx.Delete(&comment).Error
+			if err := tx.Delete(&comment).Error; err != nil {
+				return err
+			}
+			return writeModerationAudit(tx, principal, "moderation.comment."+body.Status, commentID.String(), nil)
 		}
 		status := string(commentPolicyAllow)
 		if err := tx.Model(&comment).Updates(map[string]any{
@@ -318,7 +322,10 @@ func AdminResolveCommentReview(c *gin.Context) {
 		}).Error; err != nil {
 			return err
 		}
-		return updateEngagementCount(tx, comment.ContentItemID, models.InteractionTypeComment, 1)
+		if err := updateEngagementCount(tx, comment.ContentItemID, models.InteractionTypeComment, 1); err != nil {
+			return err
+		}
+		return writeModerationAudit(tx, principal, "moderation.comment."+body.Status, commentID.String(), nil)
 	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"message": "Comment review not found"})
@@ -328,7 +335,6 @@ func AdminResolveCommentReview(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to resolve comment review"})
 		return
 	}
-	writeModerationAudit(db, principal, "moderation.comment."+body.Status, commentID.String(), nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Comment review resolved"})
 }
 
@@ -365,7 +371,7 @@ func AdminListModerationReports(c *gin.Context) {
 		return
 	}
 	var reports []models.ModerationReport
-	if err := query.Order("created_at ASC").Offset((page - 1) * limit).Limit(limit).Find(&reports).Error; err != nil {
+	if err := query.Order("created_at ASC, id ASC").Offset((page - 1) * limit).Limit(limit).Find(&reports).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to load moderation queue"})
 		return
 	}
@@ -418,6 +424,8 @@ func AdminListModerationReports(c *gin.Context) {
 	c.JSON(http.StatusOK, moderationQueueResponse{Data: response, Total: total, Page: page, Limit: limit, TotalPages: int((total + int64(limit) - 1) / int64(limit))})
 }
 
+var errModerationAlreadyReviewed = errors.New("This report was already reviewed. Refresh the case.")
+
 func AdminResolveModerationReport(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
@@ -430,23 +438,43 @@ func AdminResolveModerationReport(c *gin.Context) {
 	}
 	var body struct {
 		Status string `json:"status"`
+		Reason string `json:"reason"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || (body.Status != "resolved" && body.Status != "dismissed") {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "status must be resolved or dismissed"})
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	var report models.ModerationReport
-	if err := db.Where("public_id = ? AND tenant_id = ?", reportID, principal.TenantID).First(&report).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"message": "Report not found"})
+	body.Reason = strings.TrimSpace(body.Reason)
+	if len(body.Reason) > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Review reason is too long"})
 		return
 	}
-	report.Status = body.Status
-	if err := db.Save(&report).Error; err != nil {
+	var report models.ModerationReport
+	err = db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("public_id = ? AND tenant_id = ?", reportID, principal.TenantID).First(&report).Error; err != nil {
+			return err
+		}
+		if report.Status != "open" {
+			return errModerationAlreadyReviewed
+		}
+		report.Status = body.Status
+		if err := tx.Save(&report).Error; err != nil {
+			return err
+		}
+		return writeModerationAudit(tx, principal, "moderation.report."+body.Status, reportID.String(), map[string]any{"target_type": report.TargetType, "target_id": report.TargetID.String(), "review_reason": body.Reason})
+	})
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		c.JSON(http.StatusNotFound, gin.H{"message": "Report not found"})
+		return
+	case errors.Is(err, errModerationAlreadyReviewed):
+		c.JSON(http.StatusConflict, gin.H{"message": err.Error()})
+		return
+	case err != nil:
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to update report"})
 		return
 	}
-	writeModerationAudit(db, principal, "moderation.report."+body.Status, reportID.String(), map[string]any{"target_type": report.TargetType, "target_id": report.TargetID.String()})
 	c.JSON(http.StatusOK, gin.H{"data": report})
 }
 
@@ -465,13 +493,21 @@ func AdminRemoveComment(c *gin.Context) {
 	db := c.MustGet("db").(*gorm.DB)
 	err = db.Transaction(func(tx *gorm.DB) error {
 		var comment models.UserInteraction
-		if err := tx.Where("public_id = ? AND type = ?", commentID, models.InteractionTypeComment).First(&comment).Error; err != nil {
+		if err := tx.Model(&models.UserInteraction{}).
+			Clauses(clause.Locking{Strength: "UPDATE", Table: clause.Table{Name: "user_interactions"}}).
+			Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+			Where("content_items.tenant_id = ? AND user_interactions.public_id = ? AND user_interactions.type = ?", principal.TenantID, commentID, models.InteractionTypeComment).First(&comment).Error; err != nil {
 			return err
 		}
-		if err := updateEngagementCount(tx, comment.ContentItemID, models.InteractionTypeComment, -1); err != nil {
+		if comment.CommentModerationStatus == nil || *comment.CommentModerationStatus == string(commentPolicyAllow) {
+			if err := updateEngagementCount(tx, comment.ContentItemID, models.InteractionTypeComment, -1); err != nil {
+				return err
+			}
+		}
+		if err := tx.Delete(&comment).Error; err != nil {
 			return err
 		}
-		return tx.Delete(&comment).Error
+		return writeModerationAudit(tx, principal, "moderation.comment.remove", commentID.String(), nil)
 	})
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -481,11 +517,104 @@ func AdminRemoveComment(c *gin.Context) {
 		}
 		return
 	}
-	writeModerationAudit(db, principal, "moderation.comment.remove", commentID.String(), nil)
 	c.JSON(http.StatusOK, gin.H{"message": "Comment removed"})
 }
 
-func writeModerationAudit(db *gorm.DB, principal utils.AdminPrincipal, action, target string, payload map[string]any) {
+func writeModerationAudit(db *gorm.DB, principal utils.AdminPrincipal, action, target string, payload map[string]any) error {
 	encoded, _ := json.Marshal(payload)
-	_ = db.Create(&models.AuditLog{TenantID: principal.TenantID, UserID: principal.UserID, UserEmail: principal.Email, Action: action, TargetService: "cms", TargetResource: target, Status: "success", Payload: datatypes.JSON(encoded)}).Error
+	return db.Create(&models.AuditLog{TenantID: principal.TenantID, UserID: principal.UserID, UserEmail: principal.Email, Action: action, TargetService: "cms", TargetResource: target, Status: "success", Payload: datatypes.JSON(encoded)}).Error
+}
+
+func AdminGetModerationReport(c *gin.Context) {
+	p, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"message": "Invalid report ID"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB).WithContext(c.Request.Context())
+	var report models.ModerationReport
+	err = db.Where("public_id = ? AND tenant_id = ?", id, p.TenantID).First(&report).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(404, gin.H{"message": "Report not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(503, gin.H{"message": "Case is unavailable"})
+		return
+	}
+	result := gin.H{"report": report, "target_available": false}
+	parentID := report.TargetID
+	if report.TargetType == models.ModerationTargetComment {
+		var comment models.UserInteraction
+		err = db.Model(&models.UserInteraction{}).
+			Joins("JOIN content_items ON content_items.public_id = user_interactions.content_item_id").
+			Where("content_items.tenant_id = ? AND user_interactions.public_id = ? AND user_interactions.type = ?", p.TenantID, report.TargetID, models.InteractionTypeComment).First(&comment).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(200, gin.H{"data": result})
+			return
+		}
+		if err != nil {
+			c.JSON(503, gin.H{"message": "Comment evidence is unavailable"})
+			return
+		}
+		parentID = comment.ContentItemID
+		var meta commentMetadata
+		if json.Unmarshal(comment.Metadata, &meta) == nil {
+			result["comment_text"] = meta.Text
+		}
+	}
+	var content models.ContentItem
+	err = db.Select("public_id", "title").Where("tenant_id = ? AND public_id = ?", p.TenantID, parentID).First(&content).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		c.JSON(200, gin.H{"data": result})
+		return
+	}
+	if err != nil {
+		c.JSON(503, gin.H{"message": "Parent evidence is unavailable"})
+		return
+	}
+	result["target_available"] = true
+	result["parent_id"] = content.PublicID
+	result["parent_title"] = content.Title
+	c.JSON(200, gin.H{"data": result})
+}
+
+func AdminNextModerationReport(c *gin.Context) {
+	p, ok := requireAdminPrincipal(c)
+	if !ok {
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil || id == uuid.Nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Invalid report ID"})
+		return
+	}
+	db := c.MustGet("db").(*gorm.DB).WithContext(c.Request.Context())
+	var next struct{ ID *uuid.UUID }
+	// A lateral read preserves the tenant-scoped anchor even after closure.
+	result := db.Raw(`
+		SELECT next.public_id AS id
+		FROM moderation_reports anchor
+		LEFT JOIN LATERAL (
+			SELECT candidate.public_id
+			FROM moderation_reports candidate
+			WHERE candidate.tenant_id = anchor.tenant_id AND candidate.status = 'open'
+				AND (candidate.created_at, candidate.id) > (anchor.created_at, anchor.id)
+			ORDER BY candidate.created_at, candidate.id LIMIT 1
+		) next ON TRUE
+		WHERE anchor.tenant_id = ? AND anchor.public_id = ?
+	`, p.TenantID, id).Scan(&next)
+	if result.Error != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"message": "Could not check the next case"})
+		return
+	}
+	if result.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "Report not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"id": next.ID}})
 }

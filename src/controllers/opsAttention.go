@@ -1,12 +1,15 @@
 package controllers
 
 import (
+	"content-management-system/src/models"
+	"content-management-system/src/utils"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -105,7 +108,7 @@ func opsNormalizeAttentionRow(member opsFleetMember, kind string, row opsAttenti
 	if fingerprint == "" {
 		fingerprint = opsFingerprint(member.Key, kind, row.TenantID, row.NativeID)
 	}
-	return opsAttentionItem{Key: opsAttentionKey(member.Key, kind, row.TenantID, row.NativeID), Fingerprint: fingerprint, System: member.Key, TenantID: row.TenantID, Kind: kind, Severity: severity, Title: row.Title, Detail: row.Detail, Count: count, FirstSeen: row.FirstSeen, Href: href, ClientPlatform: row.ClientPlatform}
+	return opsAttentionItem{Key: opsAttentionKey(member.Key, kind, row.TenantID, row.NativeID), Fingerprint: fingerprint, System: member.Key, TenantID: row.TenantID, Kind: kind, Severity: severity, Title: row.Title, Detail: row.Detail, Count: count, FirstSeen: row.FirstSeen, Href: href, NativeID: row.NativeID, ClientPlatform: row.ClientPlatform}
 }
 
 func opsAttentionQuery(db *gorm.DB, member opsFleetMember, kind, query string, args ...any) ([]opsAttentionItem, error) {
@@ -214,4 +217,23 @@ func opsAttentionKey(system, kind, tenant, native string) string {
 		return system + ":" + kind + ":" + tenant + ":" + opsFingerprint(native)
 	}
 	return key
+}
+
+func opsExactIssueHref(item opsAttentionItem, principal utils.AdminPrincipal) string {
+	if item.Kind != "episode" || item.TenantID == "" || item.TenantID != principal.TenantID || !principal.HasPermission("feed:read") {
+		return ""
+	}
+	id, err := uuid.Parse(item.NativeID)
+	if err != nil || id == uuid.Nil {
+		return ""
+	}
+	switch item.System {
+	case "feed_integrity":
+		return "/platform/feed-integrity?tab=issues&selected=" + id.String()
+	case "experience":
+		if models.RuxClientPlatforms[item.ClientPlatform] {
+			return "/platform/real-experience?client=" + item.ClientPlatform + "&incident=" + id.String()
+		}
+	}
+	return ""
 }

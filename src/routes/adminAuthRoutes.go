@@ -30,6 +30,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/ops/status", utils.RequireAdminRole("admin"), controllers.GetOpsStatus)
 	adminGroup.GET("/ops/fleet", utils.RequireAdminRole("admin"), controllers.GetOpsFleet)
 	adminGroup.GET("/ops/attention", utils.RequireAdminRole("admin"), controllers.ListOpsAttention)
+	adminGroup.POST("/ops/attention/handoff", utils.RequireAdminRole("admin"), controllers.OpsUpdateHandoff)
 	adminGroup.POST("/ops/attention/ack", utils.RequireAdminRole("admin"), controllers.AckOpsAttention)
 	adminGroup.POST("/ops/attention/snooze", utils.RequireAdminRole("admin"), controllers.SnoozeOpsAttention)
 	adminGroup.POST("/ops/attention/clear", utils.RequireAdminRole("admin"), controllers.ClearOpsAttentionState)
@@ -54,6 +55,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	workloadAdmin.GET("/qualification", controllers.GetWorkloadQualification)
 	workloadAdmin.GET("/permits", controllers.ListWorkloadPermits)
 	workloadAdmin.GET("/decisions", controllers.ListWorkloadDecisions)
+	workloadAdmin.GET("/policy-outcomes", controllers.GetWorkloadPolicyOutcomes)
 	workloadAdmin.GET("/snapshots", controllers.ListWorkloadSnapshots)
 	workloadAdmin.POST("/pause", controllers.PauseWorkloadGovernor)
 	workloadAdmin.POST("/permits/:id/revoke", controllers.RevokeWorkloadPermit)
@@ -69,6 +71,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/sources/podcast-search", perm("source", "write"), controllers.SearchPodcasts)
 	adminGroup.GET("/sources/youtube-resolve", perm("source", "write"), controllers.ResolveYoutube)
 	adminGroup.GET("/sources/stats", perm("source", "read"), controllers.GetSourceStats)
+	adminGroup.GET("/sources/lookup", perm("source", "read"), controllers.FindConsoleSources)
 	adminGroup.GET("/sources/:id", perm("source", "read"), controllers.GetContentSource)
 	adminGroup.PUT("/sources/:id", perm("source", "write"), controllers.UpdateContentSource)
 	adminGroup.DELETE("/sources/:id", perm("source", "delete"), controllers.DeleteContentSource)
@@ -123,6 +126,9 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.PATCH("/content/:id/status", perm("content", "write"), controllers.UpdateContentStatus)
 	adminGroup.PATCH("/content/:id/suitability", perm("content", "write"), controllers.UpdateContentSuitability)
 	adminGroup.POST("/content/bulk-delete", perm("content", "delete"), controllers.BulkDeleteContent)
+	adminGroup.POST("/content/bulk-delete/reviews", perm("content", "delete"), controllers.PreviewNewsContentDelete)
+	adminGroup.GET("/content/bulk-delete/reviews/:id", perm("content", "delete"), controllers.GetNewsContentDeleteReview)
+	adminGroup.POST("/content/bulk-delete/reviews/:id/apply", perm("content", "delete"), controllers.ApplyNewsContentDelete)
 	adminGroup.POST("/content/bulk-status", perm("content", "write"), controllers.BulkStatusChange)
 	adminGroup.POST("/content/bulk-tags", perm("content", "write"), controllers.BulkEditTags)
 	adminGroup.POST("/content/bulk-topic", perm("content", "write"), controllers.BulkAssignTopic)
@@ -130,12 +136,15 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// Consumer moderation queue. CMS owns all report status and comment
 	// removal; Platform Console is only the authenticated operator surface.
 	adminGroup.GET("/moderation/reports", perm("content", "read"), controllers.AdminListModerationReports)
+	adminGroup.GET("/moderation/reports/:id", perm("content", "read"), controllers.AdminGetModerationReport)
+	adminGroup.GET("/moderation/reports/:id/next", perm("content", "read"), controllers.AdminNextModerationReport)
 	adminGroup.POST("/moderation/reports/:id/resolve", perm("content", "write"), controllers.AdminResolveModerationReport)
 	adminGroup.GET("/moderation/comments/review", perm("content", "read"), controllers.AdminListCommentReviews)
 	adminGroup.POST("/moderation/comments/:id/review", perm("content", "write"), controllers.AdminResolveCommentReview)
 	adminGroup.DELETE("/moderation/comments/:id", perm("content", "write"), controllers.AdminRemoveComment)
 
 	// First-class topics (LLM-labeled) management
+	adminGroup.GET("/stories/:id", perm("content", "read"), controllers.GetConsoleNewsStory)
 	adminGroup.PATCH("/stories/:id", perm("content", "write"), controllers.RenameTopic)
 	adminGroup.DELETE("/stories/:id", perm("content", "write"), controllers.DeleteTopic)
 	adminGroup.POST("/stories/merge", perm("content", "write"), controllers.MergeTopics)
@@ -215,6 +224,8 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.POST("/media-acquisition/requests", perm("content", "write"), controllers.BulkRequestMediaAcquisition)
 	adminGroup.GET("/content-stages/health", perm("aggregation", "read"), controllers.AdminGetContentStageHealth)
 	adminGroup.GET("/content-stages/items/:id/trace", perm("aggregation", "read"), controllers.AdminGetContentStageTrace)
+	adminGroup.GET("/content-stages/items/:id/trace-summary", perm("aggregation", "read"), controllers.AdminGetDeliverySummary)
+	adminGroup.GET("/content-stages/items/:id/trace-evidence", perm("aggregation", "read"), controllers.AdminGetDeliveryEvidence)
 	adminGroup.PATCH("/content-stages/:lane/control", perm("aggregation", "manage"), controllers.AdminUpdateContentStageControl)
 	adminGroup.POST("/content-stages/:lane/cutover", perm("aggregation", "manage"), controllers.AdminPromoteContentStageLane)
 	adminGroup.GET("/content-stages/:lane/qualification", perm("aggregation", "read"), controllers.AdminGetContentStageQualification)
@@ -279,6 +290,7 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	adminGroup.GET("/intelligence/embeddings/stats", perm("content", "read"), controllers.GetEmbeddingStats)
 
 	// Intelligence — Analytics
+	adminGroup.GET("/intelligence/analytics/pods-outcomes", perm("content", "read"), controllers.GetPodsOutcomeEvidence)
 	adminGroup.GET("/intelligence/analytics/score-distribution", perm("content", "read"), controllers.GetScoreDistribution)
 	adminGroup.GET("/intelligence/analytics/velocity", perm("content", "read"), controllers.GetVelocityLeaderboard)
 	adminGroup.GET("/intelligence/analytics/trending", perm("content", "read"), controllers.GetTrendingItems)

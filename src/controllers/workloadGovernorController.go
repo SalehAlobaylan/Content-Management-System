@@ -196,6 +196,14 @@ func ListWorkloadDecisions(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if raw := c.Query("policy_revision"); raw != "" {
+		revision, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || revision <= 0 {
+			c.JSON(400, gin.H{"error": "Invalid policy revision"})
+			return
+		}
+		filter.PolicyRevision = revision
+	}
 	rows, err := workload.ListDecisions(c.MustGet("db").(*gorm.DB), filter)
 	if err != nil {
 		workloadFailure(c, err)

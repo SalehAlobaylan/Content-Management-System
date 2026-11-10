@@ -867,6 +867,31 @@ func DeleteInteraction(c *gin.Context) {
 		}
 	}
 
+	if interaction.Type == models.InteractionTypeComment {
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var current models.UserInteraction
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("public_id = ? AND user_id = ? AND type = ?", interactionID, interaction.UserID, models.InteractionTypeComment).First(&current).Error; err != nil {
+				return err
+			}
+			if current.CommentModerationStatus == nil || *current.CommentModerationStatus == string(commentPolicyAllow) {
+				if err := updateEngagementCount(tx, current.ContentItemID, current.Type, -1); err != nil {
+					return err
+				}
+			}
+			return tx.Delete(&current).Error
+		})
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, utils.HTTPError{Code: http.StatusNotFound, Message: "Interaction not found"})
+		case err != nil:
+			c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "Failed to delete interaction"})
+		default:
+			c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Interaction deleted successfully"})
+		}
+		return
+	}
+
 	if err := updateEngagementCount(db, interaction.ContentItemID, interaction.Type, -1); err != nil {
 		log.Printf("failed to decrement engagement counter for interaction %s on content %s: %v", interaction.Type, interaction.ContentItemID, err)
 	}

@@ -615,13 +615,6 @@ func BulkAssignTopic(c *gin.Context) {
 		return q
 	}
 
-	if req.DryRun {
-		var count int64
-		apply(db.Model(&models.ContentItem{})).Count(&count)
-		c.JSON(http.StatusOK, bulkEditTagsResponse{UpdatedCount: count, Message: "Dry run — no items updated"})
-		return
-	}
-
 	var target interface{}
 	var targetID *uuid.UUID
 	if req.TargetStoryID == "" || strings.EqualFold(req.TargetStoryID, "null") {
@@ -634,6 +627,27 @@ func BulkAssignTopic(c *gin.Context) {
 		}
 		target = tid
 		targetID = &tid
+	}
+
+	if req.DryRun {
+		if targetID != nil {
+			var exists int64
+			if err := db.Model(&models.Story{}).Where("public_id = ? AND tenant_id = ?", *targetID, principal.TenantID).Count(&exists).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not verify the destination story"})
+				return
+			}
+			if exists == 0 {
+				c.JSON(http.StatusNotFound, gin.H{"message": "Destination story not found"})
+				return
+			}
+		}
+		var count int64
+		if err := apply(db.Model(&models.ContentItem{})).Count(&count).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not verify matching content"})
+			return
+		}
+		c.JSON(http.StatusOK, bulkEditTagsResponse{UpdatedCount: count, Message: "Dry run — no items updated"})
+		return
 	}
 
 	var updated int64

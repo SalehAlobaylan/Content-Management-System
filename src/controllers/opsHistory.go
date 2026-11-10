@@ -231,7 +231,8 @@ func GetOpsBriefing(c *gin.Context) {
 	for _, item := range items {
 		totals[item.Kind] += item.Count
 	}
-	c.JSON(200, gin.H{"data": gin.H{"since": since, "through": through, "items": items, "totals": totals, "commands": commands, "commands_truncated": truncated, "command_count": commandCount, "adapter_errors": errs, "complete": len(errs) == 0, "read_token": token, "overlap_seconds": 300}})
+	handoffs, handoffErr := readOpsHandoffs(db, p.TenantID, p.UserID, nil)
+	c.JSON(200, gin.H{"data": gin.H{"since": since, "through": through, "items": items, "totals": totals, "commands": commands, "commands_truncated": truncated, "command_count": commandCount, "adapter_errors": errs, "complete": len(errs) == 0, "read_token": token, "overlap_seconds": 300, "handoffs": handoffs, "handoffs_available": handoffErr == nil}})
 }
 func MarkOpsBriefingSeen(c *gin.Context) {
 	p, ok := utils.GetAdminPrincipal(c)

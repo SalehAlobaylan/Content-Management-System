@@ -93,18 +93,21 @@ type incomingRuxEvent struct {
 		NetworkClass  string `json:"network_class"`
 		InstalledPWA  bool   `json:"installed_pwa"`
 	} `json:"client"`
-	Measurements *struct {
-		DurationMS         *int    `json:"duration_ms"`
-		MediaErrorCode     *int    `json:"media_error_code"`
-		StallDurationMS    *int    `json:"stall_duration_ms"`
-		FailureClass       *string `json:"failure_class"`
-		ObservedPlaybackMS *int    `json:"observed_playback_ms"`
-		StallCount         *int    `json:"stall_count"`
-		PositionDriftMS    *int    `json:"position_drift_ms"`
-		FallbackUsed       *bool   `json:"fallback_used"`
-		BoundaryStarved    *bool   `json:"boundary_starved"`
-		Visible            *bool   `json:"visible"`
-	} `json:"measurements"`
+	Measurements *incomingRuxMeasurements `json:"measurements"`
+}
+
+type incomingRuxMeasurements struct {
+	ProductSessionFeedMask *int    `json:"product_session_feed_mask"`
+	DurationMS             *int    `json:"duration_ms"`
+	MediaErrorCode         *int    `json:"media_error_code"`
+	StallDurationMS        *int    `json:"stall_duration_ms"`
+	FailureClass           *string `json:"failure_class"`
+	ObservedPlaybackMS     *int    `json:"observed_playback_ms"`
+	StallCount             *int    `json:"stall_count"`
+	PositionDriftMS        *int    `json:"position_drift_ms"`
+	FallbackUsed           *bool   `json:"fallback_used"`
+	BoundaryStarved        *bool   `json:"boundary_starved"`
+	Visible                *bool   `json:"visible"`
 }
 
 type incomingRuxBatch struct {
@@ -381,6 +384,21 @@ func validateAndNormalizeRuxEvent(in *incomingRuxEvent, now time.Time) (models.E
 	if in.Sequence < 0 {
 		return out, false
 	}
+	productSessionClosed := in.EventType == "product_session_closed"
+	durationLimit := models.RuxMaxDurationMS
+	if productSessionClosed {
+		durationLimit = 12 * 60 * 60 * 1000
+	}
+	if in.EventType == "product_session_started" || productSessionClosed {
+		if in.SchemaVersion != 3 || out.JourneyID == nil {
+			return out, false
+		}
+		if productSessionClosed && (in.Measurements == nil ||
+			in.Measurements.DurationMS == nil || *in.Measurements.DurationMS < 0 || *in.Measurements.DurationMS > durationLimit ||
+			in.Measurements.ProductSessionFeedMask == nil || *in.Measurements.ProductSessionFeedMask < 1 || *in.Measurements.ProductSessionFeedMask > 3) {
+			return out, false
+		}
+	}
 	if in.EventType == "journey_terminal" {
 		if in.SchemaVersion < 2 || out.JourneyID == nil || !models.RuxPhases[in.Phase] || !models.RuxOutcomes[in.Outcome] || in.Measurements == nil {
 			return out, false
@@ -424,7 +442,7 @@ func validateAndNormalizeRuxEvent(in *incomingRuxEvent, now time.Time) (models.E
 		for _, bound := range []struct {
 			v   *int
 			max int
-		}{{m.DurationMS, models.RuxMaxDurationMS}, {m.StallDurationMS, models.RuxMaxStallMS}, {m.ObservedPlaybackMS, models.RuxMaxDurationMS}, {m.StallCount, 10000}, {m.PositionDriftMS, models.RuxMaxDurationMS}} {
+		}{{m.DurationMS, durationLimit}, {m.StallDurationMS, models.RuxMaxStallMS}, {m.ObservedPlaybackMS, models.RuxMaxDurationMS}, {m.StallCount, 10000}, {m.PositionDriftMS, models.RuxMaxDurationMS}} {
 			if bound.v != nil && (*bound.v < 0 || *bound.v > bound.max) {
 				return out, false
 			}
@@ -443,7 +461,7 @@ func validateAndNormalizeRuxEvent(in *incomingRuxEvent, now time.Time) (models.E
 		if m.StallDurationMS != nil && m.ObservedPlaybackMS != nil && *m.StallDurationMS > *m.ObservedPlaybackMS {
 			return out, false
 		}
-		if m.DurationMS != nil && *m.DurationMS >= 0 && *m.DurationMS <= models.RuxMaxDurationMS {
+		if m.DurationMS != nil && *m.DurationMS >= 0 && *m.DurationMS <= durationLimit {
 			v := *m.DurationMS
 			out.DurationMS = &v
 		}
@@ -462,6 +480,10 @@ func validateAndNormalizeRuxEvent(in *incomingRuxEvent, now time.Time) (models.E
 		if m.Visible != nil {
 			v := *m.Visible
 			out.Visible = &v
+		}
+		if productSessionClosed {
+			out.Measurements, _ = json.Marshal(map[string]any{"duration_ms": out.DurationMS, "product_session_feed_mask": m.ProductSessionFeedMask})
+			return out, true
 		}
 		// Persist the sanitized measurements block too (bounded, known keys only).
 		if b, e := json.Marshal(map[string]any{

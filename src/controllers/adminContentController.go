@@ -23,6 +23,7 @@ import (
 var (
 	errBulkDeleteScopeTooLarge = errors.New("bulk content deletion is limited to 500 exact rows per request")
 	errBulkDeletePodsRequired  = errors.New("Pods content must be retired through the Pods Reset owner")
+	errBulkDeleteScopeChanged  = errors.New("bulk delete scope changed before the exact rows could be removed")
 )
 
 type adminContentListResponse struct {
@@ -1222,49 +1223,16 @@ func BulkDeleteContent(c *gin.Context) {
 		return
 	}
 
-	query := db.Where("tenant_id = ?", principal.TenantID)
-
-	if hasIDs {
-		// When ids are provided, ignore the other filters — they're an
-		// explicit row-selection from the UI.
-		query = query.Where("public_id IN ?", req.IDs)
-	} else {
-		if req.Status != "" {
-			query = query.Where("status = ?", strings.ToUpper(req.Status))
-		}
-
-		if req.SourceName != "" {
-			query = query.Where("source_name = ?", req.SourceName)
-		}
-
-		if req.Type != "" {
-			query = query.Where("type = ?", strings.ToUpper(req.Type))
-		}
-
-		if req.Topic != "" {
-			query = query.Where("? = ANY(topic_tags)", req.Topic)
-		}
-
-		if req.StoryID != "" {
-			if strings.EqualFold(req.StoryID, "none") {
-				query = query.Where("story_id IS NULL")
-			} else {
-				query = query.Where("story_id = ?", req.StoryID)
-			}
-		}
-
-		if req.CreatedBefore != "" {
-			parsedTime, err := time.Parse(time.RFC3339, req.CreatedBefore)
-			if err != nil {
-				c.JSON(http.StatusBadRequest, authErrorResponse{
-					Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
-					Code:    "INVALID_DATE",
-				})
-				return
-			}
-			query = query.Where("created_at < ?", parsedTime)
+	if !hasIDs && req.CreatedBefore != "" {
+		if _, err := time.Parse(time.RFC3339, req.CreatedBefore); err != nil {
+			c.JSON(http.StatusBadRequest, authErrorResponse{
+				Message: "Invalid created_before format. Use RFC3339 (e.g., 2026-03-14T00:00:00Z)",
+				Code:    "INVALID_DATE",
+			})
+			return
 		}
 	}
+	query := bulkContentDeleteQuery(db, principal.TenantID, req)
 
 	var podsCount int64
 	if err := query.Session(&gorm.Session{}).Model(&models.ContentItem{}).Where("type IN ?", []models.ContentType{models.ContentTypeVideo, models.ContentTypePodcast}).Count(&podsCount).Error; err != nil {
@@ -1277,7 +1245,10 @@ func BulkDeleteContent(c *gin.Context) {
 	}
 	if req.DryRun {
 		var count int64
-		query.Session(&gorm.Session{}).Model(&models.ContentItem{}).Count(&count)
+		if err := query.Session(&gorm.Session{}).Model(&models.ContentItem{}).Count(&count).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not verify matching content"})
+			return
+		}
 		c.JSON(http.StatusOK, bulkDeleteContentResponse{
 			DeletedCount: count,
 			Message:      "Dry run - no items deleted",
@@ -1287,102 +1258,12 @@ func BulkDeleteContent(c *gin.Context) {
 
 	var deletedCount int64
 	err := db.Transaction(func(tx *gorm.DB) error {
-		deleteQuery := tx.Model(&models.ContentItem{}).Where("tenant_id = ?", principal.TenantID)
-		if hasIDs {
-			deleteQuery = deleteQuery.Where("public_id IN ?", req.IDs)
-		} else {
-			if req.Status != "" {
-				deleteQuery = deleteQuery.Where("status = ?", strings.ToUpper(req.Status))
-			}
-			if req.SourceName != "" {
-				deleteQuery = deleteQuery.Where("source_name = ?", req.SourceName)
-			}
-			if req.Type != "" {
-				deleteQuery = deleteQuery.Where("type = ?", strings.ToUpper(req.Type))
-			}
-			if req.Topic != "" {
-				deleteQuery = deleteQuery.Where("? = ANY(topic_tags)", req.Topic)
-			}
-			if req.StoryID != "" {
-				if strings.EqualFold(req.StoryID, "none") {
-					deleteQuery = deleteQuery.Where("story_id IS NULL")
-				} else {
-					deleteQuery = deleteQuery.Where("story_id = ?", req.StoryID)
-				}
-			}
-			if req.CreatedBefore != "" {
-				parsedTime, _ := time.Parse(time.RFC3339, req.CreatedBefore)
-				deleteQuery = deleteQuery.Where("created_at < ?", parsedTime)
-			}
-		}
-
-		var targets []models.ContentItem
-		if err := deleteQuery.Order("id ASC").Limit(bulkDeleteIDsLimit + 1).Find(&targets).Error; err != nil {
+		deleteQuery := bulkContentDeleteQuery(tx, principal.TenantID, req)
+		targets, err := loadBulkDeleteTargets(deleteQuery)
+		if err != nil {
 			return err
 		}
-		if len(targets) > bulkDeleteIDsLimit {
-			return errBulkDeleteScopeTooLarge
-		}
-		if len(targets) == 0 {
-			return nil
-		}
-
-		resources := make([]lifecycle.Resource, 0, len(targets))
-		for _, item := range targets {
-			lane := ""
-			switch item.Type {
-			case models.ContentTypeNews, models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
-				lane = "news"
-			case models.ContentTypeVideo, models.ContentTypePodcast:
-				return errBulkDeletePodsRequired
-			default:
-				return errors.New("bulk deletion encountered an unsupported content type")
-			}
-			sourceID := "-"
-			if item.ContentSourceID != nil {
-				sourceID = item.ContentSourceID.String()
-			}
-			resources = append(resources, lifecycle.Resource{Type: lifecycle.ResourceItem, Key: lane + "/" + sourceID + "/" + item.PublicID.String()})
-		}
-		if err := lifecycle.CheckResources(tx, principal.TenantID, resources, lifecycle.PhaseContentWrite); err != nil {
-			return err
-		}
-		ids := make([]uuid.UUID, 0, len(targets))
-		selectedUpdatedAt := make(map[uuid.UUID]time.Time, len(targets))
-		for _, item := range targets {
-			ids = append(ids, item.PublicID)
-			selectedUpdatedAt[item.PublicID] = item.UpdatedAt
-		}
-		var lockedTargets []models.ContentItem
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).
-			Order("id ASC").Find(&lockedTargets).Error; err != nil {
-			return err
-		}
-		if len(lockedTargets) != len(targets) {
-			return errors.New("bulk delete scope changed before its exact rows were locked")
-		}
-		var stillMatching int64
-		if err := deleteQuery.Where("public_id IN ?", ids).Count(&stillMatching).Error; err != nil {
-			return err
-		}
-		if stillMatching != int64(len(targets)) {
-			return errors.New("bulk delete filters changed before their exact rows were locked")
-		}
-		for _, item := range lockedTargets {
-			if !item.UpdatedAt.Equal(selectedUpdatedAt[item.PublicID]) {
-				return errors.New("bulk delete scope changed before its exact rows were locked")
-			}
-		}
-		result := tx.Where("tenant_id = ? AND public_id IN ?", principal.TenantID, ids).Delete(&models.ContentItem{})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != int64(len(targets)) {
-			return errors.New("bulk delete scope changed before its exact rows were removed")
-		}
-		deletedCount = result.RowsAffected
-		return nil
+		return deleteBulkContentTargets(tx, principal.TenantID, deleteQuery, targets, &deletedCount)
 	})
 	if errors.Is(err, errBulkDeleteScopeTooLarge) {
 		c.JSON(http.StatusRequestEntityTooLarge, authErrorResponse{Message: err.Error(), Code: "TOO_MANY_DELETE_TARGETS"})
@@ -1390,6 +1271,10 @@ func BulkDeleteContent(c *gin.Context) {
 	}
 	if errors.Is(err, errBulkDeletePodsRequired) {
 		c.JSON(http.StatusConflict, authErrorResponse{Message: "Direct content deletion is disabled for Pods media; use the explicit Pods Reset owner workflow", Code: "PODS_RESET_REQUIRED"})
+		return
+	}
+	if errors.Is(err, errBulkDeleteScopeChanged) {
+		c.JSON(http.StatusConflict, authErrorResponse{Message: err.Error(), Code: "DELETE_SCOPE_CHANGED"})
 		return
 	}
 	if lifecycle.IsConflict(err) {
@@ -1408,6 +1293,111 @@ func BulkDeleteContent(c *gin.Context) {
 		DeletedCount: deletedCount,
 		Message:      "Successfully deleted content items",
 	})
+}
+
+func bulkContentDeleteQuery(tx *gorm.DB, tenant string, req bulkDeleteContentRequest) *gorm.DB {
+	deleteQuery := tx.Model(&models.ContentItem{}).Where("tenant_id = ?", tenant)
+	if len(req.IDs) > 0 {
+		deleteQuery = deleteQuery.Where("public_id IN ?", req.IDs)
+	} else {
+		if req.Status != "" {
+			deleteQuery = deleteQuery.Where("status = ?", strings.ToUpper(req.Status))
+		}
+		if req.SourceName != "" {
+			deleteQuery = deleteQuery.Where("source_name = ?", req.SourceName)
+		}
+		if req.Type != "" {
+			deleteQuery = deleteQuery.Where("type = ?", strings.ToUpper(req.Type))
+		}
+		if req.Topic != "" {
+			deleteQuery = deleteQuery.Where("? = ANY(topic_tags)", req.Topic)
+		}
+		if req.StoryID != "" {
+			if strings.EqualFold(req.StoryID, "none") {
+				deleteQuery = deleteQuery.Where("story_id IS NULL")
+			} else {
+				deleteQuery = deleteQuery.Where("story_id = ?", req.StoryID)
+			}
+		}
+		if req.CreatedBefore != "" {
+			parsedTime, _ := time.Parse(time.RFC3339, req.CreatedBefore)
+			deleteQuery = deleteQuery.Where("created_at < ?", parsedTime)
+		}
+	}
+	return deleteQuery
+}
+
+func loadBulkDeleteTargets(query *gorm.DB) ([]models.ContentItem, error) {
+	var targets []models.ContentItem
+	if err := query.Session(&gorm.Session{}).Order("id ASC").Limit(bulkDeleteIDsLimit + 1).Find(&targets).Error; err != nil {
+		return nil, err
+	}
+	if len(targets) > bulkDeleteIDsLimit {
+		return nil, errBulkDeleteScopeTooLarge
+	}
+	return targets, nil
+}
+
+func deleteBulkContentTargets(tx *gorm.DB, tenant string, deleteQuery *gorm.DB, targets []models.ContentItem, deletedCount *int64) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	resources := make([]lifecycle.Resource, 0, len(targets))
+	for _, item := range targets {
+		lane := ""
+		switch item.Type {
+		case models.ContentTypeNews, models.ContentTypeArticle, models.ContentTypeTweet, models.ContentTypeComment:
+			lane = "news"
+		case models.ContentTypeVideo, models.ContentTypePodcast:
+			return errBulkDeletePodsRequired
+		default:
+			return errors.New("bulk deletion encountered an unsupported content type")
+		}
+		sourceID := "-"
+		if item.ContentSourceID != nil {
+			sourceID = item.ContentSourceID.String()
+		}
+		resources = append(resources, lifecycle.Resource{Type: lifecycle.ResourceItem, Key: lane + "/" + sourceID + "/" + item.PublicID.String()})
+	}
+	if err := lifecycle.CheckResources(tx, tenant, resources, lifecycle.PhaseContentWrite); err != nil {
+		return err
+	}
+	ids := make([]uuid.UUID, 0, len(targets))
+	selectedUpdatedAt := make(map[uuid.UUID]time.Time, len(targets))
+	for _, item := range targets {
+		ids = append(ids, item.PublicID)
+		selectedUpdatedAt[item.PublicID] = item.UpdatedAt
+	}
+	var lockedTargets []models.ContentItem
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("tenant_id = ? AND public_id IN ?", tenant, ids).
+		Order("id ASC").Find(&lockedTargets).Error; err != nil {
+		return err
+	}
+	if len(lockedTargets) != len(targets) {
+		return errBulkDeleteScopeChanged
+	}
+	var stillMatching int64
+	if err := deleteQuery.Where("public_id IN ?", ids).Count(&stillMatching).Error; err != nil {
+		return err
+	}
+	if stillMatching != int64(len(targets)) {
+		return errBulkDeleteScopeChanged
+	}
+	for _, item := range lockedTargets {
+		if !item.UpdatedAt.Equal(selectedUpdatedAt[item.PublicID]) {
+			return errBulkDeleteScopeChanged
+		}
+	}
+	result := tx.Where("tenant_id = ? AND public_id IN ?", tenant, ids).Delete(&models.ContentItem{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != int64(len(targets)) {
+		return errBulkDeleteScopeChanged
+	}
+	*deletedCount = result.RowsAffected
+	return nil
 }
 
 // GetStatusCounts handles GET /admin/content/status-counts
@@ -1529,7 +1519,10 @@ func BulkStatusChange(c *gin.Context) {
 
 		if req.DryRun {
 			var count int64
-			query.Count(&count)
+			if err := query.Count(&count).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not verify matching content"})
+				return
+			}
 			c.JSON(http.StatusOK, bulkStatusChangeResponse{
 				UpdatedCount: count,
 				Message:      "Dry run — no items updated",
@@ -1671,7 +1664,10 @@ func BulkStatusChange(c *gin.Context) {
 
 	if req.DryRun {
 		var count int64
-		applyFilters(db.Model(&models.ContentItem{})).Count(&count)
+		if err := applyFilters(db.Model(&models.ContentItem{})).Count(&count).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Could not verify matching content"})
+			return
+		}
 		if limit > 0 && int64(limit) < count {
 			count = int64(limit)
 		}

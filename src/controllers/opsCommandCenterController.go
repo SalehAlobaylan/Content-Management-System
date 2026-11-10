@@ -149,6 +149,8 @@ type opsAttentionItem struct {
 	Count          int        `json:"count"`
 	FirstSeen      time.Time  `json:"first_seen"`
 	Href           string     `json:"href"`
+	IssueHref      string     `json:"issue_href,omitempty"`
+	NativeID       string     `json:"-"`
 	State          string     `json:"state,omitempty"`
 	Snoozed        bool       `json:"snoozed"`
 	SnoozedUntil   *time.Time `json:"snoozed_until,omitempty"`

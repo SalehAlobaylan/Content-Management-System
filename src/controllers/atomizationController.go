@@ -1413,22 +1413,23 @@ func repairMediaAtomizationLeaksForTenant(c *gin.Context, tenantID string, envel
 }
 
 type atomizationPolicyPatchRequest struct {
-	ChapteringEnabled           *bool    `json:"chaptering_enabled"`
-	AutoPublishHighConfidence   *bool    `json:"auto_publish_high_confidence"`
-	ParentFeedVisible           *bool    `json:"parent_feed_visible"`
-	PreserveVideo               *bool    `json:"preserve_video"`
-	RemoveSponsorSegments       *bool    `json:"remove_sponsor_segments"`
-	MinChapterMinutes           *int     `json:"min_chapter_minutes"`
-	MinFeedUnitSeconds          *int     `json:"min_feed_unit_seconds"`
-	SoftMaxChapterMinutes       *int     `json:"soft_max_chapter_minutes"`
-	HardMaxChapterMinutes       *int     `json:"hard_max_chapter_minutes"`
-	AtomizationMinParentSeconds *int     `json:"atomization_min_parent_seconds"`
-	MaxChaptersPerParent        *int     `json:"max_chapters_per_parent"`
-	ChapteringMode              *string  `json:"chaptering_mode"`
-	HighConfidenceThreshold     *float64 `json:"high_confidence_threshold"`
-	PreferredPlaybackRendition  *string  `json:"preferred_playback_rendition"`
-	FallbackPlaybackRendition   *string  `json:"fallback_playback_rendition"`
-	AudioOnlyAllowed            *bool    `json:"audio_only_allowed"`
+	ExpectedUpdatedAt           *time.Time `json:"expected_updated_at"`
+	ChapteringEnabled           *bool      `json:"chaptering_enabled"`
+	AutoPublishHighConfidence   *bool      `json:"auto_publish_high_confidence"`
+	ParentFeedVisible           *bool      `json:"parent_feed_visible"`
+	PreserveVideo               *bool      `json:"preserve_video"`
+	RemoveSponsorSegments       *bool      `json:"remove_sponsor_segments"`
+	MinChapterMinutes           *int       `json:"min_chapter_minutes"`
+	MinFeedUnitSeconds          *int       `json:"min_feed_unit_seconds"`
+	SoftMaxChapterMinutes       *int       `json:"soft_max_chapter_minutes"`
+	HardMaxChapterMinutes       *int       `json:"hard_max_chapter_minutes"`
+	AtomizationMinParentSeconds *int       `json:"atomization_min_parent_seconds"`
+	MaxChaptersPerParent        *int       `json:"max_chapters_per_parent"`
+	ChapteringMode              *string    `json:"chaptering_mode"`
+	HighConfidenceThreshold     *float64   `json:"high_confidence_threshold"`
+	PreferredPlaybackRendition  *string    `json:"preferred_playback_rendition"`
+	FallbackPlaybackRendition   *string    `json:"fallback_playback_rendition"`
+	AudioOnlyAllowed            *bool      `json:"audio_only_allowed"`
 }
 
 func applyAtomizationPolicyPatch(policy atomizationPolicy, req atomizationPolicyPatchRequest) atomizationPolicy {
@@ -1483,14 +1484,39 @@ func applyAtomizationPolicyPatch(policy atomizationPolicy, req atomizationPolicy
 	return validateAtomizationPolicy(policy)
 }
 
+var errAtomizationPolicyChanged = errors.New("tenant policy changed; review the latest settings")
+
+func readAtomizationPolicyRow(db *gorm.DB, tenant string, lock bool) (models.MediaAtomizationPolicy, error) {
+	var row models.MediaAtomizationPolicy
+	query := db
+	if lock {
+		query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	err := query.Where("tenant_id = ?", tenant).First(&row).Error
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return row, err
+	}
+	defaults := models.DefaultMediaAtomizationPolicy(tenant)
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&defaults).Error; err != nil {
+		return row, err
+	}
+	err = query.Where("tenant_id = ?", tenant).First(&row).Error
+	return row, err
+}
+
 func AdminGetMediaAtomizationPolicy(c *gin.Context) {
 	principal, ok := requireAdminPrincipal(c)
 	if !ok {
 		return
 	}
 	db := c.MustGet("db").(*gorm.DB)
-	policy := validateAtomizationPolicy(policyFromModel(getOrCreateMediaAtomizationPolicy(db, principal.TenantID)))
-	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy fetched", Data: gin.H{"policy": policy}})
+	row, err := readAtomizationPolicyRow(db, principal.TenantID, false)
+	if err != nil {
+		mediaAtomizationQueryError(c, err)
+		return
+	}
+	policy := validateAtomizationPolicy(policyFromModel(row))
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy fetched", Data: gin.H{"policy": policy, "updated_at": row.UpdatedAt}})
 }
 
 func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
@@ -1505,6 +1531,7 @@ func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
 	}
 	db := c.MustGet("db").(*gorm.DB)
 	var updated atomizationPolicy
+	var updatedAt time.Time
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		scope := lifecycle.Scope{TenantID: principal.TenantID, Lane: "pods"}
 		if err := lifecycle.Check(tx, scope, lifecycle.PhaseSourceDispatch); err != nil {
@@ -1513,7 +1540,13 @@ func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
 		if err := lifecycle.Check(tx, scope, lifecycle.PhaseContentWrite); err != nil {
 			return err
 		}
-		model := getOrCreateMediaAtomizationPolicy(tx, principal.TenantID)
+		model, err := readAtomizationPolicyRow(tx, principal.TenantID, true)
+		if err != nil {
+			return err
+		}
+		if req.ExpectedUpdatedAt != nil && !model.UpdatedAt.Equal(*req.ExpectedUpdatedAt) {
+			return errAtomizationPolicyChanged
+		}
 		updated = applyAtomizationPolicyPatch(policyFromModel(model), req)
 		model.ChapteringEnabled = updated.ChapteringEnabled
 		model.AutoPublishHighConfidence = updated.AutoPublishHighConfidence
@@ -1531,15 +1564,23 @@ func AdminUpdateMediaAtomizationPolicy(c *gin.Context) {
 		model.PreferredPlaybackRendition = updated.PreferredPlaybackRendition
 		model.FallbackPlaybackRendition = updated.FallbackPlaybackRendition
 		model.AudioOnlyAllowed = updated.AudioOnlyAllowed
-		return tx.Save(&model).Error
+		if err := tx.Save(&model).Error; err != nil {
+			return err
+		}
+		updatedAt = model.UpdatedAt
+		return nil
 	}); err != nil {
+		if errors.Is(err, errAtomizationPolicyChanged) {
+			c.JSON(http.StatusConflict, gin.H{"message": err.Error()})
+			return
+		}
 		if writeLifecycleConflict(c, err) {
 			return
 		}
 		mediaAtomizationQueryError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy updated", Data: gin.H{"policy": updated}})
+	c.JSON(http.StatusOK, utils.ResponseMessage{Code: http.StatusOK, Message: "Media atomization policy updated", Data: gin.H{"policy": updated, "updated_at": updatedAt}})
 }
 
 func AdminRunAtomizationSweepNow(c *gin.Context) {

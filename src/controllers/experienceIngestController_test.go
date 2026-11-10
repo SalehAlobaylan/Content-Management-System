@@ -83,18 +83,7 @@ func TestValidateRuxEvent_BoundsMeasurements(t *testing.T) {
 	over := models.RuxMaxDurationMS + 1
 	badCode := 9
 	neg := -5
-	in.Measurements = &struct {
-		DurationMS         *int    `json:"duration_ms"`
-		MediaErrorCode     *int    `json:"media_error_code"`
-		StallDurationMS    *int    `json:"stall_duration_ms"`
-		FailureClass       *string `json:"failure_class"`
-		ObservedPlaybackMS *int    `json:"observed_playback_ms"`
-		StallCount         *int    `json:"stall_count"`
-		PositionDriftMS    *int    `json:"position_drift_ms"`
-		FallbackUsed       *bool   `json:"fallback_used"`
-		BoundaryStarved    *bool   `json:"boundary_starved"`
-		Visible            *bool   `json:"visible"`
-	}{DurationMS: &over, MediaErrorCode: &badCode, StallDurationMS: &neg}
+	in.Measurements = &incomingRuxMeasurements{DurationMS: &over, MediaErrorCode: &badCode, StallDurationMS: &neg}
 
 	if _, ok := validateAndNormalizeRuxEvent(&in, time.Now()); ok {
 		t.Fatal("v2 measurements outside supported range must reject the event")
@@ -106,20 +95,34 @@ func TestValidateRuxEvent_AcceptsValidFailureClass(t *testing.T) {
 	in := validRuxEvent()
 	in.EventType = "playback_failed"
 	fc := "autoplay_blocked"
-	in.Measurements = &struct {
-		DurationMS         *int    `json:"duration_ms"`
-		MediaErrorCode     *int    `json:"media_error_code"`
-		StallDurationMS    *int    `json:"stall_duration_ms"`
-		FailureClass       *string `json:"failure_class"`
-		ObservedPlaybackMS *int    `json:"observed_playback_ms"`
-		StallCount         *int    `json:"stall_count"`
-		PositionDriftMS    *int    `json:"position_drift_ms"`
-		FallbackUsed       *bool   `json:"fallback_used"`
-		BoundaryStarved    *bool   `json:"boundary_starved"`
-		Visible            *bool   `json:"visible"`
-	}{FailureClass: &fc}
+	in.Measurements = &incomingRuxMeasurements{FailureClass: &fc}
 	out, ok := validateAndNormalizeRuxEvent(&in, time.Now())
 	if !ok || out.FailureClass == nil || *out.FailureClass != "autoplay_blocked" {
 		t.Fatalf("valid failure_class not preserved: ok=%v out=%+v", ok, out)
+	}
+}
+
+func TestValidateRuxEvent_ProductSessionRequiresNativeEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	in := validRuxEvent()
+	in.EventType = "product_session_closed"
+	id := uuid.NewString()
+	in.JourneyID = &id
+	if _, ok := validateAndNormalizeRuxEvent(&in, now); ok {
+		t.Fatal("legacy event accepted as a product session")
+	}
+	in.SchemaVersion = 3
+	in.Client.Platform = "ios"
+	in.Measurements = new(incomingRuxMeasurements)
+	duration, mask := 25*60*1000, 3
+	in.Measurements.DurationMS = &duration
+	in.Measurements.ProductSessionFeedMask = &mask
+	out, ok := validateAndNormalizeRuxEvent(&in, now)
+	if !ok || out.DurationMS == nil || *out.DurationMS != duration {
+		t.Fatal("valid native session duration was lost")
+	}
+	mask = 4
+	if _, ok := validateAndNormalizeRuxEvent(&in, now); ok {
+		t.Fatal("unrecognized feed mask accepted")
 	}
 }

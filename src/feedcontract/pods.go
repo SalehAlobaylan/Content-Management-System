@@ -79,7 +79,7 @@ func ApplyServingViewMembership(db *gorm.DB, query *gorm.DB, view ServingView) *
 	args := make([]interface{}, 0, 8)
 	now := time.Now().UTC()
 	if view.NewsGenerationID != uuid.Nil {
-		supported, known := supportsNewsItemMembershipSchema(db)
+		supported, known := NewsExactMembershipSchema(db)
 		if !known {
 			return query.Where("1 = 0")
 		}
@@ -252,7 +252,7 @@ func ApplyActiveGenerationMembership(db *gorm.DB, query *gorm.DB, tenant, lane, 
 		return query.Where("1 = 0")
 	}
 	if lane == "news" && memberType == "news_item" {
-		supported, known := supportsNewsItemMembershipSchema(db)
+		supported, known := NewsExactMembershipSchema(db)
 		if !known {
 			return query.Where("1 = 0")
 		}
@@ -292,7 +292,7 @@ func ApplyPublicItemGenerationMembership(db *gorm.DB, query *gorm.DB) *gorm.DB {
 					WHERE exact_head.tenant_id = content_items.tenant_id
 					  AND exact_head.lane = 'news'
 				)`
-	supported, known := supportsNewsItemMembershipSchema(db)
+	supported, known := NewsExactMembershipSchema(db)
 	if !known {
 		return query.Where("1 = 0")
 	}
@@ -374,7 +374,8 @@ func isDryRun(db *gorm.DB) bool {
 	return db != nil && ((db.Config != nil && db.Config.DryRun) || (db.Statement != nil && db.Statement.DryRun))
 }
 
-func supportsNewsItemMembershipSchema(db *gorm.DB) (bool, bool) {
+// NewsExactMembershipSchema reports whether the active schema records exact News item membership.
+func NewsExactMembershipSchema(db *gorm.DB) (bool, bool) {
 	if schema, ok := requestSchema(db); ok {
 		return schema.ExactItems, schema.ConstraintFound
 	}

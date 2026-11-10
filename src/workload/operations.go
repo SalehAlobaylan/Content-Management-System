@@ -169,6 +169,9 @@ func ListDecisions(db *gorm.DB, f ListFilter) ([]models.WorkloadDecision, error)
 		if f.Verdict != "" {
 			q = q.Where("verdict=?", f.Verdict)
 		}
+		if f.PolicyRevision > 0 {
+			q = q.Where("tenant_id = ? AND system = ? AND class = ? AND event = ? AND policy_revision = ?", "platform", "workload_governor", "policy", "policy_changed", f.PolicyRevision)
+		}
 		if f.BeforeID > 0 {
 			q = q.Where("id<?", f.BeforeID)
 		}

@@ -197,6 +197,7 @@ type Qualification struct {
 }
 
 type ListFilter struct {
+	PolicyRevision int64
 	TenantID       string
 	System         string
 	Class          string

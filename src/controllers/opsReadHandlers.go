@@ -10,6 +10,7 @@ import (
 	"content-management-system/src/models"
 	"content-management-system/src/utils"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -94,7 +95,20 @@ func ListOpsAttention(c *gin.Context) {
 	if end > total {
 		end = total
 	}
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"as_of": now, "items": items[start:end], "total": total, "offset": offset, "limit": limit, "has_more": end < total, "adapter_errors": s.Errors, "complete": s.Complete}})
+	p, _ := utils.GetAdminPrincipal(c)
+	ids := []uuid.UUID{}
+	prefix := "feed_integrity:episode:" + p.TenantID + ":"
+	for i := start; i < end; i++ {
+		item := &items[i]
+		item.IssueHref = opsExactIssueHref(*item, p)
+		if suffix, match := strings.CutPrefix(item.Key, prefix); match {
+			if id, err := uuid.Parse(suffix); err == nil {
+				ids = append(ids, id)
+			}
+		}
+	}
+	handoffs, handoffErr := readOpsHandoffs(db, p.TenantID, p.UserID, ids)
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"as_of": now, "items": items[start:end], "total": total, "offset": offset, "limit": limit, "has_more": end < total, "handoffs": handoffs, "handoffs_available": handoffErr == nil, "adapter_errors": s.Errors, "complete": s.Complete}})
 }
 func opsPageInt(value string, fallback, min, max int) int {
 	n, err := strconv.Atoi(value)
