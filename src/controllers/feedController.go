@@ -335,7 +335,7 @@ func GetPodsFeed(c *gin.Context) {
 			CaughtUp: len(responseItems) == 0 && !hasCursor(pagination),
 			Meta:     availability,
 		})
-		if !isFeedIntegritySynthetic(c) {
+	if !isFeedIntegritySynthetic(c) {
 			recordPodsServe(db, tenantID, items, pagination.Limit, durationTargetMinutes)
 			recordPreferenceServes(db, tenantID, preferenceEligible, int64(boosted), int64(len(items)))
 		}
@@ -501,7 +501,7 @@ func GetNewsFeed(c *gin.Context) {
 		return seenIDs
 	}
 	slides, nextCursor, serveMeta, err := serveStoryNewsFeed(
-		db, tenantID, config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !isFeedIntegritySynthetic(c),
+		db, tenantID, config, circ, pagination.Timestamp, pagination.LastID, slideLimit, waitSeen, userIDStr, !suppressFeedAccounting(c),
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, utils.HTTPError{Code: http.StatusInternalServerError, Message: "News feed is temporarily unavailable"})

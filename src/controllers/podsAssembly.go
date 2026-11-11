@@ -146,7 +146,7 @@ func getPodsFeedCanonical(c *gin.Context) {
 		response[index] = mapToPodsItem(item, liked[item.PublicID], bookmarked[item.PublicID])
 	}
 	c.JSON(200, PodsResponse{Cursor: nextCursor, Items: response, CaughtUp: len(response) == 0 && !hasCursorParam(hasCursor), Meta: availability})
-	if !isFeedIntegritySynthetic(c) {
+	if !suppressFeedAccounting(c) {
 		recordPodsServe(db, tenantID, items, limit, duration)
 		recordPreferenceServes(db, tenantID, assembled.PreferenceEligible, assembled.PreferenceBoosted, int64(len(items)))
 	}

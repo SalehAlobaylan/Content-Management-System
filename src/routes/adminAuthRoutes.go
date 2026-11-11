@@ -25,6 +25,13 @@ func SetupAdminAuthRoutes(router *gin.Engine, db *gorm.DB) {
 	// /me only needs a valid principal (any authenticated user may read their own access).
 	adminGroup.GET("/me", controllers.AdminMe)
 
+	inspection := adminGroup.Group("/feed-inspection", perm("feed", "read"), controllers.FeedInspectionIdentity(), controllers.FeedInspectionConsumerScope)
+	inspection.GET("/pods", controllers.GetPodsFeed)
+	inspection.POST("/pods/sessions", controllers.CreatePodsFeedSession)
+	inspection.GET("/pods/sessions/:id", controllers.GetPodsFeedSessionPage)
+	inspection.GET("/pods/sessions/:id/freshness", controllers.GetPodsFeedSessionFreshness)
+	inspection.GET("/news", controllers.GetNewsFeed)
+
 	// Operations Command Center is intentionally admin-only: it aggregates
 	// deployment-wide state and can write bounded pause fields across systems.
 	adminGroup.GET("/ops/status", utils.RequireAdminRole("admin"), controllers.GetOpsStatus)
